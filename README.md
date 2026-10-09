@@ -47,26 +47,29 @@ Din lokale historik og dine private enhedsnøgler er vigtige. En kontoadgangskod
 
 Relay er en preview under udvikling. Krypteringen er implementeret, men integrationen har endnu ikke fået et uafhængigt sikkerhedsreview. En kompromitteret computer kan stadig give andre adgang til indholdet på den computer.
 
-**Hvad fortæller en VirusTotal-rapport?**
+**Er programfilerne scannet med Microsoft Defender?**
 
-Den viser antivirusresultater for en bestemt programfil. Den kontrollerer ikke, om Relays kryptering er implementeret korrekt, og er ingen garanti for fuld sikkerhed. [Læs om VirusTotal](https://docs.virustotal.com/docs/how-it-works).
+Ja. De tre programfiler i **Relay 0.10.0 navigation-preview** blev scannet lokalt med **Microsoft Defender Antivirus den 9. oktober 2026**. Microsoft Defender fandt ingen trusler i de tre scannede programfiler.
 
-De tre programfiler i **Relay 0.10.0 navigation-preview** blev analyseret **9. oktober 2026**:
+| Programfil | Microsoft Defender |
+| --- | --- |
+| Relay-appen (`relay.exe`) | Ingen trusler fundet |
+| Den lokale Relay-server (`relay-server.exe`) | Ingen trusler fundet |
+| Video-/streamingserveren (`livekit-server.exe`) | Ingen trusler fundet |
 
-| Program | Detektioner | VirusTotal |
-| --- | --- | --- |
-| Relay-appen | **1/57** | [Se rapport](https://www.virustotal.com/gui/file/2d0ac2b71c6a41a2a98bd510fbbe70d7bb7ee22eb3219288f9a3ec3b17c8cfd0/detection) |
-| Den lokale Relay-server | **2/67** | [Se rapport](https://www.virustotal.com/gui/file/604f3a42e91cf20d5956e1852b45d49508ec6e53f6690426a849964763703f41/detection) |
-| Video-/streamingserveren (LiveKit) | **0/70** | [Se rapport](https://www.virustotal.com/gui/file/951f9466cd4450b3c3c7f1a5830a05a9bb97cc11d93cf1be9ebcd3b47cc316d1/detection) |
+Dette er et scanningsresultat, **ikke en godkendelse fra Microsoft eller en garanti for fuld sikkerhed**. Andre antivirusmarkeringer er endnu ikke afklaret. Scanningen dækker disse tre programfiler; launcher-scripts og krypteringens korrekthed er ikke undersøgt med denne scanning.
 
-**Fundene er endnu ikke afklaret.** Trapmine markerede Relay-appen. ClamAV og Trapmine markerede den lokale server. Vi har ikke fastslået, om disse fund er fejlmeldinger, og udgaven beskrives derfor ikke som en sikkerhedsgodkendt udgivelse.
+<details>
+<summary>Om Defender-scanningen</summary>
 
-Microsofts antivirusmotor rapporterede ingen fund i de tre filer. Nogle øvrige motorer overskred svartiden, fejlede eller understøttede ikke filtypen; tallene viser motorer, der returnerede en vurdering. Rapporter kan ændre sig ved senere analyser. Scanningen dækker disse tre programfiler, ikke en gennemgang af kryptering eller alle launcher-scripts.
+Scanningen blev gennemført med antivirusdefinitioner **1.459.639.0**. Hver fil gav resultatet “found no threats” og afslutningskode 0. Scanningen ændrede ikke programfilerne. [Microsofts dokumentation om filscanning](https://learn.microsoft.com/en-us/defender-endpoint/command-line-arguments-microsoft-defender-antivirus).
+
+</details>
 
 <details>
 <summary>Filernes kontrolkoder (SHA-256)</summary>
 
-En kontrolkode identificerer den præcise fil, som rapporten gælder for.
+En kontrolkode identificerer den præcise fil, som scanningen gælder for.
 
 | Fil | SHA-256 |
 | --- | --- |
@@ -78,7 +81,7 @@ En kontrolkode identificerer den præcise fil, som rapporten gælder for.
 
 **Hvorfor kan Windows advare ved download?**
 
-Den nuværende preview er usigneret. Microsoft SmartScreen kan advare, når en fil ikke downloades særlig ofte, eller udgiveren endnu ikke har opbygget omdømme. Digital signering identificerer udgiveren og kan hjælpe på tværs af udgaver, men garanterer ikke, at advarslen forsvinder. En VirusTotal-rapport fjerner ikke automatisk denne advarsel. [Microsofts forklaring](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation).
+Den nuværende preview er usigneret. Microsoft SmartScreen kan advare, når en fil ikke downloades særlig ofte, eller udgiveren endnu ikke har opbygget omdømme. Digital signering identificerer udgiveren og kan hjælpe på tværs af udgaver, men garanterer ikke, at advarslen forsvinder. Et antivirusresultat fjerner ikke automatisk denne advarsel. [Microsofts forklaring](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation).
 
 ## Tale og streaming
 
