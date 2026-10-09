@@ -21,15 +21,35 @@ En lokal Relay-server kan startes fra appen. Værten bestemmer over fællesskabe
 
 Venner skal kunne nå værtscomputeren via det lokale netværk eller en korrekt opsat internetadresse. Ved internetadgang skal værten sørge for sikker transport med HTTPS. En lokal adresse på værtscomputeren gør ikke automatisk serveren tilgængelig for andre.
 
-## Kryptering, forklaret enkelt
+## Sikkerhed, kort forklaret
 
-Nye beskeder, filer og opkald beskyttes på deltagernes enheder, før indholdet sendes gennem Relay-serveren. Serveren videresender det krypterede indhold.
+**Hvem kan læse vores samtale?**
 
-For at kontrollere, hvem man kommunikerer med, sammenligner deltagerne en sikkerhedskode eller et verificeringskort gennem en kontaktmetode, de allerede stoler på. Derefter godkender de hinandens enheder i Relay. Disse offentlige koder indeholder ingen private nøgler.
+Relay krypterer nye beskeder, filer og opkald på deltagernes enheder, før de sendes. Det kaldes end-to-end-kryptering. De godkendte enheder i samtalen har nøglerne til indholdet; serveren videresender det krypterede indhold. Personer, der deltager i samtalen, kan stadig gemme eller videredele det, de modtager.
 
-Kryptering beskytter samtalernes indhold. Serveren kan stadig se blandt andet konti, kanalmedlemskab, offentlige profiler og forbindelsesoplysninger. Ældre ukrypterede beskeder har en tydelig **Legacy**-markering.
+**Hvad kan serveren stadig se?**
 
-Private enhedsnøgler og lokal historik skal bevares. En kontoadgangskode eller en serverbackup alene kan ikke genskabe mistede krypteringsnøgler. Projektet mangler fortsat et uafhængigt sikkerhedsreview.
+Serveren kan se blandt andet konti, offentlige profiler, kanalmedlemskab og forbindelsesoplysninger. Krypteringen beskytter samtalernes indhold; den gør ikke brugerne anonyme.
+
+**Hvordan ved jeg, at jeg taler med den rigtige person?**
+
+Sammenlign jeres sikkerhedskoder eller verificeringskort gennem en kontaktvej, I allerede stoler på, for eksempel personligt eller under et kendt opkald. Godkend derefter de rigtige enheder i Relay. Koden eller kortet kan deles med den anden person og indeholder ingen private nøgler. Hvis koden ændrer sig, skal den kontrolleres igen.
+
+**Hvad betyder “Legacy” ved en besked?**
+
+Det betyder, at beskeden stammer fra den ældre, ukrypterede historik. En opdatering kan ikke gøre allerede gemte, ukrypterede beskeder private med tilbagevirkende kraft.
+
+**Hvad sker der, hvis jeg mister min computer?**
+
+Din lokale historik og dine private enhedsnøgler er vigtige. En kontoadgangskode eller serverbackup alene kan ikke genskabe mistede nøgler. Bevar dem sikkert, og regn ikke med, at en ny installation automatisk giver adgang til alle gamle samtaler.
+
+**Er Relay sikkerhedsgodkendt?**
+
+Relay er en preview under udvikling. Krypteringen er implementeret, men integrationen har endnu ikke fået et uafhængigt sikkerhedsreview. En kompromitteret computer kan stadig give andre adgang til indholdet på den computer.
+
+**Hvad fortæller en VirusTotal-rapport?**
+
+Den viser antivirusresultater for en bestemt programfil. Den kontrollerer ikke, om Relays kryptering er implementeret korrekt, og er ingen garanti for fuld sikkerhed. Der er endnu ikke offentliggjort en VirusTotal-rapport for denne udgave. [Læs om VirusTotal](https://docs.virustotal.com/docs/how-it-works).
 
 ## Tale og streaming
 
