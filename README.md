@@ -49,7 +49,36 @@ Relay er en preview under udvikling. Krypteringen er implementeret, men integrat
 
 **Hvad fortæller en VirusTotal-rapport?**
 
-Den viser antivirusresultater for en bestemt programfil. Den kontrollerer ikke, om Relays kryptering er implementeret korrekt, og er ingen garanti for fuld sikkerhed. Der er endnu ikke offentliggjort en VirusTotal-rapport for denne udgave. [Læs om VirusTotal](https://docs.virustotal.com/docs/how-it-works).
+Den viser antivirusresultater for en bestemt programfil. Den kontrollerer ikke, om Relays kryptering er implementeret korrekt, og er ingen garanti for fuld sikkerhed. [Læs om VirusTotal](https://docs.virustotal.com/docs/how-it-works).
+
+De tre programfiler i **Relay 0.10.0 navigation-preview** blev analyseret **9. oktober 2026**:
+
+| Program | Detektioner | VirusTotal |
+| --- | --- | --- |
+| Relay-appen | **1/57** | [Se rapport](https://www.virustotal.com/gui/file/2d0ac2b71c6a41a2a98bd510fbbe70d7bb7ee22eb3219288f9a3ec3b17c8cfd0/detection) |
+| Den lokale Relay-server | **2/67** | [Se rapport](https://www.virustotal.com/gui/file/604f3a42e91cf20d5956e1852b45d49508ec6e53f6690426a849964763703f41/detection) |
+| Video-/streamingserveren (LiveKit) | **0/70** | [Se rapport](https://www.virustotal.com/gui/file/951f9466cd4450b3c3c7f1a5830a05a9bb97cc11d93cf1be9ebcd3b47cc316d1/detection) |
+
+**Fundene er endnu ikke afklaret.** Trapmine markerede Relay-appen. ClamAV og Trapmine markerede den lokale server. Vi har ikke fastslået, om disse fund er fejlmeldinger, og udgaven beskrives derfor ikke som en sikkerhedsgodkendt udgivelse.
+
+Microsofts antivirusmotor rapporterede ingen fund i de tre filer. Nogle øvrige motorer overskred svartiden, fejlede eller understøttede ikke filtypen; tallene viser motorer, der returnerede en vurdering. Rapporter kan ændre sig ved senere analyser. Scanningen dækker disse tre programfiler, ikke en gennemgang af kryptering eller alle launcher-scripts.
+
+<details>
+<summary>Filernes kontrolkoder (SHA-256)</summary>
+
+En kontrolkode identificerer den præcise fil, som rapporten gælder for.
+
+| Fil | SHA-256 |
+| --- | --- |
+| relay.exe | `2d0ac2b71c6a41a2a98bd510fbbe70d7bb7ee22eb3219288f9a3ec3b17c8cfd0` |
+| relay-server.exe | `604f3a42e91cf20d5956e1852b45d49508ec6e53f6690426a849964763703f41` |
+| livekit-server.exe | `951f9466cd4450b3c3c7f1a5830a05a9bb97cc11d93cf1be9ebcd3b47cc316d1` |
+
+</details>
+
+**Hvorfor kan Windows advare ved download?**
+
+Den nuværende preview er usigneret. Microsoft SmartScreen kan advare, når en fil ikke downloades særlig ofte, eller udgiveren endnu ikke har opbygget omdømme. Digital signering identificerer udgiveren og kan hjælpe på tværs af udgaver, men garanterer ikke, at advarslen forsvinder. En VirusTotal-rapport fjerner ikke automatisk denne advarsel. [Microsofts forklaring](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation).
 
 ## Tale og streaming
 
