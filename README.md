@@ -4,7 +4,17 @@
 
 Relay er en Windows-app til venner og fællesskaber, der ønsker en velkendt, Discord-inspireret brugerflade og mulighed for selv at drive deres server. Fokus er nem kommunikation, kort taleforsinkelse og kontrol over samtalernes indhold.
 
-Dette repository samler projektets beskrivelse, aktuelle muligheder og planlagte forbedringer. Kildekode og installationsfiler offentliggøres ikke her endnu.
+Dette repository samler projektets beskrivelse og downloadbare Windows-previews. Projektets kildekode offentliggøres ikke her endnu.
+
+## Download og start
+
+**[Hent Relay 0.10.0 til Windows — preview fra 12. oktober 2026](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261012)**
+
+Hent ZIP-filen under **Assets**, pak den helt ud, og åbn kun **Relay.exe** øverst i mappen. Behold hele mappen samlet, inklusive `dist`, `scripts` og `licenses`.
+
+Vil du være vært, vælger du **Start a server on this PC** inde i appen. Relay starter serverne i baggrunden. Du skal kun åbne én startfil; serverstyringen foregår i appen.
+
+Denne udgave retter også klik på egne reaktioner og placeringen af beskedmenuen. Den er stadig en usigneret preview.
 
 ## Hvad kan Relay?
 
@@ -49,22 +59,16 @@ Relay er en preview under udvikling. Krypteringen er implementeret, men integrat
 
 **Er programfilerne scannet med Microsoft Defender?**
 
-Ja. De tre programfiler i **Relay 0.10.0 navigation-preview** blev scannet lokalt med **Microsoft Defender Antivirus den 9. oktober 2026**. Microsoft Defender fandt ingen trusler i de tre scannede programfiler.
+Ja. Microsoft Defender fandt lokalt ingen trusler i programfilerne i denne preview. Den nye klient og startfil blev scannet **12. oktober 2026**. De uændrede serverfiler blev scannet **9. oktober 2026**.
 
-| Programfil | Microsoft Defender |
-| --- | --- |
-| Relay-appen (`relay.exe`) | Ingen trusler fundet |
-| Den lokale Relay-server (`relay-server.exe`) | Ingen trusler fundet |
-| Video-/streamingserveren (`livekit-server.exe`) | Ingen trusler fundet |
+| Programfil | Scanningsdato | Microsoft Defender |
+| --- | --- | --- |
+| Startfilen (`Relay.exe`) | 12. oktober 2026 | Ingen trusler fundet |
+| Relay-appen (`dist/relay.exe`) | 12. oktober 2026 | Ingen trusler fundet |
+| Den lokale Relay-server (`dist/relay-server.exe`) | 9. oktober 2026 | Ingen trusler fundet |
+| Video-/streamingserveren (`dist/livekit-server.exe`) | 9. oktober 2026 | Ingen trusler fundet |
 
-Dette er et scanningsresultat, **ikke en godkendelse fra Microsoft eller en garanti for fuld sikkerhed**. Andre antivirusmarkeringer er endnu ikke afklaret. Scanningen dækker disse tre programfiler; launcher-scripts og krypteringens korrekthed er ikke undersøgt med denne scanning.
-
-<details>
-<summary>Om Defender-scanningen</summary>
-
-Scanningen blev gennemført med antivirusdefinitioner **1.459.639.0**. Hver fil gav resultatet “found no threats” og afslutningskode 0. Scanningen ændrede ikke programfilerne. [Microsofts dokumentation om filscanning](https://learn.microsoft.com/en-us/defender-endpoint/command-line-arguments-microsoft-defender-antivirus).
-
-</details>
+Dette er et scanningsresultat, **ikke en godkendelse fra Microsoft eller en garanti for fuld sikkerhed**. Andre antivirusmarkeringer er endnu ikke afklaret. Scanningen dækker de nævnte programfiler; launcher-scripts og krypteringens korrekthed er ikke undersøgt med denne scanning. [Microsofts dokumentation om filscanning](https://learn.microsoft.com/en-us/defender-endpoint/command-line-arguments-microsoft-defender-antivirus).
 
 <details>
 <summary>Filernes kontrolkoder (SHA-256)</summary>
@@ -73,9 +77,12 @@ En kontrolkode identificerer den præcise fil, som scanningen gælder for.
 
 | Fil | SHA-256 |
 | --- | --- |
-| relay.exe | `2d0ac2b71c6a41a2a98bd510fbbe70d7bb7ee22eb3219288f9a3ec3b17c8cfd0` |
-| relay-server.exe | `604f3a42e91cf20d5956e1852b45d49508ec6e53f6690426a849964763703f41` |
-| livekit-server.exe | `951f9466cd4450b3c3c7f1a5830a05a9bb97cc11d93cf1be9ebcd3b47cc316d1` |
+| Relay.exe | `7c4caa79aff727cf575413a410a9b5de0acc9c7f869036da514d16c2a859be22` |
+| dist/relay.exe | `0fa2f3e35e87eec18a6d3831feaec82889d295fb6c416a9766d0c39f265a31d7` |
+| dist/relay-server.exe | `604f3a42e91cf20d5956e1852b45d49508ec6e53f6690426a849964763703f41` |
+| dist/livekit-server.exe | `951f9466cd4450b3c3c7f1a5830a05a9bb97cc11d93cf1be9ebcd3b47cc316d1` |
+
+ZIP-filens kontrolkode findes i `.zip.sha256` under **Assets** på udgivelsessiden. Filoversigten `manifest.json` inde i pakken indeholder kontrolkoderne for de enkelte filer.
 
 </details>
 
@@ -106,7 +113,7 @@ Integrationen er implementeret og lokalt afprøvet. Opsætning og afprøvning mo
 
 ## Status og næste skridt
 
-Den seneste lokale Windows-preview er **Relay 0.10.0**, leveret **9. oktober 2026**. Projektet er fortsat under udvikling, og fuld funktionslighed med Discord er et langsigtet mål.
+Den seneste Windows-preview er **Relay 0.10.0**, udgivet **12. oktober 2026**. Download findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261012). Projektet er fortsat under udvikling, og fuld funktionslighed med Discord er et langsigtet mål.
 
 Det næste arbejde omfatter:
 
