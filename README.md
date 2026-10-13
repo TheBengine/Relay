@@ -8,13 +8,13 @@ Dette repository samler projektets beskrivelse og downloadbare Windows-previews.
 
 ## Download og start
 
-**[Hent Relay 0.10.0 til Windows — preview fra 12. oktober 2026](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261012)**
+**[Hent Relay 0.10.0 til Windows — preview fra 13. oktober 2026](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261013-integrated-network)**
 
 Hent ZIP-filen under **Assets**, pak den helt ud, og åbn kun **Relay.exe** øverst i mappen. Behold hele mappen samlet, inklusive `dist`, `scripts` og `licenses`.
 
 Vil du være vært, vælger du **Start a server on this PC** inde i appen. Relay starter serverne i baggrunden. Du skal kun åbne én startfil; serverstyringen foregår i appen.
 
-Denne udgave retter også klik på egne reaktioner og placeringen af beskedmenuen. Den er stadig en usigneret preview.
+Denne udgave tilføjer **indbygget privat netværk med Tailscale-teknologi**, så en separat VPN-app eller netværksdriver ikke skal installeres. Første login og netværksdeling kræver stadig en Tailscale-konto og Tailscales hjemmeside. Reelt login, deling mellem konti og opkald mellem to computere over internettet mangler endnu praktisk afprøvning. Udgaven er fortsat en usigneret preview.
 
 ## Hvad kan Relay?
 
@@ -29,13 +29,23 @@ Denne udgave retter også klik på egne reaktioner og placeringen af beskedmenue
 
 En lokal Relay-server kan startes fra appen. Værten bestemmer over fællesskabet og serverens data.
 
-Venner skal kunne nå værtscomputeren via det lokale netværk eller en korrekt opsat internetadresse. Ved internetadgang skal værten sørge for sikker transport med HTTPS. En lokal adresse på værtscomputeren gør ikke automatisk serveren tilgængelig for andre.
+Venner skal kunne nå værtscomputeren. Den nyeste preview har en indbygget privat forbindelse med Tailscale-teknologi, der skal gøre dette lettere på tværs af hjem, også uden en offentlig serveradresse. Værten bruger sin egen konto og lokale server; der kræves ingen fælles Relay-server hos projektets skaber.
+
+Forbind først det private netværk i Relay, log ind med din egen Tailscale-konto, og vælg **Share this community**. Del værtscomputeren via Tailscale og send derefter en Relay-invitation. Begge dele er stadig nødvendige. Læs `LAES-MIG.md` i pakken for den fulde opsætning. Reelt login, kontodeling og brug mellem to computere mangler endnu praktisk afprøvning.
+
+Værtscomputeren og Relay skal være tændt, mens andre bruger serveren. Ved genstart forbindes og deles fællesskabet igen fra appen. Direkte forbindelser foretrækkes; en krypteret netværksrelæserver kan bruges ved vanskelige netværk og kan give højere forsinkelse og mindre streamingkapacitet.
+
+Lokal netværksadgang og manuel offentlig hosting er også mulige. Manuel offentlig hosting kræver en korrekt opsat internetadresse og sikker transport med HTTPS.
 
 ## Sikkerhed, kort forklaret
 
 **Hvem kan læse vores samtale?**
 
 Relay krypterer nye beskeder, filer og opkald på deltagernes enheder, før de sendes. Det kaldes end-to-end-kryptering. De godkendte enheder i samtalen har nøglerne til indholdet; serveren videresender det krypterede indhold. Personer, der deltager i samtalen, kan stadig gemme eller videredele det, de modtager.
+
+**Hvorfor beholde Relays kryptering med det private netværk?**
+
+Tailscale krypterer trafikken mellem de tilsluttede computere. Relays end-to-end-kryptering beskytter de krypterede samtalers indhold fra deltager til deltager, også over for selve Relay-serveren. Begge lag er bevaret.
 
 **Hvad kan serveren stadig se?**
 
@@ -59,7 +69,7 @@ Relay er en preview under udvikling. Krypteringen er implementeret, men integrat
 
 **Er programfilerne scannet med Microsoft Defender?**
 
-Ja. Microsoft Defender fandt lokalt ingen trusler i programfilerne i denne preview. Den nye klient og startfil blev scannet **12. oktober 2026**. De uændrede serverfiler blev scannet **9. oktober 2026**.
+**De nye klient-, server- og netværksfiler i previewen fra 13. oktober 2026 er endnu ikke Microsoft Defender-scannet.** De tidligere resultater nedenfor gælder de præcise filer fra [previewen fra 12. oktober](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261012). De gælder ikke automatisk nye udgaver. Startfilen og video-/streamingserveren er uændrede i den nyeste pakke.
 
 | Programfil | Scanningsdato | Microsoft Defender |
 | --- | --- | --- |
@@ -71,7 +81,7 @@ Ja. Microsoft Defender fandt lokalt ingen trusler i programfilerne i denne previ
 Dette er et scanningsresultat, **ikke en godkendelse fra Microsoft eller en garanti for fuld sikkerhed**. Andre antivirusmarkeringer er endnu ikke afklaret. Scanningen dækker de nævnte programfiler; launcher-scripts og krypteringens korrekthed er ikke undersøgt med denne scanning. [Microsofts dokumentation om filscanning](https://learn.microsoft.com/en-us/defender-endpoint/command-line-arguments-microsoft-defender-antivirus).
 
 <details>
-<summary>Filernes kontrolkoder (SHA-256)</summary>
+<summary>Kontrolkoder for de tidligere scannede filer (SHA-256)</summary>
 
 En kontrolkode identificerer den præcise fil, som scanningen gælder for.
 
@@ -82,7 +92,7 @@ En kontrolkode identificerer den præcise fil, som scanningen gælder for.
 | dist/relay-server.exe | `604f3a42e91cf20d5956e1852b45d49508ec6e53f6690426a849964763703f41` |
 | dist/livekit-server.exe | `951f9466cd4450b3c3c7f1a5830a05a9bb97cc11d93cf1be9ebcd3b47cc316d1` |
 
-ZIP-filens kontrolkode findes i `.zip.sha256` under **Assets** på udgivelsessiden. Filoversigten `manifest.json` inde i pakken indeholder kontrolkoderne for de enkelte filer.
+Hver udgivelses ZIP-kontrolkode findes i `.zip.sha256` under **Assets** på dens udgivelsesside. Filoversigten `manifest.json` inde i hver pakke indeholder kontrolkoderne for den pakkes filer.
 
 </details>
 
@@ -113,12 +123,12 @@ Integrationen er implementeret og lokalt afprøvet. Opsætning og afprøvning mo
 
 ## Status og næste skridt
 
-Den seneste Windows-preview er **Relay 0.10.0**, udgivet **12. oktober 2026**. Download findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261012). Projektet er fortsat under udvikling, og fuld funktionslighed med Discord er et langsigtet mål.
+Den seneste Windows-preview er **Relay 0.10.0**, udgivet **13. oktober 2026**, med indbygget privat netværk. Download findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261013-integrated-network). Projektet er fortsat under udvikling, og fuld funktionslighed med Discord er et langsigtet mål.
 
 Det næste arbejde omfatter:
 
 - Mere praktisk gennemgang af den indloggede brugerflade.
-- Opkald mellem to computere på lokale netværk og over internettet.
+- Reelt Tailscale-login, netværksdeling mellem konti og opkald mellem to computere på lokale netværk og over internettet.
 - Fysisk kamera, programlyd, hardwarekodning og længere 4K/60 fps-prøver.
 - Længere målinger af stabilitet og ressourceforbrug.
 - Reel Discord-opsætning og integrationstest.
