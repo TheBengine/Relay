@@ -8,13 +8,15 @@ Dette repository samler projektets beskrivelse og downloadbare Windows-previews.
 
 ## Download og start
 
-**[Hent Relay 0.10.0 til Windows — preview fra 14. oktober 2026 med lettere serverdeling](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261013-simple-sharing)**
+**[Hent Relay 0.10.0 til Windows — preview fra 14. oktober 2026 med rettet serverdeling](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261014-sharing-fix)**
 
 Hent ZIP-filen under **Assets**, pak den helt ud, og åbn kun **Relay.exe** øverst i mappen. Behold hele mappen samlet, inklusive `dist`, `scripts` og `licenses`.
 
 På startskærmen vælger du **Create a server** eller **Join friends**. Når du opretter din egen server, starter Relay den i baggrunden og fører dig fra kontoformularen videre til **Invite friends**. Du skal kun åbne én startfil.
 
 Denne udgave samler oprettelse, forbindelse og invitation i korte trin. Værten kan samle det private adgangslink og serverinvitationen i én Relay-invitation. Tekniske alternativer ligger under **Advanced**. Første Tailscale-login og godkendelse af adgang foregår stadig i browseren. Reelt login, deling mellem konti og brug mellem to pc’er over internettet mangler fortsat praktisk afprøvning. Udgaven er en usigneret preview.
+
+**Rettelse til Windows-serverdeling:** Denne udgave retter fejlen “Cannot read the server’s saved settings. It was left running.” ved **Enable sharing**. Den læser nu det gyldige indstillingsformat, som Windows gemmer. Luk det gamle Relay-vindue normalt, og start **Relay.exe** i den nye pakkemappe; din eksisterende server og data kan genbruges.
 
 ## Hvad kan Relay?
 
@@ -127,7 +129,7 @@ Integrationen er implementeret og lokalt afprøvet. Opsætning og afprøvning mo
 
 ## Status og næste skridt
 
-Den seneste Windows-preview er **Relay 0.10.0**, udgivet **14. oktober 2026**, med enklere serverdeling og login. Download findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261013-simple-sharing). Projektet er fortsat under udvikling, og fuld funktionslighed med Discord er et langsigtet mål.
+Den seneste Windows-preview er **Relay 0.10.0**, udgivet **14. oktober 2026**, med enklere serverdeling og login samt rettelsen til Windows-indstillingsfiler. Download findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261014-sharing-fix). Projektet er fortsat under udvikling, og fuld funktionslighed med Discord er et langsigtet mål.
 
 Det næste arbejde omfatter:
 
