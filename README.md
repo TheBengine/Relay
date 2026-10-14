@@ -8,15 +8,17 @@ Dette repository samler projektets beskrivelse og downloadbare Windows-previews.
 
 ## Download og start
 
-**[Hent Relay 0.10.0 til Windows — preview fra 14. oktober 2026 med rettet serverdeling](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261014-sharing-fix)**
+**[Hent Relay til Windows — installer, 14. oktober 2026](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261014-installer/Relay-0.10.0-20261014-Setup.exe)**
 
-Hent ZIP-filen under **Assets**, pak den helt ud, og åbn kun **Relay.exe** øverst i mappen. Behold hele mappen samlet, inklusive `dist`, `scripts` og `licenses`.
+Åbn **Relay-0.10.0-20261014-Setup.exe**, og følg guiden. Installeren lægger programmet i din Windows-brugers programmappe og opretter en genvej i Startmenuen. En skrivebordsgenvej er valgfri. Du skal ikke pakke en ZIP ud eller starte serverfiler selv.
 
-På startskærmen vælger du **Create a server** eller **Join friends**. Når du opretter din egen server, starter Relay den i baggrunden og fører dig fra kontoformularen videre til **Invite friends**. Du skal kun åbne én startfil.
+**Opdatering:** Hent den nyere installer, og kør den igen. Den genbruger den eksisterende installation; du skal ikke afinstallere først. Din profil, historik, krypteringsnøgler og serverdata beholdes. Hvis denne pc hoster en server, stop den først i **Server Settings**, og luk derefter Relay. Installeren tvangslukker ingen programmer.
 
-Denne udgave samler oprettelse, forbindelse og invitation i korte trin. Værten kan samle det private adgangslink og serverinvitationen i én Relay-invitation. Tekniske alternativer ligger under **Advanced**. Første Tailscale-login og godkendelse af adgang foregår stadig i browseren. Reelt login, deling mellem konti og brug mellem to pc’er over internettet mangler fortsat praktisk afprøvning. Udgaven er en usigneret preview.
+Relay kan afinstalleres gennem Windows’ **Installerede apps**. Det fjerner programfilerne og beholder profilen og serverdata. Automatiske baggrundsopdateringer er endnu ikke aktiveret; opdatering sker ved at køre en nyere installer.
 
-**Rettelse til Windows-serverdeling:** Denne udgave retter fejlen “Cannot read the server’s saved settings. It was left running.” ved **Enable sharing**. Den læser nu det gyldige indstillingsformat, som Windows gemmer. Luk det gamle Relay-vindue normalt, og start **Relay.exe** i den nye pakkemappe; din eksisterende server og data kan genbruges.
+Den valgfrie portable ZIP findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261014-installer). Hvis du bruger ZIP-udgaven, skal hele pakkemappen beholdes samlet.
+
+På startskærmen vælger du **Create a server** eller **Join friends**. Guiden **Invite friends** hjælper med deling. Den tidligere Windows-fejl ved **Enable sharing** er rettet. Tailscale-login og godkendelse af privat adgang foregår fortsat i browseren. Brug mellem to pc’er over internettet mangler praktisk afprøvning. Udgaven er en usigneret preview.
 
 ## Hvad kan Relay?
 
@@ -129,7 +131,7 @@ Integrationen er implementeret og lokalt afprøvet. Opsætning og afprøvning mo
 
 ## Status og næste skridt
 
-Den seneste Windows-preview er **Relay 0.10.0**, udgivet **14. oktober 2026**, med enklere serverdeling og login samt rettelsen til Windows-indstillingsfiler. Download findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261014-sharing-fix). Projektet er fortsat under udvikling, og fuld funktionslighed med Discord er et langsigtet mål.
+Den seneste Windows-preview er **Relay 0.10.0**, udgivet **14. oktober 2026**, med almindelig Windows-installation og opgradering samt rettelserne til serverdeling. Download findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261014-installer). Projektet er fortsat under udvikling, og fuld funktionslighed med Discord er et langsigtet mål.
 
 Det næste arbejde omfatter:
 
@@ -138,7 +140,7 @@ Det næste arbejde omfatter:
 - Fysisk kamera, programlyd, hardwarekodning og længere 4K/60 fps-prøver.
 - Længere målinger af stabilitet og ressourceforbrug.
 - Reel Discord-opsætning og integrationstest.
-- Færdig installations- og opdateringsoplevelse samt signeret distribution.
+- Automatiske, udgiververificerede opdateringer og signeret distribution; manuel installation og opgradering er nu tilgængelig.
 - Uafhængig gennemgang af kryptering og sikkerhed.
 
 Relay er et selvstændigt projekt og er ikke tilknyttet Discord. GIPHY bruges til den valgfrie online GIF-søgning.
