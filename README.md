@@ -8,15 +8,15 @@ Dette repository samler projektets beskrivelse og downloadbare Windows-previews.
 
 ## Download og start
 
-**[Hent Relay til Windows — installer, 15. oktober 2026](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261015-encryption/Relay-0.10.0-20261015-encryption-Setup.exe)**
+**[Hent Relay til Windows — installer, 15. oktober 2026](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261015-build/Relay-0.10.0-20261015-build-Setup.exe)**
 
-Åbn **Relay-0.10.0-20261015-encryption-Setup.exe**, og følg guiden. Installeren lægger programmet i din Windows-brugers programmappe og opretter en genvej i Startmenuen. En skrivebordsgenvej er valgfri. Du skal ikke pakke en ZIP ud eller starte serverfiler selv.
+Åbn **Relay-0.10.0-20261015-build-Setup.exe**, og følg guiden. Installeren lægger programmet i din Windows-brugers programmappe og opretter en genvej i Startmenuen. En skrivebordsgenvej er valgfri. “Open Relay” er valgt som standard, når installationen er færdig. Du skal ikke pakke en ZIP ud eller starte serverfiler selv.
 
 **Opdatering:** Hent den nyere installer, og kør den igen. Den genbruger den eksisterende installation; du skal ikke afinstallere først. Din profil, historik, krypteringsnøgler og serverdata beholdes. Hvis denne pc hoster en server, stop den først i **Server Settings**, og luk derefter Relay. Installeren tvangslukker ingen programmer.
 
 Relay kan afinstalleres gennem Windows’ **Installerede apps**. Det fjerner programfilerne og beholder profilen og serverdata. Automatiske baggrundsopdateringer er endnu ikke aktiveret; opdatering sker ved at køre en nyere installer.
 
-Den valgfrie portable ZIP findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261015-encryption). Hvis du bruger ZIP-udgaven, skal hele pakkemappen beholdes samlet.
+Den valgfrie portable ZIP findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261015-build). Hvis du bruger ZIP-udgaven, skal hele pakkemappen beholdes samlet.
 
 På startskærmen vælger du **Create a server** eller **Join friends**. Guiden **Invite friends** hjælper med deling. **Copy invitation** opretter og kopierer nu invitationen i én handling. Den tidligere Windows-fejl ved **Enable sharing** er rettet. Tailscale-login og godkendelse af privat adgang foregår fortsat i browseren. Brug mellem to pc’er over internettet mangler praktisk afprøvning. Udgaven er en usigneret preview.
 
@@ -35,9 +35,9 @@ Serveren ligger på værtens pc. Hver vært beholder sine egne data; projektets 
 
 1. Vælg **Create a server**, og opret din konto. Har du allerede en server, bruger du dens eksisterende konto.
 2. Guiden **Invite friends** åbner. Vælg **Enable sharing**, og log ind med din egen Tailscale-konto i browseren første gang. Der skal ikke installeres en separat VPN-app.
-3. Følg guidens delingsside, kopiér Tailscales delingslink ind i guiden, og vælg **Copy invitation**. Send invitationen til din ven, fx i Discord.
+3. Åbn guidens delingsside. Vælg **Relay → ⋯ → Share → Copy invite link → Copy share link**, og indsæt linket i guiden. Vælg **Copy invitation**, og send invitationen til din ven, fx i Discord.
 
-Din ven vælger **Join friends** i Relay og indsætter invitationen. Relay klargør den private forbindelse og kontrollerer serveren automatisk. Første gang kan vennen skulle godkende adgang i browseren og derefter vælge **Try again**. Samme korte forløb bruges ved tilslutning til en ekstra server efter login. Når den forventede server svarer, vises kontoformularen. Vennen skal ikke starte sin egen server for at deltage.
+Din ven vælger **Join friends** i Relay og indsætter invitationen. Relay klargør den private forbindelse og kontrollerer serveren automatisk. Første gang logger vennen ind med sin egen Tailscale-konto og godkender adgang i browseren. Guiden kan derefter bede om **Try again**. Samme korte forløb bruges ved tilslutning til en ekstra server efter login. Når den forventede server svarer, vises kontoformularen. Vennen skal ikke starte sin egen server for at deltage.
 
 Behold værtscomputeren og Relay tændt, mens andre bruger serveren. Klargøringen kan kort genstarte den identificerede lokale server; konto, kanaler, historik og krypteringsnøgler bevares. Forlad et igangværende opkald først.
 
@@ -77,7 +77,7 @@ Relay er en preview under udvikling. Krypteringen er implementeret, men integrat
 
 **Er programfilerne scannet med Microsoft Defender?**
 
-**De nye klient-, server- og netværksfiler i previewen fra 15. oktober 2026 er endnu ikke Microsoft Defender-scannet.** De tidligere resultater nedenfor gælder de præcise filer fra [previewen fra 12. oktober](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261012). De gælder ikke automatisk nye udgaver. Startfilen og video-/streamingserveren er uændrede i den nyeste pakke.
+**Der er ikke udført en ny Microsoft Defender-scanning af denne preview.** De tidligere resultater nedenfor gælder de præcise filer fra [previewen fra 12. oktober](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261012). De gælder ikke automatisk nye udgaver.
 
 | Programfil | Scanningsdato | Microsoft Defender |
 | --- | --- | --- |
@@ -131,11 +131,14 @@ Integrationen er implementeret og lokalt afprøvet. Opsætning og afprøvning mo
 
 ## Status og næste skridt
 
-Den seneste Windows-preview er **Relay 0.10.0**, udgivet **15. oktober 2026**, med en enklere krypteringsside, en kort dansk vejledning, enklere invitationer og deltagelse samt almindelig Windows-installation/opgradering. Download findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261015-encryption). Projektet er fortsat under udvikling, og fuld funktionslighed med Discord er et langsigtet mål.
+Den seneste Windows-preview er **Relay 0.10.0**, udgivet **15. oktober 2026**, med tydelig version og byggedato i appen, mere præcis hjælp til deling og en installer, der tilbyder at åbne Relay bagefter. Den indeholder også den enklere krypteringsside og den korte danske vejledning. Download findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261015-build). Projektet er fortsat under udvikling, og fuld funktionslighed med Discord er et langsigtet mål.
+
+Denne preview består 871 automatiske tests og streng kodekontrol. Velkomst og About er afprøvet ved to vinduesstørrelser, og en isoleret installation og afinstallation har kontrolleret pakkens filer og bevaret testens profildata. Det erstatter ikke praktisk afprøvning mellem to pc’er på forskellige netværk.
 
 Det næste arbejde omfatter:
 
 - Mere praktisk gennemgang af den indloggede brugerflade.
+- Enklere forbindelser uden kontokrav samt valgfri ekstra kryptering og målte forskelle i forsinkelse. Disse nye valg er planlagt; den nuværende udgave bevarer E2EE og bruger fortsat Tailscale til den indbyggede private forbindelse.
 - Reelt Tailscale-login, netværksdeling mellem konti og opkald mellem to computere på lokale netværk og over internettet.
 - Fysisk kamera, programlyd, hardwarekodning og længere 4K/60 fps-prøver.
 - Længere målinger af stabilitet og ressourceforbrug.
