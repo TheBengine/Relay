@@ -8,15 +8,15 @@ Dette repository samler projektets beskrivelse og downloadbare Windows-previews.
 
 ## Download og start
 
-**[Hent Relay til Windows — installer, 15. oktober 2026](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261015-friends/Relay-0.10.0-20261015-Setup.exe)**
+**[Hent Relay til Windows — installer, 15. oktober 2026](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261015-encryption/Relay-0.10.0-20261015-encryption-Setup.exe)**
 
-Åbn **Relay-0.10.0-20261015-Setup.exe**, og følg guiden. Installeren lægger programmet i din Windows-brugers programmappe og opretter en genvej i Startmenuen. En skrivebordsgenvej er valgfri. Du skal ikke pakke en ZIP ud eller starte serverfiler selv.
+Åbn **Relay-0.10.0-20261015-encryption-Setup.exe**, og følg guiden. Installeren lægger programmet i din Windows-brugers programmappe og opretter en genvej i Startmenuen. En skrivebordsgenvej er valgfri. Du skal ikke pakke en ZIP ud eller starte serverfiler selv.
 
 **Opdatering:** Hent den nyere installer, og kør den igen. Den genbruger den eksisterende installation; du skal ikke afinstallere først. Din profil, historik, krypteringsnøgler og serverdata beholdes. Hvis denne pc hoster en server, stop den først i **Server Settings**, og luk derefter Relay. Installeren tvangslukker ingen programmer.
 
 Relay kan afinstalleres gennem Windows’ **Installerede apps**. Det fjerner programfilerne og beholder profilen og serverdata. Automatiske baggrundsopdateringer er endnu ikke aktiveret; opdatering sker ved at køre en nyere installer.
 
-Den valgfrie portable ZIP findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261015-friends). Hvis du bruger ZIP-udgaven, skal hele pakkemappen beholdes samlet.
+Den valgfrie portable ZIP findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261015-encryption). Hvis du bruger ZIP-udgaven, skal hele pakkemappen beholdes samlet.
 
 På startskærmen vælger du **Create a server** eller **Join friends**. Guiden **Invite friends** hjælper med deling. **Copy invitation** opretter og kopierer nu invitationen i én handling. Den tidligere Windows-fejl ved **Enable sharing** er rettet. Tailscale-login og godkendelse af privat adgang foregår fortsat i browseren. Brug mellem to pc’er over internettet mangler praktisk afprøvning. Udgaven er en usigneret preview.
 
@@ -43,7 +43,7 @@ Behold værtscomputeren og Relay tændt, mens andre bruger serveren. Klargøring
 
 Første login, deling mellem konti, serverskift med en reel providerforbindelse og internetopkald mangler endnu praktisk accept. Samlede invitationer kræver denne eller en nyere Relay-udgave; gamle invitationer understøttes stadig. En invitation med et privat adgangslink bør kun sendes til de tiltænkte venner.
 
-Direkte forbindelser foretrækkes. Krypteret videresendelse kan give mere forsinkelse og mindre streamingkapacitet. Manuel offentlig hosting med HTTPS og øvrige netværksmetoder findes under **Advanced**. Den fulde vejledning ligger i pakkens `LAES-MIG.md`.
+Direkte forbindelser foretrækkes. Krypteret videresendelse kan give mere forsinkelse og mindre streamingkapacitet. Manuel offentlig hosting med HTTPS og øvrige netværksmetoder findes under **Advanced**. Den korte danske vejledning ligger i pakkens `LAES-MIG.txt`.
 
 ## Sikkerhed, kort forklaret
 
@@ -61,7 +61,7 @@ Serveren kan se blandt andet konti, offentlige profiler, kanalmedlemskab og forb
 
 **Hvordan ved jeg, at jeg taler med den rigtige person?**
 
-Sammenlign jeres sikkerhedskoder eller verificeringskort gennem en kontaktvej, I allerede stoler på, for eksempel personligt eller under et kendt opkald. Godkend derefter de rigtige enheder i Relay. Koden eller kortet kan deles med den anden person og indeholder ingen private nøgler. Hvis koden ændrer sig, skal den kontrolleres igen.
+Sammenlign jeres sikkerhedskoder eller verificeringskort gennem en kontaktvej, I allerede stoler på, for eksempel personligt eller under et kendt opkald. Åbn **Settings → Encryption**, vælg **Verify** ved personen, og godkend hver af de rigtige enheder særskilt. Statuskortet viser næste trin. Egen kode og backup kan foldes ud; tekniske detaljer ligger under **Advanced**. En bekræftet enhed på din pc betyder ikke i sig selv, at vennen har bekræftet dig, eller at alle samtaler er klar. Koden eller kortet kan deles med den anden person og indeholder ingen private nøgler. Hvis koden ændrer sig, skal den kontrolleres igen.
 
 **Hvad betyder “Legacy” ved en besked?**
 
@@ -131,7 +131,7 @@ Integrationen er implementeret og lokalt afprøvet. Opsætning og afprøvning mo
 
 ## Status og næste skridt
 
-Den seneste Windows-preview er **Relay 0.10.0**, udgivet **15. oktober 2026**, med enklere invitationer og deltagelse, almindelig Windows-installation/opgradering og rettelserne til serverdeling. Download findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261015-friends). Projektet er fortsat under udvikling, og fuld funktionslighed med Discord er et langsigtet mål.
+Den seneste Windows-preview er **Relay 0.10.0**, udgivet **15. oktober 2026**, med en enklere krypteringsside, en kort dansk vejledning, enklere invitationer og deltagelse samt almindelig Windows-installation/opgradering. Download findes på [udgivelsessiden](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261015-encryption). Projektet er fortsat under udvikling, og fuld funktionslighed med Discord er et langsigtet mål.
 
 Det næste arbejde omfatter:
 
