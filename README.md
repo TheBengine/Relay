@@ -1,10 +1,10 @@
 <p align="center"><img src="assets/relay-banner.png" alt="Relay — Dine venner. Din server." width="100%"></p>
 
 <p align="center">
-<a href="https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261017.2/Relay-Setup.exe"><img alt="Hent Relay til Windows" src="https://img.shields.io/badge/Hent_til_Windows-5865F2?style=for-the-badge&amp;logo=windows&amp;logoColor=white"></a>
+<a href="https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261017.3/Relay-Setup.exe"><img alt="Hent Relay til Windows" src="https://img.shields.io/badge/Hent_til_Windows-5865F2?style=for-the-badge&amp;logo=windows&amp;logoColor=white"></a>
 </p>
-<p align="center"><b>Windows x64 · 17. oktober 2026 · Preview 2</b><br>
-<a href="#kom-i-gang">Kom i gang</a> · <a href="#opdater-din-installation">Opdatering</a> · <a href="SIKKERHED.md">Sikkerhed</a> · <a href="https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261017.2">Nyt i denne udgave</a></p>
+<p align="center"><b>Windows x64 · 17. oktober 2026 · Preview 3</b><br>
+<a href="#kom-i-gang">Kom i gang</a> · <a href="#opdater-din-installation">Opdatering</a> · <a href="SIKKERHED.md">Sikkerhed</a> · <a href="https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261017.3">Nyt i denne udgave</a></p>
 
 ---
 
@@ -16,11 +16,13 @@ Relay er til venner, der vil snakke, spille og dele skærm, mens de selv bestemm
 
 | | Fil | Til dig, der… |
 | --- | --- | --- |
-| **Anbefalet** | [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261017.2/Relay-Setup.exe) | Vil installere eller opdatere som et almindeligt Windows-program. |
-| Valgfri | [**Relay-Portable.zip**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261017.2/Relay-Portable.zip) | Vil pakke ud selv. Behold hele mappen samlet, og åbn `Relay.exe`. |
-| Kontrolkoder | [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261017.2/SHA256SUMS.txt) | Vil kontrollere, at downloadet matcher udgivelsen. |
+| **Anbefalet** | [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261017.3/Relay-Setup.exe) | Vil installere eller opdatere som et almindeligt Windows-program. |
+| Valgfri | [**Relay-Portable.zip**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261017.3/Relay-Portable.zip) | Vil pakke ud selv. Behold hele mappen samlet, og åbn `Relay.exe`. |
+| Kontrolkoder | [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261017.3/SHA256SUMS.txt) | Vil kontrollere, at downloadet matcher udgivelsen. |
 
 > Udgaven er en **usigneret preview**. Windows kan vise en advarsel. Praktiske opkald mellem to pc’er på forskellige netværk og fysisk kamera-/lydudstyr mangler stadig afprøvning.
+
+**Seneste rettelse til tale:** Iroh-opkald prøver nu automatisk en beskyttet reserveforbindelse, hvis talepakker ikke kommer igennem. En manglende opstartspakke på reservevejen er også rettet. Opdatér især pc’en, der forbinder gennem iroh. [Se ændringerne i preview 3](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261017.3).
 
 ## Kom i gang
 
