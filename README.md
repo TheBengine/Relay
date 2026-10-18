@@ -1,10 +1,10 @@
 <p align="center"><img src="assets/relay-banner.png" alt="Relay — Dine venner. Din server." width="100%"></p>
 
 <p align="center">
-<a href="https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261017.4/Relay-Setup.exe"><img alt="Hent Relay til Windows" src="https://img.shields.io/badge/Hent_til_Windows-5865F2?style=for-the-badge&amp;logo=windows&amp;logoColor=white"></a>
+<a href="https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018/Relay-Setup.exe"><img alt="Hent Relay til Windows" src="https://img.shields.io/badge/Hent_til_Windows-5865F2?style=for-the-badge&amp;logo=windows&amp;logoColor=white"></a>
 </p>
-<p align="center"><b>Windows x64 · 17. oktober 2026 · Preview 4</b><br>
-<a href="#kom-i-gang">Kom i gang</a> · <a href="#opdater-din-installation">Opdatering</a> · <a href="SIKKERHED.md">Sikkerhed</a> · <a href="https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261017.4">Nyt i denne udgave</a></p>
+<p align="center"><b>Windows x64 · 18. oktober 2026 · Lyd- og videopreview</b><br>
+<a href="#kom-i-gang">Kom i gang</a> · <a href="#opdater-din-installation">Opdatering</a> · <a href="SIKKERHED.md">Sikkerhed</a> · <a href="https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261018">Nyt i denne udgave</a></p>
 
 ---
 
@@ -16,18 +16,18 @@ Relay er til venner, der vil snakke, spille og dele skærm, mens de selv bestemm
 
 | | Fil | Til dig, der… |
 | --- | --- | --- |
-| **Anbefalet** | [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261017.4/Relay-Setup.exe) | Vil installere eller opdatere som et almindeligt Windows-program. |
-| Valgfri | [**Relay-Portable.zip**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261017.4/Relay-Portable.zip) | Vil pakke ud selv. Behold hele mappen samlet, og åbn `Relay.exe`. |
-| Kontrolkoder | [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261017.4/SHA256SUMS.txt) | Vil kontrollere, at downloadet matcher udgivelsen. |
+| **Anbefalet** | [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018/Relay-Setup.exe) | Vil installere eller opdatere som et almindeligt Windows-program. |
+| Valgfri | [**Relay-Portable.zip**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018/Relay-Portable.zip) | Vil pakke ud selv. Behold hele mappen samlet, og åbn `Relay.exe`. |
+| Kontrolkoder | [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018/SHA256SUMS.txt) | Vil kontrollere, at downloadet matcher udgivelsen. |
 
 > Udgaven er en **usigneret preview**. Windows kan vise en advarsel. Praktiske opkald mellem to pc’er på forskellige netværk og fysisk kamera-/lydudstyr mangler stadig afprøvning.
 
-**Nyt: nemmere at invitere venner.** **Share and copy invitation** gør forbindelsen klar og kopierer invitationen i ét forløb. Delingsstatus og tydeligere join-trin hjælper jer på vej. Opkald har nu en lydstatus, som viser, om den andens tale har nået din pc. Den automatiske reserveforbindelse til iroh-tale fra preview 3 er også med. [Se ændringerne i preview 4](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261017.4).
+**Nyt: færre lydhuller og video gennem iroh.** Forbedret taleregistrering, automatisk mikrofonstyrke og håndtering af forskellige lydenheder. Programlyd klarer nu genforbindelse uden den ekstra afsendelseskø, der kunne lukke lydsporet. Kamera og skærmdeling kan også bruge iroh; begge pc’er skal opdateres. De nye medieforløb er prøvet lokalt med kunstig lyd og video. [Se ændringerne og prøvernes omfang](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261018).
 
 ## Kom i gang
 
 1. **Vælg dit navn.** Første start spørger om det navn, du vil bruge.
-2. **Opret eller deltag.** Vælg **Create a server** for at være vært, eller **Join friends**, hvis du har en invitation.
+2. **Opret eller deltag.** Vælg **Create a server** for at være vært, eller **Join friends**, hvis du har en invitation. Ved oprettelse vælger du kryptering; end-to-end-kryptering er anbefalet og forvalgt.
 3. **Invitér vennerne.** Værten åbner **Invite friends**, vælger **Share and copy invitation** og sender invitationen. Vennerne opretter deres egen konto på serveren.
 
 **Bruger du allerede Tailscale?** Åbn **Invite friends → Change connection** på sidste trin for at vælge **Without accounts (iroh)** eller **With Tailscale**. Relay viser den aktuelle forbindelse. Kopiér en ny invitation efter et skift.
@@ -37,7 +37,7 @@ Relay er til venner, der vil snakke, spille og dele skærm, mens de selv bestemm
 <details>
 <summary><b>Hvilken forbindelse skal jeg vælge?</b></summary>
 
-- **Share and copy invitation:** iroh-forbindelsen til chat og tale, uden en ekstra netværkskonto. Video og skærmdeling understøttes endnu ikke på denne vej. Den kan bruge en ekstern relæserver, hvis direkte forbindelse ikke lykkes.
+- **Share and copy invitation:** iroh-forbindelsen til chat, tale, kamera og skærmdeling, uden en ekstra netværkskonto. Den kan bruge en ekstern relæserver, hvis direkte forbindelse ikke lykkes. Begge pc’er skal bruge denne udgave til de nye mediefunktioner.
 - **Tailscale:** Den indbyggede private netværksvej til bl.a. video og skærmdeling. Begge logger ind med deres egen Tailscale-konto og godkender delingen; en separat Tailscale-app er ikke nødvendig.
 - **Direkte adresse:** Til samme netværk eller en serveradresse, der allerede kan nås. Offentlig hosting kan kræve yderligere netværksopsætning.
 
@@ -62,12 +62,12 @@ Relay kan automatisk vælge mellem de veje, invitationen tilbyder. De nye forbin
 
 En tidligere lokal prøve af invitationsarbejdet (16. oktober) med to friske profiler fik vennens besked frem hos værten **6,2 sekunder efter kontooprettelsen**, uden manuel kodeudveksling. Det er et testresultat på én pc, ikke en garanti for internetforsinkelse.
 
-Værten kan vælge åben tilstand for beskeder og filer. Hver deltager skal selv acceptere, før deres app sender uden denne beskyttelse. **Åbent indhold kan læses af serveren.** Privat netværkskryptering og Relays end-to-end-kryptering er to forskellige lag. [Læs den korte sikkerhedsforklaring →](SIKKERHED.md)
+Værten kan vælge åben tilstand for beskeder, filer og opkald. Hver deltager skal selv acceptere, før deres app sender uden end-to-end-beskyttelsen. **Åbent indhold kan læses af serveren.** iroh- eller Tailscale-forbindelsen er stadig krypteret; det er et andet lag end Relays end-to-end-kryptering. [Læs den korte sikkerhedsforklaring →](SIKKERHED.md)
 
 ## Opdater din installation
 
-1. Stop en server, du hoster på denne pc, i **Server Settings**, og luk Relay.
-2. Hent **Relay-Setup.exe**, og kør den oven på installationen. Du behøver ikke afinstallere først.
+1. Luk Relay-vinduet.
+2. Hent **Relay-Setup.exe**, og kør den oven på installationen. Installeren kan stoppe installationens lokale server med **Stop my local server and continue**. Vennerne bliver afbrudt under opdateringen. Du behøver ikke afinstallere først.
 3. Åbn Relay fra Startmenuen eller din genvej.
 
 Installeren bevarer konti, indstillinger, nøgler og serverdata. Afinstallation sker gennem Windows’ **Installerede apps** og beholder dine data. Automatiske baggrundsopdateringer er endnu ikke aktiveret.
@@ -77,7 +77,7 @@ Installeren bevarer konti, indstillinger, nøgler og serverdata. Afinstallation 
 
 - Praktisk accept af deling, opkald og genforbindelse mellem to pc’er på forskellige netværk.
 - Fysisk mikrofon, kamera, programlyd og længere streamingprøver.
-- Video og skærmdeling via den kontofrie iroh-vej.
+- Praktisk afprøvning af de nye iroh-mediefunktioner på forskellige pc’er og netværk; lokale syntetiske prøver er gennemført.
 - Pålidelig åbning af invitationer direkte fra alle browsere. Brug **Join friends** og indsæt linket, hvis browseren ikke åbner appen.
 - Signeret distribution, automatiske opdateringer og uafhængigt sikkerhedsreview.
 
