@@ -1,10 +1,10 @@
 <p align="center"><img src="assets/relay-banner.png" alt="Relay — Dine venner. Din server." width="100%"></p>
 
 <p align="center">
-<a href="https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018/Relay-Setup.exe"><img alt="Hent Relay til Windows" src="https://img.shields.io/badge/Hent_til_Windows-5865F2?style=for-the-badge&amp;logo=windows&amp;logoColor=white"></a>
+<a href="https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Setup.exe"><img alt="Hent Relay til Windows" src="https://img.shields.io/badge/Hent_til_Windows-5865F2?style=for-the-badge&amp;logo=windows&amp;logoColor=white"></a>
 </p>
-<p align="center"><b>Windows x64 · 18. oktober 2026 · Lyd- og videopreview</b><br>
-<a href="#kom-i-gang">Kom i gang</a> · <a href="#opdater-din-installation">Opdatering</a> · <a href="SIKKERHED.md">Sikkerhed</a> · <a href="https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261018">Nyt i denne udgave</a></p>
+<p align="center"><b>Windows x64 · 18. oktober 2026 · Stereo- og opkaldspreview</b><br>
+<a href="#kom-i-gang">Kom i gang</a> · <a href="#opdater-din-installation">Opdatering</a> · <a href="SIKKERHED.md">Sikkerhed</a> · <a href="https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261018.1">Nyt i denne udgave</a></p>
 
 ---
 
@@ -16,13 +16,13 @@ Relay er til venner, der vil snakke, spille og dele skærm, mens de selv bestemm
 
 | | Fil | Til dig, der… |
 | --- | --- | --- |
-| **Anbefalet** | [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018/Relay-Setup.exe) | Vil installere eller opdatere som et almindeligt Windows-program. |
-| Valgfri | [**Relay-Portable.zip**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018/Relay-Portable.zip) | Vil pakke ud selv. Behold hele mappen samlet, og åbn `Relay.exe`. |
-| Kontrolkoder | [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018/SHA256SUMS.txt) | Vil kontrollere, at downloadet matcher udgivelsen. |
+| **Anbefalet** | [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Setup.exe) | Vil installere eller opdatere som et almindeligt Windows-program. |
+| Valgfri | [**Relay-Portable.zip**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Portable.zip) | Vil pakke ud selv. Behold hele mappen samlet, og åbn `Relay.exe`. |
+| Kontrolkoder | [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/SHA256SUMS.txt) | Vil kontrollere, at downloadet matcher udgivelsen. |
 
 > Udgaven er en **usigneret preview**. Windows kan vise en advarsel. Praktiske opkald mellem to pc’er på forskellige netværk og fysisk kamera-/lydudstyr mangler stadig afprøvning.
 
-**Nyt: færre lydhuller og video gennem iroh.** Forbedret taleregistrering, automatisk mikrofonstyrke og håndtering af forskellige lydenheder. Programlyd klarer nu genforbindelse uden den ekstra afsendelseskø, der kunne lukke lydsporet. Kamera og skærmdeling kan også bruge iroh; begge pc’er skal opdateres. De nye medieforløb er prøvet lokalt med kunstig lyd og video. [Se ændringerne og prøvernes omfang](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261018).
+**Nyt: stereolyd og mere stabile opkald.** Delt programlyd bevarer venstre og højre kanal og følger pc’ernes lydtempo mere jævnt. Rettet opkald, der kunne hænge under tilslutning, og gamle videobilleder, der kunne dukke op efter Stop. De tidligere lyd-, mikrofon- og iroh-forbedringer er med. De nye forløb er prøvet lokalt med kunstige medier; lytteprøve og opkald mellem to hjem mangler fortsat. [Se ændringerne og prøvernes omfang](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261018.1).
 
 ## Kom i gang
 
