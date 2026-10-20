@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="da">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="description" content="Åbn din invitation i Relay. Et sted at tale og være sammen med vennerne.">
+  <title>Åbn din invitation · Relay</title>
+  <link rel="icon" type="image/svg+xml" href="./relay.svg">
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./page.mjs"></script>
+</head>
+<body>
+  <header><a class="brand" href="./" aria-label="Relay startside"><img src="./relay.svg" width="36" height="36" alt="">Relay</a><a class="quiet" href="https://github.com/TheBengine/Relay/releases" rel="noreferrer">Hent appen <span aria-hidden="true">↗</span></a></header>
+  <main>
+    <section class="card" aria-labelledby="heading">
+      <div class="badge"><span></span>Et sted til vennerne</div>
+      <h1 id="heading">Vi ses i Relay.</h1>
+      <p class="intro" id="description">Åbn invitationslinket fra din ven for at komme videre til Relay.</p>
+      <div id="invitation" hidden>
+        <a id="open-relay" class="primary" href="#">Åbn Relay <span aria-hidden="true">↗</span></a>
+        <p class="caption" id="launch-status" role="status" aria-live="polite">Vælg “Åbn Relay”, hvis browseren spørger.</p>
+        <div class="divider"></div>
+        <p class="small-title">Første gang her?</p>
+        <p class="body">Installer Relay, og vend tilbage til denne side for at åbne invitationen.</p>
+        <a class="secondary" href="https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Setup.exe" rel="noreferrer">Hent Relay til Windows <span aria-hidden="true">↓</span></a>
+        <p class="caption">Gratis · Windows 10 og 11 · Preview</p>
+        <details id="open-help"><summary>Åbner appen ikke?</summary>
+          <p class="body">Åbn Relay, vælg <strong>Join friends</strong>, og indsæt invitationen.</p>
+          <button id="copy-native" class="secondary" type="button">Kopiér invitation</button>
+          <p id="copy-status" class="caption" role="status" aria-live="polite"></p>
+          <textarea id="manual-copy" readonly aria-label="Invitation til manuel kopiering" hidden></textarea>
+        </details>
+      </div>
+      <div id="empty-state">
+        <a class="primary" href="https://github.com/TheBengine/Relay/releases" rel="noreferrer">Hent Relay <span aria-hidden="true">↗</span></a>
+        <details id="convert-details"><summary>Har du et relay://-link?</summary>
+          <p class="body">Lav det om til et klikbart link. Invitationen bliver på din enhed.</p>
+          <label for="old-invitation">Dit invitationslink</label>
+          <textarea id="old-invitation" rows="3" spellcheck="false" autocomplete="off" placeholder="relay://join?…"></textarea>
+          <button id="convert" type="button" class="secondary">Lav klikbart link</button>
+          <p id="convert-status" class="caption" role="status" aria-live="polite"></p>
+        </details>
+      </div>
+      <div id="share" hidden><button id="copy-web" type="button" class="text-button">Kopiér det klikbare link</button><p id="share-status" class="caption" role="status" aria-live="polite"></p></div>
+      <noscript><p class="body">Slå JavaScript til for at åbne invitationen, eller indsæt dit oprindelige relay://-link i Relay → Join friends.</p></noscript>
+    </section>
+    <p class="privacy">Din ven er vært for serveren.<br>Invitationsoplysningerne sendes ikke til denne hjemmeside.</p>
+  </main>
+  <footer>Relay <span aria-hidden="true">·</span> Sammen, på jeres måde.</footer>
+</body>
+</html>
