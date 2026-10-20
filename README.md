@@ -1,88 +1,110 @@
-<p align="center"><img src="assets/relay-banner.png" alt="Relay — Dine venner. Din server." width="100%"></p>
+<p align="center"><img src="assets/relay-banner-en.svg" alt="Relay — Your friends. Your server." width="100%"></p>
 
 <p align="center">
-<a href="https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Setup.exe"><img alt="Hent Relay til Windows" src="https://img.shields.io/badge/Hent_til_Windows-5865F2?style=for-the-badge&amp;logo=windows&amp;logoColor=white"></a>
+<a href="https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Setup.exe"><img alt="Download Relay for Windows" src="https://img.shields.io/badge/Download_for_Windows-5865F2?style=for-the-badge&amp;logo=windows&amp;logoColor=white"></a>
 </p>
-<p align="center"><b>Windows x64 · 18. oktober 2026 · Stereo- og opkaldspreview</b><br>
-<a href="#kom-i-gang">Kom i gang</a> · <a href="#opdater-din-installation">Opdatering</a> · <a href="SIKKERHED.md">Sikkerhed</a> · <a href="https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261018.1">Nyt i denne udgave</a></p>
+<p align="center"><b>Windows x64 · Experimental preview</b><br>
+<a href="#get-started">Get started</a> · <a href="#why-relay">Why Relay?</a> · <a href="SECURITY.md">Privacy &amp; security</a> · <a href="https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261018.1">Release notes</a></p>
 
----
+**Chat, talk and share your screen with friends — on a server you control.**
 
-**Chat, tale og skærmdeling i en velkendt brugerflade — med jeres egen server.**
+Relay brings text channels, voice rooms, direct messages and screen sharing to a native Windows app. Host your community on your own PC or another machine. Open **Relay**; the local server and connection helpers are managed in the background.
 
-Relay er til venner, der vil snakke, spille og dele skærm, mens de selv bestemmer, hvor deres fællesskab bor. Serveren kan køre på en af jeres pc’er og styres gennem appen. I skal kun åbne **Relay**; hjælpeprogrammerne håndteres i baggrunden.
+## Why Relay?
 
-### Vælg din download
+### Your community, on your hardware
 
-| | Fil | Til dig, der… |
-| --- | --- | --- |
-| **Anbefalet** | [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Setup.exe) | Vil installere eller opdatere som et almindeligt Windows-program. |
-| Valgfri | [**Relay-Portable.zip**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Portable.zip) | Vil pakke ud selv. Behold hele mappen samlet, og åbn `Relay.exe`. |
-| Kontrolkoder | [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/SHA256SUMS.txt) | Vil kontrollere, at downloadet matcher udgivelsen. |
+Choose where your server runs and keep control of its data and backups. Your friends connect to your community; it does not have to be hosted by Relay's developer. The host must stay online while the community is in use.
 
-> Udgaven er en **usigneret preview**. Windows kan vise en advarsel. Praktiske opkald mellem to pc’er på forskellige netværk og fysisk kamera-/lydudstyr mangler stadig afprøvning.
+### Private conversations by default
 
-**Nyt: stereolyd og mere stabile opkald.** Delt programlyd bevarer venstre og højre kanal og følger pc’ernes lydtempo mere jævnt. Rettet opkald, der kunne hænge under tilslutning, og gamle videobilleder, der kunne dukke op efter Stop. De tidligere lyd-, mikrofon- og iroh-forbedringer er med. De nye forløb er prøvet lokalt med kunstige medier; lytteprøve og opkald mellem to hjem mangler fortsat. [Se ændringerne og prøvernes omfang](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261018.1).
+End-to-end encryption is the recommended default for messages, files and calls. Approved participant devices hold the content keys. The community server still handles accounts and sees metadata such as membership, sizes and timing. Relay is not an anonymity service.
 
-## Kom i gang
+The owner can explicitly choose an open community. Participants must accept before sending without Relay's end-to-end protection. **The server can read open content.** The iroh or Tailscale transport remains encrypted; transport protection and end-to-end protection are different layers. [Read the security overview](SECURITY.md).
 
-1. **Vælg dit navn.** Første start spørger om det navn, du vil bruge.
-2. **Opret eller deltag.** Vælg **Create a server** for at være vært, eller **Join friends**, hvis du har en invitation. Ved oprettelse vælger du kryptering; end-to-end-kryptering er anbefalet og forvalgt.
-3. **Invitér vennerne.** Værten åbner **Invite friends**, vælger **Share and copy invitation** og sender invitationen. Vennerne opretter deres egen konto på serveren.
+### A direct route when the network allows it
 
-**Bruger du allerede Tailscale?** Åbn **Invite friends → Change connection** på sidste trin for at vælge **Without accounts (iroh)** eller **With Tailscale**. Relay viser den aktuelle forbindelse. Kopiér en ny invitation efter et skift.
+iroh can connect friends without an extra networking account and can use a relay when a direct connection is unavailable. Tailscale is also available. You can choose your server's location rather than relying on a fixed community hosting service.
 
-**Værtscomputeren skal være tændt**, mens vennerne bruger serveren. Jeres server behøver ikke køre hos projektets skaber.
+A nearby server and a direct route can help latency. **Lower ping than Discord is not guaranteed:** geography, routing, relays, device processing and buffering all matter. A displayed connection ping is not the delay from microphone to speaker.
+
+### Native desktop design
+
+Relay's interface is built in Rust with egui, without an embedded browser shell. That is a concrete design choice; it is **not yet a measured RAM or CPU advantage**. We will publish comparative figures with the test conditions, including Relay's local server and helper processes when hosting on the same PC.
+
+### Voice and sharing without a subscription
+
+The included microphone, camera, screen-sharing and quality controls do not require a Relay subscription. Available quality options extend up to 4K/60 FPS; achieved quality depends on the hardware, connection and load. The preview includes noise reduction, automatic voice activity, microphone level control and push-to-talk.
+
+**A fair comparison with Discord:** Discord also provides end-to-end encrypted audio/video calls through [DAVE](https://support.discord.com/hc/en-us/articles/25968222946071-End-to-End-Encryption-for-Audio-and-Video). Relay's self-hosting and control over the community backend are the distinction here. Relay is still an experimental Windows app with a much smaller feature set and validation history.
+
+## Performance: measured claims only
+
+| Question | Current evidence |
+| --- | --- |
+| Does Relay use less RAM? | No comparable Relay/Discord measurement published yet. |
+| Does Relay use less CPU? | No comparable idle, voice and screen-sharing measurements published yet. |
+| Are voice and video faster? | No controlled two-PC Relay/Discord comparison published yet. |
+| What does “10 ms” mean? | An audio packet/buffering setting, not total call latency or internet ping. |
+
+Comparisons need the same PCs, devices, network, media settings and workload, with app versions and connection routes recorded. Media tests should report median and 95th-percentile delay alongside interruptions and quality. Idle RAM, network ping or one successful call cannot establish an overall advantage.
+
+## Download
+
+| Package | Best for |
+| --- | --- |
+| [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Setup.exe) | Recommended: install or update Relay like a normal Windows app. |
+| [Relay-Portable.zip](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Portable.zip) | Extract the whole folder and open `Relay.exe`. Keep the files together. |
+| [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/SHA256SUMS.txt) | Check that downloaded files match the release. |
+
+This is an **unsigned preview**. Real audio hardware, extended streaming and calls between different homes still need practical acceptance. Local synthetic media tests do not establish that these work on every PC or network.
+
+## Get started
+
+1. **Choose your name.** Relay asks for your preferred name on first launch.
+2. **Create or join.** Choose **Create a server**, or **Join friends** if you have an invitation. Server creation offers an encryption choice; end-to-end encryption is recommended and selected by default.
+3. **Invite your friends.** The host opens **Invite friends → Share and copy invitation**, then sends the invitation. Friends create their own account on that community.
+
+**Keep the host computer on.** Closing or updating the host interrupts access while its server is stopped. A private LAN address alone will not connect a friend in another home.
 
 <details>
-<summary><b>Hvilken forbindelse skal jeg vælge?</b></summary>
+<summary><b>Connection choices</b></summary>
 
-- **Share and copy invitation:** iroh-forbindelsen til chat, tale, kamera og skærmdeling, uden en ekstra netværkskonto. Den kan bruge en ekstern relæserver, hvis direkte forbindelse ikke lykkes. Begge pc’er skal bruge denne udgave til de nye mediefunktioner.
-- **Tailscale:** Den indbyggede private netværksvej til bl.a. video og skærmdeling. Begge logger ind med deres egen Tailscale-konto og godkender delingen; en separat Tailscale-app er ikke nødvendig.
-- **Direkte adresse:** Til samme netværk eller en serveradresse, der allerede kan nås. Offentlig hosting kan kræve yderligere netværksopsætning.
+- **Without accounts (iroh):** chat, voice, camera and screen sharing without a separate networking account. An external relay may be used if direct connectivity is unavailable. Both PCs need the updated media-capable preview.
+- **With Tailscale:** both friends sign in with their own Tailscale accounts and accept sharing. A separate Tailscale app is not required.
+- **Direct address:** for the same network or a server that is already reachable. Public hosting can require additional network configuration.
 
-Relay kan automatisk vælge mellem de veje, invitationen tilbyder. De nye forbindelsesvalg er softwaretestet lokalt; de er endnu ikke godkendt gennem et rigtigt opkald mellem to hjem.
+Use **Invite friends → Change connection** to change the route, then copy a new invitation. Relay can choose between routes included in an invitation. If a browser does not open the app, use **Join friends** and paste the invitation.
 
 </details>
 
-## Det får I
+## What is included?
 
-| Samtaler | Tale og deling | Jeres fællesskab |
+| Conversations | Voice & sharing | Your community |
 | --- | --- | --- |
-| Kanaler, DMs og grupper | Mikrofonvalg og push-to-talk | Lokal server gennem appen |
-| Svar, reaktioner og tråde | Støjreduktion og lydstyrker | Roller og rettigheder |
-| Filer og GIF-søgning | Kamera og skærmdeling | Profil- og serverindstillinger |
-| Søgning på din egen pc | Kvalitetsvalg op til 4K/60 fps* | Temaer og justerbar tekststørrelse |
+| Channels, DMs and groups | Microphone selection and push-to-talk | Local server managed through the app |
+| Replies, reactions and threads | Noise reduction and volume controls | Roles and permissions |
+| Files and GIF search | Camera and screen sharing | Profile and server settings |
+| Search on your own PC | Quality controls | Themes and adjustable text size |
 
-*Tilgængelige valg er ikke en garanti for opnået kvalitet; hardware, netværk og den valgte forbindelsesvej sætter grænser.*
+New one-use invitations can confirm the host's and friend's devices automatically. Send them through a trusted contact route. You can compare the security number under **Settings → Encryption**, in person or over a call you already trust.
 
-## Kryptering uden kodebøvl
+## Update Relay
 
-**End-to-end-kryptering er standard.** Nye engangsinvitationer kan bekræfte værtens og vennens enhed automatisk. I kan bagefter sammenligne det samme sikkerhedsnummer under **Settings → Encryption** gennem et kendt opkald eller personligt.
+1. Close the Relay window.
+2. Run the newer **Relay-Setup.exe** over your installation. The installer offers **Stop my local server and continue** for the installation's local server. Friends will be disconnected during the update.
+3. Open Relay from the Start menu or your shortcut. Update both PCs for media fixes.
 
-En tidligere lokal prøve af invitationsarbejdet (16. oktober) med to friske profiler fik vennens besked frem hos værten **6,2 sekunder efter kontooprettelsen**, uden manuel kodeudveksling. Det er et testresultat på én pc, ikke en garanti for internetforsinkelse.
+The installer preserves accounts, settings, device keys and server data. Uninstalling through Windows also leaves your data. Automatic background updates are not enabled.
 
-Værten kan vælge åben tilstand for beskeder, filer og opkald. Hver deltager skal selv acceptere, før deres app sender uden end-to-end-beskyttelsen. **Åbent indhold kan læses af serveren.** iroh- eller Tailscale-forbindelsen er stadig krypteret; det er et andet lag end Relays end-to-end-kryptering. [Læs den korte sikkerhedsforklaring →](SIKKERHED.md)
+## Current limits
 
-## Opdater din installation
-
-1. Luk Relay-vinduet.
-2. Hent **Relay-Setup.exe**, og kør den oven på installationen. Installeren kan stoppe installationens lokale server med **Stop my local server and continue**. Vennerne bliver afbrudt under opdateringen. Du behøver ikke afinstallere først.
-3. Åbn Relay fra Startmenuen eller din genvej.
-
-Installeren bevarer konti, indstillinger, nøgler og serverdata. Afinstallation sker gennem Windows’ **Installerede apps** og beholder dine data. Automatiske baggrundsopdateringer er endnu ikke aktiveret.
-
-<details>
-<summary><b>Hvad mangler stadig?</b></summary>
-
-- Praktisk accept af deling, opkald og genforbindelse mellem to pc’er på forskellige netværk.
-- Fysisk mikrofon, kamera, programlyd og længere streamingprøver.
-- Praktisk afprøvning af de nye iroh-mediefunktioner på forskellige pc’er og netværk; lokale syntetiske prøver er gennemført.
-- Pålidelig åbning af invitationer direkte fra alle browsere. Brug **Join friends** og indsæt linket, hvis browseren ikke åbner appen.
-- Signeret distribution, automatiske opdateringer og uafhængigt sikkerhedsreview.
-
-</details>
+- Windows only, experimental and unsigned; no independent security review of Relay's integration yet.
+- Hardware listening tests, long camera/screen-sharing sessions and reliable WAN reconnects still need practical acceptance.
+- Newer development work is not automatically included in the download. The published preview currently uses private rooms that both participants join; incoming-call ringing and later account work should not be assumed to be released.
+- Losing local device keys cannot be repaired with an account password or server backup alone.
+- Public connection helpers and relays can still be involved. Self-hosted does not mean every connection is direct or independent of all infrastructure.
 
 ---
 
-Dette repository indeholder projektets beskrivelse, grafik og downloadbare programmer. **Programkildekoden offentliggøres ikke her endnu.** Relay er et selvstændigt projekt uden tilknytning til Discord. Online GIF-søgning bruger GIPHY.
+This repository contains the project's presentation, artwork and downloadable programs. **The application source is not published here yet.** Relay is independent of Discord. Online GIF search uses GIPHY.

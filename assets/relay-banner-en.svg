@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="400" viewBox="0 0 1440 400" role="img" aria-labelledby="title desc">
+ <title id="title">Relay — Your friends. Your server.</title>
+ <desc id="desc">Native Windows chat, voice and screen sharing. Self-hosted communities. End-to-end encryption by default.</desc>
+ <defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#10141f"/><stop offset="1" stop-color="#202441"/></linearGradient><linearGradient id="accent" x2="1" y2="1"><stop stop-color="#aabaff"/><stop offset="1" stop-color="#7379ff"/></linearGradient></defs>
+ <rect width="1440" height="400" rx="22" fill="url(#bg)"/>
+ <g transform="translate(80 93)" fill="none" stroke="url(#accent)" stroke-width="12" stroke-linecap="round"><path d="M78 8C35-5 4 23 5 62C6 103 38 123 77 112C111 104 121 68 108 37"/><path d="M80 8L103 10L106 34"/></g>
+ <g font-family="Segoe UI,Arial,sans-serif" fill="#f3f5ff">
+  <text x="243" y="146" font-size="76" font-weight="700">Relay</text>
+  <text x="80" y="260" font-size="47" font-weight="600">Your friends. Your server.</text>
+  <text x="82" y="311" font-size="25" fill="#bec9e7">Chat · Voice · Screen sharing</text>
+  <text x="1358" y="107" text-anchor="end" font-size="17" fill="#bec9e7" letter-spacing="2">NATIVE WINDOWS PREVIEW</text>
+ </g>
+</svg>
