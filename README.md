@@ -3,7 +3,7 @@
   <img src="assets/relay-banner-en.svg" alt="Relay — Your friends. Your server. A self-hosted Discord alternative for chat, voice and screen sharing." width="100%">
 </picture>
 
-**[Download for Windows](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Setup.exe)** · [Portable version](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Portable.zip)
+**[Download for Windows](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261021.1/Relay-Setup.exe)** · [Portable version](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261021.1/Relay-Portable.zip)
 
 Experimental, unsigned Windows x64 preview.
 

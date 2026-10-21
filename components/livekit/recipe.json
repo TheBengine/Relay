@@ -1,0 +1,34 @@
+{
+  "tag": "v1.13.10",
+  "commit": "e5655ac20267fa5005dccaf3f0e3bfc3ea688c07",
+  "verified_commit": true,
+  "url": "https://api.github.com/repos/livekit/livekit/tarball/e5655ac20267fa5005dccaf3f0e3bfc3ea688c07",
+  "archive_sha256": "2ba8e0fb0565f0b1d3b164279283832a8578784c71593fb16a8a210914e4fe9e",
+  "go_toolchain": "go1.27.3",
+  "patch_sha256": "731d50f9fb6548af4a9f99ac0a429514428a9c253fda9f4236394d2ffcf6506f",
+  "build_command": [
+    "go",
+    "build",
+    "-p=2",
+    "-mod=readonly",
+    "-trimpath",
+    "-buildvcs=false",
+    "-ldflags",
+    "-s -w -buildid=",
+    "-o",
+    "livekit-server.exe",
+    "./cmd/server"
+  ],
+  "overrides": {
+    "go.mod": "Go minimum 1.27.3; golang.org/x/net v0.60.0",
+    "go.sum": "checksum-verified new x/net entries",
+    "version/version.go": "1.13.10-relay-security.20261021.2"
+  },
+  "patched_files": {
+    "go.mod": "8ebaf20d925f7b542fd6e616905fc17ccb397d4695cdbe9650049d6b5dcd5339",
+    "go.sum": "8f47cf15c2dc8157ece481d7983cb95e4dc3bb5e2814426bcd46e4f6025fea44",
+    "version/version.go": "bdb2f9f2c922a928114f76f9cfc652b1e125a68274710421a7a9aa41e4adeda7"
+  },
+  "binary_sha256": "b5bb7f5cb8b84bcc4ab6c0413f82f71383c7f7709411fd5ed7a2057b67e08da7",
+  "license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+}

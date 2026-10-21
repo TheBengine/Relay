@@ -26,7 +26,7 @@ No. Protect your local profile and device keys. A community server backup or acc
 
 ## Distribution and review
 
-The published Windows preview is unsigned. No new Microsoft Defender scan was performed for the 18 October 2026 preview files; earlier scans applied to different, precisely identified files.
+The published Windows preview is unsigned. No new Microsoft Defender scan was performed for the 21 October 2026 preview files. Local security checks and their limits are described in the release notes.
 
 Relay's integration has not had an independent security review. SHA-256 checksums identify the published files; they do not prove the absence of defects or malware. Local synthetic checks do not establish real hardware/WAN acceptance.
 

@@ -1,0 +1,2 @@
+components/livekit/*.patch -text -whitespace
+components/livekit/recipe.json text eol=lf
