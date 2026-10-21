@@ -32,4 +32,4 @@ No controlled Relay-versus-Discord result establishes lower RAM or CPU use, lowe
 
 Future comparisons should use the same PCs, devices, network and workload, report versions and routes, include all relevant app/server/helper processes, and report delay percentiles together with interruptions and sound quality. A ping or a 10 ms audio setting is not an end-to-end call measurement.
 
-[Get Relay](README.md#download) · [See how Relay works](README.md#why-relay) · [Privacy and security](SECURITY.md)
+[Get Relay and set up](GUIDE.md) · [Back to Relay](README.md) · [Privacy and security](SECURITY.md)
