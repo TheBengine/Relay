@@ -1,4 +1,7 @@
-<p align="center"><img src="assets/relay-banner-en.svg" alt="Relay — Your friends. Your server." width="100%"></p>
+<picture>
+  <source media="(max-width: 640px)" srcset="assets/relay-banner-compact.svg">
+  <img src="assets/relay-banner-en.svg" alt="Relay — Your friends. Your server. Native Windows chat, voice and screen sharing, hosted your way." width="100%">
+</picture>
 
 <p align="center">
 <a href="https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Setup.exe"><img alt="Download Relay for Windows" src="https://img.shields.io/badge/Download_for_Windows-5865F2?style=for-the-badge&amp;logo=windows&amp;logoColor=white"></a>
@@ -12,31 +15,48 @@ Relay brings text channels, voice rooms, direct messages and screen sharing to a
 
 ## Why Relay?
 
-### Your community, on your hardware
+**Choose the home for your community. Keep the controls familiar.** Relay is for friends who want channels, calls and sharing with control over the community backend.
 
-Choose where your server runs and keep control of its data and backups. Your friends connect to your community; it does not have to be hosted by Relay's developer. The host must stay online while the community is in use.
+| What you control | What that gives you |
+| --- | --- |
+| **Where the server lives** | Host on your Windows PC or keep a separate machine online. |
+| **Community data and backups** | Choose the storage and keep your own recovery copies. |
+| **Privacy and audio settings** | Recommended end-to-end encryption, device checks and adjustable call controls. |
 
-### Private conversations by default
+<picture>
+  <source media="(max-width: 640px)" srcset="assets/relay-hosting-compact.svg">
+  <img src="assets/relay-hosting.svg" alt="Friends connect to a community server on your PC or a separate server. You control its data and backups. The host must remain online; account services and connection relays can still be involved." width="100%">
+</picture>
 
-End-to-end encryption is the recommended default for messages, files and calls. Approved participant devices hold the content keys. The community server still handles accounts and sees metadata such as membership, sizes and timing. Relay is not an anonymity service.
+### Private content, with a clear choice
 
-The owner can explicitly choose an open community. Participants must accept before sending without Relay's end-to-end protection. **The server can read open content.** The iroh or Tailscale transport remains encrypted; transport protection and end-to-end protection are different layers. [Read the security overview](SECURITY.md).
+End-to-end encryption is the recommended default for messages, files and calls. Approved participant devices hold the content keys. The server still sees metadata such as membership, sizes and timing.
 
-### A direct route when the network allows it
+<picture>
+  <source media="(max-width: 640px)" srcset="assets/relay-privacy-compact.svg">
+  <img src="assets/relay-privacy.svg" alt="With E2EE enabled, approved devices encrypt and decrypt content while the community server routes ciphertext. Transport encryption protects a separate layer. Open mode lets the server read content; metadata remains visible." width="100%">
+</picture>
 
-iroh can connect friends without an extra networking account and can use a relay when a direct connection is unavailable. Tailscale is also available. You can choose your server's location rather than relying on a fixed community hosting service.
+An owner can explicitly choose an open community, and participants must accept before sending without Relay's end-to-end protection. **The server can read open content.** The iroh or Tailscale connection remains encrypted. [Understand the privacy choices](SECURITY.md).
 
-A nearby server and a direct route can help latency. **Lower ping than Discord is not guaranteed:** geography, routing, relays, device processing and buffering all matter. A displayed connection ping is not the delay from microphone to speaker.
+### Your hosting choice. More control over the call.
 
-### Native desktop design
+iroh can connect friends without an extra networking account, using a relay if a direct connection is unavailable. Tailscale and direct addresses are also options. You choose where your community server runs; the actual route still depends on the networks involved.
 
-Relay's interface is built in Rust with egui, without an embedded browser shell. That is a concrete design choice; it is **not yet a measured RAM or CPU advantage**. We will publish comparative figures with the test conditions, including Relay's local server and helper processes when hosting on the same PC.
+Relay's desktop interface is built in Rust with egui. Microphone level, noise reduction, voice activity, push-to-talk and buffering controls let you adjust the call to your setup.
 
-### Voice and sharing without a subscription
+<picture>
+  <source media="(max-width: 640px)" srcset="assets/relay-call-path-compact.svg">
+  <img src="assets/relay-call-path.svg" alt="Audio travels through microphone capture, processing, the network route, receive buffering and speaker playback. Hosting and audio controls affect different parts. A 10 ms packet or buffer setting is not total call latency." width="100%">
+</picture>
 
-The included microphone, camera, screen-sharing and quality controls do not require a Relay subscription. Available quality options extend up to 4K/60 FPS; achieved quality depends on the hardware, connection and load. The preview includes noise reduction, automatic voice activity, microphone level control and push-to-talk.
+A nearby server and a direct route can help latency. **Lower ping, better sound, and lower RAM or CPU use than Discord have not been established.** We will publish comparisons with matched devices, versions, routes and workloads, including the local server and helpers when hosting.
 
-**A fair comparison with Discord:** Discord also provides end-to-end encrypted audio/video calls through [DAVE](https://support.discord.com/hc/en-us/articles/25968222946071-End-to-End-Encryption-for-Audio-and-Video). Relay's self-hosting and control over the community backend are the distinction here. Relay is still an experimental Windows app with a much smaller feature set and validation history.
+### Voice and sharing without a Relay subscription
+
+The included microphone, camera, screen-sharing and quality controls do not require a Relay subscription. Quality options extend up to 4K/60 FPS; achieved quality depends on hardware, connection and load. This is still an experimental preview.
+
+**A fair comparison with Discord:** Discord also provides end-to-end encrypted audio/video calls through [DAVE](https://support.discord.com/hc/en-us/articles/25968222946071-End-to-End-Encryption-for-Audio-and-Video). Relay's self-hosting and control over the community backend are the distinction here. Relay has a much smaller feature set and validation history.
 
 ## Performance: measured claims only
 
@@ -64,6 +84,13 @@ This is an **unsigned preview**. Real audio hardware, extended streaming and cal
 1. **Choose your name.** Relay asks for your preferred name on first launch.
 2. **Create or join.** Choose **Create a server**, or **Join friends** if you have an invitation. Server creation offers an encryption choice; end-to-end encryption is recommended and selected by default.
 3. **Invite your friends.** The host opens **Invite friends → Share and copy invitation**, then sends the invitation. Friends create their own account on that community.
+
+<picture>
+  <source media="(max-width: 640px)" srcset="assets/relay-invitation-compact.svg">
+  <img src="assets/relay-invitation.svg" alt="Share an HTTPS invitation, let the browser ask to open installed Relay, then join the community. iroh needs no separate VPN account. If the app does not open, paste the invitation in Join friends." width="100%">
+</picture>
+
+With an HTTPS invitation and Relay installed, your friend chooses **Open Relay** in the browser. Already have a `relay://` invitation? The [invitation page](https://thebengine.github.io/Relay/) can turn it into a clickable link. Pasting the original invitation in **Join friends** remains available.
 
 **Keep the host computer on.** Closing or updating the host interrupts access while its server is stopped. A private LAN address alone will not connect a friend in another home.
 
