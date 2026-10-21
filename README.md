@@ -7,11 +7,24 @@
 <a href="https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261018.1/Relay-Setup.exe"><img alt="Download Relay for Windows" src="https://img.shields.io/badge/Download_for_Windows-5865F2?style=for-the-badge&amp;logo=windows&amp;logoColor=white"></a>
 </p>
 <p align="center"><b>Windows x64 · Experimental preview</b><br>
-<a href="#get-started">Get started</a> · <a href="#why-relay">Why Relay?</a> · <a href="SECURITY.md">Privacy &amp; security</a> · <a href="https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261018.1">Release notes</a></p>
+<a href="#relay-vs-discord">Relay vs Discord</a> · <a href="#get-started">Get started</a> · <a href="#why-relay">Why Relay?</a> · <a href="SECURITY.md">Privacy &amp; security</a> · <a href="https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261018.1">Release notes</a></p>
 
-**Chat, talk and share your screen with friends — on a server you control.**
+**A self-hosted Discord alternative with private text and subscription-free quality controls.**
 
 Relay brings text channels, voice rooms, direct messages and screen sharing to a native Windows app. Host your community on your own PC or another machine. Open **Relay**; the local server and connection helpers are managed in the background.
+
+## Relay vs Discord
+
+**Better for self-hosting, private text and quality controls without a Relay subscription.**
+
+<picture>
+  <source media="(max-width: 640px)" srcset="assets/relay-vs-discord-compact.svg">
+  <img src="assets/relay-vs-discord.svg" alt="Relay versus Discord: host the backend yourself, use E2EE for text in protected mode, and access 4K/60 settings without a Relay subscription. Discord hosts its backend, does not E2EE text and offers 4K/60 through Nitro. Both offer audio/video E2EE. You maintain a Relay host; Discord manages hosting. Quality settings are not a performance measurement." width="100%">
+</picture>
+
+**Your server, your data location, your backups.** Relay gives your group control over the actual community host. Protected text adds privacy beyond Discord's text messaging, while higher quality controls are included in Relay.
+
+The trade-off: Relay is an experimental Windows preview, and you keep its host online and backed up. [Read the feature-by-feature comparison and official Discord sources](COMPARISON.md).
 
 ## Why Relay?
 
@@ -56,9 +69,8 @@ A nearby server and a direct route can help latency. **Lower ping, better sound,
 
 The included microphone, camera, screen-sharing and quality controls do not require a Relay subscription. Quality options extend up to 4K/60 FPS; achieved quality depends on hardware, connection and load. This is still an experimental preview.
 
-**A fair comparison with Discord:** Discord also provides end-to-end encrypted audio/video calls through [DAVE](https://support.discord.com/hc/en-us/articles/25968222946071-End-to-End-Encryption-for-Audio-and-Video). Relay's self-hosting and control over the community backend are the distinction here. Relay has a much smaller feature set and validation history.
-
-## Performance: measured claims only
+<details>
+<summary><b>Performance comparison: what has been measured?</b></summary>
 
 | Question | Current evidence |
 | --- | --- |
@@ -68,6 +80,8 @@ The included microphone, camera, screen-sharing and quality controls do not requ
 | What does “10 ms” mean? | An audio packet/buffering setting, not total call latency or internet ping. |
 
 Comparisons need the same PCs, devices, network, media settings and workload, with app versions and connection routes recorded. Media tests should report median and 95th-percentile delay alongside interruptions and quality. Idle RAM, network ping or one successful call cannot establish an overall advantage.
+
+</details>
 
 ## Download
 
