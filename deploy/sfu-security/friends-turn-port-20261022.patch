@@ -1,0 +1,131 @@
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -295,16 +295,19 @@
+ }
+ 
+ type TURNConfig struct {
+-	Enabled             bool     `yaml:"enabled,omitempty"`
+-	Domain              string   `yaml:"domain,omitempty"`
+-	CertFile            string   `yaml:"cert_file,omitempty"`
+-	KeyFile             string   `yaml:"key_file,omitempty"`
+-	TLSPort             int      `yaml:"tls_port,omitempty"`
+-	UDPPort             int      `yaml:"udp_port,omitempty"`
+-	RelayPortRangeStart uint16   `yaml:"relay_range_start,omitempty"`
+-	RelayPortRangeEnd   uint16   `yaml:"relay_range_end,omitempty"`
+-	ExternalTLS         bool     `yaml:"external_tls,omitempty"`
+-	BindAddresses       []string `yaml:"bind_addresses,omitempty"`
++	Enabled             bool   `yaml:"enabled,omitempty"`
++	Domain              string `yaml:"domain,omitempty"`
++	CertFile            string `yaml:"cert_file,omitempty"`
++	KeyFile             string `yaml:"key_file,omitempty"`
++	TLSPort             int    `yaml:"tls_port,omitempty"`
++	UDPPort             int    `yaml:"udp_port,omitempty"`
++	RelayPortRangeStart uint16 `yaml:"relay_range_start,omitempty"`
++	RelayPortRangeEnd   uint16 `yaml:"relay_range_end,omitempty"`
++	ExternalTLS         bool   `yaml:"external_tls,omitempty"`
++	// ExternalTLSPort is the public port of a TLS-terminating TURN proxy.
++	// Zero preserves the existing public port 443, independently of tls_port.
++	ExternalTLSPort int      `yaml:"external_tls_port,omitempty"`
++	BindAddresses   []string `yaml:"bind_addresses,omitempty"`
+ 	// ProxyProtocol makes the TURN TCP listener require a PROXY protocol (v1 or v2)
+ 	// header on every connection and use the client address it carries. Needed when
+ 	// a proxy in front of TURN dials from its own address (a TLS-terminating L4
+@@ -701,6 +704,9 @@
+ 		return nil, fmt.Errorf("could not validate congestion control config: %v", err)
+ 	}
+ 
++	if err := conf.TURN.ValidateExternalTLSPort(); err != nil {
++		return nil, err
++	}
+ 	conf.NormalizeTURNTTLs()
+ 
+ 	// expand env vars in filenames
+--- /dev/null
++++ b/pkg/config/turn_public_port.go
+@@ -0,0 +1,25 @@
++package config
++
++import "fmt"
++
++// ValidateExternalTLSPort rejects invalid public proxy ports before listeners
++// start. The omitted field retains the upstream advertisement on port 443.
++func (c TURNConfig) ValidateExternalTLSPort() error {
++	if c.ExternalTLSPort == 0 {
++		return nil
++	}
++	if !c.Enabled || !c.ExternalTLS || c.TLSPort < 1 || c.TLSPort > 65535 || c.ExternalTLSPort < 1 || c.ExternalTLSPort > 65535 {
++		return fmt.Errorf("turn.external_tls_port requires enabled external TLS, a valid listener and a public port from 1 to 65535")
++	}
++	return nil
++}
++
++// TLSURI is the authenticated TURN address advertised in the normal join reply.
++// It changes only the port; credentials, expiry and transport remain unchanged.
++func (c TURNConfig) TLSURI() string {
++	port := c.ExternalTLSPort
++	if port == 0 {
++		port = 443
++	}
++	return fmt.Sprintf("turns:%s:%d?transport=tcp", c.Domain, port)
++}
+--- /dev/null
++++ b/pkg/config/turn_public_port_test.go
+@@ -0,0 +1,39 @@
++package config
++
++import (
++	"fmt"
++	"testing"
++)
++
++func TestTURNPublicTLSAddressPreservesDefaultAndUsesExplicitProxyPort(t *testing.T) {
++	for _, port := range []int{0, 10000, 65535} {
++		conf, err := NewConfig(fmt.Sprintf("turn:\n  enabled: true\n  domain: relay.example\n  tls_port: 5349\n  external_tls: true\n  external_tls_port: %d\n", port), true, nil, nil)
++		if err != nil {
++			t.Fatalf("valid public proxy port %d: %v", port, err)
++		}
++		expected := port
++		if expected == 0 {
++			expected = 443
++		}
++		if got := conf.TURN.TLSURI(); got != fmt.Sprintf("turns:relay.example:%d?transport=tcp", expected) {
++			t.Fatalf("public URI for %d: %q", port, got)
++		}
++		if conf.TURN.TLSPort != 5349 {
++			t.Fatal("public advertisement changed the listener")
++		}
++	}
++}
++
++func TestTURNPublicTLSPortRejectsInvalidOrUnconfiguredProxy(t *testing.T) {
++	for _, input := range []string{
++		"enabled: true\n  external_tls: true\n  tls_port: 5349\n  external_tls_port: -1",
++		"enabled: true\n  external_tls: true\n  tls_port: 5349\n  external_tls_port: 65536",
++		"enabled: true\n  external_tls: false\n  tls_port: 5349\n  external_tls_port: 10000",
++		"enabled: true\n  external_tls: true\n  tls_port: 0\n  external_tls_port: 10000",
++		"enabled: false\n  external_tls: true\n  tls_port: 5349\n  external_tls_port: 10000",
++	} {
++		if _, err := NewConfig("turn:\n  "+input+"\n", true, nil, nil); err == nil {
++			t.Fatal("invalid public TURN proxy configuration was accepted")
++		}
++	}
++}
+--- a/pkg/service/roommanager.go
++++ b/pkg/service/roommanager.go
+@@ -1076,7 +1076,7 @@
+ 			}
+ 		}
+ 		if r.config.TURN.TLSPort > 0 {
+-			urls = append(urls, fmt.Sprintf("turns:%s:443?transport=tcp", r.config.TURN.Domain))
++			urls = append(urls, r.config.TURN.TLSURI())
+ 		}
+ 		if len(urls) > 0 {
+ 			username, expiry := r.turnAuthHandler.CreateUsername(apiKey, participant.ID(), r.config.TURN.TTLSeconds)
+--- a/version/version.go
++++ b/version/version.go
+@@ -14,4 +14,4 @@
+ 
+ package version
+ 
+-const Version = "1.13.10-relay-security.20261021.2"
++const Version = "1.13.10-relay-media.20261022.1"

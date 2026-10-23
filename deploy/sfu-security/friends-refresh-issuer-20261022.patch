@@ -1,0 +1,475 @@
+diff --git a/pkg/routing/interfaces.go b/pkg/routing/interfaces.go
+--- a/pkg/routing/interfaces.go
++++ b/pkg/routing/interfaces.go
+@@ -185,14 +185,16 @@
+ // ------------------------------------------------
+ 
+ type ParticipantInit struct {
+-	Identity                livekit.ParticipantIdentity
+-	Name                    livekit.ParticipantName
+-	Reconnect               bool
+-	ReconnectReason         livekit.ReconnectReason
+-	AutoSubscribe           bool
+-	AutoSubscribeDataTrack  *bool
+-	Client                  *livekit.ClientInfo
+-	Grants                  *auth.ClaimGrants
++	Identity               livekit.ParticipantIdentity
++	Name                   livekit.ParticipantName
++	Reconnect              bool
++	ReconnectReason        livekit.ReconnectReason
++	AutoSubscribe          bool
++	AutoSubscribeDataTrack *bool
++	Client                 *livekit.ClientInfo
++	Grants                 *auth.ClaimGrants
++	// VerifiedAPIKey comes only from authenticated server context, never client attributes.
++	VerifiedAPIKey          string
+ 	TokenExpiresAt          time.Time
+ 	Region                  string
+ 	AdaptiveStream          bool
+@@ -242,10 +244,26 @@
+ 	return nil
+ }
+ 
++// Keep this internal binding beside the flat grants, not in user-editable
++// attributes. The local defined type deliberately has no ClaimGrants methods:
++// a custom MarshalJSON on that external type must not swallow the binding.
++type participantClaimGrants auth.ClaimGrants
++
++type participantGrantsTransport struct {
++	participantClaimGrants
++	VerifiedAPIKey string `json:"_relay_verified_api_key,omitempty"`
++}
++
+ func (pi *ParticipantInit) ToStartSession(roomName livekit.RoomName, connectionID livekit.ConnectionID) (*livekit.StartSession, error) {
+-	claims, err := json.Marshal(pi.Grants)
+-	if err != nil {
+-		return nil, err
++	wire := participantGrantsTransport{VerifiedAPIKey: pi.VerifiedAPIKey}
++	claims := []byte("null")
++	if pi.Grants != nil {
++		wire.participantClaimGrants = participantClaimGrants(*pi.Grants)
++		var err error
++		claims, err = json.Marshal(wire)
++		if err != nil {
++			return nil, err
++		}
+ 	}
+ 
+ 	var tokenExpiresAt int64
+@@ -286,10 +304,11 @@
+ }
+ 
+ func ParticipantInitFromStartSession(ss *livekit.StartSession, region string) (*ParticipantInit, error) {
+-	claims := &auth.ClaimGrants{}
+-	if err := json.Unmarshal([]byte(ss.GrantsJson), claims); err != nil {
++	var wire participantGrantsTransport
++	if err := json.Unmarshal([]byte(ss.GrantsJson), &wire); err != nil {
+ 		return nil, err
+ 	}
++	claims := auth.ClaimGrants(wire.participantClaimGrants)
+ 	var tokenExpiresAt time.Time
+ 	if ss.TokenExpiresAt > 0 {
+ 		tokenExpiresAt = time.Unix(ss.TokenExpiresAt, 0)
+@@ -302,7 +321,8 @@
+ 		ReconnectReason:         ss.ReconnectReason,
+ 		Client:                  ss.Client,
+ 		AutoSubscribe:           ss.AutoSubscribe,
+-		Grants:                  claims,
++		Grants:                  &claims,
++		VerifiedAPIKey:          wire.VerifiedAPIKey,
+ 		TokenExpiresAt:          tokenExpiresAt,
+ 		Region:                  region,
+ 		AdaptiveStream:          ss.AdaptiveStream,
+diff --git a/pkg/routing/relay_refresh_issuer_test.go b/pkg/routing/relay_refresh_issuer_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/routing/relay_refresh_issuer_test.go
+@@ -0,0 +1,70 @@
++package routing
++
++import (
++	"encoding/json"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	"go.uber.org/zap/zapcore"
++
++	"github.com/livekit/protocol/auth"
++	"github.com/livekit/protocol/livekit"
++)
++
++func TestRelayRefreshIssuerTransportRoundTrip(t *testing.T) {
++	grants := &auth.ClaimGrants{Identity: "owned-user", Name: "Owned QA", Metadata: "owned-metadata",
++		Attributes: map[string]string{"_relay_verified_api_key": "spoofed-attribute", "owned": "kept"},
++		Video:      &auth.VideoGrant{Room: "owned-room", RoomJoin: true}}
++	init := &ParticipantInit{Identity: "owned-user", Grants: grants, VerifiedAPIKey: "verified-own-key",
++		TokenExpiresAt: time.Unix(2_000_000_000, 0), Reconnect: true}
++	logFields := zapcore.NewMapObjectEncoder()
++	require.NoError(t, init.MarshalLogObject(logFields))
++	logged, err := json.Marshal(logFields.Fields)
++	require.NoError(t, err)
++	require.NotContains(t, string(logged), init.VerifiedAPIKey)
++	for range 2 {
++		wire, err := init.ToStartSession("owned-room", "owned-connection")
++		require.NoError(t, err)
++		var raw map[string]json.RawMessage
++		require.NoError(t, json.Unmarshal([]byte(wire.GrantsJson), &raw))
++		require.JSONEq(t, `"verified-own-key"`, string(raw["_relay_verified_api_key"]))
++		require.NotEmpty(t, raw["video"], "the grants must stay flat and complete")
++		_, marshaler := any(participantClaimGrants{}).(json.Marshaler)
++		require.False(t, marshaler, "the wire alias must not inherit external MarshalJSON")
++		_, marshaler = any(&participantClaimGrants{}).(json.Marshaler)
++		require.False(t, marshaler)
++		restored, err := ParticipantInitFromStartSession(wire, "owned-region")
++		require.NoError(t, err)
++		require.Equal(t, init.VerifiedAPIKey, restored.VerifiedAPIKey)
++		require.Equal(t, grants, restored.Grants)
++		require.Equal(t, init.TokenExpiresAt, restored.TokenExpiresAt)
++		require.True(t, restored.Reconnect)
++		init = restored
++	}
++}
++
++func TestRelayRefreshIssuerLegacyWireForms(t *testing.T) {
++	grants := &auth.ClaimGrants{Identity: "owned-user", Attributes: map[string]string{"_relay_verified_api_key": "not-trusted"},
++		Video: &auth.VideoGrant{Room: "owned-room", RoomJoin: true}}
++	old, err := json.Marshal(grants)
++	require.NoError(t, err)
++	wire, err := (&ParticipantInit{Grants: grants}).ToStartSession("owned-room", "owned-connection")
++	require.NoError(t, err)
++	require.JSONEq(t, string(old), wire.GrantsJson)
++	decoded, err := ParticipantInitFromStartSession(wire, "owned-region")
++	require.NoError(t, err)
++	require.Empty(t, decoded.VerifiedAPIKey, "a similarly named user attribute is not server binding")
++	require.Equal(t, grants, decoded.Grants)
++	nilWire, err := (&ParticipantInit{VerifiedAPIKey: "no-grants-no-binding"}).ToStartSession("owned-room", "owned-connection")
++	require.NoError(t, err)
++	require.Equal(t, "null", nilWire.GrantsJson)
++	decoded, err = ParticipantInitFromStartSession(&livekit.StartSession{GrantsJson: "null"}, "owned-region")
++	require.NoError(t, err)
++	require.Equal(t, &auth.ClaimGrants{}, decoded.Grants)
++	require.Empty(t, decoded.VerifiedAPIKey)
++	for _, malformed := range []string{`{"_relay_verified_api_key":123}`, `{"_relay_verified_api_key":{}}`, ""} {
++		_, err = ParticipantInitFromStartSession(&livekit.StartSession{GrantsJson: malformed}, "owned-region")
++		require.Error(t, err)
++	}
++}
+diff --git a/pkg/routing/signal.go b/pkg/routing/signal.go
+--- a/pkg/routing/signal.go
++++ b/pkg/routing/signal.go
+@@ -95,7 +95,6 @@
+ 		"participant", pi.Identity,
+ 		"connID", connectionID,
+ 		"participantInit", &pi,
+-		"startSession", logger.Proto(ss),
+ 	)
+ 
+ 	l.Debugw("starting signal connection")
+diff --git a/pkg/rtc/participant.go b/pkg/rtc/participant.go
+--- a/pkg/rtc/participant.go
++++ b/pkg/rtc/participant.go
+@@ -196,6 +196,7 @@
+ 	ReporterResolver                  roomobs.ParticipantReporterResolver
+ 	SimTracks                         map[uint32]interceptor.SimulcastTrackInfo
+ 	Grants                            *auth.ClaimGrants
++	VerifiedAPIKey                    string
+ 	TokenExpiresAt                    time.Time
+ 	InitialVersion                    uint32
+ 	ClientConf                        *livekit.ClientConfiguration
+@@ -858,6 +859,12 @@
+ 	return p.params.TokenExpiresAt
+ }
+ 
++// TokenAPIKey is the immutable issuer binding captured after token verification.
++// It is not part of the participant's mutable public grants or attributes.
++func (p *ParticipantImpl) TokenAPIKey() string {
++	return p.params.VerifiedAPIKey
++}
++
+ func (p *ParticipantImpl) SetPermission(permission *livekit.ParticipantPermission) bool {
+ 	if permission == nil {
+ 		return false
+diff --git a/pkg/service/relay_refresh_issuer_test.go b/pkg/service/relay_refresh_issuer_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/service/relay_refresh_issuer_test.go
+@@ -0,0 +1,184 @@
++package service
++
++import (
++	"crypto/hmac"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/livekit/livekit-server/pkg/config"
++	"github.com/livekit/livekit-server/pkg/routing"
++	"github.com/livekit/livekit-server/pkg/rtc/types"
++	"github.com/livekit/livekit-server/pkg/rtc/types/typesfakes"
++	"github.com/livekit/protocol/auth"
++	"github.com/livekit/protocol/livekit"
++)
++
++type relayRefreshBoundParticipant struct {
++	*typesfakes.FakeLocalParticipant
++	verifiedKey string
++}
++
++func (p *relayRefreshBoundParticipant) TokenAPIKey() string { return p.verifiedKey }
++
++func relayRefreshFake(grants *auth.ClaimGrants) *typesfakes.FakeLocalParticipant {
++	p := &typesfakes.FakeLocalParticipant{}
++	p.ClaimGrantsReturns(grants)
++	p.IdentityReturns(livekit.ParticipantIdentity(grants.Identity))
++	return p
++}
++
++func TestRelayRefreshIssuerAuthenticatedRoundTripAndSignature(t *testing.T) {
++	keys := map[string]string{
++		"owned-community-key": "owned-community-secret-longer-than-thirty-two-bytes",
++		"owned-friends-key":   "owned-friends-secret-longer-than-thirty-two-bytes",
++	}
++	for _, key := range []string{"owned-community-key", "owned-friends-key"} {
++		t.Run(key, func(t *testing.T) {
++			other := "owned-community-key"
++			if key == other {
++				other = "owned-friends-key"
++			}
++			attributes := map[string]string{"relay_session": "owned-session", "relay_channel": "owned-channel",
++				"relay_server": "owned-server", "_relay_verified_api_key": other}
++			original, err := auth.NewAccessToken(key, keys[key]).SetIdentity("owned-user").
++				SetName("Owned QA").SetMetadata("owned-metadata").SetAttributes(attributes).
++				SetVideoGrant(&auth.VideoGrant{Room: "owned-private-room", RoomJoin: true}).
++				SetValidFor(2 * time.Hour).ToJWT()
++			require.NoError(t, err)
++			// A signed but client-controlled extra claim must not become the trusted
++			// binding. Both actual entrypoints use the helper exercised below.
++			original = relayRefreshSpoofClaim(t, original, other, keys[key])
++			request := httptest.NewRequest(http.MethodGet, "http://owned.invalid/rtc", nil)
++			SetAuthorizationToken(request, original)
++			recorder := httptest.NewRecorder()
++			var init routing.ParticipantInit
++			called := false
++			NewAPIKeyAuthMiddleware(auth.NewFileBasedKeyProviderFromMap(keys)).ServeHTTP(recorder, request,
++				func(w http.ResponseWriter, r *http.Request) {
++					called = true
++					grants := GetGrants(r.Context())
++					init = routing.ParticipantInit{Identity: livekit.ParticipantIdentity(grants.Identity),
++						Grants: grants, TokenExpiresAt: GetTokenExpiresAt(r.Context()), VerifiedAPIKey: other}
++					bindVerifiedParticipantTokenKey(r.Context(), &init)
++					w.WriteHeader(http.StatusOK)
++				})
++			require.True(t, called)
++			require.Equal(t, http.StatusOK, recorder.Code)
++			require.Equal(t, key, init.VerifiedAPIKey)
++			// Exercise the existing inter-node transport twice, including resume.
++			for range 2 {
++				wire, err := init.ToStartSession("owned-private-room", "owned-connection")
++				require.NoError(t, err)
++				restored, err := routing.ParticipantInitFromStartSession(wire, "owned-region")
++				require.NoError(t, err)
++				init = *restored
++				init.Reconnect = true
++				require.Equal(t, key, init.VerifiedAPIKey)
++			}
++			base := relayRefreshFake(init.Grants)
++			base.TokenExpiresAtReturns(init.TokenExpiresAt)
++			participant := &relayRefreshBoundParticipant{FakeLocalParticipant: base, verifiedKey: init.VerifiedAPIKey}
++			manager := &RoomManager{config: &config.Config{Keys: keys}}
++			require.NoError(t, manager.refreshToken(participant))
++			require.Equal(t, 1, base.SendRefreshTokenCallCount())
++			refreshed := base.SendRefreshTokenArgsForCall(0)
++			verifier, err := auth.ParseAPIToken(refreshed)
++			require.NoError(t, err)
++			require.Equal(t, key, verifier.APIKey())
++			claims, grants, err := verifier.Verify(keys[key])
++			require.NoError(t, err)
++			require.Equal(t, key, claims.Issuer)
++			require.Equal(t, "owned-user", claims.Subject)
++			require.Equal(t, init.Grants.Identity, grants.Identity)
++			require.Equal(t, init.Grants.Name, grants.Name)
++			require.Equal(t, init.Grants.Metadata, grants.Metadata)
++			require.Equal(t, init.Grants.Video, grants.Video)
++			require.Equal(t, attributes, grants.Attributes)
++			require.NotNil(t, claims.ExpiresAt)
++			require.WithinDuration(t, init.TokenExpiresAt, claims.ExpiresAt.Time, time.Second)
++			_, _, err = verifier.Verify(keys[other])
++			require.Error(t, err, "another configured service key must not verify this refreshed token")
++		})
++	}
++}
++
++func relayRefreshSpoofClaim(t *testing.T, token, spoofedKey, secret string) string {
++	t.Helper()
++	parts := strings.Split(token, ".")
++	require.Len(t, parts, 3)
++	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
++	require.NoError(t, err)
++	var claims map[string]any
++	require.NoError(t, json.Unmarshal(raw, &claims))
++	claims["_relay_verified_api_key"] = spoofedKey
++	raw, err = json.Marshal(claims)
++	require.NoError(t, err)
++	signed := parts[0] + "." + base64.RawURLEncoding.EncodeToString(raw)
++	mac := hmac.New(sha256.New, []byte(secret))
++	_, err = mac.Write([]byte(signed))
++	require.NoError(t, err)
++	return signed + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
++}
++
++func TestRelayRefreshIssuerFailsClosedWithoutEmittingToken(t *testing.T) {
++	const secret = "owned-test-secret-longer-than-thirty-two-bytes"
++	for _, test := range []struct {
++		name    string
++		keys    map[string]string
++		binding string
++		legacy  bool
++	}{
++		{"unknown-bound-key", map[string]string{"owned-a": secret, "owned-b": secret}, "owned-unknown", false},
++		{"revoked-bound-key-never-falls-back", map[string]string{"owned-a": secret}, "owned-removed", false},
++		{"bound-key-with-empty-secret", map[string]string{"owned-a": secret, "owned-b": ""}, "owned-b", false},
++		{"empty-binding-multiple-keys", map[string]string{"owned-a": secret, "owned-b": secret}, "", false},
++		{"legacy-interface-multiple-keys", map[string]string{"owned-a": secret, "owned-b": secret}, "", true},
++		{"no-keys", map[string]string{}, "", false},
++		{"single-empty-key-id", map[string]string{"": secret}, "", true},
++		{"single-empty-secret", map[string]string{"owned-a": ""}, "", true},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			base := relayRefreshFake(&auth.ClaimGrants{Identity: "owned-user", Video: &auth.VideoGrant{RoomJoin: true}})
++			var participant types.LocalParticipant = base
++			if !test.legacy {
++				participant = &relayRefreshBoundParticipant{FakeLocalParticipant: base, verifiedKey: test.binding}
++			}
++			manager := &RoomManager{config: &config.Config{Keys: test.keys}}
++			err := manager.refreshToken(participant)
++			require.Error(t, err)
++			require.Zero(t, base.SendRefreshTokenCallCount())
++			require.NotContains(t, err.Error(), secret)
++			if test.binding != "" {
++				require.NotContains(t, err.Error(), test.binding)
++			}
++		})
++	}
++}
++
++func TestRelayRefreshIssuerSingleKeyLegacyCompatibility(t *testing.T) {
++	const key = "owned-only-key"
++	const secret = "owned-only-secret-longer-than-thirty-two-bytes"
++	for _, legacy := range []bool{false, true} {
++		base := relayRefreshFake(&auth.ClaimGrants{Identity: "owned-user", Video: &auth.VideoGrant{Room: "owned-room", RoomJoin: true}})
++		var participant types.LocalParticipant = base
++		if !legacy {
++			participant = &relayRefreshBoundParticipant{FakeLocalParticipant: base}
++		}
++		manager := &RoomManager{config: &config.Config{Keys: map[string]string{key: secret}}}
++		require.NoError(t, manager.refreshToken(participant))
++		require.Equal(t, 1, base.SendRefreshTokenCallCount())
++		verifier, err := auth.ParseAPIToken(base.SendRefreshTokenArgsForCall(0))
++		require.NoError(t, err)
++		require.Equal(t, key, verifier.APIKey())
++		_, _, err = verifier.Verify(secret)
++		require.NoError(t, err)
++	}
++}
+diff --git a/pkg/service/roommanager.go b/pkg/service/roommanager.go
+--- a/pkg/service/roommanager.go
++++ b/pkg/service/roommanager.go
+@@ -504,6 +504,7 @@
+ 		PublishEnabledCodecs:     enabledCodecs,
+ 		SubscribeEnabledCodecs:   enabledCodecs,
+ 		Grants:                   pi.Grants,
++		VerifiedAPIKey:           pi.VerifiedAPIKey,
+ 		TokenExpiresAt:           pi.TokenExpiresAt,
+ 		Reconnect:                pi.Reconnect,
+ 		Logger:                   pLogger,
+@@ -1154,7 +1155,7 @@
+ }
+ 
+ func (r *RoomManager) refreshToken(participant types.LocalParticipant) error {
+-	key, secret, err := r.getFirstKeyPair()
++	key, secret, err := r.participantRefreshKeyPair(participant)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -1190,6 +1191,29 @@
+ 	return nil
+ }
+ 
++func (r *RoomManager) participantRefreshKeyPair(participant types.LocalParticipant) (string, string, error) {
++	// This private extension avoids changing the public participant interface and
++	// cannot be overwritten by metadata/attribute or permission updates.
++	if bound, ok := participant.(interface{ TokenAPIKey() string }); ok {
++		if key := bound.TokenAPIKey(); key != "" {
++			if secret := r.config.Keys[key]; secret != "" {
++				return key, secret, nil
++			}
++			return "", "", errors.New("verified participant signing key is unavailable")
++		}
++	}
++	// Legacy routed sessions had no issuer field. There is only a safe fallback
++	// when the authoritative configuration has one unambiguous usable key.
++	if len(r.config.Keys) == 1 {
++		for key, secret := range r.config.Keys {
++			if key != "" && secret != "" {
++				return key, secret, nil
++			}
++		}
++	}
++	return "", "", errors.New("participant signing key is missing or ambiguous")
++}
++
+ func (r *RoomManager) setIceConfig(roomName livekit.RoomName, participant types.LocalParticipant) *livekit.ICEConfig {
+ 	iceConfig := r.getIceConfig(roomName, participant)
+ 	participant.SetICEConfig(iceConfig)
+diff --git a/pkg/service/rtcservice.go b/pkg/service/rtcservice.go
+--- a/pkg/service/rtcservice.go
++++ b/pkg/service/rtcservice.go
+@@ -234,6 +234,7 @@
+ 		CreateRoom:              res.createRoomRequest,
+ 		UseSinglePeerConnection: useSinglePeerConnection,
+ 	}
++	bindVerifiedParticipantTokenKey(r.Context(), &pi)
+ 
+ 	if wrappedJoinRequestBase64 == "" {
+ 		pi.Reconnect = boolValue(r.FormValue("reconnect"))
+@@ -294,6 +295,12 @@
+ 	}
+ 
+ 	return res.roomName, pi, code, err
++}
++
++func bindVerifiedParticipantTokenKey(ctx context.Context, pi *routing.ParticipantInit) {
++	// Authentication middleware has already verified this ID against its secret.
++	// Never infer it from client-supplied attributes or unverified JWT fields.
++	pi.VerifiedAPIKey = GetAPIKey(ctx)
+ }
+ 
+ func (s *RTCService) v0(w http.ResponseWriter, r *http.Request) {
+diff --git a/pkg/service/whipservice.go b/pkg/service/whipservice.go
+--- a/pkg/service/whipservice.go
++++ b/pkg/service/whipservice.go
+@@ -195,6 +195,7 @@
+ 		AdaptiveStream: false,
+ 		DisableICELite: true,
+ 	}
++	bindVerifiedParticipantTokenKey(r.Context(), &pi)
+ 	SetRoomConfiguration(pi.CreateRoom, claims.GetRoomConfiguration())
+ 
+ 	return &createRequest{
+diff --git a/version/version.go b/version/version.go
+--- a/version/version.go
++++ b/version/version.go
+@@ -14,4 +14,4 @@
+ 
+ package version
+ 
+-const Version = "1.13.10-relay-media.20261022.4"
++const Version = "1.13.10-relay-media.20261022.5"

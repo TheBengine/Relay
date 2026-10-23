@@ -62,4 +62,4 @@ The installer preserves accounts, settings, device keys and server data. Uninsta
 
 ---
 
-This repository contains the project's presentation, artwork and downloadable programs. **The application source is not published here yet.** Relay is independent of Discord. Online GIF search uses GIPHY.
+This repository contains Relay's application source, presentation and build guidance. Relay-authored code is **source available under PolyForm Perimeter 1.0.0**; read [the licensing scope](LICENSING.md), including third-party terms and previous MIT rights. Relay is independent of Discord. Online GIF search uses GIPHY.

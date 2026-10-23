@@ -1,0 +1,13 @@
+{
+  "name": "webrtc-sys-build",
+  "version": "0.3.19",
+  "license": "Apache-2.0",
+  "upstream": "https://github.com/livekit/rust-sdks",
+  "crate": "https://crates.io/api/v1/crates/webrtc-sys-build/0.3.19/download",
+  "files": {
+    "Cargo.toml": "d2eea10f399cb157b088a327b449ecd97885dce208aa15f1da2d4545d601d5f0",
+    "Cargo.toml.orig": "ad0507d92e052c06cbafda92c89d3780621d3829a52bad3e3015b955ae9ebcc3",
+    "CHANGELOG.md": "49118e96ab5b23af66ed59ad1a744db856d4c2812fca16c02aa0721952b96633",
+    "src/lib.rs": "e70fd5bd259619ab0d4521d00a0289fc5b159f7dcac10e3fe608e173dc4d4ddb"
+  }
+}

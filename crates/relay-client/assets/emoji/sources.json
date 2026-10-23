@@ -1,0 +1,23 @@
+{
+  "metadata": "https://raw.githubusercontent.com/iamcal/emoji-data/13ee711e222ea17fe537bfea953c687866f16411/emoji.json",
+  "graphics": "https://raw.githubusercontent.com/iamcal/emoji-data/13ee711e222ea17fe537bfea953c687866f16411/sheet_twitter_64.png",
+  "unicode": "https://www.unicode.org/Public/17.0.0/emoji/emoji-test.txt",
+  "components": "https://github.com/jdecked/twemoji/tree/v17.0.3/assets/72x72",
+  "inputs_sha256": {
+    "1f9b0.png": "1ef498b932a607a9b21b784440a00946d6b455a85f7e3b9417d83409f2cf1e37",
+    "1f9b1.png": "4e6e983f68f418b69e5cca2670cfa722e2e168f83c1267f0066b39e13a74514c",
+    "1f9b2.png": "8be5af83f5a52a7d644b023da3e65cb73405ceac21a9b684a54203a6949eab3b",
+    "1f9b3.png": "4cfa99c414cde28bdca00376c535adeb847c4ce92c6e47850a6b78b10d2bddb1",
+    "emoji-data.json": "8736d721991e48c41c57acc46b65e5d32258a45e4bcdebcc6012f420f81e775d",
+    "emoji-test-17.txt": "1d8a944f88d7952f7ef7c5167fef3c67995bcae24543949710231b03a201acda",
+    "sheet-twitter-64.png": "b51c2cbb43eb35c65f2e139366e1638659d2a5efbfca2128cabad14cb4244514"
+  },
+  "output_sha256": {
+    "atlas.png": "91e9d37f652c35ce61ad8e4dcc141422ce41f5c51abd718d5393a8a2f1d07936",
+    "catalog.json": "7da58cd3a861afa1683b61e56c2ec12de83af5db0cc9ea401151713cce577fb9",
+    "space.ttf": "cda960f0b007a950b7669f7a45be5e40c1c5c3bc652ab60d82d87ba409db978e",
+    "zero.ttf": "903f3ef19374048ffdb1bd01b30be3f2f7c6d810ffe5e17549477c3f93df9c81"
+  },
+  "entries": 3953,
+  "graphic_changes": "Downsampled to 48 pixels and repacked with transparent borders."
+}

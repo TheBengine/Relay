@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "sdk": "webrtc-89d790b",
+  "base_archive_sha256": "5c2349c960bae4f06f71c102f58552d0d09c912a142811acfcadfb7c883cbf58",
+  "upstream_source": "https://raw.githubusercontent.com/webrtc-sdk/webrtc/89d790b/api/crypto/frame_crypto_transformer.cc",
+  "upstream_sha256": "a0ad0713525437fd53dd23127e10a093442a4e7f827f22bd0b54907626c582da",
+  "patched_sha256": "79813011a8cfd41a0ed872a1c30fc4ac64f2fd1baae4e61022e7822a98c3590a",
+  "replace_library_member": "obj/api/crypto/frame_crypto_transformer/frame_crypto_transformer.obj",
+  "abi_change": false,
+  "data_packet_cryptor_changed": false
+}

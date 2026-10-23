@@ -1,0 +1,2 @@
+# Preserve the checksum-reviewed upstream crate bytes on Windows checkouts.
+* -text

@@ -20,3 +20,17 @@ Experimental, unsigned Windows x64 preview.
 Protected mode is recommended by default. Keep your host online. Actual video quality depends on hardware and connection.
 
 [Full comparison & sources](COMPARISON.md) · [Setup & updates](GUIDE.md) · [Privacy & security](SECURITY.md)
+## Source and contributions
+
+Relay's client, server, connection helpers and reviewed dependency patches are
+now available in this repository under **PolyForm Perimeter 1.0.0**.
+You can inspect the code and contribute fixes. Using the covered code to offer a
+competing product is excluded, including free competing products. This is
+**source available**, rather than OSI open source.
+
+[License and earlier MIT rights](LICENSING.md) · [Contribute](CONTRIBUTING.md) ·
+[Build from source](docs/building.md)
+
+Source can be newer than the downloadable preview. This publication does not
+replace the installer, sign an existing release, or establish new hardware,
+call-quality, latency or resource-usage results.

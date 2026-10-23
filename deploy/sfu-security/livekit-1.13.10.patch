@@ -1,0 +1,38 @@
+--- a/go.mod
++++ b/go.mod
+@@ -1,6 +1,6 @@
+ module github.com/livekit/livekit-server
+ 
+-go 1.26.0
++go 1.27.3
+ 
+ require (
+ 	github.com/bep/debounce v1.2.1
+@@ -151,7 +151,7 @@
+ 	github.com/zeebo/xxh3 v1.1.0 // indirect
+ 	go.uber.org/zap/exp v0.3.0 // indirect
+ 	golang.org/x/crypto v0.57.0 // indirect
+-	golang.org/x/net v0.59.0
++	golang.org/x/net v0.60.0
+ 	golang.org/x/sys v0.48.0 // indirect
+ 	golang.org/x/text v0.42.0 // indirect
+ 	golang.org/x/tools v0.51.0 // indirect
+--- a/go.sum
++++ b/go.sum
+@@ -389,6 +389,8 @@
+ golang.org/x/net v0.0.0-20220923203811-8be639271d50/go.mod h1:YDH+HFinaLZZlnHAfSS6ZXJJ9M9t4Dl22yv3iI2vPwk=
+ golang.org/x/net v0.59.0 h1:5zfYln+w5XCxwrnMMJPufRgNoXEaGxl0wo5GqPXyues=
+ golang.org/x/net v0.59.0/go.mod h1:2DA/G1UfVbCpQPeWTmMPGY7Cs2PkBkwu743bVX5PIVg=
++golang.org/x/net v0.60.0 h1:79p50tfZlm0J9YfoDsSi639qSXNGVwEzOPLCxM2FsYU=
++golang.org/x/net v0.60.0/go.mod h1:2DA/G1UfVbCpQPeWTmMPGY7Cs2PkBkwu743bVX5PIVg=
+ golang.org/x/sync v0.0.0-20210220032951-036812b2e83c/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.0.0-20220923202941-7f9b1623fab7/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.23.0 h1:KameEIfc1IkluZyXWLn39Wd4tURc6GbCiISGiZm2bQk=
+--- a/version/version.go
++++ b/version/version.go
+@@ -14,4 +14,4 @@
+ 
+ package version
+ 
+-const Version = "1.13.10"
++const Version = "1.13.10-relay-security.20261021.2"

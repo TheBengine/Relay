@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a reproducible problem in Relay.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For vulnerabilities, use Security → Report a vulnerability.
+        Remove passwords, tokens, invitations, private messages and account details.
+  - type: input
+    id: version
+    attributes:
+      label: Relay version or build
+      placeholder: Include the build identity if available.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What did you do, what happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Relevant setup
+      description: Windows version, connection mode, and relevant devices. For calls, explain both directions and voice activity versus push to talk. Do not post private addresses or identifiers.

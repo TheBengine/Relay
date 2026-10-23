@@ -1,0 +1,40 @@
+# Declared client-source envelope. Every selected package/root/file must exist.
+# New top-level source roots require an edit here; files added inside an existing
+# root are discovered automatically. No workspace/Git/output parent is watched.
+schema = 1
+workspace_files = [
+  ".cargo/config.toml",
+  "scripts/prepare-webrtc.ps1",
+  "vendor/relay-frame-crypto/frame_crypto_transformer.cc",
+]
+
+[packages."crates/relay-client"]
+directories = ["src", "assets", "build_support"]
+files = ["build.rs"]
+
+[packages."crates/relay-protocol"]
+directories = ["src"]
+
+[packages."crates/relay-crypto"]
+directories = ["src"]
+
+[packages."crates/relay-updater"]
+directories = ["src"]
+
+[packages."vendor/audiopus_sys"]
+directories = ["src", "opus"]
+files = ["build.rs"]
+
+[packages."vendor/libwebrtc-0.3.50"]
+directories = ["src"]
+
+[packages."vendor/webrtc-sys-0.3.47"]
+directories = ["src", "include", "libwebrtc"]
+files = ["build.rs"]
+
+[packages."vendor/webrtc-sys-build"]
+directories = ["src"]
+
+[packages."vendor/livekit-0.9.3"]
+directories = ["src", "examples", "tests", "specs"]
+files = ["build.rs"]

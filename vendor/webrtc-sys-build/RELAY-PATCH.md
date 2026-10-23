@@ -1,0 +1,11 @@
+# Relay native exception bridge correction
+
+Based on the exact locked `webrtc-sys-build` 0.3.19 crate. Original files and hashes are recorded in `upstream-source.json`; source copyright is LiveKit 2025, Apache-2.0, with the terms reproduced in `LICENSE`.
+
+The original correction excludes `_HAS_EXCEPTIONS` when importing prebuilt SDK defines. The official SDK's `webrtc.ninja` sets `_HAS_EXCEPTIONS=0`. Its C++ wrapper nevertheless throws `std::runtime_error` and uses CXX try/catch to return errors to Rust, while CXX is built with normal C++ exception support. Mixing these MSVC exception representations produced an invalid error-string pointer at `cxxbridge1$exception` during removal from a closed peer connection.
+
+The change applies to the wrapper's compilation only. The pinned SDK archive, its headers/library, media transport, encryption, codec and other imported ABI defines are unchanged. Compiler exception support and ordinary error propagation are preserved; Rust's undefined-behavior checks are not disabled.
+
+Verification uses `actual_native_closed_peer_returns_error_without_abort`: an unnegotiated video sender, closed peer, and 32 error returns without network, physical capture or account data. It reproducibly aborted before the patch and returns all 32 valid errors after the patch. The final eight native opt-ins also pass, including terminal DuplicateIdentity cleanup, signal resume, full reconnect, Stop during recovery, generated application audio and synthetic hardware H264. See `docs/verification-rtc-recovery-0.10.0.json` for exact source/binary/log hashes and limitations. This verifies these local regressions, not all possible native failures or physical/WAN acceptance.
+
+The subsequent native frame cryptor patch adds Cargo invalidation for `LK_CUSTOM_WEBRTC` and the selected `lib/webrtc.lib`. This prevents cached native link metadata from keeping an older library path when the SDK generation changes. It does not change wrapper ABI. The original archive remains intact; a separately prepared generation replaces its cryptor object, described in `docs/native-frame-crypto.md`. The earlier unchanged-library statement and regression record describe the original exception-only stage.

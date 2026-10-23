@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/relay-protocol", "crates/relay-server", "crates/relay-client", "crates/relay-crypto", "crates/relay-updater"]
+exclude = ["vendor/audiopus_sys", "vendor/webrtc-sys-build", "vendor/libwebrtc-0.3.50", "vendor/webrtc-sys-0.3.47", "vendor/livekit-0.9.3", "vendor/serenity-0.12.5"]
+
+[patch.crates-io]
+serenity = { path = "vendor/serenity-0.12.5" }
+livekit = { path = "vendor/livekit-0.9.3" }
+audiopus_sys = { path = "vendor/audiopus_sys" }
+webrtc-sys-build = { path = "vendor/webrtc-sys-build" }
+libwebrtc = { path = "vendor/libwebrtc-0.3.50" }
+webrtc-sys = { path = "vendor/webrtc-sys-0.3.47" }
+
+[workspace.package]
+version = "0.10.0"
+edition = "2021"
+license = "PolyForm-Perimeter-1.0.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

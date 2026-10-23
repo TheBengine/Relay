@@ -31,3 +31,10 @@ The published Windows preview is unsigned. No new Microsoft Defender scan was pe
 Relay's integration has not had an independent security review. SHA-256 checksums identify the published files; they do not prove the absence of defects or malware. Local synthetic checks do not establish real hardware/WAN acceptance.
 
 [Download and get started](README.md) · [Releases](https://github.com/TheBengine/Relay/releases)
+
+## Report a vulnerability
+
+Please use GitHub's **Security → Report a vulnerability** for a private report
+when that option is available. If it is unavailable, open an issue asking for a
+private contact route without publishing exploit details or sensitive data.
+Never post credentials, profile databases, recovery codes or private keys.

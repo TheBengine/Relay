@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/TheBengine/Relay/security/advisories/new
+    about: Do not disclose vulnerabilities or secrets in a public issue.

@@ -1,0 +1,282 @@
+diff --git a/pkg/service/relay_turn_observation.go b/pkg/service/relay_turn_observation.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/service/relay_turn_observation.go
+@@ -0,0 +1,71 @@
++package service
++
++import (
++	"encoding/json"
++	"net"
++	"net/http"
++	"sync/atomic"
++	"time"
++)
++
++// A snapshot never contains peer addresses, room/user identifiers, credentials
++// or packet contents. Independent counters are an approximate process snapshot.
++type relayTURNObservation struct {
++	startedAt         time.Time
++	standalone        bool
++	mediaPorts        []portRange
++	permissionAllowed atomic.Uint64
++	permissionDenied  atomic.Uint64
++	portDenied        atomic.Uint64
++	udpWrites         atomic.Uint64
++	udpWriteBytes     atomic.Uint64
++	udpWriteErrors    atomic.Uint64
++	udpReads          atomic.Uint64
++	udpReadBytes      atomic.Uint64
++}
++
++var currentRelayTURNObservation atomic.Pointer[relayTURNObservation]
++
++func newRelayTURNObservation(ports []portRange, standalone bool) *relayTURNObservation {
++	return &relayTURNObservation{startedAt: time.Now().UTC(), standalone: standalone,
++		mediaPorts: append([]portRange(nil), ports...)}
++}
++
++func relayTURNObservationHandler(w http.ResponseWriter, r *http.Request) {
++	// Inspect the actual TCP peer, never Forwarded/X-Forwarded-For. This route
++	// stays on the existing API listener and is unavailable to bridge/LAN peers.
++	host, _, err := net.SplitHostPort(r.RemoteAddr)
++	if err != nil || !net.ParseIP(host).IsLoopback() {
++		http.NotFound(w, r)
++		return
++	}
++	if r.Method != http.MethodGet {
++		w.Header().Set("Allow", http.MethodGet)
++		w.WriteHeader(http.StatusMethodNotAllowed)
++		return
++	}
++	w.Header().Set("Content-Type", "application/json")
++	w.Header().Set("Cache-Control", "no-store")
++	observation := currentRelayTURNObservation.Load()
++	if observation == nil {
++		_ = json.NewEncoder(w).Encode(map[string]any{"schema": 1, "turn_observation_ready": false})
++		return
++	}
++	ports := make([]map[string]uint16, 0, len(observation.mediaPorts))
++	for _, port := range observation.mediaPorts {
++		ports = append(ports, map[string]uint16{"start": port.start, "end": port.end})
++	}
++	_ = json.NewEncoder(w).Encode(map[string]any{
++		"schema": 1, "turn_observation_ready": true, "started_at": observation.startedAt,
++		"approximate_snapshot": true, "standalone": observation.standalone,
++		"allowed_local_media_port_ranges":  ports,
++		"permission_allowed":               observation.permissionAllowed.Load(),
++		"permission_denied":                observation.permissionDenied.Load(),
++		"local_port_policy_denied_packets": observation.portDenied.Load(),
++		"relay_udp_writes":                 observation.udpWrites.Load(),
++		"relay_udp_write_bytes":            observation.udpWriteBytes.Load(),
++		"relay_udp_write_errors":           observation.udpWriteErrors.Load(),
++		"relay_udp_reads":                  observation.udpReads.Load(),
++		"relay_udp_read_bytes":             observation.udpReadBytes.Load(),
++	})
++}
+diff --git a/pkg/service/relay_turn_observation_test.go b/pkg/service/relay_turn_observation_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/service/relay_turn_observation_test.go
+@@ -0,0 +1,93 @@
++package service
++
++import (
++	"encoding/json"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/netip"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestRelayTURNObservation(t *testing.T) {
++	t.Run("loopback-only-redacted-snapshot", func(t *testing.T) {
++		before := currentRelayTURNObservation.Load()
++		t.Cleanup(func() { currentRelayTURNObservation.Store(before) })
++		observation := newRelayTURNObservation([]portRange{{7882, 7882}}, false)
++		observation.permissionAllowed.Add(3)
++		currentRelayTURNObservation.Store(observation)
++		for _, test := range []struct {
++			remote, method string
++			status         int
++		}{
++			{"127.0.0.1:12345", http.MethodGet, http.StatusOK},
++			{"[::1]:12345", http.MethodGet, http.StatusOK},
++			{"192.168.111.5:12345", http.MethodGet, http.StatusNotFound},
++			{"172.22.0.2:12345", http.MethodGet, http.StatusNotFound},
++			{"127.0.0.1", http.MethodGet, http.StatusNotFound},
++			{"127.0.0.1:12345", http.MethodPost, http.StatusMethodNotAllowed},
++		} {
++			request := httptest.NewRequest(test.method, "/relay/turn-status", nil)
++			request.RemoteAddr = test.remote
++			request.Header.Set("X-Forwarded-For", "127.0.0.1")
++			response := httptest.NewRecorder()
++			relayTURNObservationHandler(response, request)
++			require.Equal(t, test.status, response.Code)
++			if test.status != http.StatusOK {
++				continue
++			}
++			require.Equal(t, "no-store", response.Header().Get("Cache-Control"))
++			var value map[string]any
++			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &value))
++			require.Equal(t, float64(3), value["permission_allowed"])
++			require.Equal(t, true, value["approximate_snapshot"])
++			for _, forbidden := range []string{"192.168", "password", "username", "credential", "participant", "room", "token", "packet_contents"} {
++				require.False(t, strings.Contains(response.Body.String(), forbidden))
++			}
++		}
++	})
++	t.Run("actual-policy-forward-and-reply-counts", func(t *testing.T) {
++		relay := listenUDP(t)
++		media := listenUDP(t)
++		denied := listenUDP(t)
++		port := uint16(media.LocalAddr().(*net.UDPAddr).Port)
++		observation := newRelayTURNObservation([]portRange{{port, port}}, false)
++		policy := newTURNRelayPolicy(&fakeRelayAddressGenerator{conn: relay},
++			map[netip.Addr]struct{}{netip.MustParseAddr("127.0.0.1"): {}}, observation.mediaPorts)
++		policy.observation = observation
++		conn := &turnRelayPacketConn{PacketConn: relay, policy: policy}
++		n, err := conn.WriteTo([]byte("blocked"), denied.LocalAddr())
++		require.NoError(t, err)
++		require.Equal(t, len("blocked"), n)
++		require.Equal(t, uint64(1), observation.portDenied.Load())
++		require.NoError(t, denied.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
++		buffer := make([]byte, 64)
++		_, _, err = denied.ReadFrom(buffer)
++		require.Error(t, err)
++		_, err = conn.WriteTo([]byte("request"), media.LocalAddr())
++		require.NoError(t, err)
++		require.NoError(t, media.SetReadDeadline(time.Now().Add(2*time.Second)))
++		n, from, err := media.ReadFrom(buffer)
++		require.NoError(t, err)
++		require.Equal(t, "request", string(buffer[:n]))
++		_, err = media.WriteTo([]byte("reply"), from)
++		require.NoError(t, err)
++		require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
++		n, _, err = conn.ReadFrom(buffer)
++		require.NoError(t, err)
++		require.Equal(t, "reply", string(buffer[:n]))
++		require.Equal(t, uint64(1), observation.udpWrites.Load())
++		require.Equal(t, uint64(7), observation.udpWriteBytes.Load())
++		require.Equal(t, uint64(1), observation.udpReads.Load())
++		require.Equal(t, uint64(5), observation.udpReadBytes.Load())
++		require.NoError(t, relay.Close())
++		_, err = conn.WriteTo([]byte("request"), media.LocalAddr())
++		require.Error(t, err)
++		require.Equal(t, uint64(1), observation.udpWriteErrors.Load())
++		require.Equal(t, uint64(1), observation.udpWrites.Load())
++	})
++}
+diff --git a/pkg/service/server.go b/pkg/service/server.go
+--- a/pkg/service/server.go
++++ b/pkg/service/server.go
+@@ -133,6 +133,7 @@
+ 	whipService.SetupRoutes(mux)
+ 	mux.Handle("/agent", agentWSService)
+ 	mux.HandleFunc("/", s.defaultHandler)
++	mux.HandleFunc("/relay/turn-status", relayTURNObservationHandler)
+ 
+ 	// NewHTTPHandler branches on a nil handler, which a typed-nil would defeat
+ 	var agentFront http.Handler
+diff --git a/pkg/service/turn.go b/pkg/service/turn.go
+--- a/pkg/service/turn.go
++++ b/pkg/service/turn.go
+@@ -120,6 +120,8 @@
+ 		}
+ 		mediaPorts = getTURNMediaPorts(&conf.RTC)
+ 	}
++	observation := newRelayTURNObservation(mediaPorts, standalone)
++	currentRelayTURNObservation.Store(observation)
+ 
+ 	for _, addr := range turnConf.BindAddresses {
+ 		var nodeIP string
+@@ -151,6 +153,7 @@
+ 					}
+ 				}
+ 				if !allowed {
++					observation.permissionDenied.Add(1)
+ 					return false
+ 				}
+ 
+@@ -159,10 +162,12 @@
+ 
+ 			for _, ipnet := range denyPeerCIDRs {
+ 				if ipnet.Contains(peerIP) {
++					observation.permissionDenied.Add(1)
+ 					return false
+ 				}
+ 			}
+ 
++			observation.permissionAllowed.Add(1)
+ 			return true
+ 		}
+ 
+diff --git a/pkg/service/turnrelay.go b/pkg/service/turnrelay.go
+--- a/pkg/service/turnrelay.go
++++ b/pkg/service/turnrelay.go
+@@ -90,8 +90,9 @@
+ type turnRelayPolicy struct {
+ 	turn.RelayAddressGenerator
+ 
+-	localIPs   map[netip.Addr]struct{}
+-	mediaPorts []portRange
++	localIPs    map[netip.Addr]struct{}
++	mediaPorts  []portRange
++	observation *relayTURNObservation
+ }
+ 
+ func newTURNRelayPolicy(g turn.RelayAddressGenerator, localIPs map[netip.Addr]struct{}, mediaPorts []portRange) *turnRelayPolicy {
+@@ -99,6 +100,7 @@
+ 		RelayAddressGenerator: g,
+ 		localIPs:              localIPs,
+ 		mediaPorts:            mediaPorts,
++		observation:           currentRelayTURNObservation.Load(),
+ 	}
+ }
+ 
+@@ -136,9 +138,30 @@
+ 
+ func (c *turnRelayPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+ 	if !c.policy.allows(addr) {
++		if observation := c.policy.observation; observation != nil {
++			observation.portDenied.Add(1)
++		}
+ 		return len(p), nil
+ 	}
+-	return c.PacketConn.WriteTo(p, addr)
++	n, err := c.PacketConn.WriteTo(p, addr)
++	if observation := c.policy.observation; observation != nil {
++		if err != nil {
++			observation.udpWriteErrors.Add(1)
++		} else {
++			observation.udpWrites.Add(1)
++			observation.udpWriteBytes.Add(uint64(n))
++		}
++	}
++	return n, err
++}
++
++func (c *turnRelayPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
++	n, addr, err := c.PacketConn.ReadFrom(p)
++	if observation := c.policy.observation; observation != nil && err == nil {
++		observation.udpReads.Add(1)
++		observation.udpReadBytes.Add(uint64(n))
++	}
++	return n, addr, err
+ }
+ 
+ // getTURNLocalIPs returns the addresses that are delivered to this host: its
+diff --git a/version/version.go b/version/version.go
+--- a/version/version.go
++++ b/version/version.go
+@@ -14,4 +14,4 @@
+ 
+ package version
+ 
+-const Version = "1.13.10-relay-media.20261022.1"
++const Version = "1.13.10-relay-media.20261022.2"

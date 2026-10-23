@@ -1,0 +1,74 @@
+[package]
+name = "relay-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "relay"
+path = "src/main.rs"
+
+[features]
+default = ["native-rtc"]
+native-rtc = ["dep:livekit", "dep:futures-util", "dep:audiopus_sys"]
+# The account-free (iroh) route. Off until it has been tried on two real PCs.
+iroh-route = []
+
+[build-dependencies]
+toml_edit = "=0.19.15"
+sha2 = "0.10"
+serde_json = "1"
+
+[dependencies]
+relay-protocol = { path = "../relay-protocol" }
+relay-crypto = { path = "../relay-crypto" }
+relay-updater = { path = "../relay-updater" }
+zeroize = { version = "1", features = ["serde"] }
+getrandom = "0.2"
+argon2 = { version = "0.5.3", features = ["zeroize"] }
+sha2 = "0.10"
+# HMAC-SHA256 for invitation-based device verification (R3.2); already locked at 0.12.1.
+hmac = "0.12"
+qrcodegen = "=1.8.0"
+openidconnect = { version = "=4.0.1", default-features = false, features = ["reqwest-blocking"] }
+subtle = "2"
+eframe = { version = "0.27.2", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+# Text-only clipboard reads (R2.3); already built for egui-winit, no image support.
+arboard = { version = "3.6.1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# Select Rustls's standard provider explicitly before SDK/WebSocket TLS starts.
+rustls = "=0.23.46"
+tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+rfd = "0.14"
+directories = "5"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+livekit = { version = "0.9.3", optional = true, features = ["rustls-tls-native-roots"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+futures-util = { version = "0.3", optional = true }
+rtrb = "=0.3.5"
+cpal = "0.15.3"
+socket2 = "=0.6.5"
+opus = "0.3.0"
+nnnoiseless = { version = "0.5.2", default-features = false }
+chacha20poly1305 = "0.10.1"
+base64 = "0.22.1"
+image = { version = "0.24.9", default-features = false, features = ["jpeg", "png", "gif"] }
+screenshots = "0.8.10"
+
+[dev-dependencies]
+toml_edit = "=0.19.15"
+tempfile = "3"
+winit = { version = "=0.29.15", default-features = false, features = ["rwh_06"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Display the actual Relay identity page inside the app; credentials stay in its HTTPS form.
+wry = { version = "=0.57.0", default-features = false }
+raw-window-handle = "=0.6.2"
+audiopus_sys = { version = "0.2.2", optional = true, features = ["livekit-opus"] }
+windows-core = "0.58"
+nokhwa = { version = "0.10.10", default-features = false, features = ["input-msmf"] }
+windows = { version = "0.58", features = ["Win32_System_Registry", "implement", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_Storage_FileSystem", "Win32_Graphics_Dwm", "Foundation", "Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Dxgi", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT", "Win32_System_Com", "Win32_System_WinRT_Graphics_Capture", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_IO", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Media_MediaFoundation", "Win32_Media_Audio", "Win32_Devices_FunctionDiscovery", "Win32_NetworkManagement_QoS", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Media_KernelStreaming", "Win32_System_Com_StructuredStorage", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Variant"] }

@@ -1,0 +1,226 @@
+diff --git a/pkg/service/relay_turn_observation.go b/pkg/service/relay_turn_observation.go
+--- a/pkg/service/relay_turn_observation.go
++++ b/pkg/service/relay_turn_observation.go
+@@ -1,6 +1,7 @@
+ package service
+ 
+ import (
++	"encoding/binary"
+ 	"encoding/json"
+ 	"net"
+ 	"net/http"
+@@ -11,17 +12,75 @@
+ // A snapshot never contains peer addresses, room/user identifiers, credentials
+ // or packet contents. Independent counters are an approximate process snapshot.
+ type relayTURNObservation struct {
+-	startedAt         time.Time
+-	standalone        bool
+-	mediaPorts        []portRange
+-	permissionAllowed atomic.Uint64
+-	permissionDenied  atomic.Uint64
+-	portDenied        atomic.Uint64
+-	udpWrites         atomic.Uint64
+-	udpWriteBytes     atomic.Uint64
+-	udpWriteErrors    atomic.Uint64
+-	udpReads          atomic.Uint64
+-	udpReadBytes      atomic.Uint64
++	startedAt           time.Time
++	standalone          bool
++	mediaPorts          []portRange
++	permissionAllowed   atomic.Uint64
++	permissionDenied    atomic.Uint64
++	portDenied          atomic.Uint64
++	udpWrites           atomic.Uint64
++	udpWriteBytes       atomic.Uint64
++	udpWriteErrors      atomic.Uint64
++	udpReads            atomic.Uint64
++	udpReadBytes        atomic.Uint64
++	nodeIPs             []net.IP
++	readLoopback        atomic.Uint64
++	readNodeIP          atomic.Uint64
++	readOtherIP         atomic.Uint64
++	writeBindingRequest atomic.Uint64
++	writeBindingSuccess atomic.Uint64
++	writeBindingError   atomic.Uint64
++	readBindingRequest  atomic.Uint64
++	readBindingSuccess  atomic.Uint64
++	readBindingError    atomic.Uint64
++}
++
++func (o *relayTURNObservation) observeSTUN(read bool, payload []byte) {
++	if len(payload) < 20 || binary.BigEndian.Uint32(payload[4:8]) != 0x2112A442 {
++		return
++	}
++	size := int(binary.BigEndian.Uint16(payload[2:4]))
++	if size%4 != 0 || size+20 != len(payload) {
++		return
++	}
++	kind := binary.BigEndian.Uint16(payload[:2])
++	if read {
++		switch kind {
++		case 0x0001:
++			o.readBindingRequest.Add(1)
++		case 0x0101:
++			o.readBindingSuccess.Add(1)
++		case 0x0111:
++			o.readBindingError.Add(1)
++		}
++	} else {
++		switch kind {
++		case 0x0001:
++			o.writeBindingRequest.Add(1)
++		case 0x0101:
++			o.writeBindingSuccess.Add(1)
++		case 0x0111:
++			o.writeBindingError.Add(1)
++		}
++	}
++}
++
++func (o *relayTURNObservation) observeReadSource(addr net.Addr) {
++	peer, ok := addr.(*net.UDPAddr)
++	if !ok {
++		o.readOtherIP.Add(1)
++		return
++	}
++	if peer.IP.IsLoopback() {
++		o.readLoopback.Add(1)
++	}
++	for _, expected := range o.nodeIPs {
++		if expected != nil && expected.Equal(peer.IP) {
++			o.readNodeIP.Add(1)
++			return
++		}
++	}
++	o.readOtherIP.Add(1)
+ }
+ 
+ var currentRelayTURNObservation atomic.Pointer[relayTURNObservation]
+@@ -48,7 +107,7 @@
+ 	w.Header().Set("Cache-Control", "no-store")
+ 	observation := currentRelayTURNObservation.Load()
+ 	if observation == nil {
+-		_ = json.NewEncoder(w).Encode(map[string]any{"schema": 1, "turn_observation_ready": false})
++		_ = json.NewEncoder(w).Encode(map[string]any{"schema": 2, "turn_observation_ready": false})
+ 		return
+ 	}
+ 	ports := make([]map[string]uint16, 0, len(observation.mediaPorts))
+@@ -56,16 +115,25 @@
+ 		ports = append(ports, map[string]uint16{"start": port.start, "end": port.end})
+ 	}
+ 	_ = json.NewEncoder(w).Encode(map[string]any{
+-		"schema": 1, "turn_observation_ready": true, "started_at": observation.startedAt,
++		"schema": 2, "turn_observation_ready": true, "started_at": observation.startedAt,
+ 		"approximate_snapshot": true, "standalone": observation.standalone,
+-		"allowed_local_media_port_ranges":  ports,
+-		"permission_allowed":               observation.permissionAllowed.Load(),
+-		"permission_denied":                observation.permissionDenied.Load(),
+-		"local_port_policy_denied_packets": observation.portDenied.Load(),
+-		"relay_udp_writes":                 observation.udpWrites.Load(),
+-		"relay_udp_write_bytes":            observation.udpWriteBytes.Load(),
+-		"relay_udp_write_errors":           observation.udpWriteErrors.Load(),
+-		"relay_udp_reads":                  observation.udpReads.Load(),
+-		"relay_udp_read_bytes":             observation.udpReadBytes.Load(),
++		"allowed_local_media_port_ranges":   ports,
++		"permission_allowed":                observation.permissionAllowed.Load(),
++		"permission_denied":                 observation.permissionDenied.Load(),
++		"local_port_policy_denied_packets":  observation.portDenied.Load(),
++		"relay_udp_writes":                  observation.udpWrites.Load(),
++		"relay_udp_write_bytes":             observation.udpWriteBytes.Load(),
++		"relay_udp_write_errors":            observation.udpWriteErrors.Load(),
++		"relay_udp_reads":                   observation.udpReads.Load(),
++		"relay_udp_read_bytes":              observation.udpReadBytes.Load(),
++		"relay_udp_reads_from_loopback":     observation.readLoopback.Load(),
++		"relay_udp_reads_from_node_ip":      observation.readNodeIP.Load(),
++		"relay_udp_reads_from_other_ip":     observation.readOtherIP.Load(),
++		"relay_udp_write_binding_requests":  observation.writeBindingRequest.Load(),
++		"relay_udp_write_binding_successes": observation.writeBindingSuccess.Load(),
++		"relay_udp_write_binding_errors":    observation.writeBindingError.Load(),
++		"relay_udp_read_binding_requests":   observation.readBindingRequest.Load(),
++		"relay_udp_read_binding_successes":  observation.readBindingSuccess.Load(),
++		"relay_udp_read_binding_errors":     observation.readBindingError.Load(),
+ 	})
+ }
+diff --git a/pkg/service/relay_turn_observation_test.go b/pkg/service/relay_turn_observation_test.go
+--- a/pkg/service/relay_turn_observation_test.go
++++ b/pkg/service/relay_turn_observation_test.go
+@@ -1,6 +1,7 @@
+ package service
+ 
+ import (
++	"encoding/binary"
+ 	"encoding/json"
+ 	"net"
+ 	"net/http"
+@@ -14,6 +15,31 @@
+ )
+ 
+ func TestRelayTURNObservation(t *testing.T) {
++	t.Run("bounded-stun-type-and-source-classes", func(t *testing.T) {
++		observation := newRelayTURNObservation(nil, false)
++		observation.nodeIPs = []net.IP{net.ParseIP("192.0.2.10")}
++		for _, kind := range []uint16{0x0001, 0x0101, 0x0111} {
++			payload := make([]byte, 20)
++			binary.BigEndian.PutUint16(payload[:2], kind)
++			binary.BigEndian.PutUint32(payload[4:8], 0x2112A442)
++			observation.observeSTUN(true, payload)
++			observation.observeSTUN(false, payload)
++			observation.observeSTUN(true, payload[:19])
++			observation.observeSTUN(true, append(payload, 0))
++		}
++		require.Equal(t, uint64(1), observation.readBindingRequest.Load())
++		require.Equal(t, uint64(1), observation.readBindingSuccess.Load())
++		require.Equal(t, uint64(1), observation.readBindingError.Load())
++		require.Equal(t, uint64(1), observation.writeBindingRequest.Load())
++		require.Equal(t, uint64(1), observation.writeBindingSuccess.Load())
++		require.Equal(t, uint64(1), observation.writeBindingError.Load())
++		for _, ip := range []string{"127.0.0.1", "192.0.2.10", "192.0.2.11"} {
++			observation.observeReadSource(&net.UDPAddr{IP: net.ParseIP(ip), Port: 7882})
++		}
++		require.Equal(t, uint64(1), observation.readLoopback.Load())
++		require.Equal(t, uint64(1), observation.readNodeIP.Load())
++		require.Equal(t, uint64(2), observation.readOtherIP.Load())
++	})
+ 	t.Run("loopback-only-redacted-snapshot", func(t *testing.T) {
+ 		before := currentRelayTURNObservation.Load()
+ 		t.Cleanup(func() { currentRelayTURNObservation.Store(before) })
+diff --git a/pkg/service/turn.go b/pkg/service/turn.go
+--- a/pkg/service/turn.go
++++ b/pkg/service/turn.go
+@@ -121,6 +121,7 @@
+ 		mediaPorts = getTURNMediaPorts(&conf.RTC)
+ 	}
+ 	observation := newRelayTURNObservation(mediaPorts, standalone)
++	observation.nodeIPs = []net.IP{net.ParseIP(conf.RTC.NodeIP.V4), net.ParseIP(conf.RTC.NodeIP.V6)}
+ 	currentRelayTURNObservation.Store(observation)
+ 
+ 	for _, addr := range turnConf.BindAddresses {
+diff --git a/pkg/service/turnrelay.go b/pkg/service/turnrelay.go
+--- a/pkg/service/turnrelay.go
++++ b/pkg/service/turnrelay.go
+@@ -150,6 +150,7 @@
+ 		} else {
+ 			observation.udpWrites.Add(1)
+ 			observation.udpWriteBytes.Add(uint64(n))
++			observation.observeSTUN(false, p[:n])
+ 		}
+ 	}
+ 	return n, err
+@@ -160,6 +161,8 @@
+ 	if observation := c.policy.observation; observation != nil && err == nil {
+ 		observation.udpReads.Add(1)
+ 		observation.udpReadBytes.Add(uint64(n))
++		observation.observeSTUN(true, p[:n])
++		observation.observeReadSource(addr)
+ 	}
+ 	return n, addr, err
+ }
+diff --git a/version/version.go b/version/version.go
+--- a/version/version.go
++++ b/version/version.go
+@@ -14,4 +14,4 @@
+ 
+ package version
+ 
+-const Version = "1.13.10-relay-media.20261022.2"
++const Version = "1.13.10-relay-media.20261022.3"
