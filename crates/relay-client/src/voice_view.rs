@@ -402,16 +402,21 @@ impl RelayApp {
                 self.sound_check(ui, &members);
                 if let Some(stats) = self.media.as_ref().filter(|_| self.capture_path.is_none()).map(|media| media.network_stats()) {
                     let friends_call = self.bootstrap.as_ref().is_some_and(|b| b.capabilities.iter().any(|cap| cap == "people-v1"));
-                    if let Some(enabled) = voice_room_ui::local_gateway_controls(
-                        ui,
-                        self.audio_applied.local_voice_gateways,
-                        stats.gateway_available,
-                        stats.gateway_active,
-                        friends_call,
-                    ) {
-                        self.apply_quick_audio_change(|audio| audio.local_voice_gateways = enabled);
+                    // An unavailable optional route should not look like a
+                    // broken call or prevent someone from sharing their server.
+                    // Keep Stop accessible if the person already opted in.
+                    if stats.gateway_available || self.audio_applied.local_voice_gateways {
+                        if let Some(enabled) = voice_room_ui::local_gateway_controls(
+                            ui,
+                            self.audio_applied.local_voice_gateways,
+                            stats.gateway_available,
+                            stats.gateway_active,
+                            friends_call,
+                        ) {
+                            self.apply_quick_audio_change(|audio| audio.local_voice_gateways = enabled);
+                        }
+                        ui.add_space(16.0);
                     }
-                    ui.add_space(16.0);
                 }
             }
             if members.is_empty() {

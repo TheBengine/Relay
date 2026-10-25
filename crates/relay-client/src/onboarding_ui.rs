@@ -639,7 +639,11 @@ impl RelayApp {
                             .color(c_muted()),
                     );
                     if ui
-                        .add_enabled(!self.busy && self.voice_channel.is_none(), secondary("Create a server"))
+                        .add_enabled(
+                            !self.busy,
+                            primary("Create a server")
+                                .min_size(Vec2::new(ui.available_width(), 40.0)),
+                        )
                         .clicked()
                     {
                         create = true;

@@ -334,12 +334,34 @@ enum CardAction {
 }
 
 impl RelayApp {
+    fn server_creation_has_call(&self) -> bool {
+        self.voice_channel.is_some()
+            || self.joining_voice.is_some()
+            || self.audio_connecting
+            || self.private_calls.intent.is_some()
+            || self.rtc_request.is_some()
+    }
+
     /// Begin the real thing: the same steps the three "Create a server"
     /// buttons took before the choices were asked.
     pub(super) fn start_new_server(&mut self) {
+        if self.call_switch_pending() {
+            self.error = Some("Wait for your call to finish switching before creating this server.".into());
+            return;
+        }
+        let Some(server) = crate::local_host::server_binary() else {
+            self.account_start.hosting_error =
+                Some("The bundled server is missing. Reinstall Relay to restore it.".into());
+            return;
+        };
         if let Err(error) = self.remember_current_local() {
             self.error = Some(error);
             return;
+        }
+        // The final button names the call interruption. Merely opening or
+        // cancelling the choices must leave the current call running.
+        if self.server_creation_has_call() {
+            self.leave_voice();
         }
         self.account_start.opening_local = None;
         self.account_start.home = false;
@@ -349,11 +371,6 @@ impl RelayApp {
         self.hosting_setup.entry = host_setup_ui::LoginEntry::Account;
         self.error = None;
         self.account_start.hosting_error = None;
-        let Some(server) = crate::local_host::server_binary() else {
-            self.account_start.hosting_error =
-                Some("The bundled server is missing. Reinstall Relay to restore it.".into());
-            return;
-        };
         let request = uuid::Uuid::new_v4().to_string();
         self.account_start.creation_request = Some(request.clone());
         self.busy = true;
@@ -445,14 +462,27 @@ impl RelayApp {
         }
         ui.add_space(6.0);
 
+        let in_call = !waiting_server && self.server_creation_has_call();
+        let switching_call = self.call_switch_pending();
+        if in_call {
+            ui.add(egui::Label::new(RichText::new(
+                "You can choose the settings while staying in your call. Creating the server will leave the call and switch to your new server. Cancel keeps your call running."
+            ).color(c_muted())).wrap(true));
+            ui.add_space(8.0);
+        }
+        if switching_call {
+            ui.label("Wait for your call to finish switching before creating this server.");
+        }
         ui.horizontal(|ui| {
             let label = if waiting_server {
                 "Continue"
+            } else if in_call {
+                "Leave call and create server"
             } else {
                 "Create server"
             };
             if ui
-                .add_enabled(!self.busy, primary(label).min_size(Vec2::new(180.0, 42.0)))
+                .add_enabled(!self.busy && !switching_call, primary(label).min_size(Vec2::new(180.0, 42.0)))
                 .clicked()
             {
                 if self.hosting_setup.confirm_creation(iroh_available) {
