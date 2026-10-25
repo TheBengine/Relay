@@ -17,6 +17,9 @@ pub(super) struct Attempt {
     people: bool,
     account: crate::central_account::Account,
     cancel: Arc<AtomicBool>,
+    /// Editing/replacing this join form invalidates its previous login even
+    /// when the replacement invitation points at exactly the same address.
+    form_cancel: Arc<AtomicBool>,
     browser: Option<crate::central_account::Controller>,
     challenge: Option<String>,
     authority: Option<relay_protocol::handover::RoutePin>,
@@ -30,6 +33,25 @@ pub(super) struct Attempt {
 impl Attempt {
     pub(super) fn is_people(&self) -> bool {
         self.people
+    }
+
+    fn form_current(
+        &self,
+        login: &crate::connection_setup::JoinFlow,
+        other: &crate::connection_setup::JoinFlow,
+        other_open: bool,
+    ) -> bool {
+        if self.other && !other_open {
+            return false;
+        }
+        // Friends and saved-server reconnects deliberately use a temporary
+        // form. Their existing request/account binding remains authoritative.
+        if self.people || self.detached {
+            return true;
+        }
+        let flow = if self.other { other } else { login };
+        !self.form_cancel.load(Ordering::Acquire)
+            && crate::community::normalize_url(&flow.url).as_deref() == Ok(self.url.as_str())
     }
 }
 
@@ -68,7 +90,7 @@ pub(super) struct State {
     pub(super) hosting_error: Option<String>,
     pub(super) creation_request: Option<String>,
     pub(super) opening_local: Option<String>,
-    pub(super) local_choices: Option<Vec<SavedCommunity>>,
+    pub(super) local_choices: Option<Result<Vec<SavedCommunity>, String>>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -115,6 +137,18 @@ impl RelayApp {
         let gate = self.central_account.account.is_none()
             && !self.account_start.bypass
             && (self.central_account.provider.is_some() || self.session.is_none());
+        let invitation_form = (self.session.is_none()
+            && self.hosting_setup.entry == host_setup_ui::LoginEntry::Join
+            && self.login.has_invitation_input())
+            || (self.add_community_open && self.add_community.has_invitation_input());
+        if !gate && invitation_form && self.account_start.auto.is_none() {
+            // Sign-in opens the invitation the user followed, not Friends or a
+            // remembered server whose Connected response would clear this form.
+            // The normal Join/Connect/Account screen still requires consent.
+            self.account_start.entered = true;
+            self.account_start.home = false;
+            return false;
+        }
         let home = self.central_account.account.is_some() && self.account_start.home;
         if !gate && !home {
             return false;
@@ -163,10 +197,15 @@ impl RelayApp {
         entry_surface::page(ctx, "relay-account-entry", |ui| {
             let width = ui.available_width();
             if gate {
-                ui.heading("Welcome back");
+                let invitation_waiting = invitation_form || self.external_invitation.is_pending();
+                ui.heading(if invitation_waiting { "Sign in to join your friends" } else { "Welcome back" });
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("One account for your friends and servers.").color(c_muted()),
+                    RichText::new(if invitation_waiting {
+                        "Your invitation is waiting here. Sign in or create an account, then continue to your friend's server."
+                    } else {
+                        "One account for your friends and servers."
+                    }).color(c_muted()),
                 );
                 ui.add_space(28.0);
                 if self.central_account.provider.is_some() {
@@ -423,17 +462,41 @@ impl RelayApp {
     }
 
     pub(super) fn other_local_servers(&mut self, ui: &mut egui::Ui) -> bool {
-        let servers = self.account_start.local_choices.get_or_insert_with(||
-            crate::local_host::saved_communities().unwrap_or_default()).clone();
+        let loaded = self.account_start.local_choices
+            .get_or_insert_with(crate::local_host::saved_communities).clone();
+        let servers = match loaded {
+            Ok(servers) => servers,
+            Err(error) => {
+                ui.add_space(12.0);
+                ui.label(RichText::new("Your saved local servers couldn't be loaded").color(c_bad()));
+                ui.add(egui::Label::new("Your server data is kept. Retry to refresh this list.").wrap(true));
+                if ui.add_enabled(!self.busy, secondary("Retry server list")).clicked() {
+                    self.account_start.local_choices = None;
+                }
+                egui::CollapsingHeader::new("Details").id_source("local-server-list-error")
+                    .show(ui, |ui| { ui.add(egui::Label::new(error).wrap(true)); });
+                ui.add_space(12.0);
+                return false;
+            }
+        };
         let current = self.prefs.communities.iter()
             .find(|saved| saved.url == "http://127.0.0.1:4580").map(|saved| saved.server_id.clone());
-        let others: Vec<_> = servers.into_iter().filter(|saved| Some(&saved.server_id) != current.as_ref()).collect();
+        let others: Vec<_> = servers.iter().filter(|saved| Some(&saved.server_id) != current.as_ref()).collect();
         if others.is_empty() { return false; }
         ui.add_space(12.0);
         ui.label(RichText::new("Other servers on this PC").strong());
         for saved in others {
-            if ui.add_enabled(!self.busy, secondary(&format!("Open {}", saved.name))).clicked() {
-                self.open_local_server(saved.server_id);
+            let duplicate = servers.iter().filter(|other| other.name.eq_ignore_ascii_case(&saved.name)).count() > 1;
+            let label = if duplicate {
+                format!("Open {} · {}", saved.name, saved.server_id.get(..8).unwrap_or(&saved.server_id))
+            } else {
+                format!("Open {}", saved.name)
+            };
+            let clicked = ui.push_id(&saved.server_id, |ui| {
+                ui.add_enabled(!self.busy, secondary(&label)).clicked()
+            }).inner;
+            if clicked {
+                self.open_local_server(saved.server_id.clone());
                 return true;
             }
         }
@@ -767,6 +830,7 @@ impl RelayApp {
             .and_then(|i| i.authority.clone());
         let invite = zeroize::Zeroizing::new(flow.invite.clone());
         let register = flow.registering;
+        let form_cancel = flow.setup.check_cancellation();
         let initial_protection = (!other && self.hosting_setup.new_host && register)
             .then_some(self.hosting_setup.creation_protection);
         let request = self.next_request();
@@ -779,6 +843,7 @@ impl RelayApp {
             people: false,
             account,
             cancel: Arc::new(AtomicBool::new(false)),
+            form_cancel,
             browser: None,
             challenge: None,
             authority: authority.clone(),
@@ -806,6 +871,11 @@ impl RelayApp {
             .as_ref()
             .is_some_and(|a| a.request == request)
         {
+            let current = self
+                .account_start
+                .pending
+                .as_ref()
+                .is_some_and(|attempt| self.account_login_current(request, &attempt.url));
             let background = self
                 .account_start
                 .pending
@@ -813,7 +883,7 @@ impl RelayApp {
                 .is_some_and(|attempt| attempt.background);
             // A saved server that cannot be reopened automatically stays in the
             // side rail with its sign-in state; it does not stop opening Relay.
-            if !background {
+            if !background && current {
                 self.error = Some(error.into());
             }
             self.busy = false;
@@ -828,6 +898,7 @@ impl RelayApp {
             a.request == request
                 && a.url == url
                 && !a.cancel.load(Ordering::Acquire)
+                && a.form_current(&self.login, &self.add_community, self.add_community_open)
                 && self
                     .central_account
                     .account
@@ -845,6 +916,9 @@ impl RelayApp {
         data: serde_json::Value,
         request: u64,
     ) {
+        if !self.account_login_current(request, url) {
+            return;
+        }
         let Some(attempt) = self
             .account_start
             .pending
@@ -895,15 +969,7 @@ impl RelayApp {
         let Some(a) = self.account_start.pending.as_mut() else {
             return;
         };
-        let flow = if a.other {
-            &self.add_community
-        } else {
-            &self.login
-        };
-        if (a.other && !self.add_community_open)
-            || (!a.people
-                && !a.detached
-                && crate::community::normalize_url(&flow.url).as_deref() != Ok(a.url.as_str()))
+        if !a.form_current(&self.login, &self.add_community, self.add_community_open)
             || self.central_account.account.as_ref().is_none_or(|current| {
                 current.issuer != a.account.issuer || current.subject != a.account.subject
             })
@@ -965,6 +1031,58 @@ impl RelayApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn account_attempt_rejects_replaced_same_address_forms_and_closed_join_dialogs() {
+        let mut login = crate::connection_setup::JoinFlow {
+            url: "https://community.invalid".into(),
+            ..Default::default()
+        };
+        let make_attempt = |flow: &crate::connection_setup::JoinFlow, other| Attempt {
+            url: flow.url.clone(),
+            expected: None,
+            request: 1,
+            other,
+            people: false,
+            account: crate::central_account::Account {
+                issuer: "https://accounts.invalid".into(),
+                subject: "fixture-account".into(),
+                handle: "fixture".into(),
+                expires_at: u64::MAX,
+            },
+            cancel: Arc::new(AtomicBool::new(false)),
+            form_cancel: flow.setup.check_cancellation(),
+            browser: None,
+            challenge: None,
+            authority: None,
+            background: false,
+            detached: false,
+        };
+        let mut other = crate::connection_setup::JoinFlow {
+            url: login.url.clone(),
+            ..Default::default()
+        };
+        let old = make_attempt(&login, false);
+        assert!(old.form_current(&login, &other, false));
+        login.setup.edited(&mut login.invite);
+        assert_eq!(login.url, old.url);
+        assert!(!old.form_current(&login, &other, false));
+        let replacement = make_attempt(&login, false);
+        assert!(replacement.form_current(&login, &other, false));
+
+        let dialog = make_attempt(&other, true);
+        assert!(dialog.form_current(&login, &other, true));
+        assert!(!dialog.form_current(&login, &other, false));
+        other.setup = Default::default();
+        assert!(!dialog.form_current(&login, &other, true));
+
+        // Automatic reopen uses a deliberately temporary form, not the active
+        // Join dialog. It still has its separate account/request/cancel checks.
+        let mut automatic = make_attempt(&login, false);
+        automatic.detached = true;
+        login.setup = Default::default();
+        assert!(automatic.form_current(&login, &other, false));
+    }
+
     #[test]
     fn server_login_challenge_binds_destination_and_server() {
         let url = "https://community.invalid";

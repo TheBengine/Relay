@@ -88,6 +88,7 @@ pub fn local_launch(lan_discovery: bool) -> (&'static str, &'static [&'static st
 
 /// True when the read-only status report of a stopped community says its owner
 /// account exists. The server refuses a network bind before that.
+#[cfg(test)]
 pub fn owner_report_ready(stdout: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(stdout)
         .is_ok_and(|report| report["ready"] == true && report["owner_initialized"] == true)
@@ -96,6 +97,14 @@ pub fn owner_report_ready(stdout: &[u8]) -> bool {
 /// Asks the companion for that report. Failing, hanging or an unreadable answer
 /// all count as "not ready", so a start never silently listens more widely.
 pub fn owner_ready(server: &Path, data: &Path) -> bool {
+    stopped_server_report(server, data)
+        .is_some_and(|report| report["ready"] == true && report["owner_initialized"] == true)
+}
+
+/// Bounded read-only companion report; never starts, migrates or creates a server.
+pub fn stopped_server_report(server: &Path, data: &Path) -> Option<serde_json::Value> {
+    safe_folder(server).ok()?;
+    safe_folder(data).ok()?;
     let mut command = std::process::Command::new(server);
     command
         .arg("--public-hosting-status")
@@ -110,12 +119,12 @@ pub fn owner_ready(server: &Path, data: &Path) -> bool {
         command.creation_flags(0x0800_0000);
     }
     let Ok(mut child) = command.spawn() else {
-        return false;
+        return None;
     };
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return false;
+        return None;
     };
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -124,12 +133,12 @@ pub fn owner_ready(server: &Path, data: &Path) -> bool {
         let _ = stdout.take(16 * 1024).read_to_end(&mut bytes);
         let _ = sender.send(bytes);
     });
-    let ready = receiver
+    let report = receiver
         .recv_timeout(std::time::Duration::from_secs(8))
-        .is_ok_and(|bytes| owner_report_ready(&bytes));
+        .ok().and_then(|bytes| serde_json::from_slice(&bytes).ok());
     let _ = child.kill();
     let _ = child.wait();
-    ready
+    report
 }
 
 /// What a running server was started with, as far as there is evidence.
@@ -168,6 +177,17 @@ pub fn validate_app_host(
     data: &Path,
     exe: &Path,
 ) -> Result<(), String> {
+    validate_app_host_data(plan, managed, data)?;
+    if managed["exe"].as_str().and_then(|p| PathBuf::from(p).canonicalize().ok())
+        .zip(exe.canonicalize().ok()).is_some_and(|(a, b)| a == b)
+    {
+        Ok(())
+    } else {
+        Err("This local server does not match your saved server. Its data was left untouched.".into())
+    }
+}
+
+fn validate_app_host_data(plan: &AppHost, managed: &serde_json::Value, data: &Path) -> Result<(), String> {
     plan.validate()?;
     let same_path = |field: &str, expected: &Path| {
         managed[field]
@@ -179,12 +199,37 @@ pub fn validate_app_host(
     if managed["server_id"].as_str() != Some(plan.server_id.as_str())
         || !is_local_url(managed["url"].as_str().unwrap_or_default())
         || !same_path("data", data)
-        || !same_path("exe", exe)
     {
         return Err(
             "This local server does not match your saved server. Its data was left untouched."
                 .into(),
         );
+    }
+    Ok(())
+}
+
+/// A stopped host may be reopened after extracting a newer portable package.
+/// This exception never adopts an existing process or trusts an arbitrary exe:
+/// the current bundled companion must confirm the same existing database ID.
+pub fn validate_stopped_package(
+    plan: &AppHost,
+    managed: &serde_json::Value,
+    data: &Path,
+    executable: &Path,
+    bundled: &Path,
+    report: &serde_json::Value,
+) -> Result<(), String> {
+    validate_app_host_data(plan, managed, data)?;
+    for path in [data, executable, bundled] { safe_folder(path)?; }
+    if data.join("server-runtime.json").exists() || data.join("stack-instance.json").exists() {
+        return Err("Close the earlier Relay server normally before opening it with this version. Its data is kept.".into());
+    }
+    if !executable.is_file()
+        || !executable.canonicalize().ok().zip(bundled.canonicalize().ok()).is_some_and(|(a, b)| a == b)
+        || report["ready"] != true || report["owner_initialized"] != true
+        || report["server_id"].as_str() != Some(plan.server_id.as_str())
+    {
+        return Err("The current Relay package could not confirm this saved server. Its data was left untouched.".into());
     }
     Ok(())
 }
@@ -702,6 +747,47 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn portable_package_move_reopens_only_the_same_stopped_community() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("community");
+        std::fs::create_dir(&data).unwrap();
+        let old = temp.path().join("old-relay-server.exe");
+        let current = temp.path().join("current-relay-server.exe");
+        let other = temp.path().join("unrelated.exe");
+        for executable in [&old, &current, &other] {
+            std::fs::write(executable, b"fixture only; not executed").unwrap();
+        }
+        std::fs::write(data.join("relay.sqlite3"), b"existing community").unwrap();
+        std::fs::write(data.join("host-key.v1"), b"existing private key").unwrap();
+        let plan = AppHost {
+            server_id: uuid::Uuid::new_v4().to_string(), mode: "local".into(),
+            address: None, lan_discovery: false,
+        };
+        let managed = serde_json::json!({"server_id":plan.server_id,"url":"http://127.0.0.1:4580","exe":old,"data":data});
+        let report = serde_json::json!({"ready":true,"owner_initialized":true,"server_id":plan.server_id});
+        // Running-host adoption still refuses another package. Only a stopped
+        // host with matching read-only database evidence has the new route.
+        assert!(validate_app_host(&plan, &managed, &data, &current).is_err());
+        validate_stopped_package(&plan, &managed, &data, &current, &current, &report).unwrap();
+        std::fs::remove_file(&old).unwrap();
+        validate_stopped_package(&plan, &managed, &data, &current, &current, &report).unwrap();
+        assert!(validate_stopped_package(&plan, &managed, &data, &other, &current, &report).is_err());
+        let mut wrong = report.clone();
+        wrong["server_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+        assert!(validate_stopped_package(&plan, &managed, &data, &current, &current, &wrong).is_err());
+        wrong = report.clone();
+        wrong["owner_initialized"] = serde_json::json!(false);
+        assert!(validate_stopped_package(&plan, &managed, &data, &current, &current, &wrong).is_err());
+        let mut moved = managed.clone();
+        moved["data"] = serde_json::json!(temp.path());
+        assert!(validate_stopped_package(&plan, &moved, &data, &current, &current, &report).is_err());
+        std::fs::write(data.join("server-runtime.json"), b"still running or not confirmed stopped").unwrap();
+        assert!(validate_stopped_package(&plan, &managed, &data, &current, &current, &report).is_err());
+        assert_eq!(std::fs::read(data.join("relay.sqlite3")).unwrap(), b"existing community");
+        assert_eq!(std::fs::read(data.join("host-key.v1")).unwrap(), b"existing private key");
+    }
+
     #[test]
     fn hosting_record_requires_complete_bounded_utf8_json_with_optional_bom() {
         let directory = tempfile::tempdir().unwrap();

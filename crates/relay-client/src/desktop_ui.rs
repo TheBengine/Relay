@@ -113,6 +113,23 @@ fn desktop_caption(ui: &mut egui::Ui, context: &str) {
 }
 
 impl RelayApp {
+    pub(super) fn remote_video_window_visible(&self, ctx: &egui::Context) -> bool {
+        #[cfg(windows)]
+        if self.tray.as_ref().is_some_and(|tray| !tray.window_visible()) {
+            return false;
+        }
+        !ctx.input(|input| input.viewport().minimized.unwrap_or(false))
+    }
+
+    fn pause_hidden_remote_video(&self) {
+        // No final UI frame is guaranteed after SW_HIDE/minimization. Suspend
+        // remote video before hiding; audio and our explicit sharing continue.
+        #[cfg(feature = "native-rtc")]
+        if let Some(rtc) = &self.rtc {
+            rtc.set_video_visible(false);
+        }
+    }
+
     /// Only hide if Windows actually has an icon through which to reopen us.
     /// Capture/QA exits and explicit installer/tray exits always close fully.
     fn hide_on_close(&self) -> bool {
@@ -144,6 +161,7 @@ impl RelayApp {
 
     pub(super) fn window_close(&mut self, ctx: &egui::Context) {
         if self.hide_on_close() {
+            self.pause_hidden_remote_video();
             #[cfg(windows)]
             if let Some(tray) = &self.tray {
                 tray.hide();
@@ -157,6 +175,7 @@ impl RelayApp {
     pub(super) fn native_close(&mut self, ctx: &egui::Context, requested: bool) {
         if requested {
             if self.hide_on_close() {
+                self.pause_hidden_remote_video();
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 #[cfg(windows)]
                 if let Some(tray) = &self.tray {
@@ -220,6 +239,7 @@ impl RelayApp {
                         self.settings_open = true;
                     }
                     Some(TitleAction::Minimize) => {
+                        self.pause_hidden_remote_video();
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     }
                     Some(TitleAction::Maximize) => {

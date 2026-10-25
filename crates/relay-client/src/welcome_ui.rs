@@ -127,6 +127,9 @@ impl RelayApp {
         };
         let scope = format!("{}|{}", b.server_id, b.user.id);
         if !self.prefs.welcome_seen.contains(&scope) {
+            if !fresh_host(b) && !self.in_people() {
+                self.prefs.host_checklist.begin_joined(b);
+            }
             // A fresh host already gets the sharing guide and the first-steps
             // checklist; a second welcome dialog would compete with both.
             self.admin_ui.welcome_open = !fresh_host(b);
@@ -134,6 +137,7 @@ impl RelayApp {
             if self.prefs.welcome_seen.len() > 64 {
                 self.prefs.welcome_seen.remove(0);
             }
+            self.defer_preferences();
         }
     }
     pub(super) fn open_welcome(&mut self) {
@@ -808,17 +812,19 @@ impl RelayApp {
     }
 }
 
-/// R5.1: a new host's first steps, shown in an empty channel instead of a
-/// second welcome dialog. Progress comes from server state, never from clicks.
+/// First steps for the host and a newly joined member. Progress comes from
+/// server-confirmed messages and a connected shared room, never from clicks.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct HostChecklistMemory {
     /// Communities where this account could invite and was alone when first seen.
     #[serde(default)]
     started: Vec<String>,
     #[serde(default)]
+    joined: Vec<String>,
+    #[serde(default)]
     said_hello: Vec<String>,
     #[serde(default)]
-    tried_voice: Vec<String>,
+    connected_together: Vec<String>,
     #[serde(default)]
     dismissed: Vec<String>,
 }
@@ -850,7 +856,7 @@ fn community_scope(b: &Bootstrap) -> String {
 /// The one text channel the "Say hello" step opens and checks: #general, or
 /// the first text channel when the community has no #general.
 fn host_hello_channel(b: &Bootstrap) -> Option<&Channel> {
-    let text = |channel: &&Channel| channel.kind == "text";
+    let text = |channel: &&Channel| channel.kind == "text" && channel.can_send;
     b.channels
         .iter()
         .filter(text)
@@ -858,8 +864,19 @@ fn host_hello_channel(b: &Bootstrap) -> Option<&Channel> {
         .or_else(|| b.channels.iter().find(text))
 }
 
+/// Lead both PCs to the same room when someone has already joined voice.
+fn host_voice_channel(b: &Bootstrap) -> Option<&Channel> {
+    let joinable = |channel: &&Channel| channel.kind == "voice" && channel.can_join;
+    b.channels.iter().filter(joinable).find(|channel| {
+        b.voice_members.iter().any(|member| {
+            member.channel_id == channel.id && member.user.id != b.user.id
+        })
+    }).or_else(|| b.channels.iter().find(joinable))
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct HostSteps {
+    pub joining: bool,
     pub invited: bool,
     pub said_hello: bool,
     pub tried_voice: bool,
@@ -872,6 +889,16 @@ impl HostSteps {
 }
 
 impl HostChecklistMemory {
+    /// Called on the account's first community welcome, never for Friends.
+    fn begin_joined(&mut self, b: &Bootstrap) -> bool {
+        if host_hello_channel(b).is_none() && host_voice_channel(b).is_none() {
+            return false;
+        }
+        let scope = community_scope(b);
+        let changed = remember_scope(&mut self.started, &scope);
+        remember_scope(&mut self.joined, &scope) || changed
+    }
+
     /// `delivered` are server-confirmed messages (never pending sends), and
     /// `connected_voice` is the channel of a working voice connection.
     /// Returns true when something new was remembered.
@@ -897,24 +924,29 @@ impl HostChecklistMemory {
         if said_hello {
             changed |= remember_scope(&mut self.said_hello, &scope);
         }
-        let in_voice = connected_voice
-            .is_some_and(|voice| b.channels.iter().any(|channel| channel.id == voice));
+        let in_voice = connected_voice.is_some_and(|voice| {
+            b.channels.iter().any(|channel| channel.id == voice && channel.kind == "voice")
+                && b.voice_members.iter().any(|member| {
+                    member.channel_id == voice && member.user.id != b.user.id
+                })
+        });
         if in_voice {
-            changed |= remember_scope(&mut self.tried_voice, &scope);
+            changed |= remember_scope(&mut self.connected_together, &scope);
         }
         changed
     }
 
-    /// The remaining steps, or None for members, finished or dismissed communities.
+    /// Missing permissions/channels are not tasks the member can complete.
     pub(super) fn steps(&self, b: &Bootstrap) -> Option<HostSteps> {
         let scope = community_scope(b);
         if !self.started.contains(&scope) || self.dismissed.contains(&scope) {
             return None;
         }
         let steps = HostSteps {
-            invited: b.members.len() > 1,
-            said_hello: self.said_hello.contains(&scope),
-            tried_voice: self.tried_voice.contains(&scope),
+            joining: self.joined.contains(&scope),
+            invited: self.joined.contains(&scope) || b.members.len() > 1,
+            said_hello: host_hello_channel(b).is_none() || self.said_hello.contains(&scope),
+            tried_voice: host_voice_channel(b).is_none() || self.connected_together.contains(&scope),
         };
         (!steps.complete()).then_some(steps)
     }
@@ -951,7 +983,7 @@ impl RelayApp {
         memory.observe(b, &self.messages, connected_voice)
     }
 
-    /// Hook, in an empty channel: draw the checklist instead of the empty-state line.
+    /// Remain available after the first message so the voice step is not lost.
     pub(super) fn host_next_steps_panel(
         &mut self,
         ui: &mut egui::Ui,
@@ -968,16 +1000,13 @@ impl RelayApp {
             return HostPanel::default();
         };
         let hello = host_hello_channel(b).map(|channel| (channel.id.clone(), channel.name.clone()));
-        let voice = b
-            .channels
-            .iter()
-            .find(|channel| channel.kind == "voice" && channel.can_join)
-            .map(|channel| channel.id.clone());
+        let voice = host_voice_channel(b).map(|channel| channel.id.clone());
         let click = host_checklist_card(
             ui,
             steps,
             hello.as_ref().map(|(_, name)| name.as_str()),
             voice.is_some(),
+            !self.messages.is_empty(),
         );
         let mut changed = false;
         match click {
@@ -991,7 +1020,11 @@ impl RelayApp {
             }
             Some(HostClick::Voice) => {
                 if let Some(id) = voice {
-                    self.join_voice(id);
+                    if self.voice_channel.as_ref() == Some(&id) {
+                        self.select(Target::Channel(id));
+                    } else {
+                        self.join_voice(id);
+                    }
                 }
             }
             Some(HostClick::Dismiss) => {
@@ -1022,8 +1055,26 @@ fn host_checklist_card(
     steps: HostSteps,
     hello: Option<&str>,
     voice: bool,
+    compact: bool,
 ) -> Option<HostClick> {
     let mut click = None;
+    if compact {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Next step").strong());
+            if !steps.invited {
+                if ui.add(primary("Invite a friend")).clicked() { click = Some(HostClick::Invite); }
+            } else if !steps.said_hello {
+                if let Some(name) = hello {
+                    if ui.add(secondary(&format!("Say hello in #{name}"))).clicked() { click = Some(HostClick::Hello); }
+                }
+            } else if !steps.tried_voice && voice {
+                if ui.add(primary("Join voice together")).clicked() { click = Some(HostClick::Voice); }
+            }
+            if ui.small_button("Dismiss").clicked() { click = Some(HostClick::Dismiss); }
+        });
+        ui.add_space(6.0);
+        return click;
+    }
     ui.add_space(24.0);
     egui::Frame::none()
         .fill(c_panel())
@@ -1033,7 +1084,7 @@ fn host_checklist_card(
             ui.set_max_width(ui.available_width().min(460.0));
             ui.add(
                 egui::Label::new(
-                    RichText::new("Your community is ready")
+                    RichText::new(if steps.joining { "You joined the community" } else { "Your community is ready" })
                         .size(font_size(18.0))
                         .strong(),
                 )
@@ -1042,14 +1093,18 @@ fn host_checklist_card(
             ui.add_space(4.0);
             ui.add(
                 egui::Label::new(
-                    RichText::new("Invite a friend, then say hello and try voice together.")
+                    RichText::new(if steps.joining {
+                        "Say hello, then join the same voice room as your friend. Once connected, check that you can hear each other."
+                    } else {
+                        "Send an invitation to the other PC, then say hello and join voice together. Keep this host running while friends use it."
+                    })
                         .color(c_muted()),
                 )
                 .wrap(true),
             );
             ui.add_space(14.0);
             if steps.invited {
-                host_step_done(ui, "A friend has joined");
+                host_step_done(ui, if steps.joining { "Joined with your account" } else { "A friend has joined" });
             } else if ui
                 .add(primary("Invite a friend").min_size(Vec2::new(ui.available_width(), 40.0)))
                 .clicked()
@@ -1070,8 +1125,8 @@ fn host_checklist_card(
             ui.add_space(8.0);
             if voice {
                 if steps.tried_voice {
-                    host_step_done(ui, "You tried the voice channel");
-                } else if ui.add(secondary("Try the voice channel")).clicked() {
+                    host_step_done(ui, "Joined the same voice room");
+                } else if ui.add(secondary("Join voice together")).clicked() {
                     click = Some(HostClick::Voice);
                 }
             }
@@ -1146,6 +1201,13 @@ mod host_checklist_tests {
         memory.steps(b).is_some_and(|steps| steps.said_hello)
     }
 
+    fn add_voice_peer(b: &mut Bootstrap, channel: &str) {
+        b.voice_members.push(serde_json::from_value(json!({
+            "user": user("friend1", "member"), "channel_id": channel,
+            "muted": false, "deafened": false, "sharing": false, "camera": false
+        })).unwrap());
+    }
+
     #[test]
     fn fresh_host_sees_steps_and_members_never_do() {
         let mut memory = HostChecklistMemory::default();
@@ -1166,6 +1228,39 @@ mod host_checklist_tests {
         assert!(!memory.observe(&busy, &[], None));
         assert!(memory.steps(&busy).is_none());
         assert_eq!(memory.started, ["s1|owner"]);
+    }
+
+    #[test]
+    fn newly_joined_member_follows_delivered_hello_into_the_friends_voice_room() {
+        let mut member = bootstrap("joined", 2, "member");
+        member.channels[1].can_send = false;
+        member.channels.push(serde_json::from_value(channel("friends-room", "Together", "voice")).unwrap());
+        let mut memory = HostChecklistMemory::default();
+        assert!(memory.begin_joined(&member));
+        let first = memory.steps(&member).unwrap();
+        assert!(first.joining && first.invited && !first.said_hello && !first.tried_voice);
+        assert_eq!(host_hello_channel(&member).unwrap().id, "joined-random");
+        // A read-only #general is never the suggested composer destination.
+        memory.observe(&member, &[message("owner", Some("joined-general"), None)], None);
+        assert!(!memory.steps(&member).unwrap().said_hello);
+        memory.observe(&member, &[message("owner", Some("joined-random"), None)], Some("friends-room"));
+        assert!(memory.steps(&member).unwrap().said_hello);
+        assert!(!memory.steps(&member).unwrap().tried_voice);
+        add_voice_peer(&mut member, "friends-room");
+        assert_eq!(host_voice_channel(&member).unwrap().id, "friends-room");
+        // A peer in another room is not a shared connection on this PC.
+        memory.observe(&member, &[], Some("joined-voice"));
+        assert!(memory.steps(&member).is_some());
+        memory.observe(&member, &[], Some("friends-room"));
+        assert!(memory.steps(&member).is_none());
+        let restored: HostChecklistMemory = serde_json::from_str(&serde_json::to_string(&memory).unwrap()).unwrap();
+        assert!(restored.steps(&member).is_none());
+        let previous: HostChecklistMemory = serde_json::from_value(json!({
+            "started": ["joined|owner"], "said_hello": ["joined|owner"],
+            "tried_voice": ["joined|owner"]
+        })).unwrap();
+        assert!(!previous.steps(&member).unwrap().tried_voice,
+            "old solo-connection progress does not prove a shared room");
     }
 
     #[test]
@@ -1223,15 +1318,18 @@ mod host_checklist_tests {
     }
 
     #[test]
-    fn voice_needs_a_connection_in_this_community() {
+    fn voice_needs_a_connection_together_in_this_community() {
         let mut memory = HostChecklistMemory::default();
-        let host = bootstrap("s1", 1, "admin");
+        let mut host = bootstrap("s1", 1, "admin");
         memory.observe(&host, &[], None);
         // Join ack only, pending or failed media: no connected channel.
         assert!(!memory.observe(&host, &[], None));
         // Connected, but in another community's channel.
         assert!(!memory.observe(&host, &[], Some("s2-voice")));
         assert!(!memory.steps(&host).unwrap().tried_voice);
+        // A solo connection is not progress through the shared-call step.
+        assert!(!memory.observe(&host, &[], Some("s1-voice")));
+        add_voice_peer(&mut host, "s1-voice");
         assert!(memory.observe(&host, &[], Some("s1-voice")));
         // Leaving voice later does not undo a step that really happened.
         assert!(!memory.observe(&host, &[], None));
@@ -1241,10 +1339,12 @@ mod host_checklist_tests {
     #[test]
     fn progress_is_per_community_and_account_and_completes() {
         let mut memory = HostChecklistMemory::default();
-        let alone = bootstrap("s1", 1, "admin");
-        let other_account = community("s1", "second", 1, "admin", Vec::new());
+        let mut alone = bootstrap("s1", 1, "admin");
+        let mut other_account = alone.clone();
+        other_account.user.id = "second".into();
         memory.observe(&alone, &[], None);
         memory.observe(&other_account, &[], None);
+        add_voice_peer(&mut alone, "s1-voice");
         memory.observe(
             &alone,
             &[message("owner", Some("s1-general"), None)],
@@ -1287,11 +1387,13 @@ mod host_checklist_tests {
             let server = format!("s{n}");
             let hello = [message("owner", Some(&format!("{server}-general")), None)];
             let voice = format!("{server}-voice");
-            memory.observe(&bootstrap(&server, 1, "admin"), &hello, Some(&voice));
+            let mut b = bootstrap(&server, 1, "admin");
+            add_voice_peer(&mut b, &voice);
+            memory.observe(&b, &hello, Some(&voice));
         }
         assert_eq!(memory.started.len(), HOST_CHECKLIST_SCOPES);
         assert_eq!(memory.said_hello.len(), HOST_CHECKLIST_SCOPES);
-        assert_eq!(memory.tried_voice.len(), HOST_CHECKLIST_SCOPES);
+        assert_eq!(memory.connected_together.len(), HOST_CHECKLIST_SCOPES);
         assert!(memory.steps(&bootstrap("s0", 1, "admin")).is_none());
     }
 
@@ -1321,7 +1423,7 @@ mod host_checklist_tests {
                         screen = ctx.screen_rect();
                         egui::CentralPanel::default().show(ctx, |ui| {
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                host_checklist_card(ui, HostSteps::default(), Some(long), true);
+                                host_checklist_card(ui, HostSteps::default(), Some(long), true, false);
                                 card = ui.min_rect();
                                 dismiss_visible = ui.clip_rect().max.x >= card.right() - 0.5;
                             });

@@ -69,11 +69,28 @@ impl RelayApp {
                                 } else {
                                     &mut audio.output_device
                                 };
+                                let default_name = if input {
+                                    self.inventory.audio.default_input.as_deref()
+                                } else {
+                                    self.inventory.audio.default_output.as_deref()
+                                };
+                                let default_label = default_name.map_or_else(
+                                    || "System default".to_owned(),
+                                    |name| format!("System default · {name}"),
+                                );
                                 egui::ScrollArea::vertical()
                                     .max_height(180.0)
                                     .show(ui, |ui| {
+                                        let default_text = crate::settings_ui::single_line(
+                                            ui,
+                                            &default_label,
+                                            14.0,
+                                            ui.visuals().text_color(),
+                                            ui.available_width() - 20.0,
+                                        );
                                         changed |= ui
-                                            .selectable_value(selected, None, "System default")
+                                            .selectable_value(selected, None, default_text)
+                                            .on_hover_text(&default_label)
                                             .changed();
                                         // Keep a disconnected selection visible until the user chooses another device.
                                         if let Some(name) =

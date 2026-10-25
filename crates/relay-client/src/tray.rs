@@ -15,7 +15,7 @@ use windows::{
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetWindowThreadProcessId,
-                IsIconic, LoadIconW, PostMessageW, RegisterWindowMessageW, SendMessageW,
+                IsIconic, IsWindowVisible, LoadIconW, PostMessageW, RegisterWindowMessageW, SendMessageW,
                 SetForegroundWindow, ShowWindow, TrackPopupMenu, HICON, ICON_BIG, ICON_SMALL,
                 IDI_APPLICATION, MF_STRING, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_BOTTOMALIGN,
                 TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_GETICON,
@@ -255,6 +255,13 @@ impl Tray {
     }
     pub(crate) fn quitting(&self) -> bool {
         self.state.quitting.get()
+    }
+    /// A tray-hidden window is not necessarily minimized. Query the actual
+    /// native visibility so background notifications cannot resume video work.
+    pub(crate) fn window_visible(&self) -> bool {
+        self.state.alive.get()
+            && unsafe { IsWindowVisible(self.state.window).as_bool() }
+            && !unsafe { IsIconic(self.state.window).as_bool() }
     }
     pub(crate) fn hide(&self) {
         if self.state.alive.get() {

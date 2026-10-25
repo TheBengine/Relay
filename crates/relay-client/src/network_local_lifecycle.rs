@@ -8,6 +8,91 @@ pub(super) struct OwnedLocal {
     identity: Identity,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn refused_shutdown_keeps_ownership_and_the_next_attempt_can_finish() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("host");
+        std::fs::create_dir(&data).unwrap();
+        let exe = temp.path().join("relay-server.exe");
+        std::fs::write(&exe, b"not executed").unwrap();
+        let identity = Identity {
+            server_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: uuid::Uuid::new_v4().to_string(), pid: 42,
+        };
+        identity.save(&data, &exe).unwrap();
+        std::fs::write(data.join("relay.sqlite3"), b"preserved database").unwrap();
+        std::fs::write(data.join("host-key.v1"), b"preserved key").unwrap();
+        let mut health = serde_json::to_value(&identity).unwrap();
+        health["ok"] = serde_json::json!(true);
+        health["managed_instance"] = serde_json::json!(true);
+        let mut runtime = health.clone();
+        runtime["shutdown_token"] = serde_json::json!("synthetic-shutdown-proof");
+        std::fs::write(data.join("server-runtime.json"), serde_json::to_vec(&runtime).unwrap()).unwrap();
+        // All worker HTTP is sent to this test-owned proxy. Port 4580 and any
+        // actual installed local host are never contacted by this regression.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server_data = data.clone();
+        let fixture = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            for step in 0..4 {
+                let mut stream = loop {
+                    if let Ok((stream, _)) = listener.accept() { break stream; }
+                    assert!(Instant::now() < deadline, "shutdown retry did not reach its fixture");
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0; 2048];
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&request[..end]);
+                        let length: usize = header.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                        }).unwrap_or(0);
+                        if request.len() >= end + 4 + length { break; }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let (status, body) = if step % 2 == 0 {
+                    assert!(request.starts_with("GET ") && request.contains("/health"));
+                    (200, health.to_string())
+                } else {
+                    assert!(request.starts_with("POST ") && request.contains("/api/local/shutdown"));
+                    assert!(request.contains("synthetic-shutdown-proof"));
+                    if step == 1 { (503, "{}".into()) } else {
+                        std::fs::remove_file(server_data.join("server-runtime.json")).unwrap();
+                        (200, "{}".into())
+                    }
+                };
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let (tx, _updates) = mpsc::sync_channel(8);
+        let mut worker = Worker::new(tx, eframe::egui::Context::default(), Arc::new(AtomicBool::new(false))).unwrap();
+        worker.http = reqwest::blocking::Client::builder()
+            .proxy(reqwest::Proxy::all(proxy).unwrap()).timeout(Duration::from_secs(2)).build().unwrap();
+        worker.owned_local = Some(OwnedLocal { data: data.clone(), executable: exe, identity });
+        assert!(worker.close_app_host().is_err());
+        assert!(worker.owned_local.is_some(), "a temporary refusal must remain retryable");
+        worker.close_app_host().unwrap();
+        assert!(worker.owned_local.is_none());
+        fixture.join().unwrap();
+        assert_eq!(std::fs::read(data.join("relay.sqlite3")).unwrap(), b"preserved database");
+        assert_eq!(std::fs::read(data.join("host-key.v1")).unwrap(), b"preserved key");
+    }
+}
+
 impl Worker {
     fn local_restored(&self, data: &std::path::Path) {
         if let Some(plan) = AppHost::load(data) {
@@ -135,7 +220,18 @@ impl Worker {
         if plan.server_id != expected || !data.join("relay.sqlite3").is_file() {
             return Err("Your saved local server has changed. Its data was left untouched.".into());
         }
-        crate::local_host::validate_app_host(&plan, &managed, &data, &server)?;
+        let already_running = self.local_server_ready();
+        if let Err(error) = crate::local_host::validate_app_host(&plan, &managed, &data, &server) {
+            if already_running { return Err(error); }
+            let bundled = crate::local_host::server_binary()
+                .ok_or("The bundled server is missing. Reinstall Relay to restore it.")?;
+            if !server.canonicalize().ok().zip(bundled.canonicalize().ok()).is_some_and(|(a, b)| a == b) {
+                return Err(error);
+            }
+            let report = crate::local_host::stopped_server_report(&server, &data)
+                .ok_or("The current Relay version could not read your saved server. Its data was left untouched.")?;
+            crate::local_host::validate_stopped_package(&plan, &managed, &data, &server, &bundled, &report)?;
+        }
         if self
             .owned_local
             .as_ref()
@@ -148,7 +244,7 @@ impl Worker {
             return Ok(());
         }
         self.restoring_local = true;
-        if self.local_server_ready() {
+        if already_running {
             let result = self
                 .remember_local_host(server, data.clone())
                 .and_then(|_| match plan.mode.as_str() {
@@ -245,10 +341,20 @@ impl Worker {
     /// A fresh health identity plus the private runtime token authorizes stopping
     /// just this instance. No stored PID is used for killing a process.
     pub(super) fn close_app_host(&mut self) -> Result<(), String> {
-        let Some(owned) = self.owned_local.take() else {
+        // A timeout or refused shutdown must remain retryable. Forget ownership
+        // only after this exact host has stopped, not before requesting it.
+        let Some(owned) = self.owned_local.as_ref() else {
             return Ok(());
         };
         let Some(live) = self.local_identity() else {
+            if owned.data.join("server-runtime.json").exists()
+                || owned.data.join("stack-instance.json").exists()
+                || self.local_server_ready()
+            {
+                return Err("Your local server did not answer. Wait a moment, then retry. Your server data is kept.".into());
+            }
+            self.owned_local = None;
+            self.local_server = None;
             return Ok(());
         };
         if live.server_id != owned.identity.server_id
@@ -289,10 +395,11 @@ impl Worker {
                 && !owned.data.join("stack-instance.json").exists()
             {
                 self.local_server = None;
+                self.owned_local = None;
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(80));
         }
-        Err("Your local server is still closing. Wait a moment before installing an update.".into())
+        Err("Your local server is still closing. Wait a moment, then retry.".into())
     }
 }

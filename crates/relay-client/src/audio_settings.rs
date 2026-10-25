@@ -211,6 +211,37 @@ pub(crate) fn restore_device_selection(
     }
 }
 
+/// A zero volume is independent of the call's mute/deafen controls. Explain
+/// that local cause before asking the other person to troubleshoot their mic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalVolumeIssue {
+    Output,
+    Microphone,
+}
+
+impl LocalVolumeIssue {
+    pub(crate) fn current(settings: &AudioSettings, muted: bool, deafened: bool) -> Option<Self> {
+        if deafened {
+            None
+        } else if settings.playback_volume <= 0.0 {
+            Some(Self::Output)
+        } else if !muted && settings.microphone_gain <= 0.0 {
+            Some(Self::Microphone)
+        } else {
+            None
+        }
+    }
+
+    /// Called only by the explicit recovery button. Other audio preferences,
+    /// selected devices, and the call's mute/deafen state remain unchanged.
+    pub(crate) fn restore(self, settings: &mut AudioSettings) {
+        match self {
+            Self::Output => settings.playback_volume = AudioSettings::default().playback_volume,
+            Self::Microphone => settings.microphone_gain = AudioSettings::default().microphone_gain,
+        }
+    }
+}
+
 impl AudioSettings {
     pub fn automatic_sensitivity(&self) -> bool {
         self.automatic_sensitivity
@@ -390,6 +421,43 @@ pub enum AudioCue {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zero_volume_recovery_preserves_call_policy_and_unsaved_device_choices() {
+        let applied = super::AudioSettings {
+            input_device: Some("call microphone".into()),
+            output_device: Some("call headset".into()),
+            microphone_gain: 0.0,
+            playback_volume: 0.0,
+            transmission: super::TransmissionMode::PushToTalk,
+            automatic_sensitivity: Some(false),
+            activation_threshold: 0.03,
+            ..Default::default()
+        };
+        let mut edited = applied.clone();
+        edited.input_device = Some("pending microphone".into());
+        edited.activation_threshold = 0.05;
+        assert_eq!(super::LocalVolumeIssue::current(&applied, false, true), None);
+        let issue = super::LocalVolumeIssue::current(&applied, true, false).unwrap();
+        assert_eq!(issue, super::LocalVolumeIssue::Output);
+        let restored = super::quick_audio_change(&applied, &mut edited, |audio| issue.restore(audio));
+        let mut expected = applied.clone();
+        expected.playback_volume = super::AudioSettings::default().playback_volume;
+        assert_eq!(restored, expected);
+        assert_eq!(edited.input_device.as_deref(), Some("pending microphone"));
+        assert_eq!(edited.activation_threshold, 0.05);
+        assert_eq!(edited.playback_volume, restored.playback_volume);
+        // A deliberately muted microphone needs no volume recovery suggestion.
+        assert_eq!(super::LocalVolumeIssue::current(&restored, true, false), None);
+        let issue = super::LocalVolumeIssue::current(&restored, false, false).unwrap();
+        assert_eq!(issue, super::LocalVolumeIssue::Microphone);
+        let restored = super::quick_audio_change(&restored, &mut edited, |audio| issue.restore(audio));
+        expected.microphone_gain = super::AudioSettings::default().microphone_gain;
+        assert_eq!(restored, expected);
+        assert_eq!(super::LocalVolumeIssue::current(&restored, false, false), None);
+        assert_eq!(edited.input_device.as_deref(), Some("pending microphone"));
+        assert_eq!(edited.activation_threshold, 0.05);
+    }
+
     #[test]
     fn bluetooth_names_and_measured_playback_reserves_are_conservative() {
         for name in ["BTHENUM", "BTHLEDevice"] {

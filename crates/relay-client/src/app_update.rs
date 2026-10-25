@@ -2082,7 +2082,7 @@ impl RelayApp {
                 && self.voice_channel.is_some()
                 && !self.settings_open;
             rtc.set_video_visible(
-                !ctx.input(|input| input.viewport().minimized.unwrap_or(false))
+                self.remote_video_window_visible(ctx)
                     && (gallery_visible || self.stream_preview.is_some()),
             );
             if rtc.is_sharing(false) {

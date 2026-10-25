@@ -3,6 +3,34 @@ use super::*;
 use crate::handover_client::{Action, Stage, View};
 use relay_protocol::handover::Phase;
 
+fn next_move_step(
+    status: Option<&relay_protocol::handover::Status>,
+    stage: Option<Stage>,
+    on_target: bool,
+    can_finish: bool,
+) -> (&'static str, &'static str) {
+    if stage == Some(Stage::Active) {
+        return ("5. The new PC is hosting", "Keep Relay open on the new PC. The old host must stay retired.");
+    }
+    let Some(status) = status else {
+        return ("1. Prepare the new PC", "On the new PC, open this community's Hosts settings, accept the Data copy role, and prepare a setup code. Send that code privately to the administrator on the old host.");
+    };
+    let Some(preparation) = &status.preparation else {
+        return ("1. Prepare the new PC", "Prepare a setup code on the new PC, then paste it below on the administrator's PC. The current server keeps running; preparing a code does not copy its database.");
+    };
+    match preparation.phase {
+        Phase::Offered if on_target => ("2. On the new PC: accept the full server data", "Your account was selected. Continue on the new PC and review the separate full-data consent below. Accepting the Data copy role alone does not authorize receiving all accounts, messages and files."),
+        Phase::Offered => ("2. On the new PC: accept the move", "Ask the selected member to open this same Hosts page and accept the full server data. Then refresh the move status here."),
+        Phase::Accepted if !can_finish => ("Preparation saved — final switch unavailable", "The current host still runs normally. This build keeps the service pause and permanent handover disabled until the complete two-PC flow has been accepted. Keep this preparation; do not manually stop or replace either database."),
+        Phase::Accepted => ("3. On the old host: pause and prepare the final copy", "An administrator must confirm the service pause below. Then the new PC downloads or resumes the final transfer. Chat and calls stay paused until the move completes or is cancelled before the grant."),
+        Phase::Frozen if status.retired.is_some() => ("5. On the new PC: resume the granted host", "The old host has permanently stopped serving this community. On the new PC, refresh this page and choose Resume this PC as host. Relay validates its signed grant before activation; do not restart the old database."),
+        Phase::Frozen if status.received.is_none() && on_target => ("4. On the new PC: receive the final copy", "On the new PC, choose Download or resume transfer below. Keep Relay open. Verification must complete before that PC can stand by for the final grant."),
+        Phase::Frozen if status.received.is_none() => ("4. On the new PC: receive the final copy", "Ask the selected member to choose Download or resume transfer on this page. Refresh here after that PC has verified the complete copy."),
+        Phase::Frozen if on_target => ("4. On the new PC: start standby and keep Relay open", "On the new PC, choose Start this PC and wait. The administrator then checks that PC's connection and generated media before permanently granting the move. This standby copy is not yet the active server."),
+        Phase::Frozen => ("4. On the old host: check the new PC", "The new PC must choose Start this PC and wait. Then check its connection below. Finishing requires a fresh voice/video check and separate confirmation that the old host can never resume."),
+    }
+}
+
 #[derive(Default)]
 pub(super) struct State {
     owner: Option<CommandOrigin>,
@@ -154,6 +182,13 @@ impl RelayApp {
         let mut action = None;
         egui::CollapsingHeader::new("Move this community").default_open(bootstrap.host_paused).show(ui,|ui| {
             ui.label("Prepare another PC to host this community. The current host stays in charge until a completed move.");
+            let on_target = status.as_ref().and_then(|s| s.preparation.as_ref())
+                .is_some_and(|p| p.target_user_id == bootstrap.user.id);
+            let (step, instruction) = next_move_step(status.as_ref(), self.handover.view.as_ref().map(|v| v.stage), on_target, finish_enabled);
+            ui.add_space(8.0);
+            ui.label(RichText::new(step).strong());
+            ui.add(egui::Label::new(instruction).wrap(true));
+            ui.add_space(8.0);
             if !self.handover.inspected && !busy && self.handover.view.is_none() {
                 self.handover.inspected = true;
                 action = Some(Action::Inspect);
@@ -173,6 +208,7 @@ impl RelayApp {
                     ui.label(match v.stage {Stage::Waiting=>"Preparing the encrypted transfer…",Stage::Downloading=>"Receiving the encrypted transfer…",Stage::Verifying=>"Checking the complete server copy…",Stage::Ready=>"This PC is standing by. Waiting for the old host to grant the move…",_=>"Checking the host…"});
                 }
                 if v.finished&&v.stage==Stage::Checked {ui.label("The new host's connection check passed. Finishing the move runs a fresh check again.");}
+                if v.finished&&v.stage==Stage::RecoveredGrant {ui.label("The old host is offline. Relay recovered and verified this PC's saved signed grant. The new host has not been started by this status check.");}
                 if v.stage==Stage::Active {ui.label("This PC is hosting the transferred community. Relay will resume it when the app starts again.");}
                 if v.total_parts>0 {
                     ui.add(egui::ProgressBar::new(v.parts as f32/v.total_parts as f32).text(format!("{} / {} parts · {:.1} MiB",v.parts,v.total_parts,v.bytes as f64/1048576.0)));
@@ -228,7 +264,7 @@ impl RelayApp {
                                 }else{ui.label("The final switch is not available in this build. You can check a prepared new host's connection.");}
                             }
                         }
-                        if admin&&finish_enabled&&s.retired.is_some()&&ui.add_enabled(ready,secondary("Retry starting new host")).clicked(){action=Some(Action::Complete{confirm_stop_source:true});}
+                        if admin&&finish_enabled&&s.retired.is_some()&&ui.add_enabled(ready,secondary("Retry grant delivery")).clicked(){action=Some(Action::Complete{confirm_stop_source:true});}
                         if mine &&s.retired.is_none() && ui.add_enabled(ready,primary("Download or resume transfer")).clicked(){action=Some(Action::Download{retry_export:false});}
                         if mine&&s.received.is_some()&&self.handover.view.as_ref().is_none_or(|v|v.stage!=Stage::Active) {
                             ui.label(if crate::iroh_route::is_iroh(&p.target_url){"Uses this PC's own private invitation and voice/video service. Keep Relay open while the old host completes the move."}else{"Uses this PC's own voice/video service and its configured HTTPS address."});
@@ -265,6 +301,10 @@ impl RelayApp {
                     }
                     if ui.add_enabled(card.is_some(),primary("Ask this member to host")).clicked(){action=Some(Action::Offer{card:self.handover.invitation.clone()});}
                 }
+            }
+            if self.handover.view.as_ref().is_some_and(|v| matches!(v.fault,
+                Some(crate::handover_client::Fault::Integrity | crate::handover_client::Fault::Changed))) {
+                ui.add(egui::Label::new("A damaged or changed export needs a new preparation. Refresh the status, then ask the administrator to cancel this ungranted move and prepare it again. Existing received data and keys are kept; do not replace that database manually.").wrap(true));
             }
         });
         ui.add_space(8.0);

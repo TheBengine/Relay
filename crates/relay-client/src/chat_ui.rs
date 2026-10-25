@@ -87,8 +87,11 @@ pub(super) fn dismiss_inline_on_escape(
     reply: &mut Option<ReplyDraft>,
 ) {
     if !closing_overlay {
-        *editing = None;
-        *reply = None;
+        // Cancelling an edit must not discard the reply being composed below it.
+        // A second Escape can dismiss that reply after the editor has closed.
+        if editing.take().is_none() {
+            *reply = None;
+        }
     }
 }
 
@@ -827,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn escaping_plain_chat_still_cancels_inline_edit_and_reply() {
+    fn escaping_an_edit_preserves_the_reply_until_a_separate_escape() {
         let mut editing = Some(("edited-message".into(), "unsaved edit".into()));
         let mut reply = Some(ReplyDraft {
             message_id: "replied-message".into(),
@@ -837,6 +840,9 @@ mod tests {
         });
         dismiss_inline_on_escape(false, &mut editing, &mut reply);
         assert!(editing.is_none());
+        assert_eq!(reply.as_ref().unwrap().message_id, "replied-message");
+        assert_eq!(reply.as_ref().unwrap().excerpt, "reply context");
+        dismiss_inline_on_escape(false, &mut editing, &mut reply);
         assert!(reply.is_none());
     }
 

@@ -77,6 +77,7 @@ pub(super) struct ServerUi {
     role_delete: Option<String>,
     pub(super) presence_draft: Option<UserPresence>,
     friend_search: String,
+    friend_request_name: String,
     friend_tab: u8,
     friend_request_feedback: Option<(bool, String)>,
     pub(super) friend_all_servers: bool,

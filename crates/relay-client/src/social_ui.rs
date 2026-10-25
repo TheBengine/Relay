@@ -1,4 +1,56 @@
 // Included in admin_ui so all requests use the same account and community binding.
+fn friend_matches_view(b: &Bootstrap, member: &User, tab: u8, connected: bool) -> bool {
+    if member.id == b.user.id {
+        return false;
+    }
+    // A cached friend/presence entry must not override a newer block or make
+    // disconnected people look online.
+    if b.social.blocked.contains(&member.id) {
+        return tab == 3;
+    }
+    match tab {
+        0 => {
+            connected
+                && b.social.friends.contains(&member.id)
+                && b.presence.iter().any(|p| {
+                    p.user_id == member.id && matches!(p.status.as_str(), "online" | "away" | "dnd")
+                })
+        }
+        1 => b.social.friends.contains(&member.id),
+        2 => b.social.incoming.contains(&member.id) || b.social.outgoing.contains(&member.id),
+        3 => false,
+        _ => !b.social.friends.contains(&member.id),
+    }
+}
+
+fn friend_search_query(value: &str) -> String {
+    value.trim().trim_start_matches('@').to_lowercase()
+}
+
+/// Reserve an action column on wide lists; on narrow lists each part gets a
+/// whole row, letting horizontal_wrapped move the actions below the identity.
+fn friend_row_widths(ui: &egui::Ui) -> (f32, f32) {
+    let width = ui.available_width().max(1.0);
+    let scale = font_size(14.0) / 14.0;
+    let actions = (190.0 * scale).min(width);
+    let identity = width - actions - ui.spacing().item_spacing.x;
+    if identity < 200.0 * scale {
+        (width, width)
+    } else {
+        (identity, actions)
+    }
+}
+
+impl ServerUi {
+    fn friend_input(&mut self, adding_relay_friend: bool) -> &mut String {
+        if adding_relay_friend {
+            &mut self.friend_request_name
+        } else {
+            &mut self.friend_search
+        }
+    }
+}
+
 fn inbox_conversation_label(bootstrap: &Bootstrap, target: &Target) -> Option<String> {
     match target {
         Target::Channel(id) => {
@@ -85,6 +137,10 @@ impl RelayApp {
         self.admin_requests
             .values()
             .any(|key| key == "action:social" || key == "action:people-request")
+    }
+
+    fn social_actions_available(&self) -> bool {
+        self.connection_status == ConnectionStatus::Connected && !self.social_action_pending()
     }
 
     pub(super) fn people_request_failed(&mut self, error: String) {
@@ -584,7 +640,7 @@ impl RelayApp {
             ("Add Friend", AdminMethod::Post)
         };
         if ui
-            .add_enabled(!self.social_action_pending(), secondary(label))
+            .add_enabled(self.social_actions_available(), secondary(label))
             .clicked()
         {
             self.admin_request(
@@ -607,7 +663,7 @@ impl RelayApp {
             self.friend_action_button(ui, user, &b.social);
             if ui
                 .add_enabled(
-                    !self.social_action_pending(),
+                    self.social_actions_available(),
                     secondary(if blocked { "Unblock" } else { "Block" }),
                 )
                 .clicked()
@@ -732,6 +788,7 @@ impl RelayApp {
             ui.label("Update the community server to use friends and status.");
             return;
         }
+        let connected = self.connection_status == ConnectionStatus::Connected;
         self.group_invitations_ui(ui, &b);
         ui.horizontal_wrapped(|ui| {
             icon(ui, Icon::Users, 22.0, c_muted());
@@ -763,12 +820,29 @@ impl RelayApp {
                     self.admin_ui.friend_tab = value;
                 }
             }
-            if icon_button(ui, Icon::More, false, "Refresh friends").clicked() {
+            let refreshing = self.admin_requests.values().any(|key| key == "social");
+            if ui
+                .add_enabled_ui(connected && !refreshing, |ui| {
+                    icon_button(ui, Icon::More, false, "Refresh friends").clicked()
+                })
+                .inner
+            {
                 self.refresh_admin_data("social", "/api/social");
             }
         });
         ui.separator();
         ui.add_space(12.0);
+        if !connected {
+            ui.label(RichText::new(match self.connection_status {
+                ConnectionStatus::SignInRequired => "Sign in again to update Friends. Your last known list is shown below.",
+                ConnectionStatus::Reconnecting => "Reconnecting… Your last known friends are still under All. Calls and requests will be available when connected.",
+                _ => "Friends is unavailable. Relay is retrying. Your last known friends are still under All.",
+            }).color(c_accent()));
+            if self.admin_ui.friend_tab == 0 && ui.button("Show all friends").clicked() {
+                self.admin_ui.friend_tab = 1;
+            }
+            ui.add_space(8.0);
+        }
         ui.label(
             RichText::new(
                 if people { "Add a friend by their exact Relay name. You can message and call without a shared server." } else { "Find people on this server. Friend requests and private groups stay here." },
@@ -776,26 +850,33 @@ impl RelayApp {
             .color(c_muted()),
         );
         let adding = self.admin_ui.friend_tab == 4;
+        let pending = self.social_action_pending();
         let search_field = ui.add_sized(
             [ui.available_width(), 34.0],
-            egui::TextEdit::singleline(&mut self.admin_ui.friend_search).hint_text(if adding {
-                if people {
-                    "Enter your friend’s exact @RelayName"
+            egui::TextEdit::singleline(self.admin_ui.friend_input(adding && people))
+                .id_source(if adding && people {
+                    "friend-request-name"
                 } else {
-                    "Find a member to add"
-                }
-            } else {
-                "Search friends"
-            }),
+                    "friend-list-search"
+                })
+                .interactive(!(adding && people && pending))
+                .hint_text(if adding {
+                    if people {
+                        "Enter your friend’s exact @RelayName"
+                    } else {
+                        "Find a member to add"
+                    }
+                } else {
+                    "Search friends"
+                }),
         );
         if adding && people {
-            let pending = self.social_action_pending();
             if search_field.changed() && !pending {
                 self.admin_ui.friend_request_feedback = None;
             }
             let send = ui
                 .add_enabled(
-                    !pending && !self.admin_ui.friend_search.trim().is_empty(),
+                    connected && !pending && !self.admin_ui.friend_request_name.trim().is_empty(),
                     primary(if pending {
                         "Sending…"
                     } else {
@@ -804,12 +885,16 @@ impl RelayApp {
                 )
                 .clicked();
             let enter = search_field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (send || enter) && !pending && !self.admin_ui.friend_search.trim().is_empty() {
+            if (send || enter)
+                && connected
+                && !pending
+                && !self.admin_ui.friend_request_name.trim().is_empty()
+            {
                 self.admin_ui.friend_request_feedback = None;
                 self.admin_request(
                     AdminMethod::Post,
                     "/api/people/requests".into(),
-                    json!({"handle":self.admin_ui.friend_search.trim()}),
+                    json!({"handle":self.admin_ui.friend_request_name.trim()}),
                     "action:people-request".into(),
                 );
             }
@@ -843,33 +928,13 @@ impl RelayApp {
             return;
         }
         ui.add_space(12.0);
-        let search = self.admin_ui.friend_search.to_lowercase();
+        let search = friend_search_query(&self.admin_ui.friend_search);
         let tab = self.admin_ui.friend_tab;
         let rows: Vec<_> = b
             .members
             .iter()
-            .filter(|member| member.id != b.user.id)
             .filter(|member| {
-                let matches = match tab {
-                    0 => {
-                        b.social.friends.contains(&member.id)
-                            && b.presence.iter().any(|p| {
-                                p.user_id == member.id
-                                    && matches!(p.status.as_str(), "online" | "away" | "dnd")
-                            })
-                    }
-                    1 => b.social.friends.contains(&member.id),
-                    2 => {
-                        b.social.incoming.contains(&member.id)
-                            || b.social.outgoing.contains(&member.id)
-                    }
-                    3 => b.social.blocked.contains(&member.id),
-                    _ => {
-                        !b.social.friends.contains(&member.id)
-                            && !b.social.blocked.contains(&member.id)
-                    }
-                };
-                matches
+                friend_matches_view(&b, member, tab, connected)
                     && (member.username.to_lowercase().contains(&search)
                         || profile_ui::display_name(member)
                             .to_lowercase()
@@ -879,7 +944,7 @@ impl RelayApp {
                             self.central_account.provider.as_ref(),
                             &member.id,
                         )
-                        .is_some_and(|link| link.handle.contains(search.trim_start_matches('@'))))
+                        .is_some_and(|link| link.handle.to_lowercase().contains(&search)))
             })
             .cloned()
             .collect();
@@ -893,7 +958,9 @@ impl RelayApp {
             ),
         );
         if rows.is_empty() {
-            ui.label(if !search.is_empty() {
+            ui.label(if tab == 0 && !connected {
+                "Online status is unavailable until Relay reconnects."
+            } else if !search.is_empty() {
                 "No matches. Try another name."
             } else {
                 match tab {
@@ -921,10 +988,14 @@ impl RelayApp {
         }
         for member in rows.into_iter().take(100) {
             ui.push_id(&member.id, |ui| {
-                ui.horizontal(|ui| {
+                let (identity_width, action_width) = friend_row_widths(ui);
+                ui.horizontal_wrapped(|ui| {
+                    ui.allocate_ui_with_layout(Vec2::new(identity_width, 0.0), Layout::left_to_right(Align::Center), |ui| {
                     self.user_avatar(ui, &member, 36.0, false);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(profile_ui::display_name(&member)).strong());
+                        let name = profile_ui::display_name(&member);
+                        ui.add(egui::Label::new(RichText::new(name).strong()).truncate(true))
+                            .on_hover_text(name);
                         self.linked_account_label(ui,&member.id);
                         if tab == 2 {
                             ui.label(if b.social.incoming.contains(&member.id) {
@@ -932,18 +1003,21 @@ impl RelayApp {
                             } else {
                                 "Outgoing friend request"
                             });
+                        } else if !connected {
+                            ui.label(RichText::new("Status unavailable").color(c_muted()));
                         } else {
                             self.presence_label(ui, &member.id);
                         }
                     });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    });
+                    ui.allocate_ui_with_layout(Vec2::new(action_width, 0.0), Layout::right_to_left(Align::Center), |ui| {
                         ui.menu_button("•••", |ui| {
                             self.social_buttons(ui, &member);
                         });
                         if tab <= 1 && icon_button(ui, Icon::Chat, false, "Message").clicked() {
                             self.select(Target::Direct(member.id.clone()));
                         }
-                        if tab <= 1 && ui.button(if b.capabilities.iter().any(|cap| cap == "private-calls-v1") { "Call" } else { "Private voice" })
+                        if tab <= 1 && ui.add_enabled(connected, secondary(if b.capabilities.iter().any(|cap| cap == "private-calls-v1") { "Call" } else { "Private voice" }))
                             .on_hover_text("Call this friend, or open the private room on an older server.")
                             .clicked() {
                             self.start_friend_call(&member.id);
@@ -951,12 +1025,12 @@ impl RelayApp {
                         if (tab >= 2) && tab != 3 {
                             self.friend_action_button(ui, &member, &b.social);
                         }
-                        if tab == 3 && ui.add_enabled(!self.social_action_pending(), secondary("Unblock")).clicked() {
+                        if tab == 3 && ui.add_enabled(self.social_actions_available(), secondary("Unblock")).clicked() {
                             self.admin_request(AdminMethod::Delete, format!("/api/blocks/{}", member.id), Value::Null, "action:social".into());
                         }
                         if tab == 2
                             && b.social.incoming.contains(&member.id)
-                            && ui.add_enabled_ui(!self.social_action_pending(), |ui| {
+                            && ui.add_enabled_ui(self.social_actions_available(), |ui| {
                                 icon_button(ui, Icon::Close, false, "Decline friend request").clicked()
                             }).inner
                         {
@@ -1153,13 +1227,21 @@ impl RelayApp {
         user: &str,
         response: &egui::Response,
     ) {
-        let Some(status) = self.bootstrap.as_ref().filter(|b|
-            b.capabilities.iter().any(|c|c == relay_protocol::PEOPLE_GROUP_PRESENCE_CAPABILITY)).and_then(|b| {
-            b.group_presence
-                .iter()
-                .find(|p| p.channel_id == channel && p.user_id == user)
-                .map(|p| p.status.as_str())
-        }) else {
+        let Some(status) = self
+            .bootstrap
+            .as_ref()
+            .filter(|b| {
+                b.capabilities
+                    .iter()
+                    .any(|c| c == relay_protocol::PEOPLE_GROUP_PRESENCE_CAPABILITY)
+            })
+            .and_then(|b| {
+                b.group_presence
+                    .iter()
+                    .find(|p| p.channel_id == channel && p.user_id == user)
+                    .map(|p| p.status.as_str())
+            })
+        else {
             return;
         };
         let color = match status {
@@ -1173,7 +1255,11 @@ impl RelayApp {
         ui.painter().circle_filled(pos, 4.0, color);
         response
             .clone()
-            .on_hover_text(presence_name(if status == "idle" { "away" } else { status }));
+            .on_hover_text(presence_name(if status == "idle" {
+                "away"
+            } else {
+                status
+            }));
     }
     pub(super) fn reports_ui(&mut self, ui: &mut egui::Ui) {
         self.ensure_admin_data("reports", "/api/reports");
@@ -1213,6 +1299,65 @@ impl RelayApp {
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod friends_flow_tests {
+    use super::*;
+
+    #[test]
+    fn requesting_a_friend_keeps_the_list_filter_and_recipient_draft_separate() {
+        let mut state = ServerUi::default();
+        state.friend_input(false).push_str(" @Alex ");
+        state.friend_input(true).push_str("@Morgan");
+        assert_eq!(friend_search_query(state.friend_input(false)), "alex");
+        assert_eq!(state.friend_input(true), "@Morgan");
+        // Opening Pending/All after a request clears only the list filter;
+        // returning to Add Friend retains the name for correction or retry.
+        state.friend_search.clear();
+        assert!(state.friend_input(false).is_empty());
+        assert_eq!(state.friend_input(true), "@Morgan");
+    }
+
+    #[test]
+    fn disconnected_friends_stay_in_all_without_stale_online_or_blocked_actions() {
+        let friend = User {
+            id: "friend".into(),
+            ..Default::default()
+        };
+        let mut b = Bootstrap {
+            user: User {
+                id: "me".into(),
+                ..Default::default()
+            },
+            social: SocialState {
+                friends: vec![friend.id.clone()],
+                ..Default::default()
+            },
+            presence: vec![UserPresence {
+                user_id: friend.id.clone(),
+                status: "online".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(friend_matches_view(&b, &friend, 0, true));
+        assert!(!friend_matches_view(&b, &friend, 0, false));
+        assert!(friend_matches_view(&b, &friend, 1, false));
+        assert!(
+            friend_matches_view(&b, &friend, 0, true),
+            "reconnection restores online presence"
+        );
+        b.social.blocked.push(friend.id.clone());
+        b.social.incoming.push(friend.id.clone());
+        for connected in [false, true] {
+            for tab in [0, 1, 2, 4] {
+                assert!(!friend_matches_view(&b, &friend, tab, connected));
+            }
+            assert!(friend_matches_view(&b, &friend, 3, connected));
+        }
+        assert!(!friend_matches_view(&b, &b.user, 4, true));
     }
 }
 

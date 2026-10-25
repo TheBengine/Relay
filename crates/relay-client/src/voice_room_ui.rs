@@ -120,6 +120,78 @@ pub(super) fn sound_hint(deafened: bool, rows: &[SoundRow]) -> Option<String> {
     ))
 }
 
+/// Receiving packets does not mean they can be heard: a saved zero volume can
+/// silence an otherwise healthy call. Recovery is always an explicit choice.
+pub(super) fn local_volume_help(
+    ui: &mut egui::Ui,
+    issue: crate::audio_settings::LocalVolumeIssue,
+) -> bool {
+    use crate::audio_settings::LocalVolumeIssue;
+    let (message, action) = match issue {
+        LocalVolumeIssue::Output => (
+            "Your output volume is 0%, so you cannot hear this call.",
+            "Set output volume to 100%",
+        ),
+        LocalVolumeIssue::Microphone => (
+            "Your microphone volume is 0%, so others cannot hear you.",
+            "Restore microphone volume",
+        ),
+    };
+    egui::Frame::none()
+        .fill(c_rail())
+        .rounding(8.0)
+        .inner_margin(Margin::same(12.0))
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(RichText::new(message).strong()).wrap(true));
+            ui.button(action).clicked()
+        })
+        .inner
+}
+
+pub(super) fn local_gateway_controls(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    available: bool,
+    active: bool,
+    friends_call: bool,
+) -> Option<bool> {
+    egui::Frame::none()
+        .fill(c_rail())
+        .rounding(8.0)
+        .inner_margin(Margin::same(12.0))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Local voice gateways").strong());
+                ui.label(RichText::new(if !available {
+                    "Not available for this connection"
+                } else if !enabled {
+                    "Off"
+                } else if active {
+                    "Using a measured gateway route"
+                } else {
+                    "Enabled · using the normal voice route"
+                }).color(if available && enabled && active { c_good() } else { c_muted() }));
+            });
+            let description = if !available {
+                "This call keeps its normal voice route. Its server or connection does not currently support local voice gateways."
+            } else if friends_call {
+                "Optional: allow this PC to use or offer a gateway to people in this exact call on your local network. No server role is granted."
+            } else {
+                "Optional: use approved gateways on your local network. This PC can offer one only with an accepted Voice gateway role."
+            };
+            ui.add(egui::Label::new(RichText::new(description).color(c_muted())).wrap(true));
+            if available {
+                ui.add(egui::Label::new(RichText::new("Relay checks the complete voice path and selects a gateway only when it is faster or the normal route fails. Stopping returns to the normal route. Your call's privacy setting stays the same; video uses a separate route.").size(font_size(TEXT_CAPTION)).color(c_muted())).wrap(true));
+            }
+            ui.add_enabled(available || enabled, secondary(if enabled {
+                "Stop local voice gateways"
+            } else {
+                "Enable local voice gateways"
+            })).clicked().then_some(!enabled)
+        })
+        .inner
+}
+
 /// Offer help for a recent pattern of late audio, rather than a single glitch
 /// or the expected silence/concealment between words. Counters reset per call.
 #[derive(Clone, Default)]

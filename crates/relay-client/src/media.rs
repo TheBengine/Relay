@@ -115,7 +115,7 @@ struct AudioControls {
     whisper_ciphers: Mutex<HashMap<String, CallCipher>>,
     whisper_requested: Mutex<BTreeSet<String>>,
     direct_enabled: AtomicBool,
-    gateway_enabled: Arc<AtomicBool>,
+    gateway_enabled: Arc<crate::gateway_control::Toggle>,
     private_network: AtomicBool,
     direct: Mutex<Option<crate::direct_voice::DirectVoice>>,
     tcp_enabled: AtomicBool,
@@ -188,7 +188,7 @@ impl AudioControls {
             whisper_ciphers: Mutex::default(),
             whisper_requested: Mutex::default(),
             direct_enabled: AtomicBool::new(settings.direct_voice_enabled),
-            gateway_enabled: Arc::new(AtomicBool::new(settings.local_voice_gateways)),
+            gateway_enabled: Arc::new(crate::gateway_control::Toggle::new(settings.local_voice_gateways)),
             private_network: AtomicBool::new(false),
             direct: Mutex::new(None),
             tcp_enabled: AtomicBool::new(settings.tcp_fallback_enabled),
@@ -409,6 +409,9 @@ pub struct NetworkStats {
     pub input_timing: Option<DeviceTiming>,
     pub output_timing: Option<DeviceTiming>,
     pub direct_active: bool,
+    /// This exact live call has an admitted control-plane session. Opt-in and
+    /// route selection remain separate; availability does not mean it is used.
+    pub gateway_available: bool,
     pub gateway_active: bool,
     pub gateway_round_trip_ms: Option<f32>,
     pub gateway_round_trip_age: Option<Duration>,
@@ -462,6 +465,7 @@ struct Counters {
     udp_rtt_us: AtomicU64,
     udp_rtt_at: AtomicU64,
     direct_active: AtomicBool,
+    gateway_available: AtomicBool,
     gateway_active: AtomicBool,
     gateway_rtt_us: AtomicU64,
     gateway_rtt_at: AtomicU64,
@@ -524,6 +528,7 @@ impl Counters {
             input_timing: None,
             output_timing: None,
             direct_active: self.direct_active.load(Ordering::Acquire),
+            gateway_available: self.gateway_available.load(Ordering::Acquire),
             gateway_active: self.gateway_active.load(Ordering::Acquire),
             gateway_round_trip_ms: match self.gateway_rtt_us.load(Ordering::Relaxed) {
                 0 => None,
@@ -1720,10 +1725,12 @@ impl NativeAudio {
                 })
             });
         }
-        let args = VoiceWorker {
-            gateway: gateway.and_then(|config| crate::gateway_control::Session::start(
+        let gateway = gateway.and_then(|config| crate::gateway_control::Session::start(
                 config, remote, self.controls.gateway_enabled.clone(), stop.clone(),
-            )),
+            ));
+        self.counters.gateway_available.store(gateway.is_some(), Ordering::Release);
+        let args = VoiceWorker {
+            gateway,
             playback_limit: playback_limit.clone(),
             socket,
             remote,
@@ -4473,6 +4480,7 @@ fn voice_worker(mut w: VoiceWorker) {
         }
     }
     w.counters.stop_udp_link();
+    w.counters.gateway_available.store(false, Ordering::Release);
     w.counters.gateway_active.store(false, Ordering::Release);
     w.counters.direct_active.store(false, Ordering::Release);
     w.counters.direct_rtt_us.store(0, Ordering::Relaxed);

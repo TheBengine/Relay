@@ -204,8 +204,11 @@ impl RelayApp {
     fn join_friend_form(&mut self, ui: &mut egui::Ui) {
         if ui.add_enabled(!self.busy, secondary("← Back")).clicked() {
             self.hosting_setup.entry = LoginEntry::Welcome;
+            self.account_start.home = self.central_account.account.is_some();
+            self.account_start.pending = None;
             self.login.setup.clipboard.settle();
             self.error = None;
+            return;
         }
         ui.add_space(16.0);
         ui.heading("Join your friends");
@@ -286,6 +289,9 @@ impl RelayApp {
             .add_enabled(!self.busy, secondary("Use another invitation"))
             .clicked()
         {
+            // A previous account challenge must not finish after the user
+            // replaces the invitation, including one for the same server.
+            self.account_start.pending = None;
             if kind == FlowKind::AddCommunity {
                 self.add_community
                     .setup

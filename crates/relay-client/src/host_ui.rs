@@ -559,7 +559,7 @@ impl RelayApp {
                         }
                     });
                     ui.label(
-                        RichText::new("Accepting starts nothing by itself. Choose a copy below or enable local voice gateways in Settings. You can step down at any time.")
+                        RichText::new("Accepting starts nothing by itself. Choose a copy below or enable local voice gateways for your calls. You can step down at any time.")
                             .size(font_size(TEXT_CAPTION))
                             .color(c_muted()),
                     );
@@ -574,6 +574,17 @@ impl RelayApp {
                 }
                 if mine.candidate.holds(HostRole::Replica) {
                     self.copy_card(ui, busy);
+                }
+                if mine.candidate.holds(HostRole::VoiceGateway) {
+                    card(ui, |ui| {
+                        ui.label(RichText::new("Your voice gateway role is accepted").strong());
+                        ui.add(egui::Label::new(RichText::new("Join a voice call and enable local voice gateways to help other people on your local network. Relay measures the complete path before selecting it; accepting this role does not start sharing by itself.").color(c_muted())).wrap(true));
+                        let enabled = self.audio_applied.local_voice_gateways;
+                        if ui.add(secondary(if enabled { "Stop local voice gateways" } else { "Enable local voice gateways for calls" })).clicked() {
+                            self.apply_quick_audio_change(|audio| audio.local_voice_gateways = !enabled);
+                        }
+                        ui.label(RichText::new("This preference applies to your calls. You can also change it inside a call; video is separate.").size(font_size(TEXT_CAPTION)).color(c_muted()));
+                    });
                 }
             }
         }

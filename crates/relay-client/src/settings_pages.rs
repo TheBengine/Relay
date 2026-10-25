@@ -1104,7 +1104,7 @@ impl RelayApp {
                 .data_mut(|d| d.remove::<bool>(egui::Id::new("scroll-direct-voice")));
         }
         controls::description(ui, "Direct voice currently supports rooms with two people. Relay checks both participants and compares connection times; larger rooms, whispers and unavailable direct routes use the server.");
-        ui.checkbox(&mut self.prefs.audio.local_voice_gateways, "Allow approved local voice gateways").on_hover_text("Advanced. Turn this on before joining a call. Nothing is used until Relay has measured a complete working voice path through the gateway. You can turn it off during a call.");
+        ui.checkbox(&mut self.prefs.audio.local_voice_gateways, "Allow approved local voice gateways").on_hover_text("You can change this during a call. Save Changes applies it immediately; the call also has an Enable/Stop control. Nothing is used until Relay has measured a complete working voice path through the gateway.");
         controls::description(ui, "Advanced. In a community, helpers need the accepted Voice gateway role under Hosts. In a private Friends call, either joined participant can volunteer by enabling this option; no server role is granted. Only people in that exact live call can use its gateway. Relay measures the full voice path before using it and falls back to the normal route if it fails. Relay's built-in private connection uses a separate gateway route, keeping your own call untouched. Other per-person tunnels keep their normal route. Voice stays encrypted as usual. Video uses a separate path.");
         ui.checkbox(
             &mut self.prefs.audio.voice_qos,

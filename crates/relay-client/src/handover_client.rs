@@ -55,6 +55,8 @@ pub enum Stage {
     Checked,
     StoppingSource,
     Active,
+    /// Read-only recovery of the exact signed grant while the source is offline.
+    RecoveredGrant,
     Stopped,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,7 +307,7 @@ impl Job {
                 if let Err(error) = result {
                     v.stage = Stage::Stopped;
                     v.fault = Some(error);
-                } else if !matches!(v.stage, Stage::Active | Stage::Checked) {
+                } else if !matches!(v.stage, Stage::Active | Stage::Checked | Stage::RecoveredGrant) {
                     v.stage = Stage::Complete;
                 }
                 v.finished = true;
@@ -849,7 +851,20 @@ fn run(
         progress(Stage::Preparing, 0, 0, 0, None, Some(encode_card(&card)?));
         return Ok(());
     }
-    let mut s = status(remote)?;
+    let mut s = match status(remote) {
+        Ok(status) => status,
+        Err(Fault::Connection) if matches!(&action, Action::Inspect) => {
+            // The source may legitimately be offline after its irreversible
+            // grant. Inspecting a matching durable receipt must not strand the
+            // destination behind a connection error. recover validates the
+            // origin, source pin/term, receipt and signed grant; it starts nothing.
+            let recipe = crate::handover_runtime::recover_at(remote.origin(), remote.pin(), data)?
+                .ok_or(Fault::Connection)?;
+            progress(Stage::RecoveredGrant, 0, 0, 0, Some(recipe.status), None);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     progress(Stage::Checking, 0, 0, 0, Some(s.clone()), None);
     if matches!(&action, Action::CheckDestination | Action::Complete { .. }) {
         let finish=matches!(&action,Action::Complete{..});
@@ -1217,6 +1232,7 @@ mod tests {
         requested: Vec<usize>,
         fail: bool,
         receipts: usize,
+        status_fault: Option<Fault>,
     }
     fn fixture() -> (Mock, Helper) {
         let (source, target, pin, grant) = crate::host_route::tests::fixture();
@@ -1311,6 +1327,7 @@ mod tests {
                 requested: vec![],
                 fail: true,
                 receipts: 0,
+                status_fault: None,
             },
             helper,
         )
@@ -1330,6 +1347,7 @@ mod tests {
             _: u64,
         ) -> Result<T> {
             let value = if !post && path == ROOT {
+                if let Some(fault) = self.status_fault { return Err(fault); }
                 json!(self.status)
             } else if path.ends_with("/export") {
                 json!(model::ExportStatus::Ready {
@@ -1404,6 +1422,46 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn offline_inspection_recovers_only_its_exact_signed_grant_without_starting_a_host() {
+        let (mut remote, mut helper) = fixture();
+        let recipe = crate::handover_runtime::tests::recipe();
+        recipe.validate().unwrap();
+        remote.origin = recipe.origin.clone();
+        remote.pin = model::RoutePin {
+            server_id: recipe.status.server_id.clone(),
+            host: recipe.status.source_identity.clone().unwrap(),
+            term: recipe.status.term,
+        };
+        remote.status_fault = Some(Fault::Connection);
+        let folder = tempfile::tempdir().unwrap();
+        let record = folder.path().join("granted-host.json");
+        let original = serde_json::to_vec(&recipe).unwrap();
+        fs::write(&record, &original).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut inspected = None;
+        run(&mut remote, &mut helper, folder.path(), Action::Inspect, &cancel,
+            |stage, _, _, _, status, _| {
+                assert_eq!(stage, Stage::RecoveredGrant);
+                inspected = status;
+            }).unwrap();
+        assert_eq!(inspected.unwrap().retired, recipe.status.retired);
+        assert_eq!(helper.received, 0, "inspection cannot import or activate a host");
+        assert!(remote.requested.is_empty());
+        assert_eq!(fs::read(&record).unwrap(), original);
+        remote.pin.term += 1;
+        assert_eq!(run(&mut remote, &mut helper, folder.path(), Action::Inspect, &cancel,
+            |_, _, _, _, _, _| {}).unwrap_err(), Fault::Binding);
+        remote.pin.term -= 1;
+        remote.status_fault = Some(Fault::Denied);
+        assert_eq!(run(&mut remote, &mut helper, folder.path(), Action::Inspect, &cancel,
+            |_, _, _, _, _, _| {}).unwrap_err(), Fault::Denied);
+        remote.status_fault = Some(Fault::Connection);
+        fs::remove_file(&record).unwrap();
+        assert_eq!(run(&mut remote, &mut helper, folder.path(), Action::Inspect, &cancel,
+            |_, _, _, _, _, _| {}).unwrap_err(), Fault::Connection);
+    }
+
     #[test]
     fn encrypted_download_resumes_missing_parts_and_never_activates() {
         let (mut remote, mut local) = fixture();

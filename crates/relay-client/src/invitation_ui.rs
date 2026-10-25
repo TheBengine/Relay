@@ -426,7 +426,7 @@ impl RelayApp {
             .default_width(400.0);
         // The shared header (title, Close, Escape) stays above the scrolling body.
         if host_setup_ui::show_with_header(ctx, window, "Invite someone", |ui| {
-            ui.label("Copy the invitation and send it to your friend in any chat. They paste it into Relay.");
+            ui.label("Send this link to your friend in any chat. They click it, then choose Open Relay in their browser. They can also paste it into Join a server in the app.");
             ui.add_space(12.0);
             let offer = self.prefs.connection.offer.clone();
             let final_invitation = Invitation::new(
@@ -454,10 +454,20 @@ impl RelayApp {
                 host_setup_ui::local_invitation_notice(ui);
             }
             let link = final_invitation.map(|invite| invite.for_sharing().browser_link());
+            // Keep feedback in the dialog and bound to the exact invitation;
+            // editing the address or opening another invite must not say Copied.
+            let copied_id = egui::Id::new(("invitation-copied", link.as_ref().ok()));
+            let copied = ctx.data(|data| data.get_temp::<Instant>(copied_id))
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(5));
+            if copied {
+                ctx.request_repaint_after(Duration::from_secs(5));
+            }
             if ui
                 .add_enabled(
                     link.is_ok(),
-                    primary(if local_only {
+                    primary(if copied {
+                        "Copied — ready to send"
+                    } else if local_only {
                         "Copy local invitation"
                     } else {
                         "Copy invitation"
@@ -468,6 +478,7 @@ impl RelayApp {
             {
                 if let Ok(link) = &link {
                     ui.output_mut(|output| output.copied_text = link.clone());
+                    ctx.data_mut(|data| data.insert_temp(copied_id, Instant::now()));
                     self.notice = Some(("Invitation copied".into(), Instant::now()));
                 }
             }

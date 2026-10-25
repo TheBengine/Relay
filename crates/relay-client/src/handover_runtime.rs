@@ -193,6 +193,9 @@ pub fn remembered() -> Result<Option<Recipe>> {
 }
 pub fn recover(origin: &CommandOrigin, pin: &model::RoutePin) -> Result<Option<Recipe>> {
     let data = crate::handover_client::directory(origin)?;
+    recover_at(origin, pin, &data)
+}
+pub(crate) fn recover_at(origin: &CommandOrigin, pin: &model::RoutePin, data: &Path) -> Result<Option<Recipe>> {
     let mut recipe = read_record(&data.join("granted-host.json"))?;
     if recipe.is_none() {
         recipe = read_record(&data.join("standby-host.json"))?;

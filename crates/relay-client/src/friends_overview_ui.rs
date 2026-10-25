@@ -76,10 +76,14 @@ impl RelayApp {
                     &row.user.id,
                 ),
                 |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(profile_ui::display_name(&row.user)).strong());
-                            ui.label(RichText::new(&row.server_name).color(c_muted()));
+                    let (identity_width, action_width) = friend_row_widths(ui);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.allocate_ui_with_layout(Vec2::new(identity_width, 0.0), Layout::top_down(Align::Min), |ui| {
+                            let name = profile_ui::display_name(&row.user);
+                            ui.add(egui::Label::new(RichText::new(name).strong()).truncate(true))
+                                .on_hover_text(name);
+                            ui.add(egui::Label::new(RichText::new(&row.server_name).color(c_muted())).truncate(true))
+                                .on_hover_text(&row.server_name);
                             ui.label(
                                 RichText::new(if !connected {
                                     "Server disconnected · last known list"
@@ -106,7 +110,7 @@ impl RelayApp {
                                 .color(c_muted()),
                             );
                         });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.allocate_ui_with_layout(Vec2::new(action_width, 0.0), Layout::right_to_left(Align::Center), |ui| {
                             if current
                                 && row.relationship
                                     == crate::community_friends::Relationship::Friend

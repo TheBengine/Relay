@@ -8,6 +8,17 @@ impl RelayApp {
     /// Who you hear in the call, one dot per person, and a hint when
     /// someone stays silent.
     fn sound_check(&mut self, ui: &mut egui::Ui, members: &[VoiceMember]) {
+        let local_volume_issue = crate::audio_settings::LocalVolumeIssue::current(
+            &self.audio_applied,
+            self.muted,
+            self.deafened,
+        );
+        if let Some(issue) = local_volume_issue {
+            if voice_room_ui::local_volume_help(ui, issue) {
+                self.apply_quick_audio_change(|audio| issue.restore(audio));
+            }
+            ui.add_space(8.0);
+        }
         let own = self.session.as_ref().map(|s| s.user.id.clone());
         let now = Instant::now();
         let heard = if self.capture_path.is_some() {
@@ -56,7 +67,11 @@ impl RelayApp {
                     .unwrap_or_default(),
             })
             .collect();
-        let hint = voice_room_ui::sound_hint(self.deafened, &rows);
+        let hint = if local_volume_issue.is_none() {
+            voice_room_ui::sound_hint(self.deafened, &rows)
+        } else {
+            None
+        };
         voice_room_ui::sound_check(ui, &rows, hint.as_deref());
         let fixture = ui
             .ctx()
@@ -385,6 +400,19 @@ impl RelayApp {
             self.call_protection_notice(ui);
             if joined && (ready || self.capture_path.is_some()) {
                 self.sound_check(ui, &members);
+                if let Some(stats) = self.media.as_ref().filter(|_| self.capture_path.is_none()).map(|media| media.network_stats()) {
+                    let friends_call = self.bootstrap.as_ref().is_some_and(|b| b.capabilities.iter().any(|cap| cap == "people-v1"));
+                    if let Some(enabled) = voice_room_ui::local_gateway_controls(
+                        ui,
+                        self.audio_applied.local_voice_gateways,
+                        stats.gateway_available,
+                        stats.gateway_active,
+                        friends_call,
+                    ) {
+                        self.apply_quick_audio_change(|audio| audio.local_voice_gateways = enabled);
+                    }
+                    ui.add_space(16.0);
+                }
             }
             if members.is_empty() {
                 ui.add_space(30.0);

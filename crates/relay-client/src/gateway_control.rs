@@ -12,8 +12,8 @@ use std::{
     io::Read,
     net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -24,6 +24,123 @@ const ROOT: &str = "/api/hosting/voice-gateways";
 const PERIOD: Duration = Duration::from_millis(400);
 const RETRY: Duration = Duration::from_secs(5);
 const MAX_IDS: usize = 4096;
+
+#[cfg(test)]
+mod toggle_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn rapid_reenable_retires_old_path_and_preserves_new_call() {
+        let enabled = Arc::new(Toggle::new(true));
+        let path = || {
+            let now = Instant::now();
+            Path::new("127.0.0.1:49899".parse().unwrap(), Grant {
+                id: [13; 16], session: 7, key: Zeroizing::new([53; 32]),
+                valid_for: Duration::from_secs(2),
+            }, now, now).unwrap()
+        };
+        let old = Session::fixture(path(), enabled.clone());
+        let admitted = enabled.revision();
+        assert!(old.with_path(|p| p.id()).is_some());
+        old.state.lock().unwrap().active = true;
+        enabled.store(false, Ordering::Release);
+        enabled.store(true, Ordering::Release);
+        // Both worker loops could still be awaiting a broker response. The
+        // audio path must reject their old admission without awaiting cleanup.
+        assert!(!enabled.current(admitted));
+        assert!(old.with_path(|p| p.id()).is_none());
+        assert!(old.wrap_selected(&[0], Instant::now()).is_err());
+        assert_eq!(old.select(Instant::now(), 0, true), (false, true));
+        assert_eq!(old.state.lock().unwrap().seen.len(), 1);
+        let new_call = Session::fixture(path(), enabled.clone());
+        drop(old);
+        assert!(enabled.load(Ordering::Acquire));
+        assert!(new_call.with_path(|p| p.id()).is_some());
+    }
+
+    #[test]
+    fn dormant_workers_wake_on_live_opt_in_and_call_stop() {
+        for enable in [true, false] {
+            let toggle = Arc::new(Toggle::new(false));
+            let alive = Arc::new(AtomicBool::new(true));
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let toggle = toggle.clone();
+                let alive = alive.clone();
+                let ready = ready_tx.clone();
+                let done = done_tx.clone();
+                workers.push(thread::spawn(move || {
+                    ready.send(()).unwrap();
+                    toggle.wait_enabled(&|| alive.load(Ordering::Acquire));
+                    done.send(()).unwrap();
+                }));
+            }
+            for _ in 0..2 { ready_rx.recv_timeout(Duration::from_secs(2)).unwrap(); }
+            let dormant = done_rx.recv_timeout(Duration::from_millis(40)).is_err();
+            if enable {
+                toggle.store(true, Ordering::Release);
+            } else {
+                // Session::drop sets the stop flag, then wakes both worker loops.
+                alive.store(false, Ordering::Release);
+                toggle.wake();
+            }
+            let first = done_rx.recv_timeout(Duration::from_secs(2));
+            let second = done_rx.recv_timeout(Duration::from_secs(2));
+            // Unpark before assertions so a failed regression leaves no worker.
+            alive.store(false, Ordering::Release);
+            toggle.wake();
+            for worker in workers { worker.join().unwrap(); }
+            assert!(dormant, "disabled workers must stay dormant");
+            assert!(first.is_ok() && second.is_ok(), "both workers must wake");
+        }
+    }
+}
+
+/// The user's live opt-in. Dormant call workers sleep until it changes, without
+/// polling the broker or opening a LAN/private gateway socket before consent.
+pub(crate) struct Toggle {
+    // Bit zero is the opt-in; the remaining bits change on every transition.
+    // An off/on pair must retire old grants even during a pending HTTP request.
+    revision: AtomicU64,
+    wait_lock: Mutex<()>,
+    changed: Condvar,
+}
+impl Toggle {
+    pub fn new(enabled: bool) -> Self {
+        Self { revision: AtomicU64::new(u64::from(enabled)), wait_lock: Mutex::new(()), changed: Condvar::new() }
+    }
+    pub fn load(&self, order: Ordering) -> bool { self.revision.load(order) & 1 != 0 }
+    fn revision(&self) -> u64 { self.revision.load(Ordering::Acquire) }
+    fn current(&self, revision: u64) -> bool { revision & 1 != 0 && self.revision() == revision }
+    pub fn store(&self, enabled: bool, order: Ordering) {
+        let _guard = self.wait_lock.lock().ok();
+        let previous = self.revision();
+        if (previous & 1 != 0) != enabled {
+            self.revision.swap(previous.wrapping_add(2) ^ 1, order);
+            self.changed.notify_all();
+        }
+    }
+    fn wake(&self) {
+        let _guard = self.wait_lock.lock().ok();
+        self.changed.notify_all();
+    }
+    fn wait_enabled(&self, alive: &dyn Fn() -> bool) {
+        let Ok(mut guard) = self.wait_lock.lock() else { return; };
+        while alive() && !self.load(Ordering::Acquire) {
+            let Ok(next) = self.changed.wait(guard) else { return; };
+            guard = next;
+        }
+    }
+    fn wait(&self, alive: &dyn Fn() -> bool, duration: Duration, revision: u64) {
+        let Ok(guard) = self.wait_lock.lock() else { return; };
+        if alive() && self.current(revision) {
+            drop(self.changed.wait_timeout(guard, duration));
+        }
+    }
+}
 
 /// Not Debug: request factories carry an ordinary authenticated session.
 pub(crate) struct Config {
@@ -139,20 +256,22 @@ fn grant(id: &str, session: u64, key: &mut String, ttl: u32) -> Option<Grant> {
 #[derive(Default)]
 struct State {
     path: Option<Path>,
+    revision: u64,
     active: bool,
     seen: HashSet<[u8; 16]>,
 }
 pub(crate) struct Session {
     state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
-    enabled: Arc<AtomicBool>,
+    enabled: Arc<Toggle>,
 }
 impl Session {
     #[cfg(test)]
-    pub fn fixture(path: Path, enabled: Arc<AtomicBool>) -> Self {
+    pub fn fixture(path: Path, enabled: Arc<Toggle>) -> Self {
         let mut state = State::default();
         state.seen.insert(path.id());
         state.path = Some(path);
+        state.revision = enabled.revision();
         Self {
             state: Arc::new(Mutex::new(state)),
             stop: Arc::new(AtomicBool::new(false)),
@@ -162,12 +281,12 @@ impl Session {
     pub fn start(
         config: Config,
         upstream: SocketAddr,
-        enabled: Arc<AtomicBool>,
+        enabled: Arc<Toggle>,
         call_stop: Arc<AtomicBool>,
     ) -> Option<Self> {
         // An ordinary per-person loopback route must never be shared. The iroh
         // mode instead opens a dedicated independent endpoint in serve_loop.
-        if !enabled.load(Ordering::Acquire) || !upstream.is_ipv4()
+        if !upstream.is_ipv4()
             || (upstream.ip().is_loopback() && config.private_route.is_none()) {
             return None;
         }
@@ -191,20 +310,23 @@ impl Session {
         let use_state = state.clone();
         let use_valid = valid.clone();
         let use_alive = alive.clone();
+        let use_enabled = enabled.clone();
         thread::Builder::new()
             .name("voice-gateway-admission".into())
             .spawn(move || {
-                lease_loop(config, use_state, use_valid, use_alive);
+                lease_loop(config, use_state, use_valid, use_alive, use_enabled);
             })
             .ok()?;
+        let serve_enabled = enabled.clone();
         if thread::Builder::new()
             .name("voice-gateway-grants".into())
             .spawn(move || {
-                serve_loop(serving, upstream, valid, alive);
+                serve_loop(serving, upstream, valid, alive, serve_enabled);
             })
             .is_err()
         {
             stop.store(true, Ordering::Release);
+            enabled.wake();
             return None;
         }
         Some(Self {
@@ -218,6 +340,7 @@ impl Session {
             return None;
         }
         let mut state = self.state.lock().ok()?;
+        if !self.enabled.current(state.revision) { return None; }
         Some(f(state.path.as_mut()?))
     }
     /// A change is committed by an authenticated keepalive before any audio.
@@ -225,7 +348,7 @@ impl Session {
         let Ok(mut state) = self.state.lock() else {
             return (false, false);
         };
-        let active = self.enabled.load(Ordering::Acquire)
+        let active = self.enabled.current(state.revision)
             && !self.stop.load(Ordering::Acquire)
             && state
                 .path
@@ -249,7 +372,7 @@ impl Session {
         if !state.active {
             return Ok(None);
         }
-        if !self.enabled.load(Ordering::Acquire) {
+        if !self.enabled.current(state.revision) || self.stop.load(Ordering::Acquire) {
             return Err(());
         }
         let path = state.path.as_mut().ok_or(())?;
@@ -262,6 +385,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.enabled.wake();
         if let Ok(mut state) = self.state.lock() {
             state.path = None;
             state.active = false;
@@ -271,12 +395,6 @@ impl Drop for Session {
     }
 }
 
-fn wait(alive: &dyn Fn() -> bool, duration: Duration) {
-    let end = Instant::now() + duration;
-    while alive() && Instant::now() < end {
-        thread::sleep(Duration::from_millis(50));
-    }
-}
 fn release(config: &Config, id: &str) {
     discard(config.release.try_clone().map(|r| {
         r.query(&[
@@ -291,14 +409,16 @@ fn lease_loop(
     state: Arc<Mutex<State>>,
     valid: Arc<dyn Fn() -> bool + Send + Sync>,
     alive: Arc<dyn Fn() -> bool + Send + Sync>,
+    enabled: Arc<Toggle>,
 ) {
     let mut offer: Option<wire::GatewayOffer> = None;
     let mut lease_id: Option<String> = None;
     let mut began = Instant::now();
     let mut next_list = Instant::now();
     let mut skip: Option<(String, Instant)> = None;
+    let mut revision = enabled.revision();
     while alive() {
-        if !valid() {
+        if !valid() || !enabled.current(revision) {
             if let Ok(mut shared) = state.lock() {
                 shared.path = None;
             }
@@ -306,7 +426,11 @@ fn lease_loop(
                 release(&config, &id);
             }
             offer = None;
-            wait(alive.as_ref(), PERIOD);
+            // A consent change is not evidence that this gateway failed.
+            skip = None;
+            next_list = Instant::now();
+            revision = enabled.revision();
+            enabled.wait_enabled(alive.as_ref());
             continue;
         }
         if offer.is_none() && Instant::now() >= next_list {
@@ -327,7 +451,7 @@ fn lease_loop(
             }
         }
         let Some(candidate) = offer.as_ref() else {
-            wait(alive.as_ref(), PERIOD);
+            enabled.wait(alive.as_ref(), PERIOD, revision);
             continue;
         };
         let requested = Instant::now();
@@ -347,7 +471,7 @@ fn lease_loop(
                 && response.gateway_id == candidate.gateway_id
                 && response.instance == candidate.instance
                 && address == expected;
-            if matching && valid() {
+            if matching && valid() && enabled.current(revision) {
                 if let Some(grant) = grant(
                     &response.lease_id,
                     response.session_id,
@@ -365,15 +489,20 @@ fn lease_loop(
                                 began = Instant::now();
                             }
                         }
+                        shared.revision = revision;
                     }
                     lease_id = Some(response.lease_id.clone());
                 }
+            } else if matching && wire::decode_id(&response.lease_id).is_some() {
+                // A reply arriving after Stop belongs to this retired attempt,
+                // even if the user has already enabled gateways again.
+                release(&config, &response.lease_id);
             }
             response.key.zeroize();
         }
         // A missing renewal response does not revoke a still-valid admission.
         // Leave room for a retry; local expiry still fails closed in the data path.
-        if transient && valid() {
+        if transient && valid() && enabled.current(revision) {
             accepted = state.lock().is_ok_and(|s| {
                 s.path
                     .as_ref()
@@ -402,7 +531,7 @@ fn lease_loop(
             offer = None;
             next_list = Instant::now() + PERIOD;
         }
-        wait(alive.as_ref(), PERIOD);
+        enabled.wait(alive.as_ref(), PERIOD, revision);
     }
     if let Some(id) = lease_id {
         release(&config, &id);
@@ -422,27 +551,30 @@ fn serve_loop(
     upstream: SocketAddr,
     valid: Arc<dyn Fn() -> bool + Send + Sync>,
     alive: Arc<dyn Fn() -> bool + Send + Sync>,
+    enabled: Arc<Toggle>,
 ) {
     let mut backoff = RETRY;
     let mut nic_cursor = 0usize;
     while alive() {
         if !valid() {
-            wait(alive.as_ref(), PERIOD);
+            enabled.wait_enabled(alive.as_ref());
             continue;
         }
+        let revision = enabled.revision();
+        let valid = || valid() && enabled.current(revision);
         // Iroh gets its own helper client/voice socket; normal voice keeps its
         // existing endpoint, application address, sequence and admission.
         let private = match &config.private_route {
             Some((saved, server_id)) => match crate::iroh_route::PreparedRoute::open_voice_gateway(saved, server_id) {
                 Ok(route) if alive() && valid() => Some(route),
-                _ => { wait(alive.as_ref(), RETRY); continue; }
+                _ => { enabled.wait(alive.as_ref(), RETRY, revision); continue; }
             },
             None => None,
         };
         let fixed = match &private {
             Some(route) => match route.voice_gateway_address() {
                 Ok(address) => address,
-                Err(_) => { wait(alive.as_ref(), RETRY); continue; }
+                Err(_) => { enabled.wait(alive.as_ref(), RETRY, revision); continue; }
             },
             None => upstream,
         };
@@ -453,13 +585,13 @@ fn serve_loop(
             UdpSocket::bind("0.0.0.0:0").and_then(|s| {s.connect(upstream)?; s.local_addr()}).ok()
                 .filter(|a|matches!(a.ip(),IpAddr::V4(ip) if ip.is_private())).map(|a|vec![a.ip()]).unwrap_or_default()
         };
-        if binds.is_empty() { wait(alive.as_ref(), RETRY); continue; }
+        if binds.is_empty() { enabled.wait(alive.as_ref(), RETRY, revision); continue; }
         let local = binds[nic_cursor % binds.len()];
         nic_cursor = nic_cursor.wrapping_add(1);
         // The owned lease is declared before Worker, so packets stop before its
         // helper endpoint is closed on every exit from this serving attempt.
         let Ok(worker) = Worker::start(SocketAddr::new(local, 0), fixed) else {
-            wait(alive.as_ref(), RETRY);
+            enabled.wait(alive.as_ref(), RETRY, revision);
             continue;
         };
         let mut private_renewal = Instant::now() + Duration::from_secs(30);
@@ -483,7 +615,7 @@ fn serve_loop(
                         if v.instance == instance
                             && v.session_id == config.session
                             && (30..=wire::REGISTRATION_TTL_SECS).contains(&v.expires_in_secs)
-                            && v.max_grants <= 32 =>
+                            && v.max_grants <= 32 && valid() =>
                     {
                         registered_until = requested + Duration::from_secs(v.expires_in_secs);
                         renewal = Instant::now() + Duration::from_secs(30);
@@ -520,7 +652,7 @@ fn serve_loop(
                             .all(|(_, end)| *end > Instant::now() + Duration::from_millis(300)) =>
                 {
                     missed_polls += 1;
-                    wait(alive.as_ref(), PERIOD);
+                    enabled.wait(alive.as_ref(), PERIOD, revision);
                     continue;
                 }
                 _ => break,
@@ -569,7 +701,7 @@ fn serve_loop(
                 // uses this instance. Every path is measured before selection.
                 if binds.len() > 1 && Instant::now() >= idle_until { break; }
             }
-            wait(alive.as_ref(), PERIOD);
+            enabled.wait(alive.as_ref(), PERIOD, revision);
         }
         drop(worker);
         drop(private);
@@ -579,6 +711,6 @@ fn serve_loop(
                 ("session_id", config.session.to_string()),
             ])
         }));
-        wait(alive.as_ref(), backoff);
+        enabled.wait(alive.as_ref(), backoff, revision);
     }
 }

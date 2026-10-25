@@ -214,6 +214,15 @@ impl RelayApp {
                     });
                 });
         }
+        // The empty conversation has the full first-steps card below. Once a
+        // message arrives, keep the compact next action outside virtualized
+        // history so sending a hello does not hide the route into voice.
+        if !searching && self.messages_ready && !self.messages.is_empty() {
+            let mut checklist = std::mem::take(&mut self.prefs.host_checklist);
+            let panel = self.host_next_steps_panel(ui, &mut checklist);
+            self.prefs.host_checklist = checklist;
+            if panel.changed { self.defer_preferences(); }
+        }
         let chat_rect = ui.available_rect_before_wrap();
         let interacted = ui.ctx().input(|input| chat_scroll_intent(input, chat_rect));
         if interacted
@@ -855,28 +864,21 @@ impl RelayApp {
                             .as_ref()
                             .is_some_and(|(id, _)| *id == message.id);
                         if editing {
+                            let enabled = !self.modal_open() && ui.is_enabled();
+                            let pending = self.pending_edits.contains(&message.id);
                             let (_, value) = self.editing.as_mut().unwrap();
-                            ui.add_enabled(
-                                !self.pending_edits.contains(&message.id),
-                                egui::TextEdit::multiline(value)
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(2)
-                                    .char_limit(4000)
-                                    .font(FontId::proportional(font_size(15.0))),
+                            let (save, cancel) = message_edit_controls(
+                                ui,
+                                egui::Id::new(("message-editor", &message.id)),
+                                value,
+                                !message.attachments.is_empty(),
+                                pending,
+                                enabled,
                             );
-                            let value = value.trim().to_owned();
-                            let content = self.expand_message_shortcodes(&value);
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(
-                                        !self.pending_edits.contains(&message.id),
-                                        primary("Save"),
-                                    )
-                                    .clicked()
-                                {
-                                    let Some(origin) = self.command_origin() else {
-                                        return;
-                                    };
+                            if save {
+                                let value = value.trim().to_owned();
+                                let content = self.expand_message_shortcodes(&value);
+                                if let Some(origin) = self.command_origin() {
                                     match self.network.send(Command::EditMessage {
                                         origin,
                                         message_id: message.id.clone(),
@@ -888,10 +890,10 @@ impl RelayApp {
                                         Err(error) => self.error = Some(error),
                                     }
                                 }
-                                if ui.add(secondary("Cancel")).clicked() {
-                                    self.editing = None;
-                                }
-                            });
+                            }
+                            if cancel {
+                                self.editing = None;
+                            }
                         } else if self.poll_view(ui, message) {
                         } else if (!message.content.is_empty() && !gif_only)
                             || self.compact
@@ -1281,7 +1283,7 @@ impl RelayApp {
                             }
                             if owner && icon_button(ui, Icon::Edit, false, "Edit message").clicked()
                             {
-                                self.editing = Some((message.id.clone(), message.content.clone()));
+                                self.begin_message_edit(ui, message);
                             }
                             let menu =
                                 ui.menu_button("•••", |ui| self.message_actions(ui, message));
@@ -1351,8 +1353,8 @@ impl RelayApp {
             .is_some_and(|s| s.user.id == message.author.id)
             && ui.button("Edit message").clicked()
         {
-            self.editing = Some((message.id.clone(), message.content.clone()));
             ui.close_menu();
+            self.begin_message_edit(ui, message);
         }
         if self.session.as_ref().is_some_and(|s| {
             s.user.id == message.author.id
@@ -1368,6 +1370,50 @@ impl RelayApp {
             ui.close_menu();
         }
     }
+
+    fn begin_message_edit(&mut self, ui: &egui::Ui, message: &Message) {
+        self.editing = Some((message.id.clone(), message.content.clone()));
+        ui.ctx().memory_mut(|memory| {
+            memory.request_focus(egui::Id::new(("message-editor", &message.id)));
+        });
+    }
+}
+
+/// Consume the save shortcut before the multiline editor can insert a newline.
+/// Escape continues through the app's existing modal-aware dismiss handling.
+fn message_edit_controls(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    value: &mut String,
+    has_files: bool,
+    pending: bool,
+    enabled: bool,
+) -> (bool, bool) {
+    let shortcut = enabled
+        && !pending
+        && ui.memory(|memory| memory.has_focus(id))
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
+    ui.add_enabled(
+        enabled && !pending,
+        egui::TextEdit::multiline(value)
+            .id(id)
+            .desired_width(f32::INFINITY)
+            .desired_rows(2)
+            .char_limit(4000)
+            .font(FontId::proportional(font_size(15.0))),
+    );
+    let valid = has_files || !value.trim().is_empty();
+    let (save, cancel) = ui.horizontal_wrapped(|ui| {
+        let save = ui.add_enabled(enabled && !pending && valid, primary(if pending { "Saving…" } else { "Save" })).clicked();
+        let cancel = ui.add_enabled(enabled, secondary("Cancel")).clicked();
+        (save, cancel)
+    }).inner;
+    ui.add(egui::Label::new(RichText::new(if valid {
+        "Ctrl+Enter to save · Esc to cancel · Enter for a new line"
+    } else {
+        "Add text to save, or use Delete message to remove it."
+    }).size(font_size(TEXT_CAPTION)).color(c_muted())).wrap(true));
+    (save || (shortcut && valid), cancel)
 }
 
 /// The direct message introduction's fixed height: room for an 80 px avatar,
@@ -1380,4 +1426,70 @@ fn direct_intro_height() -> f32 {
         + 10.0
         + font_size(15.0) * 1.4 * 2.0
         + 20.0
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+
+    fn frame(
+        context: &egui::Context,
+        text: &mut String,
+        modifiers: Option<egui::Modifiers>,
+        has_files: bool,
+        pending: bool,
+        enabled: bool,
+    ) -> bool {
+        let mut save = false;
+        let _ = context.run(
+            egui::RawInput {
+                focused: true,
+                events: modifiers.into_iter().map(|modifiers| egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }).collect(),
+                modifiers: modifiers.unwrap_or_default(),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    save = message_edit_controls(ui, egui::Id::new("editor"), text, has_files, pending, enabled).0;
+                });
+            },
+        );
+        save
+    }
+
+    #[test]
+    fn message_edit_shortcut_is_focused_and_does_not_insert_a_newline() {
+        let context = egui::Context::default();
+        configure(&context);
+        let id = egui::Id::new("editor");
+        let command = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
+        let mut text = "Existing message".to_owned();
+        frame(&context, &mut text, None, false, false, true);
+        context.memory_mut(|memory| memory.request_focus(id));
+        assert!(frame(&context, &mut text, Some(command), false, false, true));
+        assert_eq!(text, "Existing message");
+        context.memory_mut(|memory| memory.surrender_focus(id));
+        assert!(!frame(&context, &mut text, Some(command), false, false, true));
+        context.memory_mut(|memory| memory.request_focus(id));
+        assert!(!frame(&context, &mut text, Some(egui::Modifiers::NONE), false, false, true));
+        assert!(text.contains('\n'));
+        assert_eq!(text.replace('\n', ""), "Existing message");
+        context.memory_mut(|memory| memory.request_focus(id));
+        assert!(!frame(&context, &mut text, Some(command), false, true, true));
+        context.memory_mut(|memory| memory.request_focus(id));
+        assert!(!frame(&context, &mut text, Some(command), false, false, false));
+        text.clear();
+        frame(&context, &mut text, None, false, false, true);
+        context.memory_mut(|memory| memory.request_focus(id));
+        assert!(!frame(&context, &mut text, Some(command), false, false, true));
+        assert!(text.is_empty());
+        context.memory_mut(|memory| memory.request_focus(id));
+        assert!(frame(&context, &mut text, Some(command), true, false, true));
+    }
 }

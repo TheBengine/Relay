@@ -91,6 +91,13 @@ pub struct JoinFlow {
 }
 
 impl JoinFlow {
+    /// A join the user is working on, including an unopened deep link. This
+    /// only chooses which screen to resume; parsing, identity checks and the
+    /// explicit Join action still run in the normal invitation flow.
+    pub fn has_invitation_input(&self) -> bool {
+        self.setup.invitation.is_some() || !self.setup.invitation_text.trim().is_empty()
+    }
+
     /// Only a worker-verified delegation may change the invitation's destination.
     /// A late answer must never replace a newly edited form or its credentials.
     pub fn accept_checked(

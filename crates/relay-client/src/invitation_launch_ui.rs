@@ -82,7 +82,21 @@ impl RelayApp {
                 }
             }
         }
-        let invitation = pending.take_ready(self.busy, updating, self.invitation_form());
+        // Keep the capability in the existing volatile slot while account
+        // sign-in or automatic server reopening can still reset setup forms.
+        // Afterward it opens the ordinary Join screen for the active session.
+        let account_gate = self.central_account.provider.is_some()
+            && self.central_account.account.is_none()
+            && !self.account_start.bypass;
+        let changing_account = account_gate
+            || self.central_account.waiting()
+            || self.account_start.pending.is_some()
+            || self.account_start.auto.is_some();
+        let invitation = pending.take_ready(
+            self.busy || changing_account,
+            updating,
+            self.invitation_form(),
+        );
         self.external_invitation = pending;
         if let Some(invitation) = invitation {
             if self.session.is_some() {
