@@ -193,9 +193,18 @@ impl RelayApp {
                             self.central_account.start(ctx.clone());
                         }
                         ui.add_space(24.0);
-                        ui.horizontal_wrapped(|ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().interact_size.y = 20.0;
+                            ui.spacing_mut().button_padding = Vec2::ZERO;
+                            ui.spacing_mut().item_spacing.y = 4.0;
                             ui.label(RichText::new("New to Relay?").color(c_muted()));
-                            if entry_surface::text_action(ui, "Create account").clicked() {
+                            let create_account = egui::Button::new(
+                                RichText::new("Create account")
+                                    .text_style(egui::TextStyle::Body)
+                                    .color(ui.visuals().hyperlink_color),
+                            )
+                            .frame(false);
+                            if ui.add(create_account).clicked() {
                                 #[cfg(windows)]
                                 if let Some(surface) = &mut self.account_webview {
                                     surface.browser_only = false;
