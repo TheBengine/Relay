@@ -260,6 +260,7 @@ pub enum Command {
         data: PathBuf,
     },
     CreateLocal { server: PathBuf, request: String },
+    OpenLocal { server: PathBuf, server_id: String },
     HostTailscale {
         server: PathBuf,
         data: PathBuf,
@@ -685,6 +686,7 @@ pub enum Update {
     Notice(String),
     Error(String),
     LocalHostFailed(String),
+    LocalOpened(crate::community::SavedCommunity),
     Busy(bool),
     LocalReady {
         created: bool,
@@ -1969,6 +1971,7 @@ impl Worker {
             &command,
             Command::HostLocal { .. }
                 | Command::CreateLocal { .. }
+                | Command::OpenLocal { .. }
                 | Command::HostIroh { .. }
                 | Command::HostTailscale { .. }
                 | Command::HostEmbedded { .. }
@@ -2176,7 +2179,7 @@ impl Worker {
             _ => None,
         };
         let local_hosting = matches!(&command,
-            Command::HostLocal { .. } | Command::CreateLocal { .. } | Command::HostIroh { .. }
+            Command::HostLocal { .. } | Command::CreateLocal { .. } | Command::OpenLocal { .. } | Command::HostIroh { .. }
                 | Command::HostEmbedded { .. } | Command::HostTailscale { .. }
                 | Command::RestoreLocal { .. });
         self.send_wait = None;
@@ -2459,6 +2462,30 @@ impl Worker {
         } = command
         {
             return self.restore_app_host(server, data, expected);
+        }
+        if let Command::OpenLocal { server, server_id } = command {
+            let data = crate::local_host::community_directory(&server_id)?;
+            let previous = crate::local_host::data_directory().ok()
+                .and_then(|data| crate::local_host::AppHost::load(&data)).map(|plan| plan.server_id);
+            if self.local_server_ready()
+                && !self.local_identity().is_some_and(|live| live.server_id == server_id)
+            {
+                if self.owned_local.is_none() {
+                    return Err("Another local host is running. Close it normally before opening this server.".into());
+                }
+                self.close_app_host()?;
+            }
+            self.detach_local_connections()?;
+            let saved = crate::local_host::select_community(&server_id)?;
+            if let Err(error) = self.restore_app_host(server, data, server_id.clone()) {
+                if let Some(previous) = previous { let _ = crate::local_host::select_community(&previous); }
+                return Err(error);
+            }
+            if !self.local_identity().is_some_and(|live| live.server_id == server_id) {
+                return Err("A different local server answered. Your account was not connected.".into());
+            }
+            self.emit(Update::LocalOpened(saved));
+            return Ok(());
         }
         match &command {
             Command::Auth {
@@ -3089,13 +3116,7 @@ impl Worker {
                     }
                     self.close_app_host()?;
                 }
-                if self.connection.as_ref().is_some_and(|c| crate::local_host::is_local_url(&c.url)) {
-                    self.cancel_transfers();
-                    self.clear_voice_intent();
-                    self.connection = None;
-                    self.socket_stop.store(true, Ordering::Relaxed);
-                    self.emit(Update::Disconnected);
-                }
+                self.detach_local_connections()?;
                 let data = crate::local_host::create_directory(&request)?;
                 self.host_local(server.clone(), data.clone())?;
                 self.remember_local_host(server, data)?;
@@ -3475,6 +3496,32 @@ impl Worker {
                 },
             });
         }
+    }
+
+    fn detach_local_connections(&mut self) -> Result<(), String> {
+        if self.connection.as_ref().is_some_and(|c| crate::local_host::is_local_url(&c.url)) {
+            self.cancel_transfers();
+            self.live.epoch.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut context) = self.live.context.lock() { *context = None; }
+            let gate = self.live.gate.clone();
+            let _guard = gate.lock().map_err(|_| "The media worker stopped.")?;
+            self.clear_voice_intent();
+            self.chat_media_epoch.fetch_add(1, Ordering::SeqCst);
+            self.chat_media_workers = None;
+            self.legacy_reactions.clear();
+            self.connection = None;
+            self.socket_stop.store(true, Ordering::SeqCst);
+            self.emit(Update::Disconnected);
+        }
+        let local: Vec<_> = self.saved_connections.keys()
+            .filter(|url| crate::local_host::is_local_url(url)).cloned().collect();
+        for url in local {
+            if let Some(saved) = self.saved_connections.remove(&url) {
+                saved.stop.store(true, Ordering::SeqCst);
+            }
+        }
+        self.publish_communities();
+        Ok(())
     }
 
     fn host_local(&mut self, server: PathBuf, data: PathBuf) -> Result<(), String> {

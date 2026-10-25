@@ -67,6 +67,8 @@ pub(super) struct State {
     pub(super) auto: Option<AutoEntry>,
     pub(super) hosting_error: Option<String>,
     pub(super) creation_request: Option<String>,
+    pub(super) opening_local: Option<String>,
+    pub(super) local_choices: Option<Vec<SavedCommunity>>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -78,6 +80,8 @@ impl Default for State {
             auto: None,
             hosting_error: None,
             creation_request: None,
+            opening_local: None,
+            local_choices: None,
         }
     }
 }
@@ -316,6 +320,12 @@ impl RelayApp {
                             )
                             .clicked()
                         {
+                            if crate::local_host::is_local_url(&saved.url)
+                                && crate::local_host::community_directory(&saved.server_id).is_ok()
+                            {
+                                self.open_local_server(saved.server_id);
+                                continue;
+                            }
                             self.login.url = saved.url;
                             self.login.registering = false;
                             self.login.setup = Default::default();
@@ -325,6 +335,7 @@ impl RelayApp {
                             self.begin_account_login(false);
                         }
                     }
+                    self.other_local_servers(ui);
                     self.local_host_problem(ui);
                     ui.add_space(12.0);
                     ui.columns(2, |columns| {
@@ -383,7 +394,9 @@ impl RelayApp {
                 ).color(c_muted())).wrap(true));
                 ui.add_space(8.0);
                 if ui.add_enabled(!self.busy, secondary("Retry server")).clicked() {
-                    if let (Some(request), Some(server)) = (self.account_start.creation_request.clone(), crate::local_host::server_binary()) {
+                    if let Some(id) = self.account_start.opening_local.clone() {
+                        self.open_local_server(id);
+                    } else if let (Some(request), Some(server)) = (self.account_start.creation_request.clone(), crate::local_host::server_binary()) {
                         self.account_start.hosting_error = None;
                         self.busy = true;
                         self.send(Command::CreateLocal { server, request });
@@ -394,6 +407,89 @@ impl RelayApp {
                 egui::CollapsingHeader::new("Technical details").id_source("local-host-failure-details")
                     .show(ui, |ui| { ui.add(egui::Label::new(RichText::new(details).small().color(c_muted())).wrap(true)); });
             });
+    }
+
+    pub(super) fn remember_current_local(&mut self) -> Result<(), String> {
+        self.save_preferences();
+        self.account_start.local_choices = None;
+        for saved in &self.prefs.communities {
+            if saved.url == "http://127.0.0.1:4580"
+                && crate::local_host::community_directory(&saved.server_id).is_ok()
+            {
+                crate::local_host::remember_community(saved)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn other_local_servers(&mut self, ui: &mut egui::Ui) -> bool {
+        let servers = self.account_start.local_choices.get_or_insert_with(||
+            crate::local_host::saved_communities().unwrap_or_default()).clone();
+        let current = self.prefs.communities.iter()
+            .find(|saved| saved.url == "http://127.0.0.1:4580").map(|saved| saved.server_id.clone());
+        let others: Vec<_> = servers.into_iter().filter(|saved| Some(&saved.server_id) != current.as_ref()).collect();
+        if others.is_empty() { return false; }
+        ui.add_space(12.0);
+        ui.label(RichText::new("Other servers on this PC").strong());
+        for saved in others {
+            if ui.add_enabled(!self.busy, secondary(&format!("Open {}", saved.name))).clicked() {
+                self.open_local_server(saved.server_id);
+                return true;
+            }
+        }
+        ui.add_space(12.0);
+        false
+    }
+
+    pub(super) fn open_local_server(&mut self, server_id: String) {
+        if let Err(error) = self.remember_current_local() {
+            self.account_start.hosting_error = Some(error);
+            return;
+        }
+        let Some(server) = crate::local_host::server_binary() else {
+            self.account_start.hosting_error = Some("The bundled server is missing. Reinstall Relay to restore it.".into());
+            return;
+        };
+        self.account_start.pending = None;
+        self.account_start.auto = None;
+        self.account_start.creation_request = None;
+        self.account_start.opening_local = Some(server_id.clone());
+        self.account_start.hosting_error = None;
+        self.hosting_setup.cancel_creation();
+        self.hosting_setup.new_host = false;
+        self.hosting_setup.local_ready = false;
+        self.error = None;
+        self.busy = true;
+        self.send(Command::OpenLocal { server, server_id });
+    }
+
+    pub(super) fn local_server_opened(&mut self, saved: SavedCommunity) {
+        if self.account_start.opening_local.as_deref() != Some(saved.server_id.as_str()) { return; }
+        self.account_start.opening_local = None;
+        self.account_start.local_choices = None;
+        self.account_start.hosting_error = None;
+        self.hosting_setup.local_ready = true;
+        self.hosting_setup.entry = host_setup_ui::LoginEntry::Account;
+        self.account_start.home = false;
+        // The inactive host has its own consent and account metadata. Replacing
+        // the loopback slot never carries those choices between communities.
+        self.prefs.communities.retain(|entry| entry.url != saved.url);
+        self.prefs.communities.push(saved.clone());
+        self.community_statuses.remove(&saved.url);
+        self.community_reads.remove(&saved.url);
+        self.community_social.remove(&saved.url);
+        self.community_friends.remove(&saved.url);
+        self.save_preferences();
+        let previous = std::mem::take(&mut self.login);
+        self.login.url = saved.url;
+        self.login.username = saved.username;
+        self.login.registering = false;
+        self.login.setup.saved_server_id = Some(saved.server_id);
+        self.begin_account_login(false);
+        if self.session.is_some() {
+            if let Some(attempt) = &mut self.account_start.pending { attempt.detached = true; }
+            self.login = previous;
+        }
     }
 
     /// Saved servers the Relay account can reopen, excluding Friends and any

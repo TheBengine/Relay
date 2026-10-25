@@ -127,7 +127,10 @@ def owned_media_addresses(owner, udp, tcp):
     values = json.loads(result.stdout.decode('utf-8-sig'))
     if not isinstance(values,list) or not 1 <= len(values) <= 128:
         raise ValueError('Unexpected owned interface snapshot')
-    addresses = {str(ipaddress.ip_address(value)) for value in values}
+    # Windows can suffix link-local IPv6 addresses with an interface zone (%5).
+    # The fixture compares literal IPs, as native candidate stats do, so preserve
+    # the OS-confirmed address bytes without serializing the local zone index.
+    addresses = {str(ipaddress.ip_address(ipaddress.ip_address(value).packed)) for value in values}
     if any(ipaddress.ip_address(value).is_unspecified or ipaddress.ip_address(value).is_multicast for value in addresses):
         raise ValueError('Not a unicast local interface snapshot')
     if native_process(owner['pid']) != before:

@@ -323,6 +323,11 @@ fn create_directory_with(root: &Path, request: &str) -> Result<PathBuf, String> 
         data
     };
     selected.last_creation = Some(request.to_owned());
+    save_choice(root, &selected)?;
+    Ok(data)
+}
+
+fn save_choice(root: &Path, selected: &ServerChoice) -> Result<(), String> {
     let bytes = serde_json::to_vec(&selected).map_err(|_| "Cannot save your server selection.")?;
     let temporary = root.join(format!(".server-choice-{}.tmp", uuid::Uuid::new_v4()));
     use std::io::Write;
@@ -337,7 +342,85 @@ fn create_directory_with(root: &Path, request: &str) -> Result<PathBuf, String> 
     drop(out);
     std::fs::rename(&temporary, root.join("local-server-choice.json"))
         .map_err(|_| "Cannot save your server selection. All server data was kept.")?;
+    Ok(())
+}
+
+fn community_directories(root: &Path) -> Result<Vec<PathBuf>, String> {
+    safe_folder(root)?;
+    let mut paths = vec![root.to_path_buf()];
+    paths.extend(choice(root)?.created.into_iter().map(|id| root.join("communities").join(id)));
+    for path in &paths { safe_folder(path)?; }
+    Ok(paths)
+}
+
+fn directory_identity(data: &Path) -> Option<String> {
+    for name in ["relay.sqlite3", "app-host.json", "managed-instance.json", "app-community.json"] {
+        safe_folder(&data.join(name)).ok()?;
+    }
+    if !data.join("relay.sqlite3").is_file() { return None; }
+    let id = AppHost::load(data).filter(|p| p.validate().is_ok()).map(|p| p.server_id)
+        .or_else(|| read_record(&data.join("managed-instance.json")).ok()?["server_id"].as_str().map(str::to_owned))?;
+    uuid::Uuid::parse_str(&id).ok()?;
+    Some(id)
+}
+
+fn community_directory_in(root: &Path, server_id: &str) -> Result<PathBuf, String> {
+    uuid::Uuid::parse_str(server_id).map_err(|_| "Invalid local server identity.")?;
+    let mut matches = community_directories(root)?.into_iter()
+        .filter(|data| directory_identity(data).as_deref() == Some(server_id));
+    let data = matches.next().ok_or("This local server could not be found. Its saved data was not changed.")?;
+    if matches.next().is_some() { return Err("More than one local folder has this server identity. No server was started.".into()); }
     Ok(data)
+}
+
+/// Resolve by the host's saved identity, never by the shared loopback address.
+pub fn community_directory(server_id: &str) -> Result<PathBuf, String> {
+    community_directory_in(&storage_root()?, server_id)
+}
+
+fn saved_community(data: &Path, id: String) -> crate::community::SavedCommunity {
+    read_record(&data.join("app-community.json")).ok()
+        .and_then(|v| serde_json::from_value::<crate::community::SavedCommunity>(v).ok())
+        .filter(|v| v.server_id == id && v.url == "http://127.0.0.1:4580")
+        .unwrap_or_else(|| crate::community::SavedCommunity {
+            name: format!("Local server · {}", &id[..8]), server_id: id,
+            url: "http://127.0.0.1:4580".into(), ..Default::default()
+        })
+}
+
+pub fn saved_communities() -> Result<Vec<crate::community::SavedCommunity>, String> {
+    Ok(community_directories(&storage_root()?)?.into_iter().filter_map(|data| {
+        directory_identity(&data).map(|id| saved_community(&data, id))
+    }).collect())
+}
+
+/// Retain account and consent metadata with its server when another server
+/// takes the same local port. Databases and keys are never moved or replaced.
+pub fn remember_community(community: &crate::community::SavedCommunity) -> Result<(), String> {
+    if community.url != "http://127.0.0.1:4580" { return Ok(()); }
+    let data = community_directory(&community.server_id)?;
+    let destination = data.join("app-community.json");
+    safe_folder(&destination)?;
+    let raw = serde_json::to_vec(community).map_err(|_| "Cannot remember your local server.")?;
+    if raw.len() > 16_384 { return Err("Your saved local server details are too large.".into()); }
+    let temp = data.join(format!(".app-community-{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&temp, raw).and_then(|_| std::fs::rename(&temp, destination))
+        .map_err(|_| "Cannot remember your local server. Existing data was kept.".into())
+}
+
+fn select_community_in(root: &Path, server_id: &str) -> Result<crate::community::SavedCommunity, String> {
+    let data = community_directory_in(root, server_id)?;
+    let mut selected = choice(root)?;
+    selected.active = if data == root { None } else {
+        Some(data.file_name().and_then(|s| s.to_str()).ok_or("Invalid local server folder.")?.into())
+    };
+    selected.last_creation = None;
+    save_choice(root, &selected)?;
+    Ok(saved_community(&data, server_id.to_owned()))
+}
+
+pub fn select_community(server_id: &str) -> Result<crate::community::SavedCommunity, String> {
+    select_community_in(&storage_root()?, server_id)
 }
 
 fn legacy_data_directory() -> Option<PathBuf> {
@@ -986,5 +1069,48 @@ mod tests {
         .unwrap();
         assert!(create_directory_in(&root).is_err());
         assert!(!fixture.path().join("other").exists());
+    }
+
+    #[test]
+    fn selecting_an_older_local_server_keeps_each_identity_account_and_database() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("server-data");
+        create_directory_in(&root).unwrap();
+        let old_id = uuid::Uuid::new_v4().to_string();
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let seed = |data: &Path, id: &str, name: &str, consent: u64| {
+            std::fs::write(data.join("relay.sqlite3"), name).unwrap();
+            std::fs::write(data.join("host-key.v1"), id).unwrap();
+            AppHost { server_id: id.into(), mode: "local".into(), address: None, lan_discovery: false }.save(data).unwrap();
+            let saved = crate::community::SavedCommunity {
+                url: "http://127.0.0.1:4580".into(), server_id: id.into(), name: name.into(),
+                username: format!("owner-{name}"), open_protection_accepted: Some(consent), ..Default::default()
+            };
+            std::fs::write(data.join("app-community.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+        };
+        seed(&root, &old_id, "First", 7);
+        let nested = create_directory_in(&root).unwrap();
+        seed(&nested, &new_id, "Second", 2);
+        let first = select_community_in(&root, &old_id).unwrap();
+        assert_eq!((&first.name, &first.username, first.open_protection_accepted), (&"First".to_owned(), &"owner-First".to_owned(), Some(7)));
+        assert!(choice(&root).unwrap().active.is_none());
+        assert!(choice(&root).unwrap().last_creation.is_none());
+        assert_eq!(community_directory_in(&root, &old_id).unwrap(), root);
+        let second = select_community_in(&root, &new_id).unwrap();
+        assert_eq!(second.server_id, new_id);
+        assert_eq!(second.open_protection_accepted, Some(2));
+        assert_eq!(community_directory_in(&root, &new_id).unwrap(), nested);
+        assert_eq!(root.join("communities").join(choice(&root).unwrap().active.unwrap()), nested);
+        // Even at the same local address, wrong identity metadata cannot supply
+        // another community's account or previously accepted protection choice.
+        std::fs::write(root.join("app-community.json"), serde_json::to_vec(&second).unwrap()).unwrap();
+        let first = select_community_in(&root, &old_id).unwrap();
+        assert_eq!(first.server_id, old_id);
+        assert!(first.username.is_empty() && first.open_protection_accepted.is_none());
+        assert!(select_community_in(&root, &uuid::Uuid::new_v4().to_string()).is_err());
+        assert_eq!(std::fs::read(root.join("relay.sqlite3")).unwrap(), b"First");
+        assert_eq!(std::fs::read(nested.join("relay.sqlite3")).unwrap(), b"Second");
+        assert_eq!(std::fs::read(root.join("host-key.v1")).unwrap(), old_id.as_bytes());
+        assert_eq!(std::fs::read(nested.join("host-key.v1")).unwrap(), new_id.as_bytes());
     }
 }

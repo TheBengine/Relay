@@ -337,6 +337,11 @@ impl RelayApp {
     /// Begin the real thing: the same steps the three "Create a server"
     /// buttons took before the choices were asked.
     pub(super) fn start_new_server(&mut self) {
+        if let Err(error) = self.remember_current_local() {
+            self.error = Some(error);
+            return;
+        }
+        self.account_start.opening_local = None;
         self.account_start.home = false;
         self.hosting_setup.new_host = true;
         self.hosting_setup.local_ready = false;
@@ -363,6 +368,7 @@ impl RelayApp {
         let iroh_available = crate::iroh_route::available();
         let waiting_server = self.hosting_setup.new_host;
         let mut started = false;
+        if !waiting_server && self.other_local_servers(ui) { return true; }
         ui.heading("Create your server");
         ui.label(
             RichText::new(

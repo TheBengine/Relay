@@ -473,6 +473,9 @@ impl RelayApp {
                         self.record_open_consent(Some(revision));
                     }
                     self.save_preferences();
+                    if let Err(error) = self.remember_current_local() {
+                        self.notice = Some((error, Instant::now()));
+                    }
                     if let Some(target) = target {
                         self.selected_nav = !matches!(target, Target::Direct(_));
                         self.select(target);
@@ -1926,8 +1929,10 @@ impl RelayApp {
                 Update::Notice(text) => self.notice = Some((text, Instant::now())),
                 Update::LocalHostFailed(error) => {
                     self.hosting_setup.local_ready = false;
+                    if self.account_start.opening_local.is_some() { self.error = Some(error.clone()); }
                     self.account_start.hosting_error = Some(error);
                 }
+                Update::LocalOpened(saved) => self.local_server_opened(saved),
                 Update::Error(e) => {
                     self.cancel_background_people_answer();
                     self.error = Some(e);
@@ -1959,6 +1964,9 @@ impl RelayApp {
                     created,
                     setup_required,
                 } => {
+                    // An explicit older-server selection waits for its identity
+                    // verification and LocalOpened before using any account.
+                    if self.account_start.opening_local.is_some() { continue; }
                     self.account_start.hosting_error = None;
                     self.account_start.creation_request = None;
                     self.hosting_setup.hosted_address = self
