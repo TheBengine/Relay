@@ -5,7 +5,7 @@
 
 **[Download for Windows](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261025.6/Relay-Setup.exe)** · [Portable version](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261025.6/Relay-Portable.zip)
 
-Experimental, unsigned Windows x64 preview.
+Experimental, unsigned Windows x64 preview. [Release notes](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261025.6) · [Open an invitation](https://thebengine.github.io/Relay/)
 
 ## Relay vs Discord
 
@@ -20,6 +20,15 @@ Experimental, unsigned Windows x64 preview.
 End-to-end encryption is optional for each server. New servers use standard mode with E2EE off by default. Keep your host online. Actual video quality depends on hardware and connection.
 
 [Full comparison & sources](COMPARISON.md) · [Setup & updates](GUIDE.md) · [Privacy & security](SECURITY.md)
+
+## Get started
+
+1. **Create a Relay account.** No invitation needed.
+2. **Open Friends** for private messages and calls, or create/join a community.
+3. **Share an invitation.** Your friend opens the link, chooses **Open Relay**, and joins. Keep the host online.
+
+If the browser does not open the app, copy the invitation from the page and paste it into **Join a server**.
+
 ## Source and contributions
 
 Relay's client, server, connection helpers and reviewed dependency patches are

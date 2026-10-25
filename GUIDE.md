@@ -6,16 +6,16 @@
 
 | Package | Best for |
 | --- | --- |
-| [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261025.2/Relay-Setup.exe) | Recommended: install or update Relay like a normal Windows app. |
-| [Relay-Portable.zip](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261025.2/Relay-Portable.zip) | Extract the whole folder and open `Relay.exe`. Keep the files together. |
-| [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261025.2/SHA256SUMS.txt) | Check that downloaded files match the release. |
+| [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261025.6/Relay-Setup.exe) | Recommended: install or update Relay like a normal Windows app. |
+| [Relay-Portable.zip](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261025.6/Relay-Portable.zip) | Extract the whole folder and open `Relay.exe`. Keep the files together. |
+| [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261025.6/SHA256SUMS.txt) | Check that downloaded files match the release. |
 
 This is an **unsigned preview**. Real audio hardware, extended streaming and calls between different homes still need practical acceptance. Local synthetic media tests do not establish that these work on every PC or network.
 
 ## Get started
 
 1. **Sign in or create a Relay account.** No invitation is needed. Sign-in opens inside the app, with a browser option available.
-2. **Create or join a server.** End-to-end encryption off is the recommended default for new servers. You can choose protected mode during creation; existing servers keep their settings.
+2. **Choose Friends, or create/join a server.** Friends lets you message and call without sharing a community. End-to-end encryption off is the recommended default for new servers. You can choose protected mode during creation; existing servers keep their settings.
 3. **Invite your friends.** Open **Invite friends**, choose a reachable connection and copy the invitation, then send the link. Your friend signs in with their Relay account and joins your server.
 
 With an HTTPS invitation and Relay installed, your friend chooses **Open Relay** in the browser. Already have a `relay://` invitation? The [invitation page](https://thebengine.github.io/Relay/) can turn it into a clickable link. Pasting the original invitation in **Join friends** remains available.
