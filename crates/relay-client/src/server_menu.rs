@@ -70,6 +70,24 @@ fn item(ui: &mut egui::Ui, label: &str, enabled: bool, accent: bool) -> bool {
     .clicked()
 }
 
+fn clicked_outside_menu(ctx: &egui::Context, menu: Rect, header: Rect) -> bool {
+    // Context queries must run after releasing the input lock.
+    let click = ctx.input(|input| {
+        input
+            .pointer
+            .any_click()
+            .then(|| input.pointer.interact_pos())
+            .flatten()
+    });
+    click.is_some_and(|p| {
+        !menu.contains(p)
+            && !header.contains(p)
+            && !ctx
+                .layer_id_at(p)
+                .is_some_and(|layer| layer.order >= egui::Order::Foreground)
+    })
+}
+
 impl RelayApp {
     fn saved_server_origin(&self, url: &str) -> Option<CommandOrigin> {
         if self.community_status(url) != ConnectionStatus::Connected {
@@ -429,16 +447,7 @@ impl RelayApp {
                     self.server_menu_anchor - Vec2::new(12.0, 50.0),
                     self.server_menu_anchor + Vec2::new(248.0, 0.0),
                 );
-                if ctx.input(|input| {
-                    input.pointer.any_click()
-                        && input.pointer.interact_pos().is_some_and(|p| {
-                            !menu.response.rect.contains(p)
-                                && !header.contains(p)
-                                && !ctx
-                                    .layer_id_at(p)
-                                    .is_some_and(|layer| layer.order >= egui::Order::Foreground)
-                        })
-                }) {
+                if self.server_menu && clicked_outside_menu(ctx, menu.response.rect, header) {
                     self.server_menu = false;
                 }
             }
@@ -491,6 +500,41 @@ impl RelayApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn outside_menu_click_releases_input_before_layer_query() {
+        let ctx = egui::Context::default();
+        let menu = Rect::from_min_max(Pos2::new(10.0, 60.0), Pos2::new(250.0, 600.0));
+        let header = Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(250.0, 60.0));
+        for (pos, expected) in [
+            (Pos2::new(100.0, 300.0), false),
+            (Pos2::new(100.0, 30.0), false),
+            (Pos2::new(400.0, 300.0), true),
+        ] {
+            for pressed in [true, false] {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 700.0))),
+                        events: vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        if !pressed {
+                            assert_eq!(clicked_outside_menu(ctx, menu, header), expected);
+                        }
+                    },
+                );
+            }
+        }
+    }
+
     #[test]
     fn delayed_server_action_is_bound_to_server_account_and_short_lifetime() {
         let at = Instant::now();
