@@ -219,6 +219,8 @@ struct Preferences {
     giphy_favorites: Vec<String>,
     #[serde(default = "default_remember_drafts")]
     online_gif_previews: bool,
+    #[serde(default = "default_remember_drafts")]
+    automatic_update_checks: bool,
     #[serde(default)]
     appearance: AppearanceSettings,
     #[serde(default)]
@@ -460,6 +462,7 @@ impl Default for Preferences {
             giphy_api_key: String::new(),
             giphy_favorites: Vec::new(),
             online_gif_previews: true,
+            automatic_update_checks: true,
             appearance: AppearanceSettings::default(),
             connection: Default::default(),
             pending_creation: None,

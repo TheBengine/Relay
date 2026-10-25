@@ -187,7 +187,7 @@ impl Release {
             || self
                 .handoff
                 .as_deref()
-                .is_some_and(|value| value != "wait-parent-v1")
+                .is_some_and(|value| !matches!(value, "wait-parent-v1" | "in-place-v2"))
         {
             return Err("The update does not match this app, platform or release channel.".into());
         }

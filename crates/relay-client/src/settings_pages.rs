@@ -1831,15 +1831,28 @@ impl RelayApp {
         let in_call = self.voice_channel.is_some()
             || self.audio_connecting
             || self.joining_voice.is_some()
+            || self.private_calls.intent.is_some()
+            || self.call_switch_pending()
             || self.rtc_request.is_some();
         self.update_ui.show(
             ui,
             in_call,
-            self.own_local_server
-                || self.busy
+            self.own_local_server,
+            self.busy
+                || self.external_invitation.is_pending()
                 || !self.pending_sends.is_empty()
                 || self.network.update_busy(),
         );
+        if ui
+            .checkbox(
+                &mut self.prefs.automatic_update_checks,
+                "Automatically check for updates",
+            )
+            .changed()
+        {
+            self.defer_preferences();
+        }
+        controls::description(ui, "Check after startup and every six hours. Update and restart downloads, verifies and installs only when you choose it. Download only keeps Relay open.");
         controls::divider(ui);
         controls::section_heading(
             ui,

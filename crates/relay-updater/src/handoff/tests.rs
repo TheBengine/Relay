@@ -68,6 +68,36 @@ fn exact_current_parent_identity_matches_windows_creation_time() {
 }
 
 #[test]
+#[ignore = "Requires an explicitly installed isolated recovery fixture, launched as its dist/relay.exe; commits its in-place update"]
+fn actual_in_place_fixture_parent_approves_and_exits_normally() {
+    // The outer owned harness installs the fixture and observes its replacement
+    // launch/record. This test must be that fixture's sole parent operation,
+    // never the ordinary cargo test executable or the user's application.
+    let build = std::path::PathBuf::from(std::env::var_os("RELAY_INPLACE_FIXTURE_BUILD")
+        .expect("Explicit isolated installer build record required"));
+    let build: serde_json::Value = serde_json::from_slice(&storage::read(&build, 65536).unwrap()).unwrap();
+    assert_eq!(build["app_id"], "68e09dab-cada-4de3-b9d3-e2a9bdb8036c");
+    let executable = std::env::current_exe().unwrap();
+    assert_eq!(executable.file_name().unwrap(), "relay.exe");
+    assert_eq!(executable.parent().unwrap().file_name().unwrap(), "dist");
+    let path = std::path::PathBuf::from(build["installer"].as_str().unwrap());
+    let bytes = storage::read(&path, MAX_INSTALLER).unwrap();
+    assert_eq!(crate::digest(&bytes), build["installer_sha256"].as_str().unwrap());
+    let (_download, mut ready) = crate::tests::handoff_fixture_bytes(Some(bytes));
+    // These fields are private to the crate; the production Engine cannot mint
+    // a non-Relay publisher/AppId. There is no runtime fixture switch.
+    ready.release.app_id = build["app_id"].as_str().unwrap().into();
+    ready.release.version = build["version"].as_str().unwrap().into();
+    ready.release.sequence = build["sequence"].as_str().unwrap().into();
+    ready.release.handoff = Some("in-place-v2".into());
+    let signals = Arc::new(Signals::new().unwrap());
+    let waiting = prepare(&ready, signals).unwrap();
+    assert!(waiting._child.id() != std::process::id());
+    waiting.commit().unwrap();
+    // Return through the test harness normally; no process is force-terminated.
+}
+
+#[test]
 #[ignore = "Requires the explicitly compiled owned installer; no personal installation or visible wizard"]
 fn actual_signed_inno_handoff_becomes_ready_and_cancels_normally() {
     let build = std::path::PathBuf::from(

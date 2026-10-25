@@ -1,5 +1,6 @@
 //! An explicitly chosen installer waits for consent and the exact parent exit.
-//! No shell, installer flags that skip consent, force-close, or helper copy.
+//! Automatic installation requires a signed in-place protocol and this app's
+//! complete installation record. No shell, force-close, or helper copy.
 use crate::{storage, PreparedInstaller, Result, MAX_INSTALLER};
 use sha2::{Digest, Sha256};
 use std::{
@@ -21,6 +22,8 @@ use windows_sys::Win32::{
         WaitForSingleObject, CREATE_NO_WINDOW,
     },
 };
+
+mod installed;
 
 struct Event(HANDLE);
 // An event is a kernel synchronization object; these handles are never inherited.
@@ -164,7 +167,7 @@ fn information(file: &File, directory: bool) -> Result<()> {
     Ok(())
 }
 fn expiry(ready: &PreparedInstaller) -> Result<()> {
-    if ready.release.handoff.as_deref() != Some("wait-parent-v1") {
+    if !matches!(ready.release.handoff.as_deref(), Some("wait-parent-v1" | "in-place-v2")) {
         return Err("This installer doesn't support a verified handoff. Use Show download.".into());
     }
     if chrono::Utc::now().timestamp() + 90 >= ready.valid_until {
@@ -239,18 +242,38 @@ fn prepare_inner(
     extra: &[std::ffi::OsString],
 ) -> Result<WaitingInstaller> {
     let pinned = pin(ready, &signals)?;
+    let installed = if ready.release.handoff.as_deref() == Some("in-place-v2") {
+        if !extra.is_empty() {
+            return Err("Automatic installation cannot override its installed destination.".into());
+        }
+        Some(installed::current(&ready.release)?)
+    } else {
+        None
+    };
     let identity = parent_identity()?;
     if signals.cancelled() {
         return Err("Installation cancelled.".into());
     }
-    // The current Relay UI is English. A valid Inno language skips only the
-    // pre-readiness picker; all ordinary wizard pages and final consent remain.
-    // No silent flags, custom directory, shell, elevation or automatic app run.
-    let child = Command::new(&ready.path)
-        .arg("/LANG=english")
+    // v1 retains the ordinary wizard. v2 uses only the exact installation whose
+    // marker matches this running build; the installer independently checks it
+    // against the PID+creation-time-bound parent before reporting readiness.
+    let mut command = Command::new(&ready.path);
+    command.arg("/LANG=english")
         .arg(format!("/RELAYPARENT={identity}"))
         .arg(format!("/RELAYHANDOFF={}", signals.name))
-        .args(extra)
+        .arg("/RELAYRESTART=1");
+    if let Some(installed) = installed {
+        let mut destination = std::ffi::OsString::from("/DIR=");
+        destination.push(installed.directory);
+        command.args(["/VERYSILENT", "/SP-", "/NORESTART", "/RELAYAUTOMATIC=in-place-v2"])
+            .arg(destination)
+            .arg(format!("/RELAYBASEVERSION={}", installed.record.version))
+            .arg(format!("/RELAYBASESEQUENCE={}", installed.record.sequence))
+            .arg(format!("/RELAYBASEHASH={}", installed.record.payload_sha256));
+        // Error dialogs remain enabled; a failed unattended update must explain
+        // how to recover instead of disappearing after the old app has closed.
+    }
+    let child = command.args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

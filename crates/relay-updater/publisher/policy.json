@@ -1,4 +1,8 @@
 {
+  "mode": "signed",
   "schema": 1,
-  "mode": "disabled"
+  "metadata": "https://thebengine.github.io/Relay/updates/beta/metadata/",
+  "channel": "beta",
+  "targets": "https://thebengine.github.io/Relay/updates/beta/targets/",
+  "root_sha256": "383afc351bd45cf480be147e2a23f5831be25ec04f179e08acee3bbc188c7770"
 }

@@ -2330,21 +2330,27 @@ impl eframe::App for RelayApp {
         let update_call_active = self.voice_channel.is_some()
             || self.audio_connecting
             || self.joining_voice.is_some()
+            || self.private_calls.intent.is_some()
+            || self.call_switch_pending()
             || self.rtc_request.is_some();
         if self.update_ui.tick(
             ctx,
             update_call_active,
-            self.own_local_server
-                || self.busy
+            self.own_local_server,
+            self.busy
                 || self.external_invitation.is_pending()
                 || !self.pending_sends.is_empty()
                 || self.network.update_busy(),
+            self.prefs.automatic_update_checks,
             || self.network.poll_shutdown(),
         ) {
             // No further UI actions can start media/hosting after installer consent.
             self.hide_for_exit();
             return;
         }
+        // A verified download can begin handoff in this tick. Hold new network
+        // commands immediately, before the remaining UI can enqueue work.
+        self.network.set_update_hold(self.update_ui.preparing_install());
         if self.capture_path.is_some() && (self.messages_ready || self.current_name().2) {
             if let Some(panel) = self.initial_capture_panel.take() {
                 self.prepare_capture_panel(&panel);
@@ -2460,6 +2466,15 @@ impl eframe::App for RelayApp {
         }
         self.update_appearance(ctx, frame.info().system_theme);
         self.desktop_titlebar(ctx);
+        self.update_ui.show_banner(
+            ctx,
+            update_call_active,
+            self.own_local_server,
+            self.busy
+                || self.external_invitation.is_pending()
+                || !self.pending_sends.is_empty()
+                || self.network.update_busy(),
+        );
         #[cfg(windows)]
         let account_surface = self.account_surface_view(ctx);
         #[cfg(not(windows))]
