@@ -1,4 +1,4 @@
-import { fromFragment, fromNative, browserLink } from './invitation.mjs';
+import { fromFragment, fromNative, browserLink } from './invitation.mjs?v=20261025';
 const element = id => document.getElementById(id);
 let native = null;
 let generation = 0;

@@ -1,6 +1,6 @@
 export const BASE = 'https://thebengine.github.io/Relay/';
 const QUERY = ['v', 'server', 'server_id', 'alt', 'iroh', 'irelay'];
-const FRAGMENT = ['invite', 'access', 'iid', 'hd', 'hf', 'vk', 'it'];
+const FRAGMENT = ['invite', 'access', 'iid', 'hd', 'hf', 'vk', 'it', 'hp'];
 const fail = () => { throw new Error('Invitationen er ikke gyldig. Bed din ven om et nyt link.'); };
 const hex = value => /^[0-9a-f]{64}$/.test(value ?? '');
 
@@ -25,9 +25,12 @@ export function fromFragment(fragment) {
   if (typeof fragment !== 'string' || fragment.length > 4096 + BASE.length || /[\u0000-\u001f\u007f]/.test(fragment)) fail();
   const f = fields(fragment.replace(/^#/, ''), [...QUERY, ...FRAGMENT]);
   const get = name => f.get(name);
-  if (!['1', '2', '3', '4'].includes(get('v')) || !get('server') || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(get('server_id') ?? '') || !/^[A-Za-z0-9_-]{1,128}$/.test(get('invite') ?? '')) fail();
+  if (!['1', '2', '3', '4', '5'].includes(get('v')) || !get('server') || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(get('server_id') ?? '') || !/^[A-Za-z0-9_-]{1,128}$/.test(get('invite') ?? '')) fail();
   address(get('server'));
-  if (get('v') !== '4' && ['alt', 'iroh', 'irelay', 'it'].some(name => f.has(name))) fail();
+  // The native app verifies the Ed25519 key-derived identity and fresh proof.
+  // The page only transports the bounded fragment; it cannot establish trust.
+  if (get('v') === '5' ? !/^[A-Za-z0-9_-]{1,512}$/.test(get('hp') ?? '') : f.has('hp')) fail();
+  if (!['4', '5'].includes(get('v')) && ['alt', 'iroh', 'irelay', 'it'].some(name => f.has(name))) fail();
   if (get('v') === '1' && FRAGMENT.slice(1).some(name => f.has(name))) fail();
   if (get('v') === '2' && (!f.has('access') || ['iid', 'hd', 'hf', 'vk'].some(name => f.has(name)))) fail();
   const proof = ['iid', 'hd', 'hf', 'vk'].filter(name => f.has(name));
