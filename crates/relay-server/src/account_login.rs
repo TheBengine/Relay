@@ -234,7 +234,7 @@ pub(crate) async fn finish(
             // A community authenticator is password-sealed. Never bypass it by
             // using a linked global identity; its old sign-in remains available.
             if authenticator::record(&tx, &user_id)?.is_some() {
-                return Err(bad("This existing server account has its own authenticator. Use server account sign-in."));
+                return Err(bad("This existing server account has its own authenticator. Ask this server's owner to update your account access."));
             }
             let status: String = tx.query_row(
                 "SELECT status FROM membership WHERE user_id=?1",
@@ -258,7 +258,7 @@ pub(crate) async fn finish(
             tx.query_row("SELECT u.id,u.username,u.role,p.display_name,p.bio,p.version,p.avatar IS NOT NULL,p.appearance FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.id=?1",[&user_id],row_user)?
         } else {
             if !register && !state.0.config.people {
-                return Err(bad("This Relay account has not joined this server. Join with an invitation, or sign in to your old server account and link it in My Account."));
+                return Err(bad("Your Relay account has not joined this server yet. Ask its owner for an invitation, or go back and create your own server."));
             }
             let first: bool = tx.query_row("SELECT COUNT(*)=0 FROM users", [], |r| r.get(0))?;
             if first && ingress.is_some() && !state.0.config.people {

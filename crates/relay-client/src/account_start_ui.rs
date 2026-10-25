@@ -65,6 +65,8 @@ pub(super) struct State {
     /// shown when that cannot happen or fails.
     pub(super) entered: bool,
     pub(super) auto: Option<AutoEntry>,
+    pub(super) hosting_error: Option<String>,
+    pub(super) creation_request: Option<String>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -74,6 +76,8 @@ impl Default for State {
             bypass: false,
             entered: false,
             auto: None,
+            hosting_error: None,
+            creation_request: None,
         }
     }
 }
@@ -228,6 +232,7 @@ impl RelayApp {
                 }
             } else if self.hosting_setup.choosing_creation {
                 self.creation_choices(ui);
+                self.local_host_problem(ui);
             } else if entering {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -243,86 +248,106 @@ impl RelayApp {
                 ui.heading(format!("Welcome, @{handle}"));
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new(
-                        "Your account is ready. Choose a server or make a place for your friends.",
-                    )
-                    .color(c_muted()),
+                    RichText::new("Start a conversation or choose a server.").color(c_muted()),
                 );
                 ui.add_space(24.0);
-                if ui
-                    .add(primary("Friends and messages").min_size(Vec2::new(width, 44.0)))
-                    .clicked()
-                {
-                    self.open_people();
-                }
-                ui.label(RichText::new("Message and call friends with your Relay account. No shared server needed.").color(c_muted()));
-                if self.account_start.pending.is_some() {
-                    ui.spinner();
-                    ui.label("Connecting your friends…");
-                    if ui.button("Cancel").clicked() {
-                        self.account_start.pending = None;
-                    }
-                }
-                if let Some(error) = &self.error {
-                    ui.label(RichText::new(error).color(c_bad()));
-                }
-                ui.add_space(16.0);
-                let people_url = self.people_url();
-                for saved in self
-                    .prefs
-                    .communities
-                    .clone()
-                    .into_iter()
-                    .filter(|s| Some(&s.url) != people_url.as_ref())
-                {
+
+                home_section(ui, "Friends", |ui| {
+                    ui.label(
+                        RichText::new("Messages and calls. No shared server needed.")
+                            .color(c_muted()),
+                    );
+                    ui.add_space(10.0);
                     if ui
-                        .add(
-                            secondary(if saved.name.is_empty() {
-                                &saved.url
-                            } else {
-                                &saved.name
-                            })
-                            .min_size(Vec2::new(width, 44.0)),
-                        )
+                        .add_sized([ui.available_width(), 44.0], primary("Open Friends"))
                         .clicked()
                     {
-                        self.login.url = saved.url;
-                        self.login.registering = false;
-                        self.login.setup = Default::default();
-                        self.hosting_setup.entry = host_setup_ui::LoginEntry::Account;
-                        self.hosting_setup.new_host = false;
-                        self.account_start.home = false;
-                        self.begin_account_login(false);
+                        self.open_people();
                     }
-                }
+                    if self.account_start.pending.is_some() {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Connecting…");
+                            if entry_surface::text_action(ui, "Cancel").clicked() {
+                                self.account_start.pending = None;
+                            }
+                        });
+                    }
+                    if let Some(error) = &self.error {
+                        ui.add_space(8.0);
+                        ui.add(egui::Label::new(RichText::new(error).color(c_bad())).wrap(true));
+                    }
+                });
                 ui.add_space(16.0);
-                if ui
-                    .add(primary("Create a server").min_size(Vec2::new(width, 44.0)))
-                    .clicked()
-                {
-                    self.hosting_setup
-                        .begin_creation(crate::iroh_route::available());
-                    self.error = None;
-                }
-                if ui
-                    .add(secondary("Join with an invitation").min_size(Vec2::new(width, 44.0)))
-                    .clicked()
-                {
-                    self.account_start.home = false;
-                    self.hosting_setup.entry = host_setup_ui::LoginEntry::Join;
-                }
-                if self.session.is_some() && ui.button("Return to my server").clicked() {
-                    self.account_start.home = false;
-                }
-                if self.session.is_some() && ui.button("Friends on my servers").clicked() {
-                    self.admin_ui.friend_all_servers = true;
-                    self.selected_nav = false;
-                    self.home_page = Some(SettingsTab::Friends);
-                    self.account_start.home = false;
-                }
+                home_section(ui, "Your servers", |ui| {
+                    let people_url = self.people_url();
+                    let saved: Vec<_> = self
+                        .prefs
+                        .communities
+                        .clone()
+                        .into_iter()
+                        .filter(|s| Some(&s.url) != people_url.as_ref())
+                        .collect();
+                    if saved.is_empty() {
+                        ui.label(
+                            RichText::new("Join your friends, or make a server of your own.")
+                                .color(c_muted()),
+                        );
+                    }
+                    for saved in saved {
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 44.0],
+                                secondary(if saved.name.is_empty() {
+                                    &saved.url
+                                } else {
+                                    &saved.name
+                                }),
+                            )
+                            .clicked()
+                        {
+                            self.login.url = saved.url;
+                            self.login.registering = false;
+                            self.login.setup = Default::default();
+                            self.hosting_setup.entry = host_setup_ui::LoginEntry::Account;
+                            self.hosting_setup.new_host = false;
+                            self.account_start.home = false;
+                            self.begin_account_login(false);
+                        }
+                    }
+                    self.local_host_problem(ui);
+                    ui.add_space(12.0);
+                    ui.columns(2, |columns| {
+                        let left_width = columns[0].available_width();
+                        let right_width = columns[1].available_width();
+                        if columns[0]
+                            .add_sized([left_width, 44.0], secondary("Create a server"))
+                            .clicked()
+                        {
+                            self.hosting_setup
+                                .begin_creation(crate::iroh_route::available());
+                            self.error = None;
+                        }
+                        if columns[1]
+                            .add_sized([right_width, 44.0], secondary("Join a server"))
+                            .clicked()
+                        {
+                            self.account_start.home = false;
+                            self.hosting_setup.entry = host_setup_ui::LoginEntry::Join;
+                        }
+                    });
+                    if self.session.is_some()
+                        && entry_surface::text_action(ui, "Return to my server").clicked()
+                    {
+                        self.account_start.home = false;
+                    }
+                });
                 ui.add_space(24.0);
                 ui.separator();
-                ui.add_space(18.0);
+                ui.add_space(14.0);
+                ui.label(RichText::new("Account").small().color(c_muted()));
+                ui.add_space(6.0);
                 if let Some(service) = &self.central_account.provider {
                     ui.hyperlink_to("Manage my Relay account", service.management_url());
                 }
@@ -332,6 +357,34 @@ impl RelayApp {
             }
         });
         true
+    }
+
+    pub(super) fn local_host_problem(&mut self, ui: &mut egui::Ui) {
+        let Some(details) = self.account_start.hosting_error.clone() else {
+            return;
+        };
+        ui.add_space(12.0);
+        egui::Frame::none().fill(c_bg()).rounding(6.0)
+            .stroke(Stroke::new(1.0, c_line())).inner_margin(Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.label(RichText::new("Your local server couldn't start").strong());
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(
+                    "Try again to reopen it. Your server data is kept, and Friends works separately."
+                ).color(c_muted())).wrap(true));
+                ui.add_space(8.0);
+                if ui.add_enabled(!self.busy, secondary("Retry server")).clicked() {
+                    if let (Some(request), Some(server)) = (self.account_start.creation_request.clone(), crate::local_host::server_binary()) {
+                        self.account_start.hosting_error = None;
+                        self.busy = true;
+                        self.send(Command::CreateLocal { server, request });
+                    } else {
+                        self.host_local();
+                    }
+                }
+                egui::CollapsingHeader::new("Technical details").id_source("local-host-failure-details")
+                    .show(ui, |ui| { ui.add(egui::Label::new(RichText::new(details).small().color(c_muted())).wrap(true)); });
+            });
     }
 
     /// Saved servers the Relay account can reopen, excluding Friends and any
@@ -366,6 +419,11 @@ impl RelayApp {
             auto.resuming = None;
         }
         if let Some(url) = auto.queue.front().cloned() {
+            if crate::local_host::is_local_url(&url) && self.account_start.hosting_error.is_some() {
+                auto.queue.pop_front();
+                ctx.request_repaint();
+                return;
+            }
             if crate::local_host::is_local_url(&url)
                 && !self.hosting_setup.local_ready
                 && auto.started.elapsed() < LOCAL_HOST_WAIT
@@ -488,8 +546,10 @@ impl RelayApp {
         if let Err(message) = &destination {
             ui.label(RichText::new(message).color(c_muted()));
         }
-        if let Some(error) = &self.error {
-            ui.label(RichText::new(error).color(c_bad()));
+        if other {
+            if let Some(error) = &self.error {
+                ui.add(egui::Label::new(RichText::new(error).color(c_bad())).wrap(true));
+            }
         }
         if self.account_start.pending.is_some() {
             ui.spinner();
@@ -578,17 +638,28 @@ impl RelayApp {
                 return;
             }
         };
-        let expected = match flow
-            .setup
-            .expected_id_with_saved(&url, &self.prefs.communities)
-        {
+        let deliberate_new_local = !other
+            && self.hosting_setup.new_host
+            && flow.registering
+            && self.hosting_setup.creation_confirmed
+            && crate::local_host::is_local_url(&url);
+        let expected = match if deliberate_new_local {
+            Ok(None)
+        } else {
+            flow.setup
+                .expected_id_with_saved(&url, &self.prefs.communities)
+        } {
             Ok(e) => e,
             Err(e) => {
                 self.error = Some(e);
                 return;
             }
         };
-        let authority=flow.setup.invitation.as_ref().and_then(|i|i.authority.clone());
+        let authority = flow
+            .setup
+            .invitation
+            .as_ref()
+            .and_then(|i| i.authority.clone());
         let invite = zeroize::Zeroizing::new(flow.invite.clone());
         let register = flow.registering;
         let initial_protection = (!other && self.hosting_setup.new_host && register)
@@ -802,4 +873,19 @@ mod tests {
         assert!(!challenge_matches(&nonce, url, "replaced"));
         assert!(!challenge_matches(&(nonce + "x"), url, "owned"));
     }
+}
+
+/// Group related choices into a single clearly named area of the welcome card.
+fn home_section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::none()
+        .fill(c_rail())
+        .rounding(8.0)
+        .stroke(Stroke::new(1.0, c_line()))
+        .inner_margin(Margin::same(16.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(title).strong().size(font_size(16.0)));
+            ui.add_space(10.0);
+            body(ui);
+        });
 }

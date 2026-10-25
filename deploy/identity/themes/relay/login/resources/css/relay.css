@@ -1,0 +1,187 @@
+/* Relay native palette and Segoe UI; retain upstream forms, validation and MFA. */
+:root {
+  color-scheme: dark;
+  --relay-rail: #111214;
+  --relay-bg: #1a1a1e;
+  --relay-card: #232428;
+  --relay-line: #2e3036;
+  --relay-text: #f2f3f5;
+  --relay-muted: #aeb2bb;
+  --relay-accent: #5865f2;
+  --relay-bad: #ff8a8d;
+}
+html.login-pf, html.login-pf body {
+  min-height: 100%;
+  background: var(--relay-rail);
+  background-image: none;
+  color: var(--relay-text);
+  font: 14px/1.5 "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+}
+*, *::before, *::after { box-sizing: border-box; }
+.login-pf-page {
+  min-height: 100vh;
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+}
+#kc-header {
+  width: 100%;
+  max-width: 520px;
+  margin: 0;
+  padding: 32px 32px 24px;
+  border: 1px solid var(--relay-line);
+  border-bottom: 0;
+  border-radius: 12px 12px 0 0;
+  background: var(--relay-bg);
+  color: var(--relay-text);
+}
+#kc-header-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0;
+  font: 400 25px/32px "Segoe UI", sans-serif;
+  text-transform: none;
+  letter-spacing: -.4px;
+  color: var(--relay-text);
+  white-space: normal;
+}
+#kc-header-wrapper::before {
+  content: "";
+  flex: 0 0 32px;
+  height: 32px;
+  background: url("../img/relay-mark.svg") center/32px no-repeat;
+}
+.login-pf-page .card-pf {
+  width: 100%;
+  max-width: 520px;
+  margin: 0;
+  padding: 0 32px 32px;
+  border: 1px solid var(--relay-line);
+  border-top: 0;
+  border-radius: 0 0 12px 12px;
+  background: var(--relay-bg);
+  box-shadow: 0 12px 32px #00000026;
+  color: var(--relay-text);
+}
+.login-pf-page .login-pf-header { margin: 0 0 24px; text-align: left; }
+#kc-page-title {
+  margin: 0;
+  font: 600 26px/1.25 "Segoe UI", sans-serif;
+  letter-spacing: -.5px;
+  text-align: left;
+  color: var(--relay-text);
+}
+body[data-page-id="login-login"] #kc-page-title::after {
+  content: "One account for your friends and servers.";
+  display: block;
+  margin-top: 10px;
+  color: var(--relay-muted);
+  font: 400 14px/1.5 "Segoe UI", sans-serif;
+  letter-spacing: 0;
+}
+#kc-content, #kc-content-wrapper, #kc-form, #kc-form-wrapper { margin: 0; padding: 0; }
+.card-pf [class*="col-"] { float: none; width: 100%; margin: 0; padding: 0; }
+.card-pf .form-group { margin: 0 0 18px; }
+.card-pf label, .card-pf .pf-c-form__label-text {
+  color: var(--relay-muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+.card-pf label { display: inline-block; margin-bottom: 7px; }
+.card-pf input:not([type="submit"]):not([type="checkbox"]):not([type="radio"]):not([type="hidden"]),
+.card-pf select, .card-pf textarea {
+  width: 100%;
+  height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--relay-line);
+  border-radius: 6px;
+  background: var(--relay-rail);
+  box-shadow: none;
+  color: var(--relay-text);
+  font: inherit;
+  transition: border-color 120ms ease;
+}
+.card-pf input::placeholder { color: var(--relay-muted); opacity: .75; }
+.card-pf input:focus, .card-pf select:focus, .card-pf textarea:focus {
+  border-color: var(--relay-accent);
+  outline: 2px solid #5865f266;
+  outline-offset: 2px;
+}
+.card-pf input[aria-invalid="true"] { border-color: #a13d47; }
+.card-pf .pf-c-input-group { align-items: stretch; background: transparent; }
+.card-pf .pf-c-input-group input { border-radius: 6px 0 0 6px !important; }
+.card-pf .pf-c-input-group > button {
+  min-width: 44px;
+  border: 1px solid var(--relay-line);
+  border-left: 0;
+  border-radius: 0 6px 6px 0;
+  background: var(--relay-rail);
+  color: var(--relay-muted);
+}
+.card-pf .pf-c-button::after { border: 0; }
+.card-pf .pf-c-button, .card-pf .btn-default {
+  min-height: 42px;
+  padding: 10px 14px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--relay-card);
+  color: var(--relay-text);
+  font: 600 14px/1.5 "Segoe UI", sans-serif;
+  box-shadow: none;
+  cursor: pointer;
+}
+.card-pf .pf-c-button.pf-m-primary, .card-pf input[type="submit"] {
+  min-height: 44px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--relay-accent);
+  color: #fff;
+  font: 600 14px/1.5 "Segoe UI", sans-serif;
+}
+.card-pf .pf-c-button.pf-m-primary:hover, .card-pf input[type="submit"]:hover { background: #6974f5; }
+.card-pf .pf-c-button:disabled, .card-pf input[type="submit"]:disabled { opacity: .45; cursor: default; }
+.card-pf :is(button, input[type="submit"], a):focus-visible { outline: 2px solid #9ca4ff; outline-offset: 3px; }
+#kc-form-buttons { margin-top: 24px; }
+#kc-login, #kc-register { width: 100%; }
+#kc-info { margin: 24px 0 0; padding: 22px 0 0; border-top: 1px solid var(--relay-line); }
+#kc-info-wrapper { padding: 0; background: transparent; font-size: 14px; color: var(--relay-muted); }
+.login-pf-page .login-pf-signup { color: var(--relay-muted); font-size: 14px; }
+.card-pf a { color: #a0a7ff; text-decoration: none; }
+.card-pf a:hover { color: #c1c5ff; text-decoration: underline; }
+.card-pf .checkbox label { font-size: 14px; font-weight: 400; }
+.card-pf :is(input[type="checkbox"], input[type="radio"]) { accent-color: var(--relay-accent); }
+.card-pf .subtitle, .card-pf .instruction, #kc-form-options { color: var(--relay-muted); font-size: 13px; }
+.card-pf .subtitle { margin-bottom: 14px; }
+.card-pf .pf-c-form__helper-text, .card-pf .kc-feedback-text { margin-top: 7px; font-size: 13px; }
+.card-pf .pf-m-error, .card-pf .has-error .kc-feedback-text { color: var(--relay-bad); }
+.card-pf .pf-c-alert {
+  margin-bottom: 20px;
+  padding: 12px 14px;
+  border: 1px solid var(--relay-line);
+  border-radius: 7px;
+  background: var(--relay-rail);
+  color: var(--relay-text);
+}
+.card-pf .pf-c-alert.pf-m-danger { border-color: #813a43; color: var(--relay-bad); }
+.card-pf .pf-c-alert__title { color: inherit; font: 400 14px/1.5 "Segoe UI", sans-serif; }
+.card-pf .pf-c-alert__icon { color: inherit; }
+.card-pf #kc-totp-settings { padding-left: 20px; }
+.card-pf #kc-totp-settings li { margin-bottom: 18px; color: var(--relay-muted); }
+.card-pf #kc-totp-secret-key { overflow-wrap: anywhere; color: var(--relay-text); }
+.card-pf #kc-totp-secret-qr-code { max-width: 100%; background: #fff; border: 10px solid #fff; border-radius: 8px; }
+.card-pf .kc-recovery-codes-list { padding: 16px; border-radius: 8px; background: var(--relay-rail); color: var(--relay-text); }
+.card-pf .kc-recovery-codes-list li { font: 14px/2 ui-monospace, Consolas, monospace; }
+.card-pf .select-auth-box-parent { border: 1px solid var(--relay-line); border-radius: 7px; background: var(--relay-card); color: var(--relay-text); }
+.card-pf .select-auth-box-parent:hover { background: #2c2e33; }
+@media (max-width: 540px) {
+  .login-pf-page { justify-content: flex-start; padding: 24px 16px; }
+  #kc-header { padding: 24px 24px 22px; }
+  .login-pf-page .card-pf { padding: 0 24px 24px; }
+  #kc-page-title { font-size: 24px; }
+}
+@media (prefers-reduced-motion: reduce) { .card-pf input { transition: none !important; } }

@@ -1,70 +1,51 @@
-# Build Relay from source
+# Building and verifying Relay
 
-Experimental Windows x64 source snapshot. Published downloads can be older than
-this source. A source publication is not a new binary release or a quality claim.
+Current build guidance: 21 October 2026. Use the exact locked dependencies and reviewed prepared native inputs.
 
-## Prerequisites
+## Build and verify
 
-- Rust stable for `x86_64-pc-windows-msvc`.
-- Visual Studio C++ Build Tools and Windows SDK; use its x64 Developer PowerShell.
-- Python 3.11+ for tooling, CMake, and Go 1.27.3 or a compatible newer toolchain.
-- Git and prepared dependency caches for offline builds.
+Install Rust stable MSVC, Visual Studio C++ Build Tools with a Windows SDK, CMake, and Go compatible with the minimum in `network-helper/go.mod` (minimum 1.27.2, including the October security fixes). Run from an x64 Visual Studio Developer PowerShell so the C++ compiler and Windows SDK are configured. Prepare Rust dependencies, a Go module cache and the reviewed native SDK before an offline build. The build does not install tools or download Go modules/toolchains.
 
-Start in the repository root. Cargo dependencies are pinned by `Cargo.lock`;
-the iroh helper has its own lockfile. Native dependency patches are in `vendor/`.
-Do not remove the patches or silently replace a failed download with another SDK.
-
-## Minimal development build
-
-With the C++ tools available, build the community server and protocol without
-opening a microphone or contacting the public account service:
+When tools are already configured on a permitted local `PATH`, set `GOMODCACHE` and `GOCACHE` explicitly, then run:
 
 ```powershell
-cargo build --locked -p relay-server -p relay-protocol
-cargo test --locked -p relay-protocol
+.\scripts\build.ps1 -SfuCacheDirectory 'C:\prepared\relay-sfu'
 ```
 
-The client includes a native-media feature. The minimal client development
-configuration can be built with `cargo build --locked -p relay-client` but does
-not represent the complete shipping native-media package.
-
-## Complete Windows package inputs
-
-`scripts/build.ps1` assembles the client, server, launcher, Go network helper and
-optional iroh helper. It expects prepared tools/caches and the pinned SFU binary:
+For the prepared tools on this Windows workspace, this single command uses explicit paths, an isolated Cargo target, and a separate output folder:
 
 ```powershell
-.\scripts\build.ps1 -BuildDirectory 'C:\Relay-build\target' -OutputDirectory 'C:\Relay-build\output' -SfuCacheDirectory 'C:\Relay-build\sfu' -GoExecutable 'C:\tools\go\bin\go.exe' -GoModuleCache 'C:\Relay-build\gomodcache' -GoBuildCache 'C:\Relay-build\gocache'
+.\scripts\build.ps1 -BuildDirectory 'C:\Important\Projects\2026-10-03\can\work\relay-local-build' -OutputDirectory 'C:\Important\Projects\2026-10-03\can\work\relay-local-output' -SfuCacheDirectory 'C:\prepared\relay-sfu' -CMakeDirectory 'C:\Important\Projects\2026-10-03\can\work\tools\cmake-4.4.4-windows-x86_64\bin' -NativeSdkDirectory 'C:\Important\Projects\2026-10-03\can\work\relay-next\native-frame-production-20261006\build-8ab76c0925024e3aa37ab7fcc5bc4a87\sdk' -GoExecutable 'C:\Important\Projects\2026-10-03\can\work\embedded-network-20261013\tools\go\bin\go.exe' -GoModuleCache 'C:\Important\Projects\2026-10-03\can\work\embedded-network-20261013\gomodcache' -GoBuildCache 'C:\Important\Projects\2026-10-03\can\work\embedded-network-20261013\gocache'
 ```
 
-These are example paths that you choose and prepare, not tools supplied by the
-repository. Set `-CMakeDirectory` if CMake is not on your PATH. The Windows build
-uses static CRT. WebRTC acquisition and preparation are checksum-bound by
-`scripts/fetch-webrtc.ps1` and `scripts/prepare-webrtc.ps1`; its exact native
-licenses are retained in `docs/LICENSE-libwebrtc.md`. Read
-`deploy/sfu-security/README.md` and its pinned recipe to prepare the required
-SFU artifact; the build does not substitute an older unreviewed server.
+For the shared Relay account service, explicitly set `RELAY_ACCOUNT_ISSUER` to the reviewed HTTPS realm URL and `RELAY_ACCOUNT_CLIENT_ID` to its public desktop client ID before compiling. These are public configuration values, not credentials. A self-hosted build may choose another issuer or retain independent server accounts.
 
-The Go helper build intentionally uses prepared caches, `GOTOOLCHAIN=local`,
-`-mod=readonly` and offline module resolution. Prepare its locked dependencies
-with your Go toolchain before invoking the complete build. The iroh helper is
-built from its own `iroh-helper/Cargo.lock`. No toolchain is installed implicitly.
+Run it from this repository's root. The example paths describe prepared local tools; they are not installed or discovered by the script. An explicit `GoExecutable` is invoked by its absolute path. An explicit `CMakeDirectory` binds `cmake.exe` through `CMAKE`, both target-specific variable spellings, `HOST_CMAKE`/`TARGET_CMAKE`, and the build's temporary `PATH`. Module/build caches come only from the explicit parameters or the caller's `GOMODCACHE`/`GOCACHE`; missing or redirected paths fail before Cargo compilation. `GoModuleCache` must already exist; Go may create the chosen build-cache directory. The helper uses `GOTOOLCHAIN=local`, `-mod=readonly`, and offline module resolution, so missing dependencies/checksums fail with a cache-preparation error. It ignores hidden Go configuration, inherited Go flags/workspaces and external cache programs. `GOTMPDIR`/`TEMP`/`TMP` are bound to a guarded temporary directory inside the selected build cache. It restores the caller's environment on success or failure, removes only its empty temporary directory, and preserves nonempty failed work for inspection.
 
-`RELAY_ACCOUNT_ISSUER` and `RELAY_ACCOUNT_CLIENT_ID` select a public OIDC realm
-and public desktop client ID at compile time. They are public configuration,
-never a place for client secrets. A private build can use its own service. Do not
-run named-service opt-in tests against a maintainer's live system; they require
-explicit access and fresh owned QA accounts.
+The script builds the native-RTC release with static CRT, normally stores intermediates under `work/relay-build-rtc`, and publishes the Relay client, server, private-network helper and launcher together. Without `NativeSdkDirectory` it prepares the pinned checksum-verified WebRTC SDK; the native build requires the prepared, hash-pinned SFU security build described in [its recipe](../deploy/sfu-security/README.md). Pass `-SfuCacheDirectory <prepared-sfu>` to build.ps1. It verifies and stages that binary and license before expensive compilation, and refuses older or missing SFU inputs. WebRTC downloads are separate from the offline Go helper. Every reused WebRTC file is checked by the build script. The native dependency licenses ship alongside Rust [dependency notices](../THIRD_PARTY_NOTICES.txt); see [native dependencies](native-dependencies.md). Set `CARGO_NET_OFFLINE=true` in the caller when Rust must also use only prepared dependencies.
 
-## Verify a change
+```powershell
+cargo test --workspace
+python .\scripts\test-integration.py --server .\dist\relay-server.exe
+python .\scripts\test-hosting.py
+python .\scripts\test-backup.py
+python .\scripts\test-update.py
+python .\scripts\test-package.py
+python .\scripts\test-shell-runtime.py
+python .\scripts\test-data-privacy.py --server .\dist\relay-server.exe
+python .\scripts\test-native-sdk.py
+```
 
-Use the relevant crate tests and scripts after implementing the change. Native
-and live-service tests are opt-in. Use disposable profiles and generated media;
-physical devices and other people's servers require their permission. Broad
-synthetic test success is not real two-PC/WAN or headset acceptance.
+Opt-in real-server and owned-window/RTC fixtures have explicit environment/setup requirements in verification. Tests use isolated `work` folders and owned processes, not a running community's data. `test-soak.py` exercises 100 authenticated simulated clients on localhost; it does not represent 100 physical voice/video users.
 
-Generate current Windows third-party notices with
-`python scripts/generate-notices.py --offline` after preparing the dependency
-and upstream-notice caches. Dependencies keep their own terms; see
-[licensing](../LICENSING.md). The updater starts disabled and the public root is
-unconfigured. Do not ship test keys, personal data or a falsely signed installer.
+`scripts/package.ps1` produces a source-included ZIP, binary manifest and SHA256 sidecar, excluding runtime credentials, databases, logs and build artifacts. It derives the release version from the workspace unless `-Version` is supplied. Supply the exact tested client/server binaries with `-ClientBinary` and `-ServerBinary`.
+
+Five matched text-idle pairs measured about 93.00 MiB working set and 198.50 MiB private memory for the 0.3.0 client; this historical run showed no RAM reduction over 0.2.1. It is not a measurement of this release. Resource measurements remain scenario-specific. Include the client, Relay server and SFU, and measure CPU, memory, GPU, startup and end-to-end latency before claiming an improvement. The [quality gates](quality.md), [architecture](architecture.md) and [remaining roadmap](roadmap.md) distinguish implemented work from unverified acceptance.
+
+The archive is unsigned and has no automatic update service. Obtain its checksum from a trusted source before running or updating. See the [0.9.1 release notes](release-0.9.1.md), [public beta checklist](public-release.md), [known issues](known-issues.md), preserved [dependency review](dependency-review-0.6.0.md), [security policy](SECURITY.md) and [work status](tasks/STATUS.md). TLS/transport dependencies and the Windows SFU changed in the [21 October scoped dependency review](dependency-security-20261021.md); its residual findings and acceptance limits still apply. Clean Windows installs, real WAN calls and personal audio/video hardware remain acceptance work. No external publication is performed by these build scripts.
+
+Relay-authored code is source available under PolyForm Perimeter 1.0.0; see [licensing scope](../LICENSING.md). Relay is independent of Discord or Mumble. Dependencies retain their own licenses. The encrypted-content integration has not received an independent Relay security review. Server operators still see identities, profiles, targets, membership, message/file sizes and timing, and can deny service. Legacy plaintext is not retroactively encrypted. Relay makes no anonymity, Tor/Tails, endpoint-compromise or one-millisecond latency claim.
+
+## Windows runtime
+
+The shipping MSVC build uses the static C++ runtime. It still depends on supported Windows system APIs and graphics/audio drivers. A clean-machine acceptance run is separate from development-machine testing.

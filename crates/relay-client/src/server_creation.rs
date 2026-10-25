@@ -52,7 +52,7 @@ impl Choices {
     /// The defaults for every new server, whatever an earlier one used.
     pub(super) fn recommended(iroh_available: bool) -> Self {
         Self {
-            protection: ProtectionLevel::Protected,
+            protection: ProtectionLevel::Open,
             route: if iroh_available {
                 Choice::Iroh
             } else {
@@ -64,8 +64,8 @@ impl Choices {
 
 pub(super) fn protection_title(level: ProtectionLevel) -> &'static str {
     match level {
-        ProtectionLevel::Protected => "End-to-end encryption on (recommended)",
-        ProtectionLevel::Open => "End-to-end encryption off",
+        ProtectionLevel::Protected => "End-to-end encryption on",
+        ProtectionLevel::Open => "End-to-end encryption off (recommended)",
     }
 }
 
@@ -343,7 +343,16 @@ impl RelayApp {
         self.hosting_setup.resume_share = true;
         self.hosting_setup.entry = host_setup_ui::LoginEntry::Account;
         self.error = None;
-        self.host_local();
+        self.account_start.hosting_error = None;
+        let Some(server) = crate::local_host::server_binary() else {
+            self.account_start.hosting_error =
+                Some("The bundled server is missing. Reinstall Relay to restore it.".into());
+            return;
+        };
+        let request = uuid::Uuid::new_v4().to_string();
+        self.account_start.creation_request = Some(request.clone());
+        self.busy = true;
+        self.send(Command::CreateLocal { server, request });
     }
 
     /// The choices for a new server. Returns true when the server was started.
@@ -355,11 +364,17 @@ impl RelayApp {
         let waiting_server = self.hosting_setup.new_host;
         let mut started = false;
         ui.heading("Create your server");
+        ui.label(
+            RichText::new(
+                "Your existing servers are kept. One local server runs at a time on this PC.",
+            )
+            .color(c_muted()),
+        );
         ui.add(egui::Label::new(RichText::new(SCOPE).color(c_muted())).wrap(true));
         ui.add_space(14.0);
 
         ui.label(RichText::new("Server encryption").strong());
-        for level in [ProtectionLevel::Protected, ProtectionLevel::Open] {
+        for level in [ProtectionLevel::Open, ProtectionLevel::Protected] {
             ui.radio_value(
                 &mut self.hosting_setup.creation_protection,
                 level,
@@ -697,7 +712,7 @@ mod tests {
         assert_eq!(
             Choices::recommended(true),
             Choices {
-                protection: ProtectionLevel::Protected,
+                protection: ProtectionLevel::Open,
                 route: Choice::Iroh
             }
         );
@@ -705,7 +720,7 @@ mod tests {
         assert_eq!(Choices::recommended(false).route, Choice::Tailscale);
         assert_eq!(
             Choices::recommended(false).protection,
-            ProtectionLevel::Protected
+            ProtectionLevel::Open
         );
     }
 
@@ -722,7 +737,7 @@ mod tests {
         state.new_host = false;
         state.begin_creation(true);
         assert!(state.choosing_creation && !state.creation_confirmed);
-        assert_eq!(state.creation_protection, ProtectionLevel::Protected);
+        assert_eq!(state.creation_protection, ProtectionLevel::Open);
         assert_eq!(state.creation_route, Choice::Iroh);
         assert_eq!(state.route_to_apply, None);
         // Visiting the choices changes no existing server and starts nothing.
@@ -779,7 +794,7 @@ mod tests {
         state.creation_route = Choice::Tailscale;
         state.local_account_ready(&mut login, Some(true));
         assert!(state.new_host && !state.creation_confirmed);
-        assert_eq!(state.creation_protection, ProtectionLevel::Protected);
+        assert_eq!(state.creation_protection, ProtectionLevel::Open);
         assert_eq!(
             state.creation_route,
             Choices::recommended(crate::iroh_route::available()).route
@@ -1051,8 +1066,8 @@ mod tests {
         ] {
             assert!(!text.contains("Tailscale"), "{text}");
         }
-        assert!(protection_title(ProtectionLevel::Protected).contains("recommended"));
-        assert!(!protection_title(ProtectionLevel::Open).contains("recommended"));
+        assert!(!protection_title(ProtectionLevel::Protected).contains("recommended"));
+        assert!(protection_title(ProtectionLevel::Open).contains("recommended"));
         assert!(
             SCOPE.contains("Relay account")
                 && SCOPE.contains("other servers")
@@ -1116,6 +1131,6 @@ mod tests {
             line,
             "Chosen for this server: end-to-end encryption off · connecting with Tailscale"
         );
-        assert!(summary(Choices::recommended(true)).contains("encryption on"));
+        assert!(summary(Choices::recommended(true)).contains("encryption off"));
     }
 }

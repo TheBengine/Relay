@@ -2835,6 +2835,7 @@ impl RelayApp {
     }
 
     fn host_local(&mut self) {
+        self.account_start.hosting_error = None;
         match crate::handover_runtime::remembered() {
             Ok(Some(_)) => {
                 self.send(Command::RestoreHandoverHost);

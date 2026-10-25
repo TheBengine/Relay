@@ -208,14 +208,15 @@ if($publicMode -or $tailscaleMode -or $embeddedMode -or $LanDiscovery){
     # Only inspect a stopped/checkpointed community. This CLI never migrates,
     # creates directories, binds listeners or initializes an account.
     $ownerCheck=& $ServerBinary --public-hosting-status --data $dataRoot
-    if($LASTEXITCODE -ne 0 -and (($ownerCheck -join "`n") | ConvertFrom-Json).error_code -eq 'community_busy'){
-        # A crash or forced stop leaves a write-ahead log. The ordinary local open
-        # recovers it under the exclusive data lock (refused while a server runs),
-        # then closes cleanly; only then is the read-only preflight repeated.
+    if($LASTEXITCODE -ne 0 -and (($ownerCheck -join "`n") | ConvertFrom-Json).error_code -in @('community_busy','schema_update_required')){
+        # A normal app update can also leave an older database schema. Upgrade
+        # or recover it through the ordinary local maintenance path, under the
+        # exclusive data lock. No listener opens and no owner is invented.
+        # Repeat the owner/identity check before enabling any network access.
         & $ServerBinary --migrate-only --data $dataRoot | Out-Null
         if($LASTEXITCODE -eq 0){$ownerCheck=& $ServerBinary --public-hosting-status --data $dataRoot}
     }
-    if($LASTEXITCODE -ne 0){throw 'Network hosting preflight failed. Initialize the owner locally, stop that local host normally, and use a server supporting read-only hosting preflight.'}
+    if($LASTEXITCODE -ne 0){throw 'The saved local server could not be prepared. Close any other Relay host using this data folder, then retry. Existing data was kept.'}
     $ownerStatus=($ownerCheck -join "`n") | ConvertFrom-Json
     if(-not $ownerStatus.ready -or -not $ownerStatus.owner_initialized -or -not $ownerStatus.server_id){throw 'The local server owner has not been initialized.'}
 }

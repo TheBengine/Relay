@@ -4,7 +4,7 @@
 
 **Protected communities:** content is encrypted on participant devices. Approved devices hold the keys; the Relay community server forwards encrypted content. Participants can still save or share what they receive.
 
-**Open communities:** the community server can read messages, files and calls that participants agree to send without end-to-end protection. The change is announced, and each participant must explicitly accept it. Switching to open mode again requires fresh acceptance. End-to-end encryption is recommended and selected by default when creating a server.
+**Open communities:** the community server can read messages, files and calls that participants agree to send without end-to-end protection. The change is announced, and each participant must explicitly accept it. Switching to open mode again requires fresh acceptance. New servers select E2EE off by default. You can enable end-to-end encryption during creation. HTTPS and Tailscale still encrypt their connections; private Friends conversations keep their own protection.
 
 ## What does an invitation prove?
 

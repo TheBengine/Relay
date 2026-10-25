@@ -259,6 +259,7 @@ pub enum Command {
         server: PathBuf,
         data: PathBuf,
     },
+    CreateLocal { server: PathBuf, request: String },
     HostTailscale {
         server: PathBuf,
         data: PathBuf,
@@ -683,6 +684,7 @@ pub enum Update {
     },
     Notice(String),
     Error(String),
+    LocalHostFailed(String),
     Busy(bool),
     LocalReady {
         created: bool,
@@ -1966,6 +1968,7 @@ impl Worker {
         if matches!(
             &command,
             Command::HostLocal { .. }
+                | Command::CreateLocal { .. }
                 | Command::HostIroh { .. }
                 | Command::HostTailscale { .. }
                 | Command::HostEmbedded { .. }
@@ -2172,6 +2175,10 @@ impl Worker {
             | Command::AccountLoginFinish { request_id, .. } => Some(*request_id),
             _ => None,
         };
+        let local_hosting = matches!(&command,
+            Command::HostLocal { .. } | Command::CreateLocal { .. } | Command::HostIroh { .. }
+                | Command::HostEmbedded { .. } | Command::HostTailscale { .. }
+                | Command::RestoreLocal { .. });
         self.send_wait = None;
         let result = self.handle(command);
         if let Err(error) = result {
@@ -2189,6 +2196,8 @@ impl Worker {
                 });
             } else if let Some(request_id) = request_id {
                 self.emit(Update::RequestFailed { request_id, error });
+            } else if local_hosting {
+                self.emit(Update::LocalHostFailed(error));
             } else {
                 self.emit(Update::Error(error));
             }
@@ -3072,6 +3081,24 @@ impl Worker {
                         .map_err(network_error)?,
                 )?;
                 self.sync_live_transport()?;
+            }
+            Command::CreateLocal { server, request } => {
+                if self.local_server_ready() {
+                    if self.owned_local.is_none() {
+                        return Err("Another local host is running. Close it normally before creating a new server.".into());
+                    }
+                    self.close_app_host()?;
+                }
+                if self.connection.as_ref().is_some_and(|c| crate::local_host::is_local_url(&c.url)) {
+                    self.cancel_transfers();
+                    self.clear_voice_intent();
+                    self.connection = None;
+                    self.socket_stop.store(true, Ordering::Relaxed);
+                    self.emit(Update::Disconnected);
+                }
+                let data = crate::local_host::create_directory(&request)?;
+                self.host_local(server.clone(), data.clone())?;
+                self.remember_local_host(server, data)?;
             }
             Command::HostLocal { server, data } => self.host_local(server, data)?,
             Command::HostTailscale {

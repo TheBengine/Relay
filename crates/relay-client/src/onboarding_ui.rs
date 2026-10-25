@@ -491,7 +491,8 @@ impl RelayApp {
             self.error.as_deref(),
             self.hosting_setup.new_host && self.hosting_setup.local_ready && self.login.registering,
         );
-        if (!self.hosting_setup.local_ready || self.error.is_some())
+        self.local_host_problem(ui);
+        if !self.hosting_setup.local_ready && self.account_start.hosting_error.is_none()
             && crate::local_host::is_local_url(&self.login.url)
             && crate::local_host::data_directory()
                 .ok()

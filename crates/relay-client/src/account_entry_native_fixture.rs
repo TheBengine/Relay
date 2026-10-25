@@ -124,3 +124,52 @@ fn owned_native_account_entry_signup_and_otp() {
     assert_eq!(result["browser_requests"], 0);
     assert_eq!(result["community_joined"], false);
 }
+
+
+/// One visual acceptance surface with synthetic account/server labels. This never
+/// calls the normal update loop, signs in, opens a host, or uses media devices.
+#[test]
+#[ignore = "Cua visual check in an explicit isolated profile"]
+fn welcome_home_visual_preview() {
+    let root = PathBuf::from(std::env::var("RELAY_UI_PREVIEW_ROOT").expect("explicit preview folder"));
+    assert!(root.starts_with(r"C:\Important\Projects\2026-10-03\can\work\login-usability-20261025"));
+    for part in root.ancestors() {
+        if let Ok(info) = std::fs::symlink_metadata(part) { assert_eq!(info.file_attributes() & 0x400, 0); }
+    }
+    crate::profile_paths::configure(&["relay".into(), "--profile-dir".into(), root.join("profile").to_str().unwrap().into()]).unwrap();
+    struct Preview { app: RelayApp, began: Instant }
+    impl eframe::App for Preview {
+        fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+            self.app.account_front(ctx);
+            if self.began.elapsed() > Duration::from_secs(180) { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        fn on_exit(&mut self, glow: Option<&eframe::glow::Context>) { self.app.on_exit(glow); }
+    }
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Glow,
+        viewport: egui::ViewportBuilder::default().with_title("Relay - isolated UI preview")
+            .with_active(false).with_position([180.0, 80.0]).with_inner_size([1000.0, 1120.0]),
+        event_loop_builder: Some(Box::new(|builder| { builder.with_any_thread(true); })),
+        ..Default::default()
+    };
+    eframe::run_native("Relay - isolated UI preview", options, Box::new(|cc| {
+        let mut app = RelayApp::new(cc, crate::invitation_launch::Launch::default());
+        app.central_account.provider = None;
+        app.central_account.account = Some(crate::central_account::Account {
+            issuer: "https://preview.invalid/realms/relay".into(), subject: "preview-only".into(),
+            handle: "preview".into(), expires_at: u64::MAX,
+        });
+        app.account_start.entered = true;
+        app.account_start.home = true;
+        app.account_start.auto = None;
+        app.account_start.hosting_error = Some("The saved server needs a database update. Existing data was kept.".into());
+        app.prefs.close_to_tray = false;
+        app.prefs.communities = ["Relay House", "Family server"].into_iter().enumerate().map(|(i, name)|
+            crate::community::SavedCommunity { url: format!("https://server{i}.invalid"),
+                name: name.into(), server_id: uuid::Uuid::new_v4().to_string(), ..Default::default() }
+        ).collect();
+        app.error = None;
+        Box::new(Preview { app, began: Instant::now() })
+    })).unwrap();
+}

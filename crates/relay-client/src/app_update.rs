@@ -1924,6 +1924,10 @@ impl RelayApp {
                     }
                 }
                 Update::Notice(text) => self.notice = Some((text, Instant::now())),
+                Update::LocalHostFailed(error) => {
+                    self.hosting_setup.local_ready = false;
+                    self.account_start.hosting_error = Some(error);
+                }
                 Update::Error(e) => {
                     self.cancel_background_people_answer();
                     self.error = Some(e);
@@ -1945,6 +1949,7 @@ impl RelayApp {
                 }
                 Update::Busy(busy) => self.busy = busy,
                 Update::LocalRestored { iroh_only, address } => {
+                    self.account_start.hosting_error = None;
                     self.hosting_setup.local_ready = true;
                     self.hosting_setup.iroh_only = iroh_only;
                     self.hosting_setup.hosted_address = address;
@@ -1954,6 +1959,8 @@ impl RelayApp {
                     created,
                     setup_required,
                 } => {
+                    self.account_start.hosting_error = None;
+                    self.account_start.creation_request = None;
                     self.hosting_setup.hosted_address = self
                         .bootstrap
                         .as_ref()
@@ -1968,6 +1975,10 @@ impl RelayApp {
                         if self.hosting_setup.new_host {
                             self.claim_new_server(setup_required);
                         }
+                    }
+                    if self.hosting_setup.new_host && self.central_account.account.is_some()
+                        && self.account_start.pending.is_none() {
+                        self.claim_new_server(setup_required);
                     }
                     self.hosting_setup.entry = host_setup_ui::LoginEntry::Account;
                     self.own_local_server |= created;
@@ -1988,6 +1999,7 @@ impl RelayApp {
                     ));
                 }
                 Update::TailscaleReady { address } => {
+                    self.account_start.hosting_error = None;
                     self.hosting_setup.tailscale_ready(address);
                     self.login.setup.edited(&mut self.login.invite);
                     if self.session.is_none() {

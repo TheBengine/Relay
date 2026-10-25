@@ -189,7 +189,7 @@ pub fn validate_app_host(
     Ok(())
 }
 
-pub fn data_directory() -> Result<PathBuf, String> {
+fn storage_root() -> Result<PathBuf, String> {
     if let Some(directory) = std::env::var_os("RELAY_SERVER_DATA_DIR") {
         return Ok(PathBuf::from(directory));
     }
@@ -202,12 +202,142 @@ pub fn data_directory() -> Result<PathBuf, String> {
     let destination = root
         .map(|p| p.join("Relay").join("server-data"))
         .ok_or_else(|| "Cannot find your per-user server storage folder.".to_string())?;
-    if !destination.join("relay.sqlite3").is_file() {
-        if let Some(source) = legacy_data_directory() {
-            return Err(format!("An earlier community exists at {}. Stop its old host, then use scripts/import-community.ps1 to copy it safely into {}. Your existing community has been left in place.",source.display(),destination.display()));
+    Ok(destination)
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerChoice {
+    active: Option<String>,
+    created: Vec<String>,
+    #[serde(default)]
+    last_creation: Option<String>,
+}
+fn choice(root: &Path) -> Result<ServerChoice, String> {
+    let path = root.join("local-server-choice.json");
+    safe_folder(&path)?;
+    if !path.exists() {
+        return Ok(ServerChoice::default());
+    }
+    let value: ServerChoice = serde_json::from_value(
+        read_record(&path)
+            .map_err(|_| "Cannot read your local server selection. Existing servers were kept.")?,
+    )
+    .map_err(|_| "Cannot read your local server selection.")?;
+    if value.created.len() > 64
+        || value
+            .created
+            .iter()
+            .any(|id| !uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == *id))
+        || value
+            .active
+            .as_ref()
+            .is_some_and(|id| !value.created.contains(id))
+    {
+        return Err("Your local server selection is invalid. Existing servers were kept.".into());
+    }
+    Ok(value)
+}
+fn safe_folder(path: &Path) -> Result<(), String> {
+    for parent in path.ancestors() {
+        if let Ok(info) = std::fs::symlink_metadata(parent) {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if info.file_attributes() & 0x400 != 0 {
+                    return Err("Redirected local server storage is not supported.".into());
+                }
+            }
+            if info.file_type().is_symlink() {
+                return Err("Redirected local server storage is not supported.".into());
+            }
         }
     }
-    Ok(destination)
+    Ok(())
+}
+/// The chosen local server has its own database, host keys and sharing plan.
+/// Choosing a new server never moves or replaces an earlier community.
+pub fn data_directory() -> Result<PathBuf, String> {
+    let root = storage_root()?;
+    safe_folder(&root)?;
+    if let Some(id) = choice(&root)?.active {
+        let path = root.join("communities").join(id);
+        safe_folder(&path)?;
+        if !path.is_dir() {
+            return Err(
+                "Your selected local server folder is missing. Existing servers were kept.".into(),
+            );
+        }
+        return Ok(path);
+    }
+    if !root.join("relay.sqlite3").is_file() {
+        if let Some(source) = legacy_data_directory() {
+            return Err(format!("An earlier community exists at {}. Stop its old host, then use scripts/import-community.ps1 to copy it safely into {}. Your existing community has been left in place.",source.display(),root.display()));
+        }
+    }
+    Ok(root)
+}
+/// Called only after the explicit Create server action, on the control worker.
+pub fn create_directory(request: &str) -> Result<PathBuf, String> {
+    create_directory_with(&storage_root()?, request)
+}
+#[cfg(test)]
+fn create_directory_in(root: &Path) -> Result<PathBuf, String> {
+    create_directory_with(root, &uuid::Uuid::new_v4().to_string())
+}
+fn create_directory_with(root: &Path, request: &str) -> Result<PathBuf, String> {
+    if !uuid::Uuid::parse_str(request).is_ok_and(|id| id.to_string() == request) {
+        return Err("Invalid server creation request.".into());
+    }
+    safe_folder(root)?;
+    let mut selected = choice(root)?;
+    if selected.last_creation.as_deref() == Some(request) {
+        let data = selected
+            .active
+            .as_ref()
+            .map(|id| root.join("communities").join(id))
+            .unwrap_or_else(|| root.to_path_buf());
+        safe_folder(&data)?;
+        if !data.is_dir() {
+            return Err("The new server folder is missing. Existing data was kept.".into());
+        }
+        return Ok(data);
+    }
+    let data = if !root.join("relay.sqlite3").exists() && selected.created.is_empty() {
+        std::fs::create_dir_all(root).map_err(|_| "Cannot create your server folder.")?;
+        root.to_path_buf()
+    } else {
+        if selected.created.len() >= 64 {
+            return Err(
+                "You have 64 saved local servers. Open one before creating another.".into(),
+            );
+        }
+        let parent = root.join("communities");
+        safe_folder(&parent)?;
+        std::fs::create_dir_all(&parent).map_err(|_| "Cannot create your server folder.")?;
+        let data = parent.join(request);
+        std::fs::create_dir(&data)
+            .map_err(|_| "Cannot create your new server folder. Existing data was kept.")?;
+        selected.created.push(request.to_owned());
+        selected.active = Some(request.to_owned());
+        data
+    };
+    selected.last_creation = Some(request.to_owned());
+    let bytes = serde_json::to_vec(&selected).map_err(|_| "Cannot save your server selection.")?;
+    let temporary = root.join(format!(".server-choice-{}.tmp", uuid::Uuid::new_v4()));
+    use std::io::Write;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| "Cannot save your server selection.")?;
+    out.write_all(&bytes)
+        .and_then(|_| out.sync_all())
+        .map_err(|_| "Cannot save your server selection.")?;
+    drop(out);
+    std::fs::rename(&temporary, root.join("local-server-choice.json"))
+        .map_err(|_| "Cannot save your server selection. All server data was kept.")?;
+    Ok(data)
 }
 
 fn legacy_data_directory() -> Option<PathBuf> {
@@ -748,7 +878,10 @@ mod tests {
     #[test]
     fn desktop_lan_keeps_normal_ports_on_loopback() {
         assert_eq!(local_launch(false), ("127.0.0.1", &[][..]));
-        assert_eq!(local_launch(true), ("127.0.0.1", &["--lan-discovery", "--lan-pairing-only"][..]));
+        assert_eq!(
+            local_launch(true),
+            ("127.0.0.1", &["--lan-discovery", "--lan-pairing-only"][..])
+        );
     }
 
     #[test]
@@ -776,8 +909,11 @@ mod tests {
         let instance = uuid::Uuid::new_v4().to_string();
         let actual = || lan_actual(directory.path(), &server, &instance);
         let write = |value: serde_json::Value| {
-            std::fs::write(directory.path().join("server-runtime.json"),
-                serde_json::to_vec(&value).unwrap()).unwrap();
+            std::fs::write(
+                directory.path().join("server-runtime.json"),
+                serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
         };
         assert_eq!(actual(), LanActual::Unknown);
         // Requested settings cannot claim the responder actually started.
@@ -789,7 +925,9 @@ mod tests {
         assert_eq!(actual(), LanActual::Unknown);
         write(serde_json::json!({"server_id":server,"instance_id":instance,"lan_discovery":false}));
         assert_eq!(actual(), LanActual::Off);
-        write(serde_json::json!({"server_id":server,"instance_id":instance,"lan_discovery":true,"lan_pairing_port":49152}));
+        write(
+            serde_json::json!({"server_id":server,"instance_id":instance,"lan_discovery":true,"lan_pairing_port":49152}),
+        );
         assert_eq!(actual(), LanActual::On);
         for value in [
             serde_json::json!({"server_id":server,"instance_id":"other","lan_discovery":true}),
@@ -802,5 +940,51 @@ mod tests {
         }
         std::fs::write(directory.path().join("server-runtime.json"), b"{").unwrap();
         assert_eq!(actual(), LanActual::Unknown);
+    }
+    #[test]
+    fn creating_a_server_keeps_the_existing_database_keys_and_selection() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("server-data");
+        assert_eq!(create_directory_in(&root).unwrap(), root);
+        std::fs::write(root.join("relay.sqlite3"), b"existing-community-database").unwrap();
+        std::fs::write(root.join("host-key.v1"), b"existing-private-key").unwrap();
+        let request = uuid::Uuid::new_v4().to_string();
+        let first = create_directory_with(&root, &request).unwrap();
+        assert_ne!(first, root);
+        assert!(first.is_dir() && !first.join("relay.sqlite3").exists());
+        std::fs::write(first.join("relay.sqlite3"), b"second-community").unwrap();
+        assert_eq!(
+            create_directory_with(&root, &request).unwrap(),
+            first,
+            "Retry must reopen the same newly-created server"
+        );
+        let second = create_directory_in(&root).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            std::fs::read(root.join("relay.sqlite3")).unwrap(),
+            b"existing-community-database"
+        );
+        assert_eq!(
+            std::fs::read(root.join("host-key.v1")).unwrap(),
+            b"existing-private-key"
+        );
+        assert_eq!(
+            std::fs::read(first.join("relay.sqlite3")).unwrap(),
+            b"second-community"
+        );
+        let selected = choice(&root).unwrap();
+        assert_eq!(selected.created.len(), 2);
+        assert_eq!(
+            root.join("communities").join(selected.active.unwrap()),
+            second
+        );
+        // A malformed pointer must not select or create an arbitrary path.
+        std::fs::write(
+            root.join("local-server-choice.json"),
+            br#"{"active":"../other","created":["../other"]}"#,
+        )
+        .unwrap();
+        assert!(create_directory_in(&root).is_err());
+        assert!(!fixture.path().join("other").exists());
     }
 }
