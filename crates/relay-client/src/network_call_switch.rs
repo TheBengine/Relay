@@ -21,6 +21,7 @@ pub(crate) struct Ready {
     pub keys: Arc<crate::e2ee::CallKeys>,
     pub warning: Option<String>,
     pub media_generation: u64,
+    pub gateway: Option<crate::gateway_control::Config>,
 }
 pub(crate) struct Failure {
     pub message: String,
@@ -493,7 +494,11 @@ impl Worker {
                     c.chat.update_bootstrap(&bootstrap);
                 }
                 self.publish_communities();
+                // Capture only the accepted destination account after the old call is
+                // retired. The UI never builds gateway requests from its foreground URL.
+                let gateway = self.voice_gateway(&admission.ticket);
                 Ok(Ready {
+                    gateway,
                     request: r.clone(),
                     session,
                     bootstrap,

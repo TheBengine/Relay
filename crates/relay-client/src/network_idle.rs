@@ -67,6 +67,9 @@ impl super::Worker {
         let mut schedule = |at: std::time::Instant| {
             next = Some(next.map_or(at, |old: std::time::Instant| old.min(at)));
         };
+        if self.host_locator_service.is_some() {
+            schedule(if self.host_locator_more.load(std::sync::atomic::Ordering::Acquire) {now}else{self.host_locator_retry_at});
+        }
         if self.connection.is_some() {
             schedule(refreshed + Duration::from_secs(5));
             if self

@@ -1,4 +1,121 @@
 // Included only in media::tests. All audio is generated; no device enumeration.
+include!("media_gateway_acceptance.rs");
+#[test]
+fn actual_voice_worker_uses_a_proven_gateway_and_rebinds_before_fallback_audio() {
+    use crate::local_voice_gateway::{Grant, Path, Worker};
+    use zeroize::Zeroizing;
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_millis(5)))
+        .unwrap();
+    let remote = server.local_addr().unwrap();
+    let make_grant = || Grant {
+        id: [13; 16],
+        session: 7,
+        key: Zeroizing::new([53; 32]),
+        valid_for: Duration::from_secs(2),
+    };
+    let mut forwarder = Some(Worker::start("127.0.0.1:0".parse().unwrap(), remote).unwrap());
+    let gateway_addr = forwarder.as_ref().unwrap().address;
+    let began = Instant::now();
+    assert!(forwarder.as_ref().unwrap().grant(make_grant(), began));
+    let path = Path::new(gateway_addr, make_grant(), began, began).unwrap();
+    let (mut worker, _, counters) = probe_fixture(remote);
+    // The normal app uses an unconnected socket for server, direct and gateway
+    // sources. This fixture compares against an explicitly simulated 100 ms RTT.
+    worker.socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    worker.socket.set_nonblocking(true).unwrap();
+    counters.udp_rtt_us.store(100_000, Ordering::Relaxed);
+    worker
+        .controls
+        .gateway_enabled
+        .store(true, Ordering::Release);
+    worker
+        .controls
+        .transmission
+        .store(TransmissionMode::Continuous as u32, Ordering::Release);
+    // This is a transport fixture with a generated tone, not speech detection.
+    worker.controls.suppression.store(false, Ordering::Relaxed);
+    worker.controls.packet_samples.store(480, Ordering::Relaxed);
+    worker.muted.store(false, Ordering::Release);
+    worker.deafened.store(false, Ordering::Release);
+    worker.gateway = Some(crate::gateway_control::Session::fixture(
+        path,
+        worker.controls.gateway_enabled.clone(),
+    ));
+    let cipher = worker.cipher.clone();
+    let capture = worker.capture.clone();
+    let errors = worker.errors.clone();
+    let mut owner = OwnedVoiceWorker::start(worker);
+    let pcm: Vec<_> = (0..960).map(|n| (n as f32 * 0.09).sin() * 0.2).collect();
+    let mut active_binding = None;
+    let mut server_sequence = 1;
+    let mut inspector = CallCipher::new(test_call_keys("remote")).unwrap();
+    let mut gateway_audio = false;
+    let mut fallback_audio = false;
+    let mut fed_gateway = false;
+    let mut fed_fallback = false;
+    let deadline = began + Duration::from_millis(1800);
+    while Instant::now() < deadline && !fallback_audio {
+        if counters.gateway_active.load(Ordering::Acquire) && !fed_gateway {
+            capture.lock().unwrap().extend(pcm.iter().copied());
+            fed_gateway = true;
+        }
+        if gateway_audio && forwarder.is_some() {
+            forwarder.take();
+        }
+        if gateway_audio && !counters.gateway_active.load(Ordering::Acquire) && !fed_fallback {
+            capture.lock().unwrap().extend(pcm.iter().copied());
+            fed_fallback = true;
+        }
+        let Some((_, plain, from)) = receive_voice_fixture(&server, &cipher) else {
+            continue;
+        };
+        if plain == [0] {
+            active_binding = Some(from);
+        }
+        if plain.first() == Some(&relay_protocol::UDP_PATH_PROBE)
+            || (plain.first() == Some(&UDP_PING) && from == gateway_addr)
+        {
+            let packet = seal_packet(&cipher, 7, server_sequence, 1, &plain).unwrap();
+            server_sequence += 1;
+            server.send_to(&packet, from).unwrap();
+        }
+        if plain.first() == Some(&AUDIO_PACKET_V3) {
+            assert_eq!(active_binding, Some(from), "new route bound before audio");
+            let frame = inspector.open(&plain).unwrap();
+            assert_eq!(
+                opus::packet::get_nb_samples(&frame.opus, 48_000).unwrap(),
+                480
+            );
+            let mut decoder = Decoder::new(48_000, Channels::Mono).unwrap();
+            let mut decoded = [0.0; 480];
+            assert_eq!(
+                decoder
+                    .decode_float(&frame.opus, &mut decoded, false)
+                    .unwrap(),
+                480
+            );
+            if from == gateway_addr {
+                gateway_audio = true;
+            } else if gateway_audio {
+                fallback_audio = true;
+            }
+        }
+    }
+    owner.finish();
+    assert!(
+        gateway_audio,
+        "generated 10 ms Opus went through the proven gateway; selected={fed_gateway}, stats={:?}, errors={:?}", counters.snapshot(), errors.lock().unwrap()
+    );
+    assert!(
+        fallback_audio,
+        "gateway loss returned the same call to its original UDP route"
+    );
+    assert!(!counters.snapshot().gateway_active);
+    assert!(errors.lock().unwrap().is_none());
+}
+
 struct OwnedVoiceWorker {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,

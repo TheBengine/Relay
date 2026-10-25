@@ -160,9 +160,11 @@ pub(super) fn local_invitation_notice(ui: &mut egui::Ui) {
     ui.add_space(8.0);
 }
 
-/// What the host picked under "Change connection".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the host picked under "Change connection", or when creating a server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(super) enum Choice {
+    #[default]
     Iroh,
     Tailscale,
 }
@@ -305,6 +307,20 @@ pub(super) struct HostSetup {
     pub entry: LoginEntry,
     pub new_host: bool,
     pub creation_protection: relay_protocol::ProtectionLevel,
+    /// The choices for a new server are on screen. Nothing has been started.
+    pub choosing_creation: bool,
+    /// The choices were made for the server that is being created now.
+    pub creation_confirmed: bool,
+    pub creation_route: Choice,
+    /// The way chosen at creation, before the first account exists. When the
+    /// account is created it becomes the saved plan for that exact server.
+    pub route_to_apply: Option<Choice>,
+    /// Whether the account-free sharing was asked to start for the saved plan.
+    pub route_attempt: super::server_creation::Attempt,
+    /// Why the saved plan has not started, while it has not.
+    pub route_failure: Option<super::server_creation::RouteFailure>,
+    /// The server whose saved plan already reopened the Invite dialog this run.
+    pub resumed_server: Option<String>,
     pub local_ready: bool,
     pub resume_share: bool,
     pub auto_share: bool,
@@ -337,7 +353,46 @@ impl HostSetup {
         if let Some(required) = setup_required {
             self.new_host = required;
             login.registering = required;
+            if required && !self.creation_confirmed {
+                // A server left without accounts by an earlier start: its
+                // choices were never made, so offer the recommended ones.
+                self.reset_creation_choices(crate::iroh_route::available());
+            }
         }
+    }
+
+    fn reset_creation_choices(&mut self, iroh_available: bool) {
+        let recommended = super::server_creation::Choices::recommended(iroh_available);
+        self.creation_protection = recommended.protection;
+        self.creation_route = recommended.route;
+        self.route_to_apply = None;
+    }
+
+    /// "Create a server" was pressed: show the choices with the recommended
+    /// defaults, whatever an earlier server used. Starts nothing and leaves
+    /// every existing server untouched.
+    pub(super) fn begin_creation(&mut self, iroh_available: bool) {
+        self.reset_creation_choices(iroh_available);
+        self.choosing_creation = true;
+        self.creation_confirmed = false;
+    }
+
+    pub(super) fn cancel_creation(&mut self) {
+        self.choosing_creation = false;
+        self.creation_confirmed = false;
+        self.route_to_apply = None;
+    }
+
+    /// The choices are final for this server. Refuses a way this copy of Relay
+    /// cannot use, so a choice is never accepted and then ignored.
+    pub(super) fn confirm_creation(&mut self, iroh_available: bool) -> bool {
+        if self.creation_route == Choice::Iroh && !iroh_available {
+            return false;
+        }
+        self.choosing_creation = false;
+        self.creation_confirmed = true;
+        self.route_to_apply = Some(self.creation_route);
+        true
     }
 
     /// The way friends reach this server has changed. Nothing prepared for the
@@ -578,7 +633,7 @@ impl HostSetup {
         origin: &CommandOrigin,
         code: &str,
     ) -> Result<bool, String> {
-        self.finish_invitation_copy_with_proof(ctx, request_id, origin, code, None)
+        self.finish_invitation_copy_with_proof(ctx, request_id, origin, code, None, None)
     }
 
     /// As `finish_invitation_copy`; `proof` adds device verification to the link.
@@ -589,6 +644,7 @@ impl HostSetup {
         origin: &CommandOrigin,
         code: &str,
         proof: Option<crate::invite_proof::InviteProof>,
+        authority: Option<relay_protocol::handover::RoutePin>,
     ) -> Result<bool, String> {
         if !self.open {
             self.cancel_invitation_copy();
@@ -625,6 +681,7 @@ impl HostSetup {
         if let Some(proof) = proof {
             invitation = invitation.with_proof(proof);
         }
+        let invitation=invitation.with_authority(authority)?.for_sharing();
         ctx.output_mut(|output| output.copied_text = invitation.browser_link());
         self.invitation = Some(invitation);
         Ok(true)
@@ -889,6 +946,8 @@ impl RelayApp {
                     .as_ref()
                     .is_some_and(|i| crate::invitation::private_address(&i.server)));
         self.hosting_setup.poll(ctx);
+        // May reopen the dialog for the server a saved plan belongs to.
+        self.apply_creation_route();
         if !self.hosting_setup.open {
             return;
         }
@@ -953,6 +1012,7 @@ impl RelayApp {
         }
         let window = invite_friends_window(ctx, &mut open);
         let close = show_with_header(ctx, window, "Invite friends", |ui| {
+            self.lan_pairing_host_controls(ui);
             if self.remote_invite_step(ui) {
                 return;
             }
@@ -977,30 +1037,35 @@ impl RelayApp {
             step_line(ui, &["Your server", "Connect", "Invite"], step);
             ui.add_space(16.0);
             if step == 1 {
-                ui.heading("Start with your own server");
-                ui.label("Create its first account, then Relay will help you invite friends.");
-                if ui
-                    .add_enabled(
-                        !self.busy && self.session.is_none(),
-                        primary("Create my server"),
-                    )
-                    .clicked()
-                {
-                    self.hosting_setup.new_host = true;
-                    self.hosting_setup.local_ready = false;
-                    self.hosting_setup.resume_share = true;
-                    self.hosting_setup.entry = LoginEntry::Account;
-                    self.error = None;
-                    self.host_local();
-                    go_to_account = true;
-                }
-                if self.session.is_some() {
-                    ui.label("You are visiting another server. Return to your own server to change its sharing.");
+                if self.hosting_setup.choosing_creation {
+                    if self.creation_choices(ui) {
+                        go_to_account = true;
+                    }
+                } else {
+                    ui.heading("Start with your own server");
+                    ui.label("Choose how it is protected and how friends connect, create its first account, then Relay will help you invite friends.");
+                    if ui
+                        .add_enabled(
+                            !self.busy && self.session.is_none(),
+                            primary("Create my server"),
+                        )
+                        .clicked()
+                    {
+                        self.hosting_setup
+                            .begin_creation(crate::iroh_route::available());
+                        self.error = None;
+                    }
+                    if self.session.is_some() {
+                        ui.label("You are visiting another server. Return to your own server to change its sharing.");
+                    }
                 }
             } else if step == 2 {
+                self.creation_route_card(ui);
                 if self.hosting_setup.tailscale_step
                     && ui.add_enabled(!self.busy, secondary("← Back")).clicked()
                 {
+                    // Going back is a deliberate change of mind about the saved choice.
+                    self.clear_creation_plan();
                     self.hosting_setup.tailscale_step = false;
                     self.hosting_setup.auto_share = false;
                     self.error = None;
@@ -1039,7 +1104,7 @@ impl RelayApp {
                     if !self.pending_sends.is_empty() {
                         ui.label("Wait for your messages to finish sending.");
                     }
-                    ui.label(RichText::new("Relay tells a public directory (iroh.link) that your key is online and which relay server it uses. It never learns your messages or your address.").size(font_size(12.0)).color(c_muted()));
+                    ui.add(egui::Label::new(RichText::new(super::server_creation::IROH_DISCLOSURE).size(font_size(12.0)).color(c_muted())).wrap(true));
                     self.hosting_setup.firewall_notice(ui);
                     ui.add_space(14.0);
                     ui.horizontal_wrapped(|ui| {
@@ -1048,6 +1113,7 @@ impl RelayApp {
                             .add_enabled(!self.busy, secondary("Use Tailscale instead"))
                             .clicked()
                         {
+                            self.clear_creation_plan();
                             self.error = None;
                             self.hosting_setup.copy_when_shared = false;
                             self.hosting_setup.tailscale_step = true;
@@ -1056,6 +1122,7 @@ impl RelayApp {
                 } else {
                     ui.heading("Let friends connect from home");
                     ui.label("Relay uses Tailscale to connect you privately. First time, you and each friend sign in with your own Tailscale accounts in the browser. No separate app is needed.");
+                    super::server_creation::tailscale_requirements(ui);
                     ui.add_space(12.0);
                     if !self.hosting_setup.auto_share
                         && ui
@@ -1527,7 +1594,7 @@ impl RelayApp {
     }
     /// Starts sharing without any account. The server runs in the same built-in
     /// private mode as for Tailscale, with no Tailscale involved.
-    fn start_iroh_host(&mut self) {
+    pub(super) fn start_iroh_host(&mut self) {
         let server = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.join("relay-server.exe")));

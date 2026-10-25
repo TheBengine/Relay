@@ -1,0 +1,193 @@
+diff --git a/pkg/service/relay_turn_write_slow_reader_test.go b/pkg/service/relay_turn_write_slow_reader_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/service/relay_turn_write_slow_reader_test.go
+@@ -0,0 +1,188 @@
++// Copyright 2026 LiveKit, Inc.
++// Licensed under the Apache License, Version 2.0.
++
++package service
++
++import (
++	"context"
++	"crypto/ed25519"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/json"
++	"errors"
++	"io"
++	"math/big"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// Only these owned loopback sockets request small buffers to reliably reach
++// kernel backpressure without unbounded traffic. This does not tune production
++// sockets or claim that an OS accepted exactly the requested buffer size.
++func TestRelayTURNWriteBudgetRealSlowReaders(t *testing.T) {
++	for _, scenario := range []struct {
++		name   string
++		tls    bool
++		caller time.Duration
++	}{{name: "plain", caller: 0}, {name: "tls", tls: true}, {name: "tls_earlier_caller", tls: true, caller: 250 * time.Millisecond}} {
++		t.Run(scenario.name, func(t *testing.T) {
++			listener, err := net.Listen("tcp4", "127.0.0.1:0")
++			require.NoError(t, err)
++			defer listener.Close()
++			public, private, err := ed25519.GenerateKey(rand.Reader)
++			require.NoError(t, err)
++			template := &x509.Certificate{SerialNumber: big.NewInt(23), Subject: pkix.Name{CommonName: "owned.invalid"},
++				DNSNames: []string{"owned.invalid"}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour),
++				KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
++			der, err := x509.CreateCertificate(rand.Reader, template, template, public, private)
++			require.NoError(t, err)
++			cert, err := x509.ParseCertificate(der)
++			require.NoError(t, err)
++			roots := x509.NewCertPool()
++			roots.AddCert(cert)
++			ready := make(chan *relayTURNWriteConn, 1)
++			finished := make(chan struct{})
++			type outcome struct {
++				phase     string
++				err       error
++				elapsed   time.Duration
++				reported  int
++				attempted int
++			}
++			result := make(chan outcome, 1)
++			// A valid-looking whole TURN ChannelData frame and deterministic
++			// generated payload. We test transport-byte prefixes, not a TURN
++			// allocation or a parser's acceptance of an incomplete terminal frame.
++			frame := make([]byte, 32768)
++			frame[0], frame[1], frame[2], frame[3] = 0x40, 1, 0x7f, 0xfc
++			for index := 4; index < len(frame); index++ {
++				frame[index] = byte(index % 251)
++			}
++			go func() {
++				defer close(finished)
++				raw, err := listener.Accept()
++				if err != nil {
++					result <- outcome{phase: "accept", err: err}
++					return
++				}
++				defer raw.Close()
++				if err = raw.(*net.TCPConn).SetWriteBuffer(4096); err != nil {
++					result <- outcome{phase: "fixture_buffer", err: err}
++					return
++				}
++				budget := newRelayTURNWriteConn(raw)
++				defer budget.Close()
++				var conn net.Conn = budget
++				if scenario.tls {
++					secure := tls.Server(budget, &tls.Config{MinVersion: tls.VersionTLS12,
++						Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: private}}})
++					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++					err = secure.HandshakeContext(ctx)
++					cancel()
++					if err != nil {
++						result <- outcome{phase: "server_handshake", err: err}
++						return
++					}
++					conn = secure
++				}
++				if scenario.caller > 0 {
++					if err = conn.SetWriteDeadline(time.Now().Add(scenario.caller)); err != nil {
++						result <- outcome{phase: "caller_deadline", err: err}
++						return
++					}
++				}
++				ready <- budget
++				began := time.Now()
++				total, attempted := 0, 0
++				for attempted < 16*1024*1024 {
++					attempted += len(frame)
++					n, writeErr := conn.Write(frame)
++					total += n
++					if writeErr != nil {
++						result <- outcome{phase: "write", err: writeErr, elapsed: time.Since(began), reported: total, attempted: attempted}
++						return
++					}
++					if n != len(frame) {
++						result <- outcome{phase: "short_write_without_error", elapsed: time.Since(began), reported: total, attempted: attempted}
++						return
++					}
++				}
++				result <- outcome{phase: "traffic_bound_reached_without_backpressure", elapsed: time.Since(began), reported: total, attempted: attempted}
++			}()
++			raw, err := net.DialTimeout("tcp4", listener.Addr().String(), time.Second)
++			require.NoError(t, err)
++			defer func() {
++				raw.Close()
++				listener.Close()
++				select {
++				case <-finished:
++				case <-time.After(5 * time.Second):
++					t.Error("owned writer did not stop")
++				}
++			}()
++			require.NoError(t, raw.(*net.TCPConn).SetReadBuffer(4096))
++			var client net.Conn = raw
++			if scenario.tls {
++				secure := tls.Client(raw, &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: "owned.invalid"})
++				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++				err = secure.HandshakeContext(ctx)
++				cancel()
++				require.NoError(t, err)
++				client = secure
++			}
++			// No application read until the actual socket writer has finished.
++			// The kernel will acknowledge its bounded receive window normally.
++			var observed outcome
++			select {
++			case observed = <-result:
++			case <-time.After(7 * time.Second):
++				t.Fatal("write budget failed to finish under real backpressure")
++			}
++			require.Equal(t, "write", observed.phase)
++			var timeout net.Error
++			require.True(t, errors.As(observed.err, &timeout) && timeout.Timeout(), "expected an actual write timeout")
++			budget := <-ready
++			requireRelayTURNReleased(t, budget)
++			_, err = budget.Write([]byte("never append after a partial/failed transport write"))
++			require.ErrorIs(t, err, net.ErrClosed)
++			expected := relayTURNWriteStall
++			if scenario.caller > 0 {
++				expected = scenario.caller
++			}
++			require.GreaterOrEqual(t, observed.elapsed, expected-50*time.Millisecond)
++			require.Less(t, observed.elapsed, expected+4*time.Second)
++			require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
++			received, readErr := io.ReadAll(io.LimitReader(client, 16*1024*1024+1))
++			// TLS can end with unexpected EOF because the budget closed the
++			// underlying socket. That terminal failure is intentional, not a
++			// claim that every buffered frame was completely delivered.
++			if readErr != nil {
++				var readerTimeout net.Error
++				require.False(t, errors.As(readErr, &readerTimeout) && readerTimeout.Timeout(), "owned buffered prefix failed to drain")
++			}
++			require.NotEmpty(t, received)
++			// A failed overlapped socket write/TLS record is not a delivery
++			// acknowledgement. Keep returned counts and observed peer bytes
++			// separate; the actual prefix must still match attempted bytes.
++			require.LessOrEqual(t, len(received), observed.attempted)
++			require.LessOrEqual(t, observed.reported, observed.attempted)
++			for index, value := range received {
++				if value != frame[index%len(frame)] {
++					t.Fatalf("generated byte prefix changed at %d", index)
++				}
++			}
++			encoded, err := json.Marshal(map[string]any{"scenario": scenario.name, "write_failure_ms": observed.elapsed.Milliseconds(),
++				"write_reported_plaintext_bytes": observed.reported, "attempted_plaintext_bytes": observed.attempted,
++				"peer_plaintext_prefix_bytes": len(received),
++				"default_stall_budget_ms":     relayTURNWriteStall.Milliseconds(), "caller_budget_ms": scenario.caller.Milliseconds(),
++				"fixture_requested_buffer_bytes": 4096, "physical_media_or_wan": false})
++			require.NoError(t, err)
++			t.Log(string(encoded))
++		})
++	}
++}

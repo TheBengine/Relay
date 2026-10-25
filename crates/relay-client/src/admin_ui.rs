@@ -1,6 +1,8 @@
 use super::*;
 use crate::appearance::{TEXT_BODY, TEXT_CAPTION};
 use serde_json::{json, Value};
+#[path = "role_templates.rs"]
+mod role_templates;
 include!("roles_ui.rs");
 include!("social_ui.rs");
 include!("friends_overview_ui.rs");
@@ -23,6 +25,7 @@ enum Section {
     Expressions,
     Invites,
     Account,
+    Hosts,
     Backups,
     Discord,
 }
@@ -43,6 +46,7 @@ pub(super) struct ServerUi {
     search_errors: Vec<String>,
     pub(super) search: String,
     section: Section,
+    pub(super) hosting: super::host_ui::State,
     channel: Option<Channel>,
     permissions: Vec<ChannelPermission>,
     permission_user: String,
@@ -152,6 +156,11 @@ impl ServerUi {
                 "Invites",
                 bootstrap.has_permission(PERMISSION_INVITES),
             ),
+            (
+                Section::Hosts,
+                "Hosts",
+                bootstrap.capabilities.iter().any(|c| c == "hosting-v1"),
+            ),
             (Section::Backups, "Backups & Restore", admin),
             (
                 Section::Discord,
@@ -177,6 +186,11 @@ impl ServerUi {
             }
         }
     }
+    /// Native QA fixtures only: whether the Hosts page is the selected section.
+    #[cfg(test)]
+    pub(super) fn hosts_selected(&self) -> bool {
+        self.section == Section::Hosts
+    }
     pub(super) fn select_section(&mut self, section: &str) {
         self.section = match section {
             "channels" => Section::Channels,
@@ -187,6 +201,7 @@ impl ServerUi {
             "expressions" | "emoji" => Section::Expressions,
             "invites" => Section::Invites,
             "account" => Section::Account,
+            "hosts" => Section::Hosts,
             "backups" => Section::Backups,
             "discord" => Section::Discord,
             _ => Section::Overview,
@@ -579,6 +594,12 @@ impl RelayApp {
             self.private_call_result(&key, data);
             return;
         }
+        if key == "hosting" || key == "action:hosting" {
+            // Validated and stored by the Hosts page; a bad answer is a failure
+            // there, never "saved".
+            self.hosting_received(&key, data);
+            return;
+        }
         if key == "discord-host" || key == "action:discord-host" {
             self.admin_data.insert("discord-host".into(), data.clone());
             if key.starts_with("action:") {
@@ -665,6 +686,8 @@ impl RelayApp {
             let message = match action {
                 "social" => "Friends updated",
                 "presence" => "Status updated",
+                "group-invite" => "Group invitations updated",
+                "conversation:create" if self.in_people() => "Invitations sent",
                 _ => "Community settings saved",
             };
             self.notice = Some((message.into(), Instant::now()));
@@ -794,7 +817,8 @@ impl RelayApp {
                                 }
                             }
                         } else {ui.label(RichText::new("Checking server…").color(c_muted()));}
-                        if ui.small_button("Refresh hosting status").clicked(){self.refresh_admin_data("metadata","/api/admin/metadata");}
+                        self.lan_host_section(ui);
+                        if ui.small_button("Refresh hosting status").clicked(){self.lan_host.reset();self.refresh_admin_data("metadata","/api/admin/metadata");}
                     });
                     egui::CollapsingHeader::new("Advanced")
                         .id_source(("server-advanced", &self.login.url, &bootstrap.server_id))
@@ -840,6 +864,11 @@ impl RelayApp {
             Section::Members if moderator => self.member_settings_ui(ui, &bootstrap),
             Section::Invites if bootstrap.has_permission(PERMISSION_INVITES) => {
                 self.invite_settings_ui(ui)
+            }
+            Section::Hosts
+                if bootstrap.capabilities.iter().any(|c| c == "hosting-v1") =>
+            {
+                self.hosting_ui(ui, &bootstrap)
             }
             Section::Account => self.account_settings_ui(ui),
             Section::Backups if admin => self.backup_settings_ui(ui, &bootstrap),

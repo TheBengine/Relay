@@ -19,12 +19,38 @@ pub(super) struct Attempt {
     cancel: Arc<AtomicBool>,
     browser: Option<crate::central_account::Controller>,
     challenge: Option<String>,
+    authority: Option<relay_protocol::handover::RoutePin>,
+    /// An automatic reconnect of a saved server after sign-in: it may not
+    /// match the visible login form, and its failure is not an error page.
+    background: bool,
+    /// Started for another server than the visible login form (an automatic
+    /// reconnect, or the first account of a server created while Relay is open).
+    detached: bool,
 }
 impl Attempt {
     pub(super) fn is_people(&self) -> bool {
         self.people
     }
 }
+
+/// Signing in opens Relay itself: saved servers reconnect one at a time with
+/// the Relay account (each earlier one stays connected in the background),
+/// then Friends opens last, so the user lands on the Friends home with every
+/// saved server live. Nothing here asks for a password.
+pub(super) struct AutoEntry {
+    queue: std::collections::VecDeque<String>,
+    friends: bool,
+    started: Instant,
+    /// A remembered login being resumed; the next step waits for it.
+    resuming: Option<(String, Instant)>,
+}
+
+/// How long automatic entry waits for one remembered login to reconnect.
+const RESUME_WAIT: Duration = Duration::from_secs(20);
+
+/// The app's own server restarts in the background after launch; reconnecting
+/// to it waits for that, but not forever.
+const LOCAL_HOST_WAIT: Duration = Duration::from_secs(45);
 impl Drop for Attempt {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
@@ -35,6 +61,10 @@ pub(super) struct State {
     pub(super) pending: Option<Attempt>,
     pub(super) home: bool,
     pub(super) bypass: bool,
+    /// Signing in opens Relay itself once; the start page below is only
+    /// shown when that cannot happen or fails.
+    pub(super) entered: bool,
+    pub(super) auto: Option<AutoEntry>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -42,6 +72,8 @@ impl Default for State {
             pending: None,
             home: true,
             bypass: false,
+            entered: false,
+            auto: None,
         }
     }
 }
@@ -77,6 +109,31 @@ impl RelayApp {
             && (self.central_account.provider.is_some() || self.session.is_none());
         let home = self.central_account.account.is_some() && self.account_start.home;
         if !gate && !home {
+            return false;
+        }
+        if home && !self.account_start.entered && !self.hosting_setup.choosing_creation {
+            self.account_start.entered = true;
+            if self.error.is_none() {
+                self.account_start.auto = Some(AutoEntry {
+                    queue: self.saved_servers_to_reconnect().into(),
+                    friends: false,
+                    started: Instant::now(),
+                    resuming: None,
+                });
+            }
+        }
+        self.auto_entry_tick(ctx);
+        let entering = home && self.error.is_none() && self.account_start.auto.is_some();
+        if home
+            && self.account_start.entered
+            && !entering
+            && self.account_start.auto.is_none()
+            && self.account_start.pending.is_none()
+            && !self.hosting_setup.choosing_creation
+            && self.error.is_none()
+            && self.session.is_some()
+        {
+            self.account_start.home = false;
             return false;
         }
         #[cfg(windows)]
@@ -169,6 +226,13 @@ impl RelayApp {
                             );
                         });
                 }
+            } else if self.hosting_setup.choosing_creation {
+                self.creation_choices(ui);
+            } else if entering {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Opening Relay…");
+                });
             } else {
                 let handle = self
                     .central_account
@@ -236,12 +300,9 @@ impl RelayApp {
                     .add(primary("Create a server").min_size(Vec2::new(width, 44.0)))
                     .clicked()
                 {
-                    self.account_start.home = false;
-                    self.hosting_setup.new_host = true;
-                    self.hosting_setup.local_ready = false;
-                    self.hosting_setup.resume_share = true;
-                    self.hosting_setup.entry = host_setup_ui::LoginEntry::Account;
-                    self.host_local();
+                    self.hosting_setup
+                        .begin_creation(crate::iroh_route::available());
+                    self.error = None;
                 }
                 if ui
                     .add(secondary("Join with an invitation").min_size(Vec2::new(width, 44.0)))
@@ -271,6 +332,115 @@ impl RelayApp {
             }
         });
         true
+    }
+
+    /// Saved servers the Relay account can reopen, excluding Friends and any
+    /// server that is already connected.
+    fn saved_servers_to_reconnect(&self) -> Vec<String> {
+        let people = self.people_url();
+        self.prefs
+            .communities
+            .iter()
+            .map(|saved| saved.url.clone())
+            .filter(|url| Some(url) != people.as_ref())
+            .filter(|url| !(self.session.is_some() && *url == self.login.url))
+            .filter(|url| !self.communities.iter().any(|live| live.url == *url))
+            .filter(|url| crate::community::account_destination(url).is_ok())
+            .collect()
+    }
+
+    fn auto_entry_tick(&mut self, ctx: &egui::Context) {
+        let Some(auto) = self.account_start.auto.as_mut() else {
+            return;
+        };
+        if self.account_start.pending.is_some() {
+            return;
+        }
+        if let Some((url, since)) = &auto.resuming {
+            let live = self.communities.iter().any(|c| c.url == *url)
+                || (self.session.is_some() && self.login.url == *url);
+            if !live && since.elapsed() < RESUME_WAIT {
+                ctx.request_repaint_after(Duration::from_millis(250));
+                return;
+            }
+            auto.resuming = None;
+        }
+        if let Some(url) = auto.queue.front().cloned() {
+            if crate::local_host::is_local_url(&url)
+                && !self.hosting_setup.local_ready
+                && auto.started.elapsed() < LOCAL_HOST_WAIT
+            {
+                ctx.request_repaint_after(Duration::from_millis(250));
+                return;
+            }
+            auto.queue.pop_front();
+            // A login kept for a move (or by the user's choice) resumes without
+            // a new session, which also works while that host is paused.
+            if crate::credential_vault::load(&url).ok().flatten().is_some() {
+                let expected_server_id = self
+                    .prefs
+                    .communities
+                    .iter()
+                    .find(|saved| saved.url == url)
+                    .map(|saved| saved.server_id.clone())
+                    .filter(|id| !id.is_empty());
+                auto.resuming = Some((url.clone(), Instant::now()));
+                self.send(Command::Resume {
+                    url,
+                    expected_server_id,
+                });
+                return;
+            }
+            self.reconnect_saved_server(url);
+            return;
+        }
+        if !auto.friends {
+            auto.friends = true;
+            if self.people_url().is_some() {
+                self.open_people();
+                if self.account_start.pending.is_some() {
+                    return;
+                }
+            }
+        }
+        // Friends could not open (or is not configured): land on whatever
+        // server is connected; with nothing connected the start page remains.
+        self.account_start.auto = None;
+        if self.session.is_some() && self.error.is_none() {
+            self.account_start.home = false;
+        }
+    }
+
+    fn reconnect_saved_server(&mut self, url: String) {
+        let previous_login = std::mem::take(&mut self.login);
+        self.login.url = url;
+        self.login.registering = false;
+        self.login.setup = Default::default();
+        self.hosting_setup.new_host = false;
+        self.begin_account_login(false);
+        if let Some(attempt) = &mut self.account_start.pending {
+            attempt.background = true;
+            attempt.detached = true;
+        }
+        self.login = previous_login;
+    }
+
+    /// A server created while Relay is already open (on Friends or another
+    /// server) gets its first account from the Relay account at once, as the
+    /// start page's "Continue with my Relay account" did. Errors are shown.
+    pub(super) fn claim_new_server(&mut self, setup_required: Option<bool>) {
+        if self.central_account.account.is_none() || self.account_start.pending.is_some() {
+            return;
+        }
+        let previous_login = std::mem::take(&mut self.login);
+        self.login.url = "http://127.0.0.1:4580".into();
+        self.login.registering = setup_required != Some(false);
+        self.login.setup = Default::default();
+        self.begin_account_login(false);
+        if let Some(attempt) = &mut self.account_start.pending {
+            attempt.detached = true;
+        }
+        self.login = previous_login;
     }
 
     pub(super) fn sign_out_relay(&mut self) {
@@ -418,6 +588,7 @@ impl RelayApp {
                 return;
             }
         };
+        let authority=flow.setup.invitation.as_ref().and_then(|i|i.authority.clone());
         let invite = zeroize::Zeroizing::new(flow.invite.clone());
         let register = flow.registering;
         let initial_protection = (!other && self.hosting_setup.new_host && register)
@@ -434,11 +605,15 @@ impl RelayApp {
             cancel: Arc::new(AtomicBool::new(false)),
             browser: None,
             challenge: None,
+            authority: authority.clone(),
+            background: false,
+            detached: false,
         });
-        self.send(Command::RememberSession {
+        self.send(Command::RememberNextLogins {
             enabled: self.prefs.remember_session,
         });
         self.send(Command::AccountLoginBegin {
+            authority,
             url,
             expected_server_id: expected,
             invite,
@@ -455,8 +630,16 @@ impl RelayApp {
             .as_ref()
             .is_some_and(|a| a.request == request)
         {
-            self.account_start.pending = None;
-            self.error = Some(error.into());
+            let background = self
+                .account_start
+                .pending
+                .take()
+                .is_some_and(|attempt| attempt.background);
+            // A saved server that cannot be reopened automatically stays in the
+            // side rail with its sign-in state; it does not stop opening Relay.
+            if !background {
+                self.error = Some(error.into());
+            }
             self.busy = false;
             true
         } else {
@@ -543,6 +726,7 @@ impl RelayApp {
         };
         if (a.other && !self.add_community_open)
             || (!a.people
+                && !a.detached
                 && crate::community::normalize_url(&flow.url).as_deref() != Ok(a.url.as_str()))
             || self.central_account.account.as_ref().is_none_or(|current| {
                 current.issuer != a.account.issuer || current.subject != a.account.subject
@@ -586,6 +770,7 @@ impl RelayApp {
         }
         if let Some(proof) = browser.take_link_proof() {
             let command = Command::AccountLoginFinish {
+                authority: a.authority.clone(),
                 url: a.url.clone(),
                 expected_server_id: a.expected.clone().unwrap_or_default(),
                 challenge_id: a.challenge.take().unwrap_or_default(),

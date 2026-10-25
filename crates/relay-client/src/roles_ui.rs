@@ -124,7 +124,9 @@ impl RelayApp {
                         ui.label("Position");ui.add(egui::DragValue::new(&mut draft.position).clamp_range(1..=own_rank.saturating_sub(1).clamp(1,1000)));
                     });
                     ui.add_space(10.0);
-                    for (bit,label) in [(PERMISSION_READ,"Read channels"),(PERMISSION_SEND,"Send messages"),(PERMISSION_JOIN,"Connect to voice"),(PERMISSION_STREAM,"Share camera and screen"),(PERMISSION_CHANNELS,"Manage channels and permissions"),(PERMISSION_MESSAGES,"Manage messages and pins"),(PERMISSION_MEMBERS,"Moderate lower members / view audit log"),(PERMISSION_INVITES,"Manage invites"),(PERMISSION_ROLES,"Manage lower roles"),(PERMISSION_ADMIN,"Administrator (bypasses channel restrictions)")] {
+                    role_templates::section(ui,&role.id,bootstrap.member_roles.iter().filter(|m|m.role_ids.contains(&role.id)).count(),draft,role_templates::grantable(|bit|bootstrap.has_permission(bit)),role_templates::lock_reason(pending,editable));
+                    ui.add_space(6.0);
+                    for (bit,label) in role_templates::PERMISSION_LABELS {
                         let mut enabled=draft.permissions & bit != 0;
                         if ui.add_enabled(bootstrap.has_permission(bit),egui::Checkbox::new(&mut enabled,label)).changed(){if enabled {draft.permissions|=bit;}else{draft.permissions&=!bit;}}
                     }

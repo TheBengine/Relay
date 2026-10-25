@@ -87,10 +87,19 @@ pub(crate) struct WorkerWait<'a> {
     #[cfg(windows)]
     network: Option<Event>,
     #[cfg(windows)]
+    additional: Option<(&'a UdpSocket, Option<Event>)>,
+    #[cfg(windows)]
     timer: Option<Event>,
 }
 impl<'a> WorkerWait<'a> {
     pub(crate) fn new(wake: &'a Wake, socket: &'a UdpSocket) -> Self {
+        Self::new_pair(wake, socket, None)
+    }
+    pub(crate) fn new_pair(
+        wake: &'a Wake,
+        socket: &'a UdpSocket,
+        additional: Option<&'a UdpSocket>,
+    ) -> Self {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawSocket;
@@ -100,13 +109,17 @@ impl<'a> WorkerWait<'a> {
                     CreateWaitableTimerExW, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
                 },
             };
-            let network = Event::new(true).ok().filter(|event| unsafe {
-                WSAEventSelect(
-                    SOCKET(socket.as_raw_socket() as usize),
-                    WSAEVENT(event.0 .0 as isize),
-                    FD_READ as i32,
-                ) == 0
-            });
+            let event_for = |socket: &UdpSocket| {
+                Event::new(true).ok().filter(|event| unsafe {
+                    WSAEventSelect(
+                        SOCKET(socket.as_raw_socket() as usize),
+                        WSAEVENT(event.0 .0 as isize),
+                        FD_READ as i32,
+                    ) == 0
+                })
+            };
+            let network = event_for(socket);
+            let additional = additional.map(|socket| (socket, event_for(socket)));
             let timer = unsafe {
                 CreateWaitableTimerExW(
                     None,
@@ -121,30 +134,39 @@ impl<'a> WorkerWait<'a> {
                 wake,
                 socket,
                 network,
+                additional,
                 timer,
             }
         }
         #[cfg(not(windows))]
         {
-            let _ = socket;
+            let _ = (socket, additional);
             Self { wake }
         }
     }
     /// Reset before draining, so a newly arriving datagram remains observable.
     pub(crate) fn begin_receive(&self) {
         #[cfg(windows)]
-        if let Some(event) = &self.network {
+        {
             use std::os::windows::io::AsRawSocket;
             use windows::Win32::Networking::WinSock::{
                 WSAEnumNetworkEvents, SOCKET, WSAEVENT, WSANETWORKEVENTS,
             };
-            let mut events = WSANETWORKEVENTS::default();
-            unsafe {
-                WSAEnumNetworkEvents(
-                    SOCKET(self.socket.as_raw_socket() as usize),
-                    WSAEVENT(event.0 .0 as isize),
-                    &mut events,
-                );
+            let reset = |socket: &UdpSocket, event: &Event| {
+                let mut events = WSANETWORKEVENTS::default();
+                unsafe {
+                    WSAEnumNetworkEvents(
+                        SOCKET(socket.as_raw_socket() as usize),
+                        WSAEVENT(event.0 .0 as isize),
+                        &mut events,
+                    );
+                }
+            };
+            if let Some(event) = &self.network {
+                reset(self.socket, event);
+            }
+            if let Some((socket, Some(event))) = &self.additional {
+                reset(socket, event);
             }
         }
     }
@@ -158,13 +180,22 @@ impl<'a> WorkerWait<'a> {
                 SetWaitableTimer, WaitForMultipleObjects, INFINITE,
             };
             // Without a socket event, retain bounded UDP polling as a fallback.
-            if self.network.is_none() {
+            if self.network.is_none()
+                || self
+                    .additional
+                    .as_ref()
+                    .is_some_and(|(_, event)| event.is_none())
+            {
                 timeout = timeout.min(Duration::from_millis(2));
             }
-            let mut handles = [HANDLE::default(); 3];
+            let mut handles = [HANDLE::default(); 4];
             handles[0] = wake.0;
             let mut count = 1;
             if let Some(network) = &self.network {
+                handles[count] = network.0;
+                count += 1;
+            }
+            if let Some((_, Some(network))) = &self.additional {
                 handles[count] = network.0;
                 count += 1;
             }
@@ -194,11 +225,17 @@ impl<'a> WorkerWait<'a> {
 #[cfg(windows)]
 impl Drop for WorkerWait<'_> {
     fn drop(&mut self) {
-        if self.network.is_some() {
+        {
             use std::os::windows::io::AsRawSocket;
             use windows::Win32::Networking::WinSock::{WSAEventSelect, SOCKET, WSAEVENT};
-            unsafe {
-                WSAEventSelect(SOCKET(self.socket.as_raw_socket() as usize), WSAEVENT(0), 0);
+            let detach = |socket: &UdpSocket| unsafe {
+                WSAEventSelect(SOCKET(socket.as_raw_socket() as usize), WSAEVENT(0), 0);
+            };
+            if self.network.is_some() {
+                detach(self.socket);
+            }
+            if let Some((socket, Some(_))) = &self.additional {
+                detach(socket);
             }
         }
     }
@@ -237,6 +274,32 @@ mod tests {
         receiver.recv().unwrap();
         wake.notify();
         worker.join().unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn either_gateway_socket_wakes_without_waiting_for_the_other() {
+        let wake = Wake::new();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for socket in [&peer, &upstream] {
+            socket.set_nonblocking(true).unwrap();
+        }
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let waiter = WorkerWait::new_pair(&wake, &peer, Some(&upstream));
+        assert!(waiter.network.is_some());
+        assert!(waiter.additional.as_ref().unwrap().1.is_some());
+        for (socket, byte) in [(&upstream, 1), (&peer, 2), (&upstream, 3)] {
+            waiter.begin_receive();
+            sender
+                .send_to(&[byte], socket.local_addr().unwrap())
+                .unwrap();
+            let at = Instant::now();
+            waiter.wait(Duration::from_secs(1));
+            assert!(at.elapsed() < Duration::from_millis(250));
+            let mut bytes = [0; 1];
+            assert_eq!(socket.recv_from(&mut bytes).unwrap().0, 1);
+            assert_eq!(bytes[0], byte);
+        }
     }
     #[cfg(windows)]
     #[test]

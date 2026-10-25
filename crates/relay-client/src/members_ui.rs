@@ -54,7 +54,7 @@ impl RelayApp {
         let Some(b) = self.bootstrap.clone() else {
             return;
         };
-        let group_members = self.current.as_ref().and_then(|target| {
+        let group_scope = self.current.as_ref().and_then(|target| {
             let Target::Channel(id) = target else {
                 return None;
             };
@@ -68,8 +68,11 @@ impl RelayApp {
             } else {
                 info
             };
-            (group.kind == "group").then(|| group.member_ids.clone())
+            (group.kind == "group").then(|| (group.channel_id.clone(), group.member_ids.clone()))
         });
+        let group_channel = group_scope.as_ref().map(|(channel, _)| channel.clone());
+        let group_members = group_scope.map(|(_, ids)| ids);
+        let friends_server = self.in_people();
         egui::ScrollArea::vertical()
             .id_source("member-list")
             .show(ui, |ui| {
@@ -103,7 +106,18 @@ impl RelayApp {
                     }) {
                         let texture = self.avatar_texture(user);
                         let response = user_row(ui, user, false, 0, 0, texture.as_ref());
-                        self.paint_presence_badge(ui, &user.id, &response);
+                        match &group_channel {
+                            // In a Friends group, people who are not friends show the
+                            // group's coarse state; friends and you keep your own list.
+                            Some(channel)
+                                if friends_server
+                                    && user.id != b.user.id
+                                    && !b.social.friends.contains(&user.id) =>
+                            {
+                                self.paint_group_presence_badge(ui, channel, &user.id, &response)
+                            }
+                            _ => self.paint_presence_badge(ui, &user.id, &response),
+                        }
                         self.user_interactions(ui, user, &response);
                         if response.clicked() {
                             self.open_profile(user.clone());

@@ -28,7 +28,7 @@ impl Provider {
     pub fn new(issuer: &str, client_id: &str, community_url: &str) -> Result<Self, String> {
         let issuer = Url::parse(issuer.trim().trim_end_matches('/'))
             .map_err(|_| "Invalid Relay account issuer")?;
-        if issuer.scheme() != "https"
+        if (issuer.scheme() != "https" && !qa_loopback(&issuer))
             || !plain(&issuer)
             || issuer.host_str().is_none()
             || issuer.path() == "/"
@@ -80,12 +80,21 @@ impl Provider {
     }
 
     fn allows(&self, url: &Url) -> bool {
-        let secure = url.scheme() == "https";
+        let secure = url.scheme() == "https" || qa_loopback(url);
         #[cfg(test)]
         let secure = secure
             || (self.fixture_http && url.scheme() == "http" && url.host_str() == Some("127.0.0.1"));
         secure && plain(url) && url.origin() == self.issuer.origin()
     }
+}
+
+/// QA builds only (`qa-loopback-identity`): an owned loopback identity service
+/// on 127.0.0.1 with an explicit port may use plain HTTP. Never in a release.
+fn qa_loopback(url: &Url) -> bool {
+    cfg!(feature = "qa-loopback-identity")
+        && url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port().is_some()
 }
 
 fn destination_url(community_url: &str) -> Result<Url, String> {

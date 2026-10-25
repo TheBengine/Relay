@@ -83,21 +83,22 @@ type helperStatus struct {
 	OwnIP   string `json:"address,omitempty"`
 }
 type helper struct {
-	mu        sync.Mutex
-	token     string
-	status    helperStatus
-	network   relayNetwork
-	factory   func(func(string)) relayNetwork
-	media     *MediaRelay
-	irohMedia map[string]*LocalTurn
-	routes    map[string]*ownedGateway
-	voices    map[string]*ClientVoiceRelay
-	host      *ownedGateway
-	hostVoice *HostUDPRelay
-	serverID  string
-	cancel    context.CancelFunc
-	closed    bool
-	stop      chan struct{}
+	mu         sync.Mutex
+	token      string
+	status     helperStatus
+	network    relayNetwork
+	factory    func(func(string)) relayNetwork
+	media      *MediaRelay
+	irohMedia  map[string]*LocalTurn
+	httpsMedia map[string]*httpsMediaLease
+	routes     map[string]*ownedGateway
+	voices     map[string]*ClientVoiceRelay
+	host       *ownedGateway
+	hostVoice  *HostUDPRelay
+	serverID   string
+	cancel     context.CancelFunc
+	closed     bool
+	stop       chan struct{}
 }
 
 func newHelper(token string, factory func(func(string)) relayNetwork) *helper {
@@ -181,15 +182,20 @@ func (h *helper) close() {
 	hostVoice := h.hostVoice
 	media := h.media
 	irohMedia := h.irohMedia
+	httpsMedia := h.httpsMedia
 	n := h.network
 	h.routes = make(map[string]*ownedGateway)
 	h.irohMedia = nil
+	h.httpsMedia = nil
 	h.voices = make(map[string]*ClientVoiceRelay)
 	h.host = nil
 	close(h.stop)
 	h.mu.Unlock()
 	for _, voice := range voices {
 		_ = voice.Close()
+	}
+	for _, lease := range httpsMedia {
+		lease.Close()
 	}
 	for _, turn := range irohMedia {
 		_ = turn.Close()
@@ -258,6 +264,12 @@ func (h *helper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case r.URL.Path == "/https-media" && r.Method == http.MethodPost:
+		h.openHTTPSMedia(w, r)
+	case r.URL.Path == "/iroh-https-media" && r.Method == http.MethodPost:
+		h.openIrohHTTPSMedia(w, r)
+	case r.URL.Path == "/close-https-media" && r.Method == http.MethodPost:
+		h.closeHTTPSMedia(w, r)
 	case r.URL.Path == "/iroh-media" && r.Method == http.MethodPost:
 		h.openIrohMedia(w, r)
 	case r.URL.Path == "/status" && r.Method == http.MethodGet:

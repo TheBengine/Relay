@@ -3,6 +3,8 @@
 use crate::community::normalize_url;
 use crate::invitation_routes::{self, IrohRoute};
 use crate::invite_proof::InviteProof;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use relay_protocol::handover::RoutePin;
 use std::collections::HashMap;
 
 pub const BROWSER_INVITATION_URL: &str = "https://thebengine.github.io/Relay/";
@@ -23,6 +25,9 @@ pub struct Invitation {
     pub alt: Vec<String>,
     /// Version 4: an account-free route; its token sits in the fragment only.
     pub iroh: Option<IrohRoute>,
+    /// Version 5: a trust root from the host who shared this link. It grants no
+    /// account access and must be proved afresh before login. Fragment only.
+    pub authority: Option<RoutePin>,
 }
 
 impl Invitation {
@@ -58,6 +63,7 @@ impl Invitation {
             proof: None,
             alt: Vec::new(),
             iroh: None,
+            authority: None,
         })
     }
 
@@ -78,7 +84,7 @@ impl Invitation {
                 link.fragment().unwrap_or_default(),
                 &["v", "server", "server_id", "invite"],
                 &[
-                    "alt", "iroh", "irelay", "access", "iid", "hd", "hf", "vk", "it",
+                    "alt", "iroh", "irelay", "access", "iid", "hd", "hf", "vk", "it", "hp",
                 ],
             )?;
             let mut query = url::form_urlencoded::Serializer::new(String::new());
@@ -88,7 +94,7 @@ impl Invitation {
                     query.append_pair(name, value);
                 }
             }
-            for name in ["invite", "access", "iid", "hd", "hf", "vk", "it"] {
+            for name in ["invite", "access", "iid", "hd", "hf", "vk", "it", "hp"] {
                 if let Some(value) = fields.get(name) {
                     fragment.append_pair(name, value);
                 }
@@ -119,8 +125,8 @@ impl Invitation {
             &["alt", "iroh", "irelay"],
         )?;
         let version = query.get("v").map(String::as_str);
-        // Only version 4 may list further routes.
-        if version != Some("4")
+        // Versions 4 and 5 may list further routes.
+        if !matches!(version, Some("4" | "5"))
             && ["alt", "iroh", "irelay"]
                 .iter()
                 .any(|key| query.contains_key(*key))
@@ -135,6 +141,10 @@ impl Invitation {
             Some("3") => (&["invite", "iid", "hd", "hf", "vk"], &["access"]),
             // Version 4 may list further routes; every other part is optional.
             Some("4") => (&["invite"], &["access", "iid", "hd", "hf", "vk", "it"]),
+            Some("5") => (
+                &["invite", "hp"],
+                &["access", "iid", "hd", "hf", "vk", "it"],
+            ),
             _ => {
                 return Err(
                     "This invitation version is not supported. Update Relay and try again.".into(),
@@ -143,7 +153,7 @@ impl Invitation {
         };
         let fragment = fields_with(link.fragment().unwrap_or_default(), required, optional)?;
         let mut invitation = Self::new(&query["server"], &query["server_id"], &fragment["invite"])?;
-        if version == Some("4") {
+        if matches!(version, Some("4" | "5")) {
             if let Some(list) = query.get("alt") {
                 invitation.alt = invitation_routes::parse_alternatives(list)?
                     .into_iter()
@@ -173,7 +183,7 @@ impl Invitation {
                 &fragment["vk"],
             )?);
         }
-        if version == Some("4") {
+        if matches!(version, Some("4" | "5")) {
             let present = ["iid", "hd", "hf", "vk"]
                 .iter()
                 .filter(|key| fragment.contains_key(**key))
@@ -191,7 +201,39 @@ impl Invitation {
                 _ => return Err("This invitation is incomplete.".into()),
             }
         }
+        if let Some(encoded) = fragment.get("hp") {
+            if encoded.len() > 512 {
+                return Err("This invitation has an invalid host identity.".into());
+            }
+            let raw = URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|_| "This invitation has an invalid host identity.")?;
+            let pin: RoutePin = serde_json::from_slice(&raw)
+                .map_err(|_| "This invitation has an invalid host identity.")?;
+            invitation = invitation.with_authority(Some(pin))?;
+        }
         Ok(invitation)
+    }
+
+    /// New pinned links need an authenticated transport. Keep the original
+    /// format for a host still sharing only plain LAN/Tailscale addresses;
+    /// upgrading that flow is separate from inventing trust in a LAN answer.
+    pub fn for_sharing(mut self) -> Self {
+        if self.iroh.is_none() && !self.routes().iter().any(|url| crate::community::account_destination(url).is_ok()) {
+            self.authority=None;
+        }
+        self
+    }
+
+    pub fn with_authority(mut self, pin: Option<RoutePin>) -> Result<Self, String> {
+        if pin
+            .as_ref()
+            .is_some_and(|p| p.server_id != self.server_id || !crate::host_route::valid_pin(p))
+        {
+            return Err("This invitation has an invalid host identity.".into());
+        }
+        self.authority = pin;
+        Ok(self)
     }
 
     /// Adds device verification. The secret lives only in the link fragment.
@@ -255,7 +297,9 @@ impl Invitation {
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair(
                 "v",
-                if !self.alt.is_empty() || self.iroh.is_some() {
+                if self.authority.is_some() {
+                    "5"
+                } else if !self.alt.is_empty() || self.iroh.is_some() {
                     "4"
                 } else if self.proof.is_some() {
                     "3"
@@ -298,6 +342,12 @@ impl Invitation {
         }
         if let Some(iroh) = &self.iroh {
             fragment.append_pair("it", &iroh.token);
+        }
+        if let Some(pin) = &self.authority {
+            fragment.append_pair(
+                "hp",
+                &URL_SAFE_NO_PAD.encode(serde_json::to_vec(pin).expect("bounded invitation pin")),
+            );
         }
         let fragment = fragment.finish();
         format!("relay://join?{query}#{fragment}")
@@ -865,5 +915,50 @@ mod tests {
             .is_err());
         let back = chosen.using_route("http://192.168.1.50:4580").unwrap();
         assert_eq!(back.server, invitation.server);
+    }
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    #[test]
+    fn invitation_host_pin_roundtrips_and_cannot_be_dropped_or_rebound() {
+        let (_, _, pin, _) = crate::host_route::tests::fixture();
+        let old =
+            Invitation::new("https://source.example", &pin.server_id, "owned-invite").unwrap();
+        assert!(old.link().contains("v=1&"));
+        let invite = old.with_authority(Some(pin.clone())).unwrap();
+        for value in [invite.link(), invite.browser_link()] {
+            let parsed = Invitation::parse(&value).unwrap();
+            assert!(parsed == invite);
+            assert!(!value.split('#').next().unwrap().contains("hp="));
+        }
+        assert!(invite.link().contains("v=5&"));
+        let changed = invite
+            .clone()
+            .with_alternatives(&["https://other.example".into()])
+            .unwrap()
+            .using_route("https://other.example")
+            .unwrap();
+        assert_eq!(changed.authority, Some(pin.clone()));
+        let mut wrong = pin.clone();
+        wrong.server_id = uuid::Uuid::new_v4().to_string();
+        assert!(invite.clone().with_authority(Some(wrong)).is_err());
+        for bad in [
+            invite.link().replace("v=5&", "v=4&"),
+            format!("{}&hp=duplicate", invite.link()),
+            invite.link().split("&hp=").next().unwrap().to_owned(),
+            invite
+                .link()
+                .replace(&pin.server_id, &uuid::Uuid::new_v4().to_string()),
+        ] {
+            assert!(Invitation::parse(&bad).is_err());
+        }
+        let mut invalid = pin;
+        invalid.host.host_id = uuid::Uuid::new_v4().to_string();
+        let bad = invite.link().split("&hp=").next().unwrap().to_owned()
+            + "&hp="
+            + &URL_SAFE_NO_PAD.encode(serde_json::to_vec(&invalid).unwrap());
+        assert!(Invitation::parse(&bad).is_err());
     }
 }

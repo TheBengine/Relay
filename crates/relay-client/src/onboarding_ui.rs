@@ -125,6 +125,10 @@ impl RelayApp {
     }
 
     fn welcome_choices(&mut self, ui: &mut egui::Ui) {
+        if self.hosting_setup.choosing_creation {
+            self.creation_choices(ui);
+            return;
+        }
         if self.prefs.profile_name.is_empty() {
             ui.heading("A place for you and your friends");
         } else {
@@ -139,15 +143,13 @@ impl RelayApp {
             )
             .clicked()
         {
-            self.hosting_setup.new_host = true;
-            self.hosting_setup.local_ready = false;
-            self.hosting_setup.resume_share = true;
-            self.hosting_setup.entry = LoginEntry::Account;
+            self.hosting_setup
+                .begin_creation(crate::iroh_route::available());
             self.error = None;
-            self.host_local();
         }
         ui.label(
-            RichText::new("You host it. Relay helps you invite friends next.").color(c_muted()),
+            RichText::new("You host it. Choose its protection and connection, then Relay helps you invite friends.")
+                .color(c_muted()),
         );
         ui.add_space(16.0);
         if ui
@@ -312,6 +314,9 @@ impl RelayApp {
         match state.begin_check(address, request_id, retry) {
             Ok(Some(url)) => {
                 if let Err(error) = self.network.send(Command::CheckServer {
+                    cancel: state.check_cancellation(),
+                    authority: state.invitation.as_ref().and_then(|i|i.authority.clone()),
+                        locator_invite: state.invitation.as_ref().filter(|i|i.authority.is_some()).map(|i|i.code.clone()),
                     url: url.clone(),
                     request_id,
                 }) {
@@ -471,22 +476,13 @@ impl RelayApp {
         });
         if self.hosting_setup.new_host && self.login.registering {
             ui.add_space(12.0);
-            ui.label(RichText::new("Server encryption").strong());
-            ui.radio_value(
-                &mut self.hosting_setup.creation_protection,
-                relay_protocol::ProtectionLevel::Protected,
-                "End-to-end encryption on (recommended)",
-            );
-            ui.radio_value(
-                &mut self.hosting_setup.creation_protection,
-                relay_protocol::ProtectionLevel::Open,
-                "End-to-end encryption off",
-            );
-            ui.add(egui::Label::new(RichText::new(if self.hosting_setup.creation_protection == relay_protocol::ProtectionLevel::Open {
-                "The server host can read messages, files and calls. iroh still encrypts the connection. Friends accept this choice before sending or calling."
-            } else {
-                "Only the people in the conversation can read messages or hear calls. New friends are confirmed through their invitation."
-            }).color(c_muted())).wrap(true));
+            if !self.hosting_setup.creation_confirmed {
+                // A server left without accounts by an earlier start: its choices
+                // were never made, and the first account is what commits them.
+                self.creation_choices(ui);
+                return;
+            }
+            self.creation_summary(ui);
         }
         ui.add_space(12.0);
         account_feedback_ui::form_status(
@@ -596,6 +592,7 @@ impl RelayApp {
 
     pub(super) fn friend_community_dialog(&mut self, ctx: &egui::Context) {
         let mut open = true;
+        let mut create = false;
         let window = join_friends_window(ctx, &mut open);
         let close = host_setup_ui::show_with_header(ctx, window, "Join friends", |ui| {
             let saved = self
@@ -625,6 +622,21 @@ impl RelayApp {
                         return;
                     }
                 } else if !self.friend_invitation_entry(ui, FlowKind::AddCommunity) {
+                    // Signing in opens Relay directly, so the plus button is
+                    // where a new server is made as well as joined.
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Or make a new place for you and your friends.")
+                            .color(c_muted()),
+                    );
+                    if ui
+                        .add_enabled(!self.busy && self.voice_channel.is_none(), secondary("Create a server"))
+                        .clicked()
+                    {
+                        create = true;
+                    }
                     ui.add_space(16.0);
                     ui.collapsing("Or connect with a server address", |ui| {
                         self.setup_controls(ui, FlowKind::AddCommunity);
@@ -670,8 +682,14 @@ impl RelayApp {
                 RichText::new("Your friend hosts the server. You just connect.").color(c_muted()),
             );
         });
-        open &= !close;
+        open &= !close && !create;
         self.add_community_open &= open;
+        if create {
+            self.account_start.home = true;
+            self.hosting_setup
+                .begin_creation(crate::iroh_route::available());
+            self.error = None;
+        }
         if !open {
             self.add_community.password.clear();
             self.add_community
@@ -791,10 +809,11 @@ impl RelayApp {
                         return;
                     }
                     self.busy = true;
-                    self.send(Command::RememberSession {
+                    self.send(Command::RememberNextLogins {
                         enabled: self.prefs.remember_session,
                     });
                     self.send(Command::Auth {
+                        authority: self.add_community.setup.invitation.as_ref().and_then(|i|i.authority.clone()),
                         url: self.add_community.url.clone(),
                         expected_server_id,
                         request: AuthRequest {

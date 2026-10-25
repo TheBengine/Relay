@@ -70,7 +70,7 @@ pub struct Client {
 /// connection, voice socket and the application's voice address.
 #[derive(Clone)]
 struct Link {
-    spec: RouteSpec,
+    spec: Arc<Mutex<RouteSpec>>,
     endpoint: Endpoint,
     connection: Arc<tokio::sync::Mutex<Option<Connection>>>,
     voice_socket: Arc<UdpSocket>,
@@ -120,6 +120,55 @@ impl Client {
         }
     }
 
+    /// Applies an admission the caller has already verified, to a route which is ALREADY
+    /// open, for the handshakes still to come. Nothing else about the route changes: the
+    /// same `Route`, live connection, local HTTP listener and voice port, voice address,
+    /// stream tasks, endpoint and map entry all stay exactly as they are, and nothing is
+    /// dialled, closed, opened or awaited. It never creates a route.
+    ///
+    /// `expected_token` must be the admission the route holds now. If the route already
+    /// holds the new token (a reply was lost and the caller asks again) the answer is the
+    /// same and nothing changes. A missing route, a different current admission or an
+    /// unusable token changes nothing and is an error. Whether the new admission deserves
+    /// trust is the caller's decision; this only applies it. Errors carry no token.
+    pub async fn refresh_route(&self, spec: RouteSpec, expected_token: &str) -> Result<RouteInfo> {
+        if !protocol::valid_token(&spec.token) || !protocol::valid_token(expected_token) {
+            bail!("the route is not valid");
+        }
+        // The same lock order as `route_for`: the map, then the route's spec.
+        let routes = self.routes.lock().unwrap();
+        let Some(route) = routes.get(&spec.id) else {
+            bail!("the route is not open");
+        };
+        let mut known = route.link.spec.lock().unwrap();
+        if known.token == spec.token {
+            return Ok(route.info);
+        }
+        if !protocol::token_matches(&protocol::digest(&known.token), expected_token) {
+            bail!("the route holds a different admission");
+        }
+        known.token = spec.token;
+        // Reachability for the next reconnect, as `route_for` refreshes it.
+        if spec.relay.is_some() {
+            known.relay = spec.relay;
+        }
+        if !spec.direct.is_empty() {
+            known.direct = spec.direct;
+        }
+        Ok(route.info)
+    }
+
+    /// Which live connection a route has, so a test can tell one that was kept from one
+    /// that was replaced. Not used by the control API.
+    #[doc(hidden)]
+    pub async fn connection_id(&self, id: &EndpointId) -> Option<usize> {
+        let route = self.routes.lock().unwrap().get(id).cloned()?;
+        let slot = route.link.connection.lock().await;
+        slot.as_ref()
+            .filter(|connection| connection.close_reason().is_none())
+            .map(|connection| connection.stable_id())
+    }
+
     pub async fn close_route(&self, id: &EndpointId) {
         let route = self.routes.lock().unwrap().remove(id);
         if let Some(route) = route {
@@ -135,10 +184,13 @@ impl Client {
             .drain()
             .map(|(_, r)| r)
             .collect();
-        for route in routes {
-            route.shutdown().await;
-        }
-        self.endpoint.close().await;
+        // Closing the endpoint concurrently interrupts a pending handshake which
+        // may hold a route's connection lock. Cleanup must not wait 20 seconds
+        // behind that handshake while its loopback listeners remain open.
+        tokio::join!(
+            async { for route in routes { route.shutdown().await; } },
+            self.endpoint.close(),
+        );
     }
 
     async fn route_for(&self, spec: RouteSpec) -> Result<Arc<Route>> {
@@ -148,7 +200,12 @@ impl Client {
         {
             let routes = self.routes.lock().unwrap();
             if let Some(route) = routes.get(&spec.id) {
-                if route.link.spec.token == spec.token {
+                let mut known=route.link.spec.lock().unwrap();
+                if known.token == spec.token {
+                    // Refresh reachability for the next reconnect without
+                    // closing a live admission or changing its local sockets.
+                    if spec.relay.is_some(){known.relay=spec.relay;}
+                    if !spec.direct.is_empty(){known.direct=spec.direct;}
                     return Ok(route.clone());
                 }
             }
@@ -162,7 +219,7 @@ impl Client {
         self.routes
             .lock()
             .unwrap()
-            .insert(route.link.spec.id, route.clone());
+            .insert(route.link.spec.lock().unwrap().id, route.clone());
         Ok(route)
     }
 }
@@ -174,7 +231,7 @@ impl Route {
         let voice_socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
         let voice_udp_port = voice_socket.local_addr()?.port();
         let link = Link {
-            spec,
+            spec: Arc::new(Mutex::new(spec)),
             endpoint,
             connection: Arc::new(tokio::sync::Mutex::new(None)),
             voice_socket,
@@ -218,14 +275,15 @@ async fn ensure_connection(link: &Link) -> Result<Connection> {
             return Ok(connection.clone());
         }
     }
+    let spec=link.spec.lock().unwrap().clone();
     let connection = timeout(
         CONNECT_TIMEOUT,
-        link.endpoint.connect(link.spec.addr(), ALPN),
+        link.endpoint.connect(spec.addr(), ALPN),
     )
     .await
     .context("the host did not answer in time")??;
     let (mut send, mut recv) = connection.open_bi().await?;
-    let hello = protocol::encode_hello(&link.spec.token)
+    let hello = protocol::encode_hello(&spec.token)
         .map_err(|_| anyhow::anyhow!("the invitation's token is not valid"))?;
     send.write_all(&hello).await?;
     send.finish()?;

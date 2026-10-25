@@ -1,8 +1,8 @@
 //! Regression tests for the native client's command worker. No device APIs run.
-#[path = "network_message_alert_tests.rs"]
-mod message_alert_tests;
 #[path = "network_call_switch_tests.rs"]
 mod call_switch_tests;
+#[path = "network_message_alert_tests.rs"]
+mod message_alert_tests;
 #[cfg(windows)]
 #[path = "network_status_problem_tests.rs"]
 mod status_problem_tests;
@@ -81,6 +81,80 @@ struct TestWorker {
 }
 
 #[test]
+fn handover_restore_survives_account_changes_and_prevents_the_old_default_host_start() {
+    let mut test = TestWorker::new();
+    test.connection("https://owned.example".into());
+    let origin = test.command_origin();
+    test.worker.handover_job = Some((
+        crate::handover_client::Job::held_for_test(origin.clone(), true),
+        0,
+    ));
+    test.worker.command(Command::StopHandover {
+        origin: origin.clone(),
+        account_change: true,
+    });
+    assert!(!test
+        .worker
+        .handover_job
+        .as_ref()
+        .unwrap()
+        .0
+        .cancelled_for_test());
+    let mut other = origin.clone();
+    other.user_id = "other-account".into();
+    test.worker.command(Command::StopHandover {
+        origin: other,
+        account_change: false,
+    });
+    assert!(!test
+        .worker
+        .handover_job
+        .as_ref()
+        .unwrap()
+        .0
+        .cancelled_for_test());
+    // Internal remembered-login restores bypass command(), so guard them too.
+    let folder = tempfile::tempdir().unwrap();
+    let error = test
+        .worker
+        .restore_app_host(
+            folder.path().join("never-start.exe"),
+            folder.path().join("never-open"),
+            origin.server_id.clone(),
+        )
+        .unwrap_err();
+    assert!(error.contains("transferred community"));
+    assert!(!folder.path().join("never-open").exists());
+    assert!(test.worker.local_server.is_none());
+    test.worker.command(Command::StopHandover {
+        origin: origin.clone(),
+        account_change: false,
+    });
+    assert!(test
+        .worker
+        .handover_job
+        .as_ref()
+        .unwrap()
+        .0
+        .cancelled_for_test());
+    test.worker.handover_job = Some((
+        crate::handover_client::Job::held_for_test(origin.clone(), false),
+        0,
+    ));
+    test.worker.command(Command::StopHandover {
+        origin,
+        account_change: true,
+    });
+    assert!(test
+        .worker
+        .handover_job
+        .as_ref()
+        .unwrap()
+        .0
+        .cancelled_for_test());
+}
+
+#[test]
 fn reconnecting_poll_does_not_latch_an_error_but_auth_and_command_failures_remain_visible() {
     let mut test = TestWorker::new();
     test.connection("https://fixture.invalid".into());
@@ -128,6 +202,7 @@ fn reconnecting_poll_does_not_latch_an_error_but_auth_and_command_failures_remai
     test.worker.set_status(ConnectionStatus::Reconnecting);
     test.drain();
     test.worker.command(Command::Auth {
+        authority: None,
         url: server.url.clone(),
         expected_server_id: None,
         request: AuthRequest {
@@ -275,6 +350,7 @@ fn connect_shutdown_network(server: &MockHttp) -> Network {
     let mut network = Network::new(eframe::egui::Context::default());
     network
         .send(Command::Auth {
+            authority: None,
             url: server.url.clone(),
             expected_server_id: None,
             request: AuthRequest {
@@ -5201,6 +5277,7 @@ fn failed_bootstrap_never_replaces_existing_connection_or_stops_events() {
             Some(Target::Channel("previous-channel".into()));
         let previous_events = client.worker.socket_stop.clone();
         let result = client.worker.handle(Command::Auth {
+            authority: None,
             url: server.url.clone(),
             expected_server_id: None,
             request: AuthRequest {
@@ -5250,6 +5327,7 @@ fn invitation_identity_check_precedes_password_and_preserves_existing_account() 
     client.connection("http://previous-community.test".into());
     let events = client.worker.socket_stop.clone();
     let result = client.worker.handle(Command::Auth {
+        authority: None,
         url: server.url.clone(),
         expected_server_id: Some("49eb3c90-3520-4932-ae14-2f63ec80c38b".into()),
         request: AuthRequest {
@@ -5320,6 +5398,9 @@ fn connection_check_is_bounded_and_does_not_block_commands() {
     client
         .worker
         .handle(Command::CheckServer {
+                locator_invite: None,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            authority: None,
             url: server.url.clone(),
             request_id: 1,
         })
@@ -5333,6 +5414,9 @@ fn connection_check_is_bounded_and_does_not_block_commands() {
     client
         .worker
         .handle(Command::CheckServer {
+                locator_invite: None,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            authority: None,
             url: server.url.clone(),
             request_id: 2,
         })
@@ -5377,6 +5461,7 @@ fn failed_auth_is_reported_with_its_own_request_id() {
     });
     let mut client = TestWorker::new();
     client.worker.command(Command::Auth {
+        authority: None,
         url: server.url.clone(),
         expected_server_id: None,
         register: true,
@@ -5434,6 +5519,7 @@ fn account_login_canceled_during_bootstrap_revokes_new_session_and_keeps_the_old
     client
         .worker
         .account_login_finish(
+            None,
             server.url.clone(),
             ID.into(),
             uuid::Uuid::new_v4().to_string(),
@@ -5476,6 +5562,7 @@ fn account_login_checks_the_server_pin_before_sending_any_proof() {
     let mut client = TestWorker::new();
     client.connection("http://previous-community.test".into());
     let result = client.worker.account_login_finish(
+            None,
         server.url.clone(),
         "49eb3c90-3520-4932-ae14-2f63ec80c38b".into(),
         uuid::Uuid::new_v4().to_string(),
@@ -5525,6 +5612,7 @@ fn owned_live_account_first_joins_and_reopens_the_same_community_identity() {
         client
             .worker
             .account_login_begin(
+            None,
                 community.clone(),
                 Some(config["server_id"].as_str().unwrap().into()),
                 zeroize::Zeroizing::new(if attempt == 1 {
@@ -5572,6 +5660,7 @@ fn owned_live_account_first_joins_and_reopens_the_same_community_identity() {
         client
             .worker
             .account_login_finish(
+            None,
                 community.clone(),
                 config["server_id"].as_str().unwrap().into(),
                 challenge["challenge_id"].as_str().unwrap().into(),
@@ -5695,6 +5784,7 @@ fn matching_invitation_allows_auth_but_changed_bootstrap_is_revoked() {
     let mut client = TestWorker::new();
     client.connection("http://previous-community.test".into());
     let result = client.worker.handle(Command::Auth {
+        authority: None,
         url: server.url.clone(),
         expected_server_id: Some(ID.into()),
         register: true,
@@ -7046,6 +7136,7 @@ fn remembered_login_checks_public_pin_before_token_and_authenticated_scope_after
             _ => panic!("unexpected remembered-login request"),
         });
         let remembered = crate::credential_vault::RememberedSession {
+            authority: None,
             server_id: (case != "legacy").then(|| PIN.into()),
             session: Session {
                 token: "fixture-token".into(),
@@ -7087,6 +7178,7 @@ fn unconfirmed_or_conflicting_remembered_pin_never_sends_a_request() {
     let server = MockHttp::new(|_| panic!("invalid remembered scope must be rejected before HTTP"));
     let client = TestWorker::new();
     let mut remembered = crate::credential_vault::RememberedSession {
+        authority: None,
         server_id: None,
         session: Session {
             token: "fixture-token".into(),
@@ -7169,6 +7261,7 @@ fn fresh_sign_in_rejects_bootstrap_for_another_account_without_replacing_current
     assert!(client
         .worker
         .handle(Command::Auth {
+            authority: None,
             url: server.url.clone(),
             expected_server_id: None,
             register: false,
@@ -7268,6 +7361,9 @@ fn idle_refresh_reconciles_auth_and_changes_without_reloading_unchanged_chat() {
 #[test]
 fn worker_waits_for_real_deadlines_instead_of_forty_millisecond_polling() {
     let mut client = TestWorker::new();
+    // A build with a compiled-in account provider also schedules the invitation
+    // locator; this check is about the connection's own deadlines.
+    client.worker.host_locator_service = None;
     let now = Instant::now();
     assert!(client.worker.idle_delay(now).is_none());
     client.connection("http://fixture.invalid".into());
@@ -7406,6 +7502,7 @@ fn authenticator_challenge_sends_only_explicit_factor_and_keeps_existing_account
         let error = test
             .worker
             .handle(Command::Auth {
+                authority: None,
                 url: server.url.clone(),
                 expected_server_id: None,
                 request: input,
@@ -7421,4 +7518,672 @@ fn authenticator_challenge_sends_only_explicit_factor_and_keeps_existing_account
             "a challenge must not fetch/bootstrap a new account"
         );
     }
+}
+
+#[test]
+fn game_activity_background_write_and_retry_keep_the_selected_voice_account_unchanged() {
+    let altered = Arc::new(AtomicBool::new(false));
+    let remote_altered = altered.clone();
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let remote_deletes = deletes.clone();
+    let friends = MockHttp::with_request(move |r| {
+        assert_eq!(
+            r.authorization.as_deref(),
+            Some("Bearer friends-only-fixture")
+        );
+        match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "/api/bootstrap") => {
+                let mut b = Bootstrap::default();
+                b.server_id = if remote_altered.load(Ordering::SeqCst) {
+                    "replaced-service"
+                } else {
+                    "friends"
+                }
+                .into();
+                b.user.id = "fixture-user".into();
+                b.capabilities = vec![
+                    "people-v1".into(),
+                    relay_protocol::game_activity::CAPABILITY.into(),
+                ];
+                Reply::json(200, serde_json::to_value(b).unwrap())
+            }
+            ("PUT", "/api/activity") => {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&r.body).unwrap()["game_id"],
+                    "terraria"
+                );
+                Reply::json(
+                    200,
+                    json!({"game_id":"terraria","name":"Terraria","join":null,"expires_at":99999}),
+                )
+            }
+            ("DELETE", "/api/activity") if remote_deletes.fetch_add(1, Ordering::SeqCst) == 0 => {
+                Reply::json(503, json!({"error":"fixture unavailable"}))
+            }
+            ("DELETE", "/api/activity") => Reply {
+                status: 204,
+                body: vec![],
+                headers: vec![],
+            },
+            _ => panic!("Unexpected activity route"),
+        }
+    });
+    let selected =
+        MockHttp::new(|_| panic!("The selected community must receive no activity request"));
+    let mut test = TestWorker::new();
+    test.connection(friends.url.clone());
+    let c = test.worker.connection.as_mut().unwrap();
+    c.server_id = "friends".into();
+    c.session.token = "friends-only-fixture".into();
+    let origin = test.command_origin();
+    test.worker.saved_connections.insert(
+        friends.url.clone(),
+        SavedConnection {
+            connection: test.worker.connection.take().unwrap(),
+            stop: Arc::new(AtomicBool::new(false)),
+            dirty: Arc::new(AtomicBool::new(false)),
+        },
+    );
+    test.connection(selected.url.clone());
+    let c = test.worker.connection.as_mut().unwrap();
+    c.server_id = "community".into();
+    c.session.token = "selected-only-fixture".into();
+    let before = test.command_origin();
+    test.worker.command(Command::SetGameActivity {
+        origin: origin.clone(),
+        share: Some(relay_protocol::game_activity::Share {
+            game_id: "terraria".into(),
+            join: None,
+        }),
+        request_id: 71,
+    });
+    assert!(test.drain().iter().any(|u| matches!(
+        u,
+        Update::GameActivityResult {
+            request_id: 71,
+            result: Ok(Some(_)),
+            ..
+        }
+    )));
+    for (id, success) in [(72, false), (73, true)] {
+        test.worker.command(Command::SetGameActivity {
+            origin: origin.clone(),
+            share: None,
+            request_id: id,
+        });
+        let updates = test.drain();
+        assert!(updates.iter().any(|u| matches!(u, Update::GameActivityResult { request_id, result, .. } if *request_id == id && result.is_ok() == success)));
+        assert!(!updates
+            .iter()
+            .any(|u| matches!(u, Update::Error(_) | Update::Busy(_))));
+    }
+    let count = friends.requests.lock().unwrap().len();
+    altered.store(true, Ordering::SeqCst);
+    test.worker.command(Command::SetGameActivity {
+        origin: origin.clone(),
+        share: None,
+        request_id: 74,
+    });
+    assert!(test.drain().iter().any(|u| matches!(
+        u,
+        Update::GameActivityResult {
+            request_id: 74,
+            result: Err(_),
+            ..
+        }
+    )));
+    assert_eq!(friends.requests.lock().unwrap().len(), count + 1); // GET only, no mutation
+    test.worker
+        .saved_connections
+        .get_mut(&friends.url)
+        .unwrap()
+        .connection
+        .session
+        .user
+        .id = "replacement-account".into();
+    test.worker.command(Command::SetGameActivity {
+        origin,
+        share: None,
+        request_id: 75,
+    });
+    assert!(test.drain().iter().any(|u| matches!(
+        u,
+        Update::GameActivityResult {
+            request_id: 75,
+            result: Err(_),
+            ..
+        }
+    )));
+    assert_eq!(friends.requests.lock().unwrap().len(), count + 1); // rejected before any request
+    assert_eq!(test.command_origin(), before);
+    assert_eq!(
+        test.worker
+            .connection
+            .as_ref()
+            .unwrap()
+            .voice_channel
+            .as_deref(),
+        Some("voice-room")
+    );
+    assert!(selected.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_verified_host_move_adopts_only_matching_account_authority_and_provider_without_logging_out_the_shared_token(
+) {
+    use base64::Engine;
+    use ed25519_dalek::SigningKey;
+    use sha2::{Digest, Sha256};
+    let key = SigningKey::from_bytes(&[74; 32]);
+    let public = key.verifying_key();
+    let mut hash = Sha256::new();
+    hash.update(b"relay-host-identity-v1\0");
+    hash.update(public.as_bytes());
+    let hash = hash.finalize();
+    let mut id: [u8; 16] = hash[..16].try_into().unwrap();
+    id[6] = (id[6] & 15) | 128;
+    id[8] = (id[8] & 63) | 128;
+    let pin = relay_protocol::handover::RoutePin {
+        server_id: uuid::Uuid::new_v4().to_string(),
+        term: 2,
+        host: relay_protocol::handover::HostIdentity {
+            host_id: uuid::Uuid::from_bytes(id).to_string(),
+            public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.as_bytes()),
+        },
+    };
+    for fault in ["none", "account", "authority", "provider"] {
+        let expected = pin.clone();
+        let incoming = pin.clone();
+        let target = MockHttp::new(move |path| {
+            if path != "/api/bootstrap" {
+                return Reply::json(409, json!({"error":"fixture has no other API"}));
+            }
+            let mut bootstrap = Bootstrap {
+                server_id: incoming.server_id.clone(),
+                host_authority: Some(incoming.clone()),
+                user: User {
+                    id: if fault == "account" {
+                        "another-account"
+                    } else {
+                        "fixture-user"
+                    }
+                    .into(),
+                    username: "fixture".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            if fault == "authority" {
+                bootstrap.host_authority.as_mut().unwrap().term += 1;
+            }
+            if fault == "provider" {
+                bootstrap.account_provider = Some(AccountProvider {
+                    issuer: "https://different-issuer.example".into(),
+                    client_id: "relay".into(),
+                    community_url: String::new(),
+                });
+            }
+            Reply::json(200, json!(bootstrap))
+        });
+        let source = MockHttp::new(|_| Reply::json(409, json!({"error":"source retired"})));
+        let mut test = TestWorker::new();
+        test.connection(source.url.clone());
+        test.worker.connection.as_mut().unwrap().server_id = expected.server_id.clone();
+        let origin = test.command_origin();
+        let session = test.worker.connection.as_ref().unwrap().session.clone();
+        let result = test.worker.adopt_session_checked(
+            target.url.clone(),
+            Some(expected.server_id.clone()),
+            session,
+            None,
+            Some(MovingSession {
+                origin: origin.clone(),
+                pin: expected,
+                provider: None,
+                aliases: Vec::new(),
+                remembered: false,
+                resuming: false,
+            }),
+            None,
+        );
+        if fault == "none" {
+            result.unwrap();
+            assert_eq!(test.worker.connection.as_ref().unwrap().url, target.url);
+            assert!(!test.worker.saved_connections.contains_key(&source.url));
+            assert!(test.drain().iter().any(|u|matches!(u,Update::CommunityMoved {origin:old,url,..} if old==&origin&&url==&target.url)));
+        } else {
+            assert!(result.is_err(), "{fault}");
+            assert_eq!(test.command_origin(), origin);
+            assert!(!test
+                .drain()
+                .iter()
+                .any(|u| matches!(u, Update::CommunityMoved { .. } | Update::Connected { .. })));
+        }
+        assert!(!source
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.path == "/api/logout"));
+        assert!(!target
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.path == "/api/logout"));
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn remembered_host_move_restarts_the_bound_account_and_removes_old_vault_aliases_when_forgotten() {
+    let profile = std::path::PathBuf::from(
+        std::env::var_os("RELAY_PROFILE_DIR")
+            .expect("this native vault trial needs its dedicated QA profile"),
+    );
+    let base = std::path::PathBuf::from(std::env::var_os("RELAY_TEST_WORK_ROOT").unwrap());
+    assert_eq!(
+        profile.parent(),
+        base.parent(),
+        "the vault fixture must use the owned QA namespace"
+    );
+    let (_, _, source_pin, g) = crate::host_route::tests::fixture();
+    let target_pin = relay_protocol::handover::RoutePin {
+        server_id: source_pin.server_id.clone(),
+        host: g.receipt.body.target_identity,
+        term: 4,
+    };
+    let source_url = format!("https://{}.owned-resume.invalid", uuid::Uuid::new_v4());
+    let old = crate::credential_vault::RememberedSession {
+        server_id: Some(source_pin.server_id.clone()),
+        session: Session {
+            token: "owned-restart-token".into(),
+            user: User {
+                id: "owned-restart-user".into(),
+                username: "fixture".into(),
+                ..Default::default()
+            },
+        },
+        authority: Some(crate::host_route::RememberedAuthority {
+            pin: source_pin.clone(),
+            account_provider: None,
+            previous_urls: Vec::new(),
+        }),
+    };
+    let incoming = target_pin.clone();
+    let target = MockHttp::new(move |path| {
+        if path != "/api/bootstrap" {
+            return Reply::json(
+                409,
+                json!({"error":"no device or other API in this fixture"}),
+            );
+        }
+        Reply::json(
+            200,
+            json!(Bootstrap {
+                server_id: incoming.server_id.clone(),
+                host_authority: Some(incoming.clone()),
+                user: User {
+                    id: "owned-restart-user".into(),
+                    username: "fixture".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+    });
+    crate::credential_vault::save_bound(
+        &source_url,
+        &source_pin.server_id,
+        &old.session,
+        old.authority.as_ref(),
+    )
+    .unwrap();
+    let mut test = TestWorker::new();
+    let origin = CommandOrigin {
+        url: source_url.clone(),
+        server_id: source_pin.server_id.clone(),
+        user_id: old.session.user.id.clone(),
+    };
+    test.worker.pending_host_resume = Some(PendingHostResume {
+        origin: origin.clone(),
+        remembered: old,
+        job: crate::host_route::Job::ready(Ok(Some(crate::host_route::VerifiedMove {
+            url: target.url.clone(),
+            pin: target_pin.clone(),
+        }))),
+    });
+    test.worker.poll_host_resume();
+    assert!(test.worker.pending_host_resume.is_none());
+    assert_eq!(test.command_origin().url, target.url);
+    assert!(test
+        .drain()
+        .iter()
+        .any(|u| matches!(u,Update::CommunityMoved {origin:old,..} if old==&origin)));
+    let saved = crate::credential_vault::load(&target.url).unwrap().unwrap();
+    assert_eq!(saved.authority.as_ref().unwrap().pin, target_pin);
+    assert!(saved.authority.unwrap().previous_urls.contains(&source_url));
+    // Source record stays until the new record exists, allowing a crash before
+    // the protected preferences save to resume from the original address.
+    assert!(crate::credential_vault::load(&source_url)
+        .unwrap()
+        .is_some());
+    crate::credential_vault::forget(&target.url).unwrap();
+    assert!(crate::credential_vault::load(&source_url)
+        .unwrap()
+        .is_none());
+    assert!(crate::credential_vault::load(&target.url)
+        .unwrap()
+        .is_none());
+}
+#[test]
+fn remembered_host_move_is_cancelled_by_logout_before_a_completed_probe_can_send_a_token() {
+    let (_, _, pin, _) = crate::host_route::tests::fixture();
+    let target =
+        MockHttp::new(|_| panic!("a cancelled reconnect must not contact the destination"));
+    let mut test = TestWorker::new();
+    test.worker.pending_host_resume = Some(PendingHostResume {
+        origin: CommandOrigin {
+            url: "https://source.example".into(),
+            server_id: pin.server_id.clone(),
+            user_id: "fixture-user".into(),
+        },
+        remembered: crate::credential_vault::RememberedSession {
+            server_id: Some(pin.server_id.clone()),
+            session: Session {
+                token: "cancelled-token".into(),
+                user: User {
+                    id: "fixture-user".into(),
+                    ..Default::default()
+                },
+            },
+            authority: Some(crate::host_route::RememberedAuthority {
+                pin: pin.clone(),
+                account_provider: None,
+                previous_urls: Vec::new(),
+            }),
+        },
+        job: crate::host_route::Job::ready(Ok(Some(crate::host_route::VerifiedMove {
+            url: target.url.clone(),
+            pin,
+        }))),
+    });
+    test.worker.handle(Command::Logout).unwrap();
+    test.worker.poll_host_resume();
+    assert!(test.worker.connection.is_none());
+    assert!(test.worker.pending_host_resume.is_none());
+    assert!(target.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn invitation_authority_is_proved_before_password_invite_and_account_proof_are_sent() {
+    use relay_protocol::handover::{RouteChallenge, RouteState};
+    for fault in ["none", "wrong-key", "frozen", "replayed"] {
+        let (a, b, pin, _) = crate::host_route::tests::fixture();
+        let server_pin = pin.clone();
+        let id = pin.server_id.clone();
+        let server = MockHttp::with_request(move |request| match request.path.as_str() {
+            "/api/health" => Reply::json(200, invitation_health(&id)),
+            "/api/hosting/handover/route" => {
+                let request: RouteChallenge = serde_json::from_slice(&request.body).unwrap();
+                let proof = crate::host_route::tests::sign(
+                    if fault == "wrong-key" { &b } else { &a },
+                    RouteState {
+                        pin: server_pin.clone(),
+                        challenge: if fault == "replayed" {
+                            "A".repeat(43)
+                        } else {
+                            request.challenge
+                        },
+                        writes_allowed: fault != "frozen",
+                        moved: None,
+                        history: Vec::new(),
+                    },
+                );
+                Reply::json(200, serde_json::to_value(proof).unwrap())
+            }
+            _ => Reply::json(
+                503,
+                json!({"error":"owned endpoint reached after verification"}),
+            ),
+        });
+        let mut client = TestWorker::new();
+        assert_eq!(
+            client
+                .worker
+                .confirm_login_authority(&server.url, Some(&pin.server_id), Some(&pin))
+                .is_ok(),
+            fault == "none"
+        );
+        let auth = client.worker.handle(Command::Auth {
+            authority: Some(pin.clone()),
+            url: server.url.clone(),
+            expected_server_id: Some(pin.server_id.clone()),
+            request: AuthRequest {
+                username: "owned-user".into(),
+                password: "never-leak-password".into(),
+                invite: "never-leak-invite".into(),
+                second_factor: None,
+                initial_protection: None,
+            },
+            register: false,
+            request_id: 71,
+        });
+        assert!(auth.is_err());
+        assert!(client
+            .worker
+            .account_login_begin(
+                Some(pin.clone()),
+                server.url.clone(),
+                Some(pin.server_id.clone()),
+                zeroize::Zeroizing::new("never-leak-invite".into()),
+                true,
+                None,
+                72
+            )
+            .is_err());
+        assert!(client
+            .worker
+            .account_login_finish(
+                Some(pin.clone()),
+                server.url.clone(),
+                pin.server_id.clone(),
+                uuid::Uuid::new_v4().to_string(),
+                zeroize::Zeroizing::new("never-leak-account-proof".into()),
+                Arc::new(AtomicBool::new(false)),
+                73
+            )
+            .is_err());
+        let requests = server.requests.lock().unwrap();
+        let authenticated: Vec<_> = requests
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.path.as_str(),
+                    "/api/login" | "/api/account-login/challenge" | "/api/account-login"
+                )
+            })
+            .collect();
+        assert_eq!(
+            authenticated.len(),
+            if fault == "none" { 3 } else { 0 },
+            "{fault}"
+        );
+        if fault != "none" {
+            for request in requests.iter() {
+                assert!(request.authorization.is_none());
+                assert!(!String::from_utf8_lossy(&request.body).contains("never-leak"));
+            }
+        }
+    }
+}
+
+#[test]
+fn locator_issuance_is_background_and_retains_the_original_community_credentials() {
+    let (started_tx, started_rx)=mpsc::sync_channel(1);
+    let (release_tx, release_rx)=mpsc::sync_channel(1);
+    let release=std::sync::Mutex::new(release_rx);
+    let server=MockHttp::with_request(move |request| {
+        assert_eq!(request.authorization.as_deref(),Some("Bearer original-community"));
+        assert_eq!(request.path,relay_protocol::host_locator::ISSUE_PATH);
+        let _=started_tx.send(());
+        release.lock().unwrap().recv_timeout(Duration::from_secs(3)).unwrap();
+        Reply::json(401,json!({"error":"Sign in again"}))
+    });
+    let mut client=TestWorker::new();
+    client.connection(server.url.clone());
+    let (_,_,pin,_)=crate::host_route::tests::fixture();
+    let request=client.worker.http.post(format!("{}{}",server.url,relay_protocol::host_locator::ISSUE_PATH))
+        .bearer_auth("original-community").timeout(Duration::from_secs(3)).json(&json!({"owned":"fixture"}));
+    client.worker.spawn_locator_issue(request,"https://directory.invalid/people".into(),pin);
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    // The request is actually blocked now, but the command worker is free and
+    // switching its account cannot rewrite the already captured bearer/URL.
+    assert_eq!(client.worker.background_active.load(Ordering::Acquire),1);
+    client.worker.connection.as_mut().unwrap().session.token="another-community".into();
+    client.worker.connection.as_mut().unwrap().current=Some(Target::Channel("unrelated-call".into()));
+    client.worker.live.shutdown.store(true,Ordering::Release);
+    release_tx.send(()).unwrap();
+    let until=Instant::now()+Duration::from_secs(3);
+    while client.worker.background_active.load(Ordering::Acquire)>0 {
+        assert!(Instant::now()<until,"background issuance did not finish");
+        let observed=client.worker.wake.generation();
+        if client.worker.background_active.load(Ordering::Acquire)>0 {
+            client.worker.wake.wait(observed,Some(Duration::from_millis(50)));
+        }
+    }
+    assert_eq!(client.worker.connection.as_ref().unwrap().session.token,"another-community");
+    assert_eq!(client.worker.connection.as_ref().unwrap().current,Some(Target::Channel("unrelated-call".into())));
+    assert!(client.drain().iter().any(|u|matches!(u,Update::Notice(_))));
+}
+
+#[test]
+fn a_rejected_locator_is_acknowledged_only_by_verified_same_directory_state() {
+    use ed25519_dalek::Signer;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use relay_protocol::host_locator as locator;
+    for (status, valid, expected, requests) in [(400,true,true,2),(400,false,false,2),(503,true,false,1)] {
+        let (a,b,pin,grant)=crate::host_route::tests::fixture();
+        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut queued=locator::Record{id:"c".repeat(64),anchor:pin.clone(),current:pin.clone(),history:vec![],
+            issued_ms:now-2000,expires_ms:now+60_000,nonce:URL_SAFE_NO_PAD.encode([3;12]),
+            ciphertext:URL_SAFE_NO_PAD.encode([7;32]),signature:String::new()};
+        queued.signature=URL_SAFE_NO_PAD.encode(a.sign(&locator::record_message(&queued)).to_bytes());
+        let mut stored=queued.clone();
+        stored.current=relay_protocol::handover::RoutePin{server_id:pin.server_id.clone(),host:grant.receipt.body.target_identity.clone(),term:grant.next_term};
+        stored.history=vec![grant];stored.issued_ms=now-1000;
+        stored.signature=URL_SAFE_NO_PAD.encode(b.sign(&locator::record_message(&stored)).to_bytes());
+        if !valid {stored.id="d".repeat(64);}
+        let expected_id=queued.id.clone();
+        let response=serde_json::to_value(stored).unwrap();
+        let server=MockHttp::with_request(move |request| {
+            assert!(request.authorization.is_none(),"community credentials reached the directory");
+            assert_eq!(request.method,"POST");
+            if request.path==locator::PUBLISH_PATH {return Reply::json(status,json!({"error":"rejected"}));}
+            assert_eq!(request.path,locator::LOOKUP_PATH);
+            assert_eq!(serde_json::from_slice::<Value>(&request.body).unwrap(),json!({"id":expected_id}));
+            Reply::json(200,response.clone())
+        });
+        assert_eq!(crate::host_locator::publish_at(&server.url,&queued).is_ok(),expected);
+        assert_eq!(server.requests.lock().unwrap().len(),requests);
+    }
+}
+
+#[test]
+fn local_pairing_http_never_receives_a_plain_code_or_account_credential(){
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD,Engine};
+    use chacha20poly1305::{aead::{Aead,KeyInit,Payload},ChaCha20Poly1305,Nonce};
+    use hmac::{Hmac,Mac};
+    use sha2::{Digest,Sha256};
+    use relay_protocol::lan_pairing as model;
+    let (_,_,pin,_)=crate::host_route::tests::fixture();let server=pin.server_id.clone();let raw=[93u8;16];
+    let display=format!("LAN-{}",URL_SAFE_NO_PAD.encode(raw));
+    let key:[u8;32]=Sha256::digest(model::material(&server,&raw,model::Purpose::Seal)).into();
+    let auth:[u8;32]=Sha256::digest(model::material(&server,&raw,model::Purpose::Auth)).into();
+    let invitation=model::Invitation{server_id:server.clone(),code:"synthetic-invitation-bearer".into(),authority:pin,
+        destination:relay_protocol::host_locator::Destination{url:"https://pairing-host.example".into(),iroh:None}};
+    let mut envelope=model::Envelope{server_id:server.clone(),id:format!("{:x}",Sha256::digest(model::material(&server,&raw,model::Purpose::Lookup))),
+        expires_ms:crate::lan_pairing::now_ms().unwrap()+60_000,nonce:URL_SAFE_NO_PAD.encode([9u8;12]),ciphertext:String::new()};
+    envelope.ciphertext=URL_SAFE_NO_PAD.encode(ChaCha20Poly1305::new_from_slice(&key).unwrap().encrypt(Nonce::from_slice(&[9u8;12]),
+        Payload{msg:&serde_json::to_vec(&invitation).unwrap(),aad:&model::associated_data(&envelope)}).unwrap());
+    let expected_id=envelope.id.clone();let body=serde_json::to_value(envelope).unwrap();
+    let responder=MockHttp::with_request(move |request|{
+        assert_eq!(request.method,"POST");assert_eq!(request.path,model::REDEEM_PATH);assert!(request.authorization.is_none());
+        let wire=String::from_utf8_lossy(&request.body);assert!(!wire.contains(&URL_SAFE_NO_PAD.encode(raw)));assert!(!wire.contains("synthetic-invitation-bearer"));
+        let request:model::Redeem=serde_json::from_slice(&request.body).unwrap();assert_eq!(request.id,expected_id);
+        let mut mac=<Hmac<Sha256> as Mac>::new_from_slice(&auth).unwrap();mac.update(&model::redeem_message(&request));
+        mac.verify_slice(&URL_SAFE_NO_PAD.decode(&request.tag).unwrap()).unwrap();Reply::json(200,body.clone())
+    });
+    let found=crate::lan_discovery::Found{name:"Local fixture".into(),server_id:server,ip:"192.168.1.8".parse().unwrap(),port:4580};
+    let joined=crate::lan_pairing::fetch_for_test(&found,&display,&responder.url).unwrap();
+    assert_eq!(joined.server,"https://pairing-host.example");assert_eq!(joined.code,"synthetic-invitation-bearer");
+    assert_eq!(responder.requests.lock().unwrap().len(),1);
+}
+
+#[test]
+fn friends_gateway_requests_keep_the_accepted_account_and_require_its_own_capability() {
+    let mut test = TestWorker::new();
+    test.connection("https://friends.example".into());
+    let mut bootstrap = Bootstrap::default();
+    bootstrap.capabilities = vec!["people-v1".into(), "gateway-broker-v1".into()];
+    test.worker.connection.as_mut().unwrap().chat = extended::ChatSession::new(&bootstrap);
+    let ticket: VoiceTicket = serde_json::from_value(json!({
+        "session_id":201,"key":base64::engine::general_purpose::STANDARD.encode([1u8;32]),
+        "udp_port":4581,"wire_version":4
+    })).unwrap();
+    // Community capability is deliberately insufficient on a Friends service.
+    assert!(test.worker.voice_gateway(&ticket).is_none());
+    bootstrap.capabilities.push("friends-gateway-broker-v1".into());
+    test.worker.connection.as_mut().unwrap().chat = extended::ChatSession::new(&bootstrap);
+    let captured = test.worker.voice_gateway(&ticket).unwrap();
+    // A later foreground account change cannot retarget this call's requests.
+    test.connection("https://community.example".into());
+    test.worker.connection.as_mut().unwrap().session.token = "different-fixture-token".into();
+    let request = captured.prepared_list_for_test();
+    assert_eq!(request.url().as_str(), "https://friends.example/api/hosting/voice-gateways");
+    assert_eq!(request.headers().get("authorization").unwrap(), "Bearer fixture-token");
+    // A newly found ordinary HTTP address cannot carry the shared-account bearer.
+    test.connection("http://192.168.1.9:4580".into());
+    test.worker.connection.as_mut().unwrap().chat = extended::ChatSession::new(&bootstrap);
+    assert!(test.worker.voice_gateway(&ticket).is_none());
+    assert!(test.drain().is_empty());
+}
+
+#[test]
+fn prepared_media_routes_recheck_their_exact_lease_and_never_close_the_normal_route() {
+    let changing = Arc::new(AtomicBool::new(false));
+    let changed = changing.clone();
+    let lease = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([3u8;32]);
+    let named = lease.clone();
+    let control = MockHttp::with_request(move |request| {
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.authorization.as_deref(), Some("Bearer synthetic-helper-control"));
+        match request.path.as_str() {
+            "/prepared-route" => {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert!(body.get("token").is_some() && body.get("endpoint_id").is_some());
+            },
+            "/prepared-route-status" | "/close-prepared-route" => {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body, json!({"lease":named}));
+            },
+            _ => panic!("prepared media must never change a normal route"),
+        }
+        if request.path == "/close-prepared-route" { return Reply::json(200, json!({"closed":true})); }
+        Reply::json(200,json!({"lease":named,"http_url":if changed.load(Ordering::Acquire){"http://127.0.0.1:49202"}else{"http://127.0.0.1:49201"},"voice_udp_port":49203,"expires_in_secs":120}))
+    });
+    let id = uuid::Uuid::new_v4().simple().to_string().repeat(2);
+    let saved = crate::iroh_route::SavedIroh {endpoint_id:id,relay:None,token:"A".repeat(43)};
+    let before = crate::iroh_route::saved_for(&saved.address());
+    let prepared = crate::iroh_route::PreparedRoute::open_for_test(&saved,&control.url,"synthetic-helper-control").unwrap();
+    assert_eq!(prepared.gateway().unwrap(),"http://127.0.0.1:49201");
+    assert_eq!(prepared.signaling(&saved.address().replace("http://","ws://")).unwrap(),"ws://127.0.0.1:49201/");
+    assert!(prepared.signaling("ws://other.iroh:4580/").is_err());
+    changing.store(true,Ordering::Release);
+    assert!(prepared.gateway().is_err(),"a changed port is not silently adopted");
+    drop(prepared);
+    assert_eq!(crate::iroh_route::saved_for(&saved.address()),before);
+    let requests=control.requests.lock().unwrap();
+    assert_eq!(requests.last().unwrap().path,"/close-prepared-route");
+    assert!(requests.iter().all(|r|matches!(r.path.as_str(),"/prepared-route"|"/prepared-route-status"|"/close-prepared-route")));
 }

@@ -109,6 +109,10 @@ pub struct AudioSettings {
     pub ultra_short_packets: bool,
     /// Explicit opt-in because direct peers learn each other's network address.
     pub direct_voice_enabled: bool,
+    /// Explicit opt-in: let an approved local voice gateway help carry this call's voice.
+    /// Off by default. It is only ever used after a measured full voice path.
+    #[serde(default)]
+    pub local_voice_gateways: bool,
     /// Prefer the smallest supported Windows shared-mode audio period.
     pub low_latency_device: bool,
     pub overlay_enabled: bool,
@@ -153,6 +157,7 @@ impl Default for AudioSettings {
             packet_ms: 10,
             ultra_short_packets: false,
             direct_voice_enabled: false,
+            local_voice_gateways: false,
             low_latency_device: true,
             overlay_enabled: false,
             overlay_x: 24.0,

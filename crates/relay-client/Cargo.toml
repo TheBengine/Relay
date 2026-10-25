@@ -13,6 +13,10 @@ default = ["native-rtc"]
 native-rtc = ["dep:livekit", "dep:futures-util", "dep:audiopus_sys"]
 # The account-free (iroh) route. Off until it has been tried on two real PCs.
 iroh-route = []
+# QA only: owned loopback HTTP identity/Friends service. Never in a release.
+qa-loopback-identity = []
+# QA only: accessibility SetValue enters text into egui fields. Never in a release.
+qa-automation = []
 
 [build-dependencies]
 toml_edit = "=0.19.15"
@@ -56,10 +60,15 @@ opus = "0.3.0"
 nnnoiseless = { version = "0.5.2", default-features = false }
 chacha20poly1305 = "0.10.1"
 base64 = "0.22.1"
+ed25519-dalek = "=2.2.0"
 image = { version = "0.24.9", default-features = false, features = ["jpeg", "png", "gif"] }
 screenshots = "0.8.10"
 
 [dev-dependencies]
+# Native call acceptance uses the real in-process server and disposable records.
+relay-server = { path = "../relay-server" }
+axum = "0.8"
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 toml_edit = "=0.19.15"
 tempfile = "3"
 winit = { version = "=0.29.15", default-features = false, features = ["rwh_06"] }
@@ -71,4 +80,4 @@ raw-window-handle = "=0.6.2"
 audiopus_sys = { version = "0.2.2", optional = true, features = ["livekit-opus"] }
 windows-core = "0.58"
 nokhwa = { version = "0.10.10", default-features = false, features = ["input-msmf"] }
-windows = { version = "0.58", features = ["Win32_System_Registry", "implement", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_Storage_FileSystem", "Win32_Graphics_Dwm", "Foundation", "Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Dxgi", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT", "Win32_System_Com", "Win32_System_WinRT_Graphics_Capture", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_IO", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Media_MediaFoundation", "Win32_Media_Audio", "Win32_Devices_FunctionDiscovery", "Win32_NetworkManagement_QoS", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Media_KernelStreaming", "Win32_System_Com_StructuredStorage", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Variant"] }
+windows = { version = "0.58", features = ["Win32_System_JobObjects", "Win32_System_Registry", "implement", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_Storage_FileSystem", "Win32_Graphics_Dwm", "Foundation", "Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Dxgi", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT", "Win32_System_Com", "Win32_System_WinRT_Graphics_Capture", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_IO", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Media_MediaFoundation", "Win32_Media_Audio", "Win32_Devices_FunctionDiscovery", "Win32_NetworkManagement_QoS", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Media_KernelStreaming", "Win32_System_Com_StructuredStorage", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Variant"] }

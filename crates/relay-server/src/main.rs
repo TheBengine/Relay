@@ -41,8 +41,48 @@ struct Options {
     port: u16,
     #[arg(long, default_value_t = 4581)]
     udp_port: u16,
+    /// Answer "who runs a community here?" from private LAN addresses with the
+    /// community name, HTTP port and server id. Off unless given; needs a LAN --bind.
+    #[arg(long)]
+    lan_discovery: bool,
+    /// With --lan-discovery on a desktop host whose HTTP and voice stay on loopback: open ONE
+    /// extra IPv4 listener on an OS-chosen port which serves only the LAN pairing
+    /// redemption, and advertise that port. The ordinary API and voice stay loopback-only.
+    #[arg(
+        long,
+        requires = "lan_discovery",
+        conflicts_with_all = [
+            "people", "replica_pull", "handover_target", "handover_ready", "backup",
+            "raw_backup", "restore", "init_admin", "recover_admin", "migrate_only", "status",
+            "stop", "public_hosting_status"
+        ]
+    )]
+    lan_pairing_only: bool,
     #[arg(long)]
     data: Option<PathBuf>,
+    /// Pull one verified read-only copy into a separate folder. Configuration and
+    /// the dedicated pull token arrive only through the owned stdin pipe.
+    #[arg(long, value_name = "DIR", conflicts_with_all = [
+        "data", "backup", "raw_backup", "restore", "init_admin", "recover_admin",
+        "migrate_only", "status", "stop", "public_hosting_status", "people",
+        "lan_discovery", "tailscale_bind", "network_peer_port"
+    ])]
+    replica_pull: Option<PathBuf>,
+    /// Destination identity, consent, image verification or granted activation.
+    /// A bounded JSON request arrives through the owned stdin pipe.
+    #[arg(long, value_name = "DIR", conflicts_with_all = [
+        "data", "replica_pull", "backup", "raw_backup", "restore", "init_admin", "recover_admin",
+        "migrate_only", "status", "stop", "public_hosting_status", "people",
+        "lan_discovery", "tailscale_bind", "network_peer_port"
+    ])]
+    handover_target: Option<PathBuf>,
+    /// Hold destination listeners and a read-only readiness endpoint until the
+    /// source grant arrives through the private local control endpoint.
+    #[arg(long, value_name="DIR", conflicts_with_all=[
+        "data","replica_pull","handover_target","backup","raw_backup","restore","init_admin","recover_admin",
+        "migrate_only","status","stop","public_hosting_status","people","lan_discovery","tailscale_bind"
+    ])]
+    handover_ready: Option<PathBuf>,
     /// Account-wide friends, private messages and calls. Use a separate new --data directory.
     #[arg(long)]
     people: bool,
@@ -132,6 +172,22 @@ fn resolved_udp_bind(options: &Options) -> Result<IpAddr, &'static str> {
 }
 fn requires_admin_initialization(http_bind: IpAddr, udp_bind: IpAddr) -> bool {
     !http_bind.is_loopback() || !udp_bind.is_loopback()
+}
+/// The explicit pairing-only mode opens nothing but its one redemption listener, so the
+/// ordinary HTTP and voice endpoints must stay on IPv4 loopback.
+fn validate_pairing_only(options: &Options, udp_bind: IpAddr) -> Result<(), &'static str> {
+    if !options.lan_pairing_only {
+        return Ok(());
+    }
+    if !options.lan_discovery {
+        return Err("--lan-pairing-only needs --lan-discovery");
+    }
+    if !(options.bind.is_ipv4() && options.bind.is_loopback())
+        || !(udp_bind.is_ipv4() && udp_bind.is_loopback())
+    {
+        return Err("--lan-pairing-only keeps the normal HTTP and voice ports on IPv4 loopback; use an IPv4 loopback --bind and --udp-bind");
+    }
+    Ok(())
 }
 fn managed_control_address(http_bind: IpAddr, port: u16) -> SocketAddr {
     let control_ip = if http_bind.is_unspecified() {
@@ -364,6 +420,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
     let options = Options::parse();
+    if let Some(directory) = &options.handover_target {
+        return relay_server::handover_target::run(directory);
+    }
+    if let Some(directory) = &options.replica_pull {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        match runtime.block_on(relay_server::replica_agent::run_stdin(directory)) {
+            Ok(report) => println!("{}", serde_json::to_string(&report)?),
+            Err(failure) => {
+                println!("{}", serde_json::to_string(&failure)?);
+                std::process::exit(failure.exit_code());
+            }
+        }
+        return Ok(());
+    }
     if options.public_hosting_status {
         let data = options
             .data
@@ -380,10 +450,112 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(run(options))
 }
 
-async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(mut options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let udp_bind = resolved_udp_bind(&options)?;
-    let data = options.data.unwrap_or_else(default_data);
-    if options.tailscale_bind.is_some() || options.network_peer_port.is_some() {
+    validate_pairing_only(&options, udp_bind)?;
+    let mut prepared_control: Option<zeroize::Zeroizing<String>> = None;
+    let prepared = if let Some(data) = options.handover_ready.take() {
+        use std::io::{Read, Write};
+        if udp_bind != options.bind {
+            return Err("Standby requires the same loopback interface for HTTP and voice".into());
+        }
+        let mut input = Vec::new();
+        std::io::stdin()
+            .take(relay_protocol::handover::CONTROL_BYTES + 1)
+            .read_to_end(&mut input)?;
+        if input.len() as u64 > relay_protocol::handover::CONTROL_BYTES {
+            return Err("Standby request is too large".into());
+        }
+        let status: relay_protocol::handover::Status = serde_json::from_slice(&input)?;
+        let token = zeroize::Zeroizing::new(
+            std::env::var("RELAY_HANDOVER_CONTROL_TOKEN")
+                .map_err(|_| "Set a private standby control token")?,
+        );
+        std::env::remove_var("RELAY_HANDOVER_CONTROL_TOKEN");
+        if !(32..=256).contains(&token.len()) {
+            return Err("Set a private standby control token".into());
+        }
+        // The app owns this process and its retained loopback listener. Keep
+        // its control token across activation, including a granted restart;
+        // neither a community session nor a network ingress can use it.
+        prepared_control = Some(token.clone());
+        let private=url::Url::parse(&status.preparation.as_ref().ok_or("No prepared destination")?.target_url)?
+            .scheme()=="http";
+        if private != options.network_peer_port.is_some() {
+            return Err("The prepared private destination requires its isolated network ingress".into());
+        }
+        let peer=if let Some(port)=options.network_peer_port {
+            let token=std::env::var("RELAY_HANDOVER_NETWORK_TOKEN").map_err(|_|"Set a private destination ingress token")?;
+            std::env::remove_var("RELAY_HANDOVER_NETWORK_TOKEN");
+            Some(relay_server::handover_readiness::Peer::bind(port,zeroize::Zeroizing::new(token)).await?)
+        }else{None};
+        if status.retired.is_some() {
+            let mut resumed = relay_server::handover_readiness::ReadyRuntime::resume(
+                    &data,
+                    status,
+                    options.bind,
+                    options.port,
+                    options.udp_port,
+                    RtcConfig::from_env()?,
+                )
+                .await?;
+            resumed.peer=peer;
+            println!(
+                "{}",
+                json!({"mode":"handover-activating","server_id":resumed.activation.server_id,"target_host_id":resumed.activation.target_host_id,"http_port":resumed.http.local_addr()?.port(),"voice_port":resumed.udp.local_addr()?.port(),"network_peer_port":resumed.peer.as_ref().map(|p|p.http.local_addr().map(|a|a.port())).transpose()?})
+            );
+            std::io::stdout().flush()?;
+            Some(resumed)
+        } else {
+            let waiting = relay_server::handover_readiness::Prepared::bind(
+                &data,
+                status,
+                options.bind,
+                options.port,
+                options.udp_port,
+                RtcConfig::from_env()?,
+                token,
+            )
+            .await?.with_peer(peer);
+            println!("{}", waiting.report());
+            std::io::stdout().flush()?;
+            Some(waiting.wait().await?)
+        }
+    } else {
+        None
+    };
+    let was_prepared = prepared.is_some();
+    if let Some(runtime)=&prepared {
+        // The authenticated destination URL is also the one public Host header
+        // the activated router must accept behind its existing HTTPS proxy.
+        // No wildcard or source-machine proxy setting is inherited.
+        if let Ok(url)=url::Url::parse(&runtime.activation.target_url) {
+            if let Some(url::Host::Domain(host))=url.host() {options.allowed_host.push(host.to_owned());}
+        }
+    }
+    let (prepared_data, mut prepared_http, mut prepared_udp, prepared_rtc, _prepared_reservation, mut prepared_peer) =
+        match prepared {
+            Some(p) => (
+                Some(p.activation.data),
+                Some(p.http),
+                Some(p.udp),
+                p.rtc,
+                Some(p.reservation),
+                p.peer,
+            ),
+            None => (None, None, None, None, None, None),
+        };
+    if options.lan_discovery
+        && !options.lan_pairing_only
+        && !relay_server::lan_discovery::bind_is_lan_reachable(options.bind)
+    {
+        return Err("--lan-discovery needs --bind 0.0.0.0 or a private LAN IPv4 address, so the community can be reached from the network it advertises on".into());
+    }
+    let data = prepared_data.or(options.data).unwrap_or_else(default_data);
+    if options.tailscale_bind.is_some()
+        || options.network_peer_port.is_some()
+        || options.lan_pairing_only
+    {
         let status = public_hosting_status(&data);
         if status["ready"] != true {
             return Err(status["message"]
@@ -419,9 +591,10 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     lock.try_lock().map_err(|_| {
         "This data directory is in use; stop its server before maintenance or a second launch"
     })?;
+    let inherited = relay_server::handover_target::active_runtime(&data)?;
     let mut config = ServerConfig {
         people: options.people,
-        account_provider: relay_server::AccountProviderConfig::configured()?,
+        account_provider: if inherited.is_none() { relay_server::AccountProviderConfig::configured()? } else { None },
         storage_limit_bytes: options.storage_limit,
         user_storage_limit_bytes: options.user_storage_limit,
         trusted_proxy_ips: options.trusted_proxy,
@@ -443,8 +616,21 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
         ..Default::default()
     };
-    let secret = uuid::Uuid::new_v4().to_string() + &uuid::Uuid::new_v4().to_string();
+    let secret = prepared_control.take().map(|token| token.to_string()).unwrap_or_else(||
+        uuid::Uuid::new_v4().to_string() + &uuid::Uuid::new_v4().to_string());
     config.local_control_token = Some(secret.clone());
+    if let Some(runtime) = &inherited {
+        options.name = runtime.name.clone();
+        config.storage_limit_bytes = runtime.storage_limit_bytes;
+        config.user_storage_limit_bytes = runtime.user_storage_limit_bytes;
+        config.account_provider = runtime
+            .account_provider
+            .as_ref()
+            .map(|p| {
+                relay_server::AccountProviderConfig::new(&p.issuer, &p.client_id, &p.community_url)
+            })
+            .transpose()?;
+    }
     if let Some(destination) = options.raw_backup {
         let db = rusqlite::Connection::open_with_flags(
             data.join("relay.sqlite3"),
@@ -481,8 +667,18 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    config.rtc = RtcConfig::from_env()?;
-    let udp = tokio::net::UdpSocket::bind(SocketAddr::new(udp_bind, options.udp_port)).await?;
+    config.rtc = if was_prepared {
+        prepared_rtc
+    } else {
+        RtcConfig::from_env()?
+    };
+    if inherited.as_ref().is_some_and(|v| v.rtc_setup_required) && config.rtc.is_none() {
+        return Err("Configure this destination's local video service before starting the transferred community".into());
+    }
+    let udp = match prepared_udp.take() {
+        Some(socket) => socket,
+        None => tokio::net::UdpSocket::bind(SocketAddr::new(udp_bind, options.udp_port)).await?,
+    };
     mark_voice_priority(&udp);
     let udp_address = udp.local_addr()?;
     let state = AppState::open_with_config(&data, &options.name, udp_address.port(), config)?;
@@ -492,8 +688,34 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("Initialize the administrator locally with --init-admin before binding to LAN/public interfaces".into());
     }
-    let http = tokio::net::TcpListener::bind(SocketAddr::new(options.bind, options.port)).await?;
+    if options.lan_pairing_only && !state.has_users()? {
+        return Err("Initialize the administrator locally with --init-admin before opening the LAN pairing listener".into());
+    }
+    let http = match prepared_http.take() {
+        Some(listener) => listener,
+        None => tokio::net::TcpListener::bind(SocketAddr::new(options.bind, options.port)).await?,
+    };
     let http_address = http.local_addr()?;
+    // The pairing-only listener: one IPv4 socket whose port the OS chooses and holds, so no
+    // port is probed and rebound. It is optional: if it cannot be opened the community
+    // still runs and no pairing port is reported.
+    let mut pairing_http = if options.lan_pairing_only {
+        match tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+            .await
+        {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                eprintln!("LAN pairing unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let pairing_port = pairing_http
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|address| address.port());
     // Bind both listeners before serving either; failure cannot leave a partial
     // hosting mode or allow a peer to claim the first local owner account.
     let tailscale_http = if let Some(peer_bind) = options.tailscale_bind {
@@ -507,27 +729,72 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let network_http = if let Some(port) = options.network_peer_port {
-        Some(
+    let (network_http, prepared_ingress) = if let Some(peer)=prepared_peer.take() {
+        (Some(peer.http),Some(peer.token.to_string()))
+    } else if let Some(port) = options.network_peer_port {
+        (Some(
             tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
                 .await?,
-        )
+        ),None)
     } else {
-        None
+        (None,None)
     };
     let network_peer_port = network_http
         .as_ref()
         .map(|listener| listener.local_addr().map(|address| address.port()))
         .transpose()?;
-    let network_ingress_token = network_peer_port
-        .map(|_| uuid::Uuid::new_v4().to_string() + &uuid::Uuid::new_v4().to_string());
+    let network_ingress_token = prepared_ingress.or_else(||network_peer_port
+        .map(|_| uuid::Uuid::new_v4().to_string() + &uuid::Uuid::new_v4().to_string()));
+    // Optional LAN discovery. In the explicit pairing-only mode the beacon advertises the
+    // additional pairing listener (never the loopback API) and only if that listener is
+    // bound; otherwise it advertises the HTTP port exactly as before. A failure leaves the
+    // community running, and a pairing listener nobody can discover is not kept open.
+    let mut lan_task: Option<Owned> = None;
+    let mut pairing_task: Option<Owned> = None;
+    let mut lan_pairing_port: Option<u16> = None;
+    if options.lan_discovery {
+        let advertised = if options.lan_pairing_only {
+            pairing_port.map(|port| (port, Ipv4Addr::UNSPECIFIED))
+        } else if let IpAddr::V4(http_bind) = options.bind {
+            Some((http_address.port(), http_bind))
+        } else {
+            None
+        };
+        if let Some((port, bind)) = advertised {
+            match relay_server::lan_discovery::start(
+                state.clone(),
+                port,
+                bind,
+                std::net::SocketAddrV4::new(
+                    Ipv4Addr::UNSPECIFIED,
+                    relay_protocol::lan_discovery::PORT,
+                ),
+            ) {
+                Ok((address, task)) => {
+                    println!("Relay LAN discovery listening on {address}");
+                    lan_task = Some(Owned(task));
+                    if let Some(listener) = pairing_http.take() {
+                        println!("Relay LAN pairing listening on port {port}");
+                        let pairing_state = state.clone();
+                        pairing_task = Some(Owned(tokio::spawn(async move {
+                            let _ = serve_lan_pairing(listener, pairing_state).await;
+                        })));
+                        lan_pairing_port = Some(port);
+                    }
+                }
+                // The community itself keeps running; only discovery is unavailable.
+                Err(error) => eprintln!("LAN discovery unavailable: {error}"),
+            }
+        }
+    }
+    drop(pairing_http);
     let address = format!(
         "http://{}",
         managed_control_address(options.bind, http_address.port())
     );
     private_record(
         &data.join("server-runtime.json"),
-        &json!({"instance_id":state.instance_id(),"server_id":state.server_id()?,"pid":std::process::id(),"started_at":chrono::Utc::now().to_rfc3339(),"exe":std::env::current_exe()?,"data":data,"address":address,"shutdown_token":secret,"network_peer_port":network_peer_port,"network_ingress_token":network_ingress_token}),
+        &json!({"instance_id":state.instance_id(),"server_id":state.server_id()?,"pid":std::process::id(),"started_at":chrono::Utc::now().to_rfc3339(),"exe":std::env::current_exe()?,"data":data,"address":address,"shutdown_token":secret,"network_peer_port":network_peer_port,"network_ingress_token":network_ingress_token,"lan_discovery":lan_task.is_some(),"lan_pairing_port":lan_pairing_port}),
     )?;
     private_record(
         &data.join("managed-instance.json"),
@@ -580,6 +847,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     shutdown.abort();
     udp_task.abort();
     cleanup.abort();
+    drop(lan_task);
+    drop(pairing_task);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(7), discord).await;
     let _ = std::fs::remove_file(data.join("server-runtime.json"));
     drop(lock);
@@ -611,6 +880,29 @@ async fn serve_network_http(
     .await
 }
 
+/// Serves only the LAN pairing redemption on its own listener, until shutdown.
+async fn serve_lan_pairing(
+    listener: tokio::net::TcpListener,
+    state: AppState,
+) -> std::io::Result<()> {
+    let shutdown = state.clone();
+    axum::serve(
+        listener,
+        relay_server::lan_pairing_router(state)
+            .into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
+    .await
+}
+
+/// A background task which ends with its owner, however the owner ends.
+struct Owned(tokio::task::JoinHandle<()>);
+impl Drop for Owned {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn mark_voice_priority(socket: &tokio::net::UdpSocket) {
     #[cfg(unix)]
     {
@@ -630,6 +922,52 @@ fn mark_voice_priority(socket: &tokio::net::UdpSocket) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handover_ready_options_do_not_mix_standby_with_normal_or_maintenance_hosts() {
+        let private=Options::try_parse_from(["relay-server","--handover-ready","owned-preparation","--network-peer-port","4582"]).unwrap();
+        assert!(resolved_udp_bind(&private).unwrap().is_loopback());
+        assert!(Options::try_parse_from([
+            "relay-server",
+            "--handover-ready",
+            "owned-preparation",
+            "--port",
+            "0",
+            "--udp-port",
+            "0"
+        ])
+        .is_ok());
+        for extra in [
+            "--people",
+            "--lan-discovery",
+            "--status",
+            "--stop",
+            "--migrate-only",
+        ] {
+            assert!(Options::try_parse_from([
+                "relay-server",
+                "--handover-ready",
+                "owned-preparation",
+                extra
+            ])
+            .is_err());
+        }
+        for (flag, value) in [
+            ("--data", "other-data"),
+            ("--handover-target", "other-data"),
+            ("--replica-pull", "other-data"),
+            ("--tailscale-bind", "100.64.0.1"),
+        ] {
+            assert!(Options::try_parse_from([
+                "relay-server",
+                "--handover-ready",
+                "owned-preparation",
+                flag,
+                value
+            ])
+            .is_err());
+        }
+    }
 
     fn owner_status_fixture(role: &str, membership: &str, schema: u32) -> tempfile::TempDir {
         let data = tempfile::Builder::new()
@@ -1235,10 +1573,89 @@ mod tests {
     }
 
     #[test]
+    fn lan_discovery_is_opt_in_and_needs_a_lan_reachable_bind() {
+        assert!(!Options::try_parse_from(["relay-server"]).unwrap().lan_discovery);
+        let on = Options::try_parse_from(["relay-server", "--lan-discovery"]).unwrap();
+        assert!(on.lan_discovery);
+        // The default bind is loopback: asking for discovery there is refused at start.
+        assert!(!relay_server::lan_discovery::bind_is_lan_reachable(on.bind));
+        for lan in ["0.0.0.0", "192.168.1.10", "10.0.0.2"] {
+            assert!(relay_server::lan_discovery::bind_is_lan_reachable(lan.parse().unwrap()));
+        }
+    }
+
+    #[test]
     fn udp_bind_rejects_hostnames_and_socket_addresses() {
         for invalid in ["localhost", "127.0.0.1:4581", "[::1]:4581"] {
             assert!(Options::try_parse_from(["relay-server", "--udp-bind", invalid]).is_err());
         }
+    }
+
+    #[test]
+    fn the_explicit_pairing_only_mode_needs_discovery_a_loopback_host_and_no_other_mode() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["relay-server"];
+            args.extend_from_slice(extra);
+            Options::try_parse_from(args)
+        };
+        // It needs --lan-discovery, and with it a loopback host is exactly what it wants.
+        assert!(parse(&["--lan-pairing-only"]).is_err());
+        let ok = parse(&["--lan-discovery", "--lan-pairing-only"]).unwrap();
+        assert!(ok.lan_pairing_only);
+        assert!(validate_pairing_only(&ok, resolved_udp_bind(&ok).unwrap()).is_ok());
+        // An embedded-network host (loopback helper ingress) may carry it too.
+        let helper = parse(&[
+            "--lan-discovery",
+            "--lan-pairing-only",
+            "--network-peer-port",
+            "5000",
+        ])
+        .unwrap();
+        assert!(validate_pairing_only(&helper, resolved_udp_bind(&helper).unwrap()).is_ok());
+        // Never beside maintenance, Friends, replica pull or a handover mode.
+        for extra in [
+            vec!["--people"],
+            vec!["--status"],
+            vec!["--stop"],
+            vec!["--migrate-only"],
+            vec!["--public-hosting-status"],
+            vec!["--backup", "b"],
+            vec!["--raw-backup", "b"],
+            vec!["--restore", "b"],
+            vec!["--init-admin", "owner"],
+            vec!["--recover-admin", "owner"],
+            vec!["--replica-pull", "d"],
+            vec!["--handover-target", "d"],
+            vec!["--handover-ready", "d"],
+        ] {
+            let mut args = vec!["--lan-discovery", "--lan-pairing-only"];
+            args.extend(extra.iter().copied());
+            assert!(parse(&args).is_err(), "{extra:?}");
+        }
+        // Normal HTTP and voice must stay on IPv4 loopback: nothing silently opens a port.
+        for (flag, value) in [
+            ("--bind", "0.0.0.0"),
+            ("--bind", "192.168.1.5"),
+            ("--bind", "::1"),
+            ("--udp-bind", "0.0.0.0"),
+            ("--udp-bind", "192.168.1.5"),
+            ("--udp-bind", "::1"),
+        ] {
+            let options = parse(&["--lan-discovery", "--lan-pairing-only", flag, value]).unwrap();
+            let udp = resolved_udp_bind(&options).unwrap();
+            assert!(validate_pairing_only(&options, udp).is_err(), "{flag} {value}");
+        }
+        // Ordinary discovery is exactly as before: it needs a reachable LAN bind, and the
+        // pairing-only rules do not apply to it.
+        let old = parse(&["--lan-discovery", "--bind", "192.168.1.5"]).unwrap();
+        assert!(!old.lan_pairing_only);
+        assert!(validate_pairing_only(&old, resolved_udp_bind(&old).unwrap()).is_ok());
+        assert!(relay_server::lan_discovery::bind_is_lan_reachable(old.bind));
+        let loopback_only = parse(&["--lan-discovery"]).unwrap();
+        assert!(!loopback_only.lan_pairing_only);
+        assert!(!relay_server::lan_discovery::bind_is_lan_reachable(
+            loopback_only.bind
+        ));
     }
 }
 

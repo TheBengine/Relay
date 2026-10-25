@@ -22,7 +22,9 @@ impl Write for HashWriter {
 impl Snapshots {
     pub(super) fn should_emit(&mut self, update: &Update) -> bool {
         let (slot, digest) = match update {
-            Update::Connected { .. } | Update::AccountLoginComplete { .. } => {
+            Update::Connected { .. }
+            | Update::CommunityMoved { .. }
+            | Update::AccountLoginComplete { .. } => {
                 *self = Self::default();
                 return true;
             }

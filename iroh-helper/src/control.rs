@@ -19,13 +19,7 @@ use hyper::{body::Incoming, service::service_fn, Method, Request, Response, Stat
 use hyper_util::rt::TokioIo;
 use iroh::{EndpointId, RelayUrl};
 use serde::{Deserialize, Serialize};
-use std::{
-    convert::Infallible,
-    path::PathBuf,
-    str::FromStr,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{convert::Infallible, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::Notify};
 
 const MAX_BODY: usize = 4096;
@@ -35,11 +29,13 @@ pub struct Control {
     token_digest: [u8; 32],
     state_dir: PathBuf,
     network: Network,
-    host: tokio::sync::Mutex<Option<HostService>>,
+    host: tokio::sync::Mutex<Option<Hosted>>,
     client: tokio::sync::Mutex<Option<Arc<Client>>>,
+    /// Route-proof exchanges. Apart from `client`: its own budget and no shared route.
+    proofs: crate::route_proof::Prover,
+    prepared: crate::prepared_route::Store,
     /// Signalled by `/shutdown`; the program then ends.
     pub stop: Notify,
-    last_host: Mutex<Option<String>>,
 }
 
 impl Control {
@@ -54,8 +50,9 @@ impl Control {
             network,
             host: tokio::sync::Mutex::new(None),
             client: tokio::sync::Mutex::new(None),
+            proofs: crate::route_proof::Prover::new(),
+            prepared: crate::prepared_route::Store::new(),
             stop: Notify::new(),
-            last_host: Mutex::new(None),
         }))
     }
 
@@ -88,13 +85,97 @@ struct HostInput {
     udp_port: u16,
     #[serde(default = "default_media_port")]
     media_udp_port: u16,
+    #[serde(default)]
+    identity_scope: Option<String>,
+    #[serde(default)]
+    expected_endpoint: Option<String>,
+    #[serde(default)]
+    expected_admission: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareIdentity {
+    scope: String,
+    #[serde(default)]
+    expected_endpoint: Option<String>,
 }
 
 fn default_media_port() -> u16 {
     7882
 }
 
-#[derive(Serialize)]
+/// A private app lease, distinct from the community's public identity and the
+/// invitation capability. A late stop/rotate cannot affect its replacement.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HostBinding {
+    server_id: String,
+    lease_id: String,
+}
+impl HostBinding {
+    fn valid(&self) -> bool {
+        canonical_id(&self.server_id) && canonical_id(&self.lease_id)
+    }
+}
+fn canonical_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+            }
+        })
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedStart {
+    binding: HostBinding,
+    host: HostInput,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedChange {
+    binding: HostBinding,
+}
+struct HostSpec {
+    peer: u16,
+    voice: u16,
+    media: u16,
+    ingress: [u8; 32],
+    identity_scope: Option<String>,
+    expected_endpoint: Option<String>,
+}
+impl HostSpec {
+    fn new(h: &HostInput) -> Self {
+        Self {
+            peer: h.peer_port,
+            voice: h.udp_port,
+            media: h.media_udp_port,
+            ingress: protocol::digest(&h.ingress_token),
+            identity_scope: h.identity_scope.clone(),
+            expected_endpoint: h.expected_endpoint.clone(),
+        }
+    }
+    fn matches(&self, h: &HostInput) -> bool {
+        self.peer == h.peer_port
+            && self.voice == h.udp_port
+            && self.media == h.media_udp_port
+            && protocol::token_matches(&self.ingress, &h.ingress_token)
+            && self.identity_scope == h.identity_scope
+            && self.expected_endpoint == h.expected_endpoint
+    }
+}
+struct Hosted {
+    service: HostService,
+    binding: Option<HostBinding>,
+    spec: HostSpec,
+    reply: HostReply,
+    identity_dir: PathBuf,
+}
+
+#[derive(Clone, Serialize)]
 struct HostReply {
     endpoint_id: String,
     /// Only in the loopback test mode, where there is no relay to find the host by.
@@ -117,6 +198,23 @@ struct RouteInput {
     direct: Vec<String>,
 }
 
+/// A host route and a fresh challenge, for `/route-proof`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProofInput {
+    route: RouteInput,
+    challenge: String,
+}
+
+/// The admission an already open route should use for later handshakes, and the one it
+/// is expected to hold now, for `/route-refresh`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefreshInput {
+    route: RouteInput,
+    expected_token: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdInput {
@@ -127,6 +225,43 @@ struct IdInput {
 struct RouteReply {
     http_url: String,
     voice_udp_port: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedInput { lease: String }
+#[derive(Serialize)]
+struct PreparedReply { lease: String, http_url: String, voice_udp_port: u16, expires_in_secs: u64 }
+fn prepared_reply(value: crate::prepared_route::Lease) -> Reply {
+    json(StatusCode::OK, &PreparedReply { lease: value.id,
+        http_url: format!("http://{}", value.route.http),
+        voice_udp_port: value.route.voice_udp_port, expires_in_secs: value.expires_in_secs })
+}
+#[derive(Serialize)]
+struct GatewayReply { lease: String, http_url: String, voice_udp_port: u16, expires_in_secs: u64, purpose: &'static str }
+fn gateway_reply(value: crate::prepared_route::Lease) -> Reply {
+    json(StatusCode::OK, &GatewayReply { lease: value.id,
+        http_url: format!("http://{}", value.route.http),
+        voice_udp_port: value.route.voice_udp_port, expires_in_secs: value.expires_in_secs,
+        purpose: value.purpose.as_str() })
+}
+fn gateway_error(value: crate::prepared_route::Error) -> Reply {
+    use crate::prepared_route::Error;
+    match value {
+        Error::Invalid => error(StatusCode::BAD_REQUEST, "A valid voice gateway route is required"),
+        Error::Busy => error(StatusCode::TOO_MANY_REQUESTS, "Two private routes are already open"),
+        Error::Missing => error(StatusCode::CONFLICT, "The voice gateway route expired or was closed"),
+        Error::Failed => error(StatusCode::BAD_GATEWAY, "The voice gateway route is unavailable"),
+    }
+}
+fn prepared_error(value: crate::prepared_route::Error) -> Reply {
+    use crate::prepared_route::Error;
+    match value {
+        Error::Invalid => error(StatusCode::BAD_REQUEST, "A valid prepared route is required"),
+        Error::Busy => error(StatusCode::TOO_MANY_REQUESTS, "Two prepared routes are already open"),
+        Error::Missing => error(StatusCode::CONFLICT, "The prepared route expired or was closed"),
+        Error::Failed => error(StatusCode::BAD_GATEWAY, "The prepared route is unavailable"),
+    }
 }
 
 #[derive(Serialize)]
@@ -218,6 +353,36 @@ impl Control {
         let method = request.method().clone();
         let path = request.uri().path().to_owned();
         match (method, path.as_str()) {
+            (Method::POST, "/prepare-host-identity") => {
+                let input: PrepareIdentity = match body(request).await {
+                    Ok(input) => input, Err(reply) => return reply,
+                };
+                // Serialize identity preparation and hosting/rotation. Preparing
+                // another namespace does not stop the currently hosted server.
+                let _host = self.host.lock().await;
+                match token::scoped_host_identity(&self.state_dir,&input.scope,input.expected_endpoint.as_deref(),true) {
+                    Ok((_,key,admission)) => json(StatusCode::OK, &HostReply {
+                        endpoint_id:key.public().to_string(), direct:Vec::new(),
+                        relay_url:None, token:admission,
+                    }),
+                    Err(_) => error(StatusCode::CONFLICT,"The destination transport identity needs recovery"),
+                }
+            }
+            (Method::GET, "/host-identity") => {
+                // Only prepare this machine's established key/capability. No
+                // endpoint, listener or forwarding service is started here.
+                let host = self.host.lock().await;
+                if host.is_some() {
+                    return error(StatusCode::CONFLICT, "Another host already owns this helper");
+                }
+                match token::load_host_identity(&self.state_dir) {
+                    Ok((key, admission)) => json(StatusCode::OK, &HostReply {
+                        endpoint_id: key.public().to_string(), direct: Vec::new(),
+                        relay_url: None, token: admission,
+                    }),
+                    Err(_) => error(StatusCode::CONFLICT, "The established host identity needs recovery"),
+                }
+            }
             (Method::GET, "/status") => {
                 let host = self.host.lock().await;
                 json(
@@ -225,7 +390,7 @@ impl Control {
                     &Status {
                         version: 1,
                         phase: if host.is_some() { "hosting" } else { "idle" },
-                        endpoint_id: host.as_ref().map(|h| h.endpoint_id().to_string()),
+                        endpoint_id: host.as_ref().map(|h| h.service.endpoint_id().to_string()),
                     },
                 )
             }
@@ -241,10 +406,16 @@ impl Control {
                         "This helper already hosts a community",
                     );
                 }
+                let spec = HostSpec::new(&input);
                 match self.start_host(input).await {
-                    Ok((service, reply)) => {
-                        *self.last_host.lock().unwrap() = Some(reply.endpoint_id.clone());
-                        *host = Some(service);
+                    Ok((service, reply, identity_dir)) => {
+                        *host = Some(Hosted {
+                            service,
+                            binding: None,
+                            spec,
+                            reply: reply.clone(),
+                            identity_dir,
+                        });
                         json(StatusCode::OK, &reply)
                     }
                     Err(_) => error(
@@ -253,12 +424,134 @@ impl Control {
                     ),
                 }
             }
+            (Method::POST, "/host-owned") => {
+                let input: OwnedStart = match body(request).await {
+                    Ok(v) => v,
+                    Err(r) => return r,
+                };
+                if !input.binding.valid() {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "Valid community and lease IDs required",
+                    );
+                }
+                let mut host = self.host.lock().await;
+                if let Some(current) = host.as_ref() {
+                    if current.binding.as_ref() == Some(&input.binding)
+                        && current.spec.matches(&input.host)
+                    {
+                        if input.host.expected_admission.as_ref().is_some_and(|token|
+                            !protocol::token_matches(&protocol::digest(&current.reply.token),token)) {
+                            return error(StatusCode::CONFLICT,"The prepared admission changed; current host retained");
+                        }
+                        return json(
+                            StatusCode::OK,
+                            &serde_json::json!({"binding":input.binding,"route":current.reply}),
+                        );
+                    }
+                    return error(
+                        StatusCode::CONFLICT,
+                        "Another host or configuration owns this route; it was left running",
+                    );
+                }
+                let spec = HostSpec::new(&input.host);
+                match self.start_host(input.host).await {
+                    Ok((service, reply, identity_dir)) => {
+                        let response = json(
+                            StatusCode::OK,
+                            &serde_json::json!({"binding":input.binding,"route":reply}),
+                        );
+                        *host = Some(Hosted {
+                            service,
+                            binding: Some(input.binding),
+                            spec,
+                            reply,
+                            identity_dir,
+                        });
+                        response
+                    }
+                    Err(_) => error(
+                        StatusCode::BAD_GATEWAY,
+                        "The account-free route could not start",
+                    ),
+                }
+            }
+            (Method::POST, "/unhost-owned") => {
+                let input: OwnedChange = match body(request).await {
+                    Ok(v) => v,
+                    Err(r) => return r,
+                };
+                if !input.binding.valid() {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "Valid community and lease IDs required",
+                    );
+                }
+                let mut host = self.host.lock().await;
+                if host
+                    .as_ref()
+                    .is_some_and(|h| h.binding.as_ref() != Some(&input.binding))
+                {
+                    return error(
+                        StatusCode::CONFLICT,
+                        "This lease does not own the current host",
+                    );
+                }
+                if let Some(current) = host.take() {
+                    current.service.stop().await;
+                }
+                json(
+                    StatusCode::OK,
+                    &serde_json::json!({"unhosted":true,"binding":input.binding}),
+                )
+            }
+            (Method::POST, "/rotate-token-owned") => {
+                let input: OwnedChange = match body(request).await {
+                    Ok(v) => v,
+                    Err(r) => return r,
+                };
+                if !input.binding.valid() {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "Valid community and lease IDs required",
+                    );
+                }
+                let mut host = self.host.lock().await;
+                let Some(current) = host
+                    .as_mut()
+                    .filter(|h| h.binding.as_ref() == Some(&input.binding))
+                else {
+                    return error(
+                        StatusCode::CONFLICT,
+                        "This lease does not own the current host",
+                    );
+                };
+                match token::rotate_token(&current.identity_dir).and_then(|fresh| {
+                    current.service.set_token(&fresh)?;
+                    Ok(fresh)
+                }) {
+                    Ok(fresh) => {
+                        current.reply.token = fresh.clone();
+                        json(
+                            StatusCode::OK,
+                            &serde_json::json!({"binding":input.binding,"token":fresh}),
+                        )
+                    }
+                    Err(_) => error(StatusCode::BAD_GATEWAY, "The token could not be replaced"),
+                }
+            }
             (Method::POST, "/unhost") => {
-                let stopped = self.host.lock().await.take();
-                match stopped {
-                    Some(service) => {
-                        service.stop().await;
-                        json(StatusCode::OK, &serde_json::json!({ "unhosted": true }))
+                let mut host = self.host.lock().await;
+                if host.as_ref().is_some_and(|h| h.binding.is_some()) {
+                    return error(
+                        StatusCode::CONFLICT,
+                        "Use the owning lease to stop this host",
+                    );
+                }
+                match host.take() {
+                    Some(current) => {
+                        current.service.stop().await;
+                        json(StatusCode::OK, &serde_json::json!({"unhosted":true}))
                     }
                     None => error(
                         StatusCode::CONFLICT,
@@ -267,15 +560,21 @@ impl Control {
                 }
             }
             (Method::POST, "/rotate-token") => {
-                let host = self.host.lock().await;
-                let Some(service) = host.as_ref() else {
-                    return error(StatusCode::CONFLICT, "Start hosting first");
+                let mut host = self.host.lock().await;
+                let Some(current) = host.as_mut().filter(|h| h.binding.is_none()) else {
+                    return error(
+                        StatusCode::CONFLICT,
+                        "Use the owning lease to rotate this host",
+                    );
                 };
-                match token::rotate_token(&self.state_dir).and_then(|fresh| {
-                    service.set_token(&fresh)?;
+                match token::rotate_token(&current.identity_dir).and_then(|fresh| {
+                    current.service.set_token(&fresh)?;
                     Ok(fresh)
                 }) {
-                    Ok(fresh) => json(StatusCode::OK, &serde_json::json!({ "token": fresh })),
+                    Ok(fresh) => {
+                        current.reply.token = fresh.clone();
+                        json(StatusCode::OK, &serde_json::json!({"token":fresh}))
+                    }
                     Err(_) => error(StatusCode::BAD_GATEWAY, "The token could not be replaced"),
                 }
             }
@@ -328,6 +627,110 @@ impl Control {
                     ),
                 }
             }
+            (Method::POST, "/prepared-route") => {
+                let input: RouteInput = match body(request).await { Ok(v) => v, Err(reply) => return reply };
+                let route = match spec(&input, &self.network) { Ok(v) => v, Err(reply) => return reply };
+                match self.prepared.open(&self.network, route).await { Ok(v) => prepared_reply(v), Err(e) => prepared_error(e) }
+            }
+            (Method::POST, "/prepared-route-status") => {
+                let input: PreparedInput = match body(request).await { Ok(v) => v, Err(reply) => return reply };
+                match self.prepared.status(&input.lease) { Ok(v) => prepared_reply(v), Err(e) => prepared_error(e) }
+            }
+            (Method::POST, "/close-prepared-route") => {
+                let input: PreparedInput = match body(request).await { Ok(v) => v, Err(reply) => return reply };
+                match self.prepared.close(&input.lease).await {
+                    Ok(()) => json(StatusCode::OK, &serde_json::json!({"closed":true})), Err(e) => prepared_error(e)
+                }
+            }
+            (Method::POST, "/voice-gateway-route") => {
+                let input: RouteInput = match body(request).await { Ok(v) => v, Err(reply) => return reply };
+                let route = match spec(&input, &self.network) { Ok(v) => v, Err(reply) => return reply };
+                match self.prepared.open_gateway(&self.network, route).await { Ok(v) => gateway_reply(v), Err(e) => gateway_error(e) }
+            }
+            (Method::POST, "/voice-gateway-route-status") => {
+                let input: PreparedInput = match body(request).await { Ok(v) => v, Err(reply) => return reply };
+                match self.prepared.status_gateway(&input.lease) { Ok(v) => gateway_reply(v), Err(e) => gateway_error(e) }
+            }
+            (Method::POST, "/renew-voice-gateway-route") => {
+                let input: PreparedInput = match body(request).await { Ok(v) => v, Err(reply) => return reply };
+                match self.prepared.renew_gateway(&input.lease) { Ok(v) => gateway_reply(v), Err(e) => gateway_error(e) }
+            }
+            (Method::POST, "/close-voice-gateway-route") => {
+                let input: PreparedInput = match body(request).await { Ok(v) => v, Err(reply) => return reply };
+                match self.prepared.close_gateway(&input.lease).await {
+                    Ok(()) => json(StatusCode::OK, &serde_json::json!({"closed":true})), Err(e) => gateway_error(e)
+                }
+            }
+            (Method::POST, "/route-proof") => {
+                use crate::route_proof::ProofError;
+                let input: ProofInput = match body(request).await {
+                    Ok(input) => input,
+                    Err(reply) => return reply,
+                };
+                let spec = match spec(&input.route, &self.network) {
+                    Ok(spec) => spec,
+                    Err(reply) => return reply,
+                };
+                // Never the shared client, its routes or its connections.
+                match self
+                    .proofs
+                    .prove(&self.network, spec, &input.challenge)
+                    .await
+                {
+                    Ok(proof) => {
+                        let mut reply = Response::new(Full::new(proof));
+                        let headers = reply.headers_mut();
+                        headers.insert(
+                            hyper::header::CONTENT_TYPE,
+                            "application/json".parse().unwrap(),
+                        );
+                        headers.insert(hyper::header::CACHE_CONTROL, "no-store".parse().unwrap());
+                        reply
+                    }
+                    Err(ProofError::Invalid) => error(
+                        StatusCode::BAD_REQUEST,
+                        "A valid route and challenge are required",
+                    ),
+                    Err(ProofError::Busy) => error(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "A route proof is already being checked",
+                    ),
+                    Err(ProofError::Failed) => error(
+                        StatusCode::BAD_GATEWAY,
+                        "The host did not give a route proof",
+                    ),
+                }
+            }
+            (Method::POST, "/route-refresh") => {
+                let input: RefreshInput = match body(request).await {
+                    Ok(input) => input,
+                    Err(reply) => return reply,
+                };
+                let spec = match spec(&input.route, &self.network) {
+                    Ok(spec) => spec,
+                    Err(reply) => return reply,
+                };
+                if !protocol::valid_token(&input.expected_token) {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "A valid invitation route is required",
+                    );
+                }
+                // Only an existing route: no client is created and nothing is dialled.
+                let Some(client) = self.client.lock().await.clone() else {
+                    return error(StatusCode::CONFLICT, "The route could not be refreshed");
+                };
+                match client.refresh_route(spec, &input.expected_token).await {
+                    Ok(info) => json(
+                        StatusCode::OK,
+                        &RouteReply {
+                            http_url: format!("http://{}", info.http),
+                            voice_udp_port: info.voice_udp_port,
+                        },
+                    ),
+                    Err(_) => error(StatusCode::CONFLICT, "The route could not be refreshed"),
+                }
+            }
             (Method::POST, "/path") => {
                 let input: IdInput = match body(request).await {
                     Ok(input) => input,
@@ -363,9 +766,16 @@ impl Control {
         }
     }
 
-    async fn start_host(&self, input: HostInput) -> Result<(HostService, HostReply)> {
-        let key = token::load_or_create_key(&self.state_dir)?;
-        let admission = token::load_or_create_token(&self.state_dir)?;
+    async fn start_host(&self, input: HostInput) -> Result<(HostService, HostReply, PathBuf)> {
+        let (identity_dir,key,admission) = if let Some(scope) = input.identity_scope.as_deref() {
+            token::scoped_host_identity(&self.state_dir,scope,input.expected_endpoint.as_deref(),false)?
+        } else {
+            anyhow::ensure!(input.expected_endpoint.is_none(),"A scoped transport identity is required");
+            let (key,admission) = token::load_host_identity(&self.state_dir)?;
+            (self.state_dir.clone(),key,admission)
+        };
+        anyhow::ensure!(input.expected_admission.as_ref().is_none_or(|expected|
+            protocol::token_matches(&protocol::digest(&admission),expected)),"The prepared admission changed");
         let service = HostService::start(HostConfig {
             secret_key: key,
             token: admission.clone(),
@@ -393,12 +803,13 @@ impl Control {
             relay_url: service.relay_url(),
             token: admission,
         };
-        Ok((service, reply))
+        Ok((service, reply, identity_dir))
     }
 
     pub async fn shutdown(&self) {
+        self.prepared.shutdown().await;
         if let Some(host) = self.host.lock().await.take() {
-            host.stop().await;
+            host.service.stop().await;
         }
         if let Some(client) = self.client.lock().await.take() {
             client.close().await;

@@ -418,12 +418,16 @@ pub fn decide(
     caps: Capabilities,
     prober: &dyn Prober,
 ) -> Outcome {
-    let all = candidates(invitation);
+    let all: Vec<_> = candidates(invitation).into_iter().filter(|candidate|
+        invitation.authority.is_none() || crate::community::account_destination(&candidate.address).is_ok()).collect();
     let fail = |message: String| Outcome {
         needs_consent: message == PLAIN_PUBLIC_MESSAGE,
         invitation: Err(message.clone()),
         summary: message,
     };
+    if all.is_empty() && invitation.authority.is_some() {
+        return fail("This invitation needs an HTTPS or iroh connection. Ask the host to enable sharing for friends.".into());
+    }
     let (chosen, rtt) = match plan(&all, prefs.mode, caps) {
         Plan::Unavailable(message) => return fail(message),
         Plan::Use(candidate) => {
@@ -924,6 +928,59 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn pinned_invites_choose_authenticated_routes_without_breaking_legacy_sharing() {
+        let (_, _, mut pin, _) = crate::host_route::tests::fixture();
+        pin.server_id = ID.into();
+        let prober = FakeProber {
+            delays: HashMap::from([(HOME.into(), Ok(1.0)), (PUBLIC_TLS.into(), Ok(40.0))]),
+            started: Default::default(),
+        };
+        let invitation = invitation().with_authority(Some(pin.clone())).unwrap();
+        let chosen = decide(&invitation, &auto(), Capabilities { iroh: false }, &prober)
+            .invitation
+            .unwrap();
+        assert_eq!(chosen.server, PUBLIC_TLS);
+        assert_eq!(chosen.authority, Some(pin.clone()));
+        assert!(prober
+            .started
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|address| address != HOME));
+        let plain = Invitation::new(HOME, ID, "owned-invite")
+            .unwrap()
+            .with_authority(Some(pin.clone()))
+            .unwrap();
+        assert!(
+            decide(&plain, &auto(), Capabilities { iroh: false }, &prober)
+                .invitation
+                .is_err()
+        );
+        let legacy = plain.for_sharing();
+        assert!(legacy.authority.is_none());
+        assert!(legacy.link().contains("v=1&"));
+        assert_eq!(
+            decide(&legacy, &auto(), Capabilities { iroh: false }, &prober)
+                .invitation
+                .unwrap()
+                .server,
+            HOME
+        );
+        let route = crate::invitation_routes::IrohRoute::new(
+            &"b".repeat(64),
+            None,
+            "abcdefghijklmnopqrstuvwxyzABCDEF0123456789_-",
+        )
+        .unwrap();
+        let shared = legacy
+            .with_authority(Some(pin.clone()))
+            .unwrap()
+            .with_iroh(route)
+            .for_sharing();
+        assert_eq!(shared.authority, Some(pin));
+        assert!(shared.link().contains("v=5&"));
+    }
     #[test]
     fn deciding_picks_the_fastest_route_and_says_so_in_plain_words() {
         let prober = FakeProber {

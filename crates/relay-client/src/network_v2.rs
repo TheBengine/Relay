@@ -6,6 +6,12 @@ pub(super) type ChatEventInbox = Arc<std::sync::Mutex<VecDeque<Event>>>;
 
 #[derive(Default)]
 pub(super) struct ChatSession {
+    pub(super) authority: Option<relay_protocol::handover::RoutePin>,
+    pub(super) host_paused: bool,
+    pub(super) authority_aliases: Vec<String>,
+    pub(super) handover_checked_at: Option<Instant>,
+    pub(super) handover_probe: Option<crate::host_route::Job>,
+    pub(super) account_provider: Option<AccountProvider>,
     pub(super) events: ChatEventInbox,
     capabilities: HashSet<String>,
     protection: CommunityProtection,
@@ -76,6 +82,8 @@ impl ChatSession {
     }
 
     pub(super) fn update_bootstrap(&mut self, bootstrap: &Bootstrap) {
+        self.host_paused = bootstrap.host_paused;
+        self.account_provider = bootstrap.account_provider.clone();
         self.capabilities = bootstrap.capabilities.iter().cloned().collect();
         self.protection = bootstrap.protection.clone();
         let channels: HashMap<_, _> = bootstrap
@@ -849,6 +857,7 @@ impl Worker {
     pub(super) fn handle_extended(&mut self, command: Command) -> Result<(), String> {
         match command {
             Command::AccountLoginBegin {
+                authority,
                 url,
                 expected_server_id,
                 invite,
@@ -856,6 +865,7 @@ impl Worker {
                 initial_protection,
                 request_id,
             } => self.account_login_begin(
+                authority,
                 url,
                 expected_server_id,
                 invite,
@@ -864,6 +874,7 @@ impl Worker {
                 request_id,
             )?,
             Command::AccountLoginFinish {
+                authority,
                 url,
                 expected_server_id,
                 challenge_id,
@@ -871,6 +882,7 @@ impl Worker {
                 cancel,
                 request_id,
             } => self.account_login_finish(
+                authority,
                 url,
                 expected_server_id,
                 challenge_id,
@@ -964,7 +976,20 @@ impl Worker {
             Command::RememberSession { enabled } => {
                 if let Some(c) = &mut self.connection {
                     if enabled {
-                        crate::credential_vault::save(&c.url, &c.server_id, &c.session)?;
+                        crate::credential_vault::save_bound(
+                            &c.url,
+                            &c.server_id,
+                            &c.session,
+                            c.chat
+                                .authority
+                                .as_ref()
+                                .map(|pin| crate::host_route::RememberedAuthority {
+                                    pin: pin.clone(),
+                                    account_provider: c.chat.account_provider.clone(),
+                                    previous_urls: c.chat.authority_aliases.clone(),
+                                })
+                                .as_ref(),
+                        )?;
                     } else {
                         crate::credential_vault::forget(&c.url)?;
                     }
@@ -982,6 +1007,34 @@ impl Worker {
                     ));
                 }
             }
+            Command::RememberNextLogins { enabled } => {
+                self.remember_session = enabled;
+            }
+            Command::KeepSignedInForMove { origin } => {
+                self.command_connection(&origin)?;
+                let c = self
+                    .connection
+                    .as_mut()
+                    .ok_or("Connect to a community first.")?;
+                if !c.remembered {
+                    let authority =
+                        c.chat
+                            .authority
+                            .as_ref()
+                            .map(|pin| crate::host_route::RememberedAuthority {
+                                pin: pin.clone(),
+                                account_provider: c.chat.account_provider.clone(),
+                                previous_urls: c.chat.authority_aliases.clone(),
+                            });
+                    crate::credential_vault::save_bound(
+                        &c.url,
+                        &c.server_id,
+                        &c.session,
+                        authority.as_ref(),
+                    )?;
+                    c.remembered = true;
+                }
+            }
             Command::Resume {
                 url,
                 expected_server_id,
@@ -989,74 +1042,12 @@ impl Worker {
                 let url = crate::community::normalize_url(&url)?;
                 let remembered = crate::credential_vault::load(&url)?
                     .ok_or("No remembered login exists for this server. Sign in first.")?;
-                let (session, bootstrap, call_received, alert_cursor) = match resume_remembered(
-                    &self.http,
-                    &url,
-                    &remembered,
-                    expected_server_id.as_deref(),
-                ) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        if error == "Sign in again" {
-                            let _ = crate::credential_vault::forget(&url);
-                        }
-                        return Err(error);
-                    }
-                };
-                if remembered.server_id.is_none() {
-                    // Upgrade only after known community and account match.
-                    // A failed vault write must preserve the current UI.
-                    crate::credential_vault::save(&url, &bootstrap.server_id, &session)?;
+                remembered.confirmed_server_id(expected_server_id.as_deref())?;
+                if remembered.authority.is_some() {
+                    self.begin_host_resume(url, remembered)?;
+                } else {
+                    self.resume_same_host(url, remembered, expected_server_id)?;
                 }
-                self.live.epoch.fetch_add(1, Ordering::SeqCst);
-                if let Ok(mut context) = self.live.context.lock() {
-                    *context = None;
-                }
-                self.park_connection(&url);
-                self.chat_media_epoch.fetch_add(1, Ordering::SeqCst);
-                self.chat_media_workers = None;
-                self.legacy_reactions.clear();
-                self.socket_stop = Arc::new(AtomicBool::new(false));
-                self.refresh_pending = Arc::new(AtomicBool::new(false));
-                self.connection = Some(Connection {
-                    url: url.clone(),
-                    session: session.clone(),
-                    current: None,
-                    voice_channel: None,
-                    voice_attempt: None,
-                    voice_admission: None,
-                    voice_recovery: None,
-                    frame_ids: HashMap::new(),
-                    sharing: false,
-                    camera: false,
-                    server_id: bootstrap.server_id.clone(),
-                    name: bootstrap.server_name.clone(),
-                    change_cursor: bootstrap.latest_change_sequence,
-                    protocol_version: bootstrap.protocol_version,
-                    remembered: true,
-                    chat: ChatSession::new(&bootstrap),
-                    crypto: None,
-                    crypto_registered: false,
-                    crypto_call_epoch: None,
-                    open_call_context: None,
-                    crypto_pending_join: None,
-                });
-                self.sync_live_transport()?;
-                spawn_events_with_alerts(
-                    url.clone(),
-                    session.token.clone(),
-                    self.refresh_pending.clone(),
-                    self.socket_stop.clone(),
-                    self.connection.as_ref().unwrap().chat.events.clone(),
-                    self.wake.clone(),
-                    self.alert_watch(&bootstrap, call_received, alert_cursor),
-                );
-                self.emit(Update::Connected {
-                    url: url.clone(),
-                    session: session.clone(),
-                    bootstrap: Box::new(bootstrap),
-                });
-                self.publish_communities();
             }
             Command::History {
                 target,
@@ -1406,23 +1397,24 @@ impl Worker {
                     .saved_connections
                     .get(&url)
                     .ok_or("Sign in to this community first.")?;
-                let super::call_alerts::BootstrapReply { bootstrap, cursor } = match parse::<super::call_alerts::BootstrapReply>(
-                    self.http
-                        .get(crate::embedded_network::endpoint(&format!(
-                            "{url}/api/bootstrap"
-                        )))
-                        .bearer_auth(&saved.connection.session.token)
-                        .send()
-                        .map_err(network_error)?,
-                ) {
-                    Ok(bootstrap) => bootstrap,
-                    Err(error) => {
-                        if error == "Sign in again" {
-                            self.reject_saved_session(&url);
+                let super::call_alerts::BootstrapReply { bootstrap, cursor } =
+                    match parse::<super::call_alerts::BootstrapReply>(
+                        self.http
+                            .get(crate::embedded_network::endpoint(&format!(
+                                "{url}/api/bootstrap"
+                            )))
+                            .bearer_auth(&saved.connection.session.token)
+                            .send()
+                            .map_err(network_error)?,
+                    ) {
+                        Ok(bootstrap) => bootstrap,
+                        Err(error) => {
+                            if error == "Sign in again" {
+                                self.reject_saved_session(&url);
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
-                    }
-                };
+                    };
                 let call_received = Instant::now();
                 // Validate the destination before touching the active community.
                 if let Err(error) = validate_bootstrap_identity(
@@ -1545,6 +1537,12 @@ impl Worker {
                 self.emit(Update::AdminResult { request_id, data });
                 self.refresh();
             }
+            Command::ReplicaToken {
+                origin,
+                action,
+                replica_id,
+                request_id,
+            } => self.replica_token(origin, action, replica_id, request_id)?,
             Command::MentionInbox {
                 origin,
                 remaining,
@@ -1728,12 +1726,13 @@ impl Worker {
                             == Some(
                                 format!("http://{}:4580", crate::iroh_route::ONLY_ADDRESS).as_str(),
                             );
-                    if crate::iroh_route::is_iroh(&connection.url) || local_iroh {
+                    let private_bridge=ticket.media_bridge.is_some()&&crate::iroh_route::is_iroh(&ticket.url);
+                    if crate::iroh_route::is_iroh(&connection.url) || local_iroh || private_bridge {
                         crate::embedded_network::prepare_iroh_rtc(
                             &mut ticket,
                             &connection.url,
                             &connection.server_id,
-                            local_iroh,
+                            local_iroh || private_bridge&&crate::local_host::is_local_url(&connection.url),
                         )?;
                     } else {
                         let private_origin = if crate::embedded_network::routed(&connection.url) {
@@ -2046,6 +2045,18 @@ impl Worker {
             }
             match result.bootstrap {
                 Ok(mut bootstrap) => {
+                    if bootstrap.host_paused {
+                        saved.connection.chat.update_bootstrap(&bootstrap);
+                        self.emit(Update::ConnectionState {
+                            url: result.url.clone(),
+                            status: ConnectionStatus::Reconnecting,
+                        });
+                        self.emit(Update::CommunityBootstrap {
+                            url: result.url.clone(),
+                            bootstrap,
+                        });
+                        continue;
+                    }
                     if saved.connection.change_cursor > bootstrap.latest_change_sequence {
                         // A public reply may have been queued before this community
                         // was selected and advanced. Do not restore its older UI
@@ -2197,7 +2208,7 @@ impl Worker {
                     let mut changes = bootstrap
                         .as_ref()
                         .ok()
-                        .filter(|b| b.protocol_version >= API_PROTOCOL_VERSION)
+                        .filter(|b| !b.host_paused && b.protocol_version >= API_PROTOCOL_VERSION)
                         .map(|b| {
                             http.get(crate::embedded_network::endpoint(&format!(
                                 "{job_url}/api/changes"

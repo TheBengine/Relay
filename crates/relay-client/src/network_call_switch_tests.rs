@@ -25,6 +25,9 @@ fn bootstrap(server: &str, accepted: bool, source: bool) -> Bootstrap {
         ],
         ..Default::default()
     };
+    if !source {
+        b.capabilities.extend(["people-v1".into(), "friends-gateway-broker-v1".into()]);
+    }
     let device = open_device();
     if source || accepted {
         b.voice_members.push(VoiceMember {
@@ -304,6 +307,11 @@ fn call_switch_lost_reply_retries_exact_call_before_releasing_source() {
     assert_eq!(join_count.load(Ordering::Acquire), 2);
     assert!(released.load(Ordering::Acquire));
     assert_eq!(ready.admission.call.id, CALL);
+    let gateway = ready.gateway.as_ref().expect("accepted Friends destination prepares its own broker");
+    let request = gateway.prepared_list_for_test();
+    assert_eq!(request.url().as_str(), format!("{}/api/hosting/voice-gateways", destination.url));
+    assert_eq!(request.headers().get("authorization").unwrap(), "Bearer fixture-token");
+
     assert_eq!(client.command_origin(), ready.request.origin);
     assert_eq!(
         client

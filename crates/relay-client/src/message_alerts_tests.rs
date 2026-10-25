@@ -753,3 +753,213 @@ fn reset_requires_subscriber_request_started_after_the_consumed_cursor() {
         "a proven reset starts conservative history baselining"
     );
 }
+
+fn with_group(b: &mut Bootstrap, members: &[&str]) {
+    b.capabilities
+        .push(relay_protocol::PEOPLE_GROUPS_CAPABILITY.into());
+    b.conversations.push(relay_protocol::ConversationInfo {
+        channel_id: "trio".into(),
+        kind: "group".into(),
+        owner_id: "friend".into(),
+        parent_id: None,
+        archived: false,
+        member_ids: members.iter().map(|m| m.to_string()).collect(),
+    });
+    b.channels.push(relay_protocol::Channel {
+        id: "trio".into(),
+        name: "Weekend".into(),
+        can_send: true,
+        ..Default::default()
+    });
+}
+fn group_change(sequence: u64, id: &str, author: &str, channel: &str) -> MessageChange {
+    MessageChange {
+        sequence,
+        kind: "created".into(),
+        message_id: id.into(),
+        user_id: author.into(),
+        channel_id: Some(channel.into()),
+        message: Some(Message {
+            id: id.into(),
+            channel_id: Some(channel.into()),
+            author: User {
+                id: author.into(),
+                ..Default::default()
+            },
+            content: "ciphertext-must-never-be-previewed".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+fn group_fixture() -> (State, CommandOrigin, u64, Bootstrap, Instant) {
+    let (mut state, origin, generation, mut b, now) = fixture(100);
+    b.members.push(User {
+        id: "other".into(),
+        username: "Sam".into(),
+        ..Default::default()
+    });
+    b.social.friends.push("other".into());
+    with_group(&mut b, &["self", "friend", "other"]);
+    state.observe_with_cursor(&origin, generation, &b, now, 1000, None);
+    (state, origin, generation, b, now)
+}
+
+#[test]
+fn a_friends_group_message_alerts_once_for_that_group_without_its_content() {
+    let (mut state, origin, generation, _, now) = group_fixture();
+    let c = group_change(101, "g1", "friend", "trio");
+    assert!(state.message_page(&origin, generation, 100, &page(vec![c.clone()], 101), now));
+    // The foreground path stands down once the background observer owns it.
+    assert!(state.ui_message_claims(&origin, std::slice::from_ref(&c), now)[0].is_err());
+    let effects = state.message_effects(now, 1000, false);
+    assert_eq!(effects.len(), 1);
+    let note = &effects[0].notification;
+    assert_eq!(note.target, Target::Channel("trio".into()));
+    assert!(note.body.contains("Alex") && note.body.contains("Weekend"));
+    assert!(!note.body.contains("ciphertext"));
+    assert!(note.background_only && note.guard.as_ref().unwrap().valid());
+    assert!(state
+        .message_effects(now + Duration::from_secs(1), 1001, false)
+        .is_empty());
+    // With previews off neither the person nor the group is named.
+    state.policy.previews = false;
+    let c = group_change(102, "g2", "other", "trio");
+    assert!(state.message_page(&origin, generation, 101, &page(vec![c], 102), now));
+    let effects = state.message_effects(now, 1002, false);
+    assert_eq!(effects.len(), 1);
+    assert!(!effects[0].notification.body.contains("Sam"));
+    assert!(!effects[0].notification.body.contains("Weekend"));
+}
+
+#[test]
+fn only_a_current_friend_who_is_in_this_accounts_group_can_alert() {
+    let (mut state, origin, generation, b, now) = group_fixture();
+    let before = |state: &mut State, sequence: u64, change: MessageChange| {
+        assert!(state.message_page(
+            &origin,
+            generation,
+            sequence - 1,
+            &page(vec![change], sequence),
+            now
+        ));
+        state.message_effects(now, 1000, false).len()
+    };
+    // Not a member of the group, even though a friend: silent.
+    let mut outsider = b.clone();
+    outsider.members.push(User {
+        id: "stranger".into(),
+        username: "Zed".into(),
+        ..Default::default()
+    });
+    outsider.social.friends.push("stranger".into());
+    state.observe_with_cursor(&origin, generation, &outsider, now, 1000, None);
+    assert_eq!(
+        before(&mut state, 101, group_change(101, "x1", "stranger", "trio")),
+        0
+    );
+    // A channel this account is not in (a community channel) keeps its own path.
+    let general = group_change(102, "x2", "friend", "general");
+    assert!(
+        state.ui_message_claims(&origin, std::slice::from_ref(&general), now)[0]
+            .as_ref()
+            .is_ok_and(|claim| claim.is_none())
+    );
+    assert_eq!(before(&mut state, 102, general), 0);
+    // My own message and a blocked friend's message never alert.
+    assert_eq!(
+        before(&mut state, 103, group_change(103, "x3", "self", "trio")),
+        0
+    );
+    let mut blocked = b.clone();
+    blocked.social.blocked.push("friend".into());
+    state.observe_with_cursor(&origin, generation, &blocked, now, 1000, None);
+    assert_eq!(
+        before(&mut state, 104, group_change(104, "x4", "friend", "trio")),
+        0
+    );
+    // A real member and friend alerts.
+    state.observe_with_cursor(&origin, generation, &b, now, 1000, None);
+    assert_eq!(
+        before(&mut state, 105, group_change(105, "x5", "other", "trio")),
+        1
+    );
+}
+
+#[test]
+fn a_group_alert_follows_the_groups_own_choice_and_mentions() {
+    let (mut state, origin, generation, _, now) = group_fixture();
+    let scope = crate::conversation_state::ConversationMemory::scope(&origin.url, &origin.user_id);
+    let key = format!("{scope}|{:?}", Target::Channel("trio".into()));
+    let choose = |state: &mut State, mode: &str| {
+        state.policy.message_policies.insert(
+            key.clone(),
+            crate::notifications::NotificationPolicy {
+                mode: mode.into(),
+                ..Default::default()
+            },
+        );
+    };
+    let mut sequence = 100;
+    let mut send = |state: &mut State, mention: bool| {
+        sequence += 1;
+        let mut c = group_change(sequence, &format!("m{sequence}"), "friend", "trio");
+        if mention {
+            c.message.as_mut().unwrap().mentions = vec![origin.user_id.clone()];
+        }
+        assert!(state.message_page(
+            &origin,
+            generation,
+            sequence - 1,
+            &page(vec![c], sequence),
+            now
+        ));
+        state.message_effects(now, 1000, false).len()
+    };
+    // Unchosen: every message of a private group.
+    assert_eq!(send(&mut state, false), 1);
+    choose(&mut state, "none");
+    assert_eq!(send(&mut state, true), 0);
+    choose(&mut state, "mentions");
+    assert_eq!(send(&mut state, false), 0);
+    assert_eq!(send(&mut state, true), 1);
+    choose(&mut state, "all");
+    assert_eq!(send(&mut state, false), 1);
+}
+
+#[test]
+fn leaving_the_group_drops_alerts_that_were_still_waiting() {
+    let (mut state, origin, generation, mut b, now) = group_fixture();
+    let c = group_change(101, "late", "friend", "trio");
+    assert!(state.message_page(&origin, generation, 100, &page(vec![c], 101), now));
+    // The account is removed from the group before the alert is shown.
+    b.conversations.clear();
+    b.channels.clear();
+    state.observe_with_cursor(&origin, generation, &b, now, 1000, None);
+    assert!(state.message_effects(now, 1000, false).is_empty());
+}
+
+#[test]
+fn a_group_member_who_is_not_a_friend_alerts_in_the_group_but_never_for_a_private_message() {
+    let (mut state, origin, generation, mut b, now) = group_fixture();
+    // Invited into the group by the owner; never this account's friend.
+    b.members.push(User {
+        id: "guest".into(),
+        username: "Gus".into(),
+        ..Default::default()
+    });
+    b.conversations[0].member_ids.push("guest".into());
+    state.observe_with_cursor(&origin, generation, &b, now, 1000, None);
+    let c = group_change(101, "g1", "guest", "trio");
+    assert!(state.message_page(&origin, generation, 100, &page(vec![c], 101), now));
+    let effects = state.message_effects(now, 1000, false);
+    assert_eq!(effects.len(), 1);
+    assert!(effects[0].notification.body.contains("Gus"));
+    assert!(effects[0].notification.body.contains("Weekend"));
+    // Blocking that person silences them, even though they are still listed.
+    b.social.blocked.push("guest".into());
+    state.observe_with_cursor(&origin, generation, &b, now, 1000, None);
+    let c = group_change(102, "g2", "guest", "trio");
+    assert!(state.message_page(&origin, generation, 101, &page(vec![c], 102), now));
+    assert!(state.message_effects(now, 1001, false).is_empty());
+}

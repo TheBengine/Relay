@@ -6304,6 +6304,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "relay-client"
 version = "0.10.0"
 dependencies = [
+ "axum",
+ "relay-server",
+ "rusqlite",
  "socket2 0.6.5",
  "rtrb",
  "arboard",
@@ -6314,6 +6317,7 @@ dependencies = [
  "chrono",
  "cpal",
  "directories",
+ "ed25519-dalek",
  "eframe",
  "futures-util",
  "getrandom 0.2.17",
@@ -6372,6 +6376,7 @@ name = "relay-protocol"
 version = "0.10.0"
 dependencies = [
  "serde",
+ "serde_json",
  "windows-sys 0.59.0",
 ]
 
@@ -6386,8 +6391,10 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "futures-util",
  "hmac 0.12.1",
+ "hpke-rs",
  "http-body-util",
  "image 0.25.10",
  "openidconnect",

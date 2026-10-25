@@ -250,10 +250,11 @@ impl RelayApp {
             ready.request.origin.clone(),
             self.voice_request,
         );
-        self.start_protected_voice(
+        self.start_protected_voice_with_gateway(
             &ready.request.origin.url,
             ready.admission.ticket,
             ready.keys,
+            ready.gateway,
         );
         self.sync_voice_state();
         self.request_video_connection();

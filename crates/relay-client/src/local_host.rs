@@ -21,6 +21,10 @@ pub struct AppHost {
     pub server_id: String,
     pub mode: String,
     pub address: Option<String>,
+    /// The host's own opt-in to answer "who hosts a community here?" on the
+    /// local network. Off unless chosen; a private iroh start can apply it too.
+    #[serde(default)]
+    pub lan_discovery: bool,
 }
 
 impl AppHost {
@@ -39,11 +43,121 @@ impl AppHost {
 
     pub fn save(&self, data: &Path) -> Result<(), String> {
         self.validate()?;
-        std::fs::write(
-            data.join("app-host.json"),
-            serde_json::to_vec(self).map_err(|_| "Cannot prepare hosting choice.")?,
-        )
-        .map_err(|_| "Cannot remember your server's hosting choice.".into())
+        let bytes = serde_json::to_vec(self).map_err(|_| "Cannot prepare hosting choice.")?;
+        // Replaced in one step, so a start that reads it never sees half a file.
+        let temporary = data.join("app-host.json.tmp");
+        std::fs::write(&temporary, bytes)
+            .and_then(|()| std::fs::rename(&temporary, data.join("app-host.json")))
+            .map_err(|_| "Cannot remember your server's hosting choice.".into())
+    }
+}
+
+/// Whether this host has chosen to be found on the local network.
+pub fn lan_choice(data: &Path) -> bool {
+    AppHost::load(data).is_some_and(|plan| plan.lan_discovery)
+}
+
+/// Saves the choice without touching anything else about the saved hosting
+/// plan. It changes nothing for a server that is already running.
+pub fn set_lan_choice(data: &Path, enabled: bool) -> Result<(), String> {
+    let mut plan = match AppHost::load(data) {
+        Some(plan) => plan,
+        None if data.join("app-host.json").exists() => {
+            return Err(
+                "Your saved hosting choice could not be read. Start your server again from Relay."
+                    .into(),
+            )
+        }
+        None => {
+            return Err("Start your server from Relay first; its choice is saved with it.".into())
+        }
+    };
+    plan.lan_discovery = enabled;
+    plan.save(data)
+}
+
+/// Desktop hosting keeps the ordinary API and voice on loopback. The explicit
+/// LAN opt-in opens only the sealed pairing redemption on its own OS-chosen port.
+pub fn local_launch(lan_discovery: bool) -> (&'static str, &'static [&'static str]) {
+    if lan_discovery {
+        ("127.0.0.1", &["--lan-discovery", "--lan-pairing-only"])
+    } else {
+        ("127.0.0.1", &[])
+    }
+}
+
+/// True when the read-only status report of a stopped community says its owner
+/// account exists. The server refuses a network bind before that.
+pub fn owner_report_ready(stdout: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(stdout)
+        .is_ok_and(|report| report["ready"] == true && report["owner_initialized"] == true)
+}
+
+/// Asks the companion for that report. Failing, hanging or an unreadable answer
+/// all count as "not ready", so a start never silently listens more widely.
+pub fn owner_ready(server: &Path, data: &Path) -> bool {
+    let mut command = std::process::Command::new(server);
+    command
+        .arg("--public-hosting-status")
+        .arg("--data")
+        .arg(data)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let _ = stdout.take(16 * 1024).read_to_end(&mut bytes);
+        let _ = sender.send(bytes);
+    });
+    let ready = receiver
+        .recv_timeout(std::time::Duration::from_secs(8))
+        .is_ok_and(|bytes| owner_report_ready(&bytes));
+    let _ = child.kill();
+    let _ = child.wait();
+    ready
+}
+
+/// What a running server was started with, as far as there is evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanActual {
+    On,
+    Off,
+    /// No matching record: the server was not started by this Relay, or the
+    /// record could not be written. Never shown as "off".
+    Unknown,
+}
+
+/// Actual startup evidence for this exact instance, written by the server after it
+/// binds its listeners and starts the responder. Requested flags and an old app
+/// record are not evidence that discovery succeeded.
+pub fn lan_actual(data: &Path, server_id: &str, instance_id: &str) -> LanActual {
+    let Ok(record) = read_record(&data.join("server-runtime.json")) else {
+        return LanActual::Unknown;
+    };
+    if record["server_id"].as_str() != Some(server_id)
+        || record["instance_id"].as_str() != Some(instance_id)
+    {
+        return LanActual::Unknown;
+    }
+    match record["lan_discovery"].as_bool() {
+        Some(true) => LanActual::On,
+        Some(false) => LanActual::Off,
+        None => LanActual::Unknown,
     }
 }
 
@@ -323,6 +437,7 @@ mod tests {
                 server_id: uuid::Uuid::new_v4().to_string(),
                 mode: mode.into(),
                 address: address.map(str::to_owned),
+                lan_discovery: false,
             };
             plan.save(directory.path()).unwrap();
             assert_eq!(AppHost::load(directory.path()), Some(plan));
@@ -333,6 +448,7 @@ mod tests {
             server_id: uuid::Uuid::new_v4().to_string(),
             mode: "iroh".into(),
             address: Some("8.8.8.8".into()),
+            lan_discovery: false,
         };
         assert!(plan.validate().is_err());
         plan.mode = "tailscale".into();
@@ -352,6 +468,7 @@ mod tests {
             server_id: uuid::Uuid::new_v4().to_string(),
             mode: "local".into(),
             address: None,
+            lan_discovery: false,
         };
         let managed = serde_json::json!({"server_id":plan.server_id,"url":"http://127.0.0.1:4580","exe":exe,"data":directory.path()});
         validate_app_host(&plan, &managed, directory.path(), &exe).unwrap();
@@ -573,5 +690,117 @@ mod tests {
         ] {
             assert!(!is_local_url(url));
         }
+    }
+
+    fn plan(mode: &str, address: Option<&str>) -> AppHost {
+        AppHost {
+            server_id: uuid::Uuid::new_v4().to_string(),
+            mode: mode.into(),
+            address: address.map(str::to_owned),
+            lan_discovery: false,
+        }
+    }
+
+    #[test]
+    fn network_discovery_is_off_unless_chosen_and_an_older_choice_file_keeps_it_off() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(!lan_choice(directory.path()));
+        let id = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            directory.path().join("app-host.json"),
+            format!(r#"{{"server_id":"{id}","mode":"local","address":null}}"#),
+        )
+        .unwrap();
+        assert!(!lan_choice(directory.path()));
+        assert_eq!(AppHost::load(directory.path()).unwrap().server_id, id);
+    }
+
+    #[test]
+    fn saving_the_discovery_choice_changes_nothing_else_about_the_saved_host() {
+        let directory = tempfile::tempdir().unwrap();
+        // Nothing is saved before a server has started, so there is nothing to change.
+        assert!(set_lan_choice(directory.path(), true).is_err());
+        let saved = plan("tailscale", Some("100.70.1.2"));
+        saved.save(directory.path()).unwrap();
+        set_lan_choice(directory.path(), true).unwrap();
+        let on = AppHost::load(directory.path()).unwrap();
+        assert!(on.lan_discovery);
+        assert_eq!(
+            (
+                on.server_id.as_str(),
+                on.mode.as_str(),
+                on.address.as_deref()
+            ),
+            (saved.server_id.as_str(), "tailscale", Some("100.70.1.2"))
+        );
+        set_lan_choice(directory.path(), false).unwrap();
+        assert_eq!(AppHost::load(directory.path()), Some(saved));
+        assert!(!directory.path().join("app-host.json.tmp").exists());
+        // A damaged file is reported, never replaced by a fresh plan.
+        std::fs::write(directory.path().join("app-host.json"), b"{").unwrap();
+        assert!(set_lan_choice(directory.path(), true).is_err());
+        assert_eq!(
+            std::fs::read(directory.path().join("app-host.json")).unwrap(),
+            b"{"
+        );
+    }
+
+    #[test]
+    fn desktop_lan_keeps_normal_ports_on_loopback() {
+        assert_eq!(local_launch(false), ("127.0.0.1", &[][..]));
+        assert_eq!(local_launch(true), ("127.0.0.1", &["--lan-discovery", "--lan-pairing-only"][..]));
+    }
+
+    #[test]
+    fn a_network_bind_waits_for_the_owner_account_the_companion_reports() {
+        assert!(owner_report_ready(
+            br#"{"ready":true,"owner_initialized":true,"server_id":"x"}"#
+        ));
+        let refused: [&[u8]; 6] = [
+            br#"{"ready":true,"owner_initialized":false}"#,
+            br#"{"ready":false,"owner_initialized":true}"#,
+            br#"{"ready":false,"owner_initialized":false,"error_code":"community_missing"}"#,
+            br#"{"ready":"true","owner_initialized":true}"#,
+            b"not json",
+            b"",
+        ];
+        for report in refused {
+            assert!(!owner_report_ready(report));
+        }
+    }
+
+    #[test]
+    fn runtime_visibility_is_bound_to_the_running_instance_and_not_requested_flags() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = uuid::Uuid::new_v4().to_string();
+        let instance = uuid::Uuid::new_v4().to_string();
+        let actual = || lan_actual(directory.path(), &server, &instance);
+        let write = |value: serde_json::Value| {
+            std::fs::write(directory.path().join("server-runtime.json"),
+                serde_json::to_vec(&value).unwrap()).unwrap();
+        };
+        assert_eq!(actual(), LanActual::Unknown);
+        // Requested settings cannot claim the responder actually started.
+        for name in ["lan-discovery.json", "stack-instance.json"] {
+            std::fs::write(directory.path().join(name), serde_json::to_vec(
+                &serde_json::json!({"server_id":server,"instance_id":instance,"enabled":true,"lan_discovery":true})
+            ).unwrap()).unwrap();
+        }
+        assert_eq!(actual(), LanActual::Unknown);
+        write(serde_json::json!({"server_id":server,"instance_id":instance,"lan_discovery":false}));
+        assert_eq!(actual(), LanActual::Off);
+        write(serde_json::json!({"server_id":server,"instance_id":instance,"lan_discovery":true,"lan_pairing_port":49152}));
+        assert_eq!(actual(), LanActual::On);
+        for value in [
+            serde_json::json!({"server_id":server,"instance_id":"other","lan_discovery":true}),
+            serde_json::json!({"server_id":"other","instance_id":instance,"lan_discovery":false}),
+            serde_json::json!({"server_id":server,"instance_id":instance,"lan_discovery":"yes"}),
+            serde_json::json!({"server_id":server,"instance_id":instance}),
+        ] {
+            write(value);
+            assert_eq!(actual(), LanActual::Unknown);
+        }
+        std::fs::write(directory.path().join("server-runtime.json"), b"{").unwrap();
+        assert_eq!(actual(), LanActual::Unknown);
     }
 }

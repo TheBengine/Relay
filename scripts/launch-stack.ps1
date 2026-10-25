@@ -16,6 +16,7 @@ param(
     [switch]$AcceptedCertificateTerms,
     [string]$TailscaleIPv4,
     [string]$EmbeddedIPv4,
+    [switch]$LanDiscovery,
     [ValidateRange(1,65535)][int]$NetworkPeerPort=4582
 )
 $ErrorActionPreference='Stop'
@@ -27,6 +28,7 @@ $publicMode=@('PublicIPv4','LocalIPv4','RouterWanIPv4','CaddyBinary','AcceptedCe
 $tailscaleMode=$PSBoundParameters.ContainsKey('TailscaleIPv4')
 $embeddedMode=$PSBoundParameters.ContainsKey('EmbeddedIPv4')
 if($embeddedMode -and ($publicMode -or $tailscaleMode)){throw 'Choose one hosting connection at a time.'}
+if($LanDiscovery -and ($publicMode -or $tailscaleMode)){throw 'Local code discovery needs a local or built-in private host. Use the existing HTTPS or Tailscale invitation for this connection.'}
 if($PSBoundParameters.ContainsKey('NetworkPeerPort') -and -not $embeddedMode){throw 'NetworkPeerPort requires built-in private hosting.'}
 if($embeddedMode){
     $embeddedOctets=ConvertTo-RelayStrictIPv4 -Address $EmbeddedIPv4
@@ -197,14 +199,22 @@ if(Test-Path -LiteralPath $record){
     if($existingHealthy){
         if($publicMode){throw 'A Relay stack is already running in this folder. Stop it explicitly before changing to public hosting; the local stack was left running.'}
         if($tailscaleMode -or $embeddedMode){throw 'A Relay stack is already running in this folder. Stop it explicitly before changing its connection.'}
+        if($LanDiscovery){throw 'A Relay stack is already running in this folder. Stop it explicitly before changing who can find it on the network.'}
         if(-not $health.rtc_enabled){throw 'A chat-only Relay instance is already running in this folder. Stop it with stop-server.ps1, then start the complete stack.'}
         Write-Host "Relay already running: $($previous.url)";exit 0
     }
 }
-if($publicMode -or $tailscaleMode -or $embeddedMode){
+if($publicMode -or $tailscaleMode -or $embeddedMode -or $LanDiscovery){
     # Only inspect a stopped/checkpointed community. This CLI never migrates,
     # creates directories, binds listeners or initializes an account.
     $ownerCheck=& $ServerBinary --public-hosting-status --data $dataRoot
+    if($LASTEXITCODE -ne 0 -and (($ownerCheck -join "`n") | ConvertFrom-Json).error_code -eq 'community_busy'){
+        # A crash or forced stop leaves a write-ahead log. The ordinary local open
+        # recovers it under the exclusive data lock (refused while a server runs),
+        # then closes cleanly; only then is the read-only preflight repeated.
+        & $ServerBinary --migrate-only --data $dataRoot | Out-Null
+        if($LASTEXITCODE -eq 0){$ownerCheck=& $ServerBinary --public-hosting-status --data $dataRoot}
+    }
     if($LASTEXITCODE -ne 0){throw 'Network hosting preflight failed. Initialize the owner locally, stop that local host normally, and use a server supporting read-only hosting preflight.'}
     $ownerStatus=($ownerCheck -join "`n") | ConvertFrom-Json
     if(-not $ownerStatus.ready -or -not $ownerStatus.owner_initialized -or -not $ownerStatus.server_id){throw 'The local server owner has not been initialized.'}
@@ -285,7 +295,10 @@ try {
     $env:RELAY_RTC_API_URL="http://127.0.0.1:$SfuPort"
     $env:RELAY_RTC_API_KEY=$key
     $env:RELAY_RTC_API_SECRET=$secret
-    $args='--bind 127.0.0.1 --port {0} --udp-port {1} --data "{2}" --name "{3}"' -f $Port,$UdpPort,$dataRoot,$ServerName
+    # LAN opt-in opens only the sealed-code listener. Ordinary API and voice stay local.
+    $bindAddress='127.0.0.1'
+    $args='--bind {4} --port {0} --udp-port {1} --data "{2}" --name "{3}"' -f $Port,$UdpPort,$dataRoot,$ServerName,$bindAddress
+    if($LanDiscovery){$args+=' --lan-discovery --lan-pairing-only'}
     if($publicMode){$args+=' --udp-bind 0.0.0.0 --trusted-proxy 127.0.0.1'}
     if($tailscaleMode){$args+=' --tailscale-bind '+$tailscalePlan.Address}
     if($embeddedMode){$args+=' --network-peer-port '+$NetworkPeerPort}
@@ -302,7 +315,15 @@ try {
     }
     $hostingMode=if($embeddedMode){'embedded'}elseif($tailscaleMode){'tailscale'}elseif($publicMode){'public'}else{'local'}
     $advertisedUrl=if($embeddedMode){"http://${EmbeddedIPv4}:$Port"}elseif($tailscaleMode){$tailscalePlan.RelayUrl}elseif($publicMode){$publicPlan.RelayUrl}else{"http://127.0.0.1:$Port"}
-    $stackRecord=[ordered]@{stack_id=$stackId;server_id=$health.server_id;instance_id=$health.instance_id;relay_pid=$relay.Id;relay_exe=$ServerBinary;relay_started_at=$relayStarted.ToString('o');sfu_pid=$sfu.Id;sfu_exe=$SfuBinary;sfu_started_at=$sfuStarted.ToString('o');public_mode=$publicMode;tailscale_mode=$tailscaleMode;hosting_mode=$hostingMode;advertised_url=$advertisedUrl}
+    $lanActual=$null;$lanPairingPort=$null
+    try {
+        $runtime=Get-Content -LiteralPath (Join-Path $dataRoot 'server-runtime.json') -Raw | ConvertFrom-Json
+        if($runtime.server_id -ceq $health.server_id -and $runtime.instance_id -ceq $health.instance_id -and $runtime.pid -eq $relay.Id -and $runtime.lan_discovery -is [bool]){
+            $lanActual=$runtime.lan_discovery
+            if($lanActual -and ($runtime.lan_pairing_port -is [long] -or $runtime.lan_pairing_port -is [int]) -and $runtime.lan_pairing_port -ge 1024 -and $runtime.lan_pairing_port -le 65535){$lanPairingPort=$runtime.lan_pairing_port}
+        }
+    }catch{}
+    $stackRecord=[ordered]@{stack_id=$stackId;server_id=$health.server_id;instance_id=$health.instance_id;relay_pid=$relay.Id;relay_exe=$ServerBinary;relay_started_at=$relayStarted.ToString('o');sfu_pid=$sfu.Id;sfu_exe=$SfuBinary;sfu_started_at=$sfuStarted.ToString('o');public_mode=$publicMode;tailscale_mode=$tailscaleMode;hosting_mode=$hostingMode;advertised_url=$advertisedUrl;lan_discovery=$lanActual;lan_pairing_port=$lanPairingPort}
     if($publicMode){$stackRecord.caddy_pid=$caddy.Id;$stackRecord.caddy_exe=$CaddyBinary;$stackRecord.caddy_started_at=$caddyStarted.ToString('o');$stackRecord.public_url=$publicPlan.RelayUrl;$stackRecord.public_https_status='certificate_and_external_check_pending'}
     if($tailscaleMode){$stackRecord.tailscale_ipv4=$tailscalePlan.Address;$stackRecord.tailscale_url=$tailscalePlan.RelayUrl}
     if($embeddedMode){$stackRecord.embedded_ipv4=$EmbeddedIPv4;$stackRecord.network_peer_port=$NetworkPeerPort}
@@ -314,6 +335,8 @@ try {
     [ordered]@{pid=$supervisor.Id;started_at=$supervisorStarted.ToString('o');relay_pid=$relay.Id;stack_id=$stackId} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $dataRoot 'stack-supervisor.json') -Encoding UTF8
     Write-Host "Relay ready with native video at http://127.0.0.1:$Port"
     if($publicMode){Write-Host "Public HTTPS helper started for $($publicPlan.RelayUrl). Certificate and external reachability still need verification; router/firewall settings were not changed."}
+    if($lanActual -eq $true){Write-Host 'Local code discovery started. Login, administration and video keep their existing private connection. No router or firewall settings were changed.'}
+    elseif($LanDiscovery){Write-Warning 'The community is running, but local code discovery could not be confirmed. Use its secure invitation.'}
     if($tailscaleMode){Write-Host "Private Tailscale host started at $($tailscalePlan.RelayUrl). Friends need Tailscale access to this PC; no router or firewall settings were changed."}
 }catch{
     $failure=$_

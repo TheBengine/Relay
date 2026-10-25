@@ -488,12 +488,12 @@ impl RelayApp {
             if before.1 != after.1 {
                 ctx.set_zoom_factor(self.ui_scale);
             }
-            if before.5 != after.5 {
+            if before.6 != after.6 {
                 self.send(Command::RememberSession {
                     enabled: self.prefs.remember_session,
                 });
             }
-            if before.7 != after.7 {
+            if before.8 != after.8 {
                 if let Some(media) = &mut self.media {
                     media.set_push_to_talk_key(self.prefs.ptt_key);
                 }
@@ -622,6 +622,8 @@ impl RelayApp {
             "Verify devices in Encryption settings before sharing protected messages or calls.",
         );
         controls::description(ui,"The server cannot recover your encryption keys. Account, channel, membership, timing and traffic metadata remain visible to the server.");
+        controls::divider(ui);
+        self.game_activity_settings(ui);
     }
 
     /// How Relay reaches a community. Automatic is right for almost everyone;
@@ -1102,6 +1104,8 @@ impl RelayApp {
                 .data_mut(|d| d.remove::<bool>(egui::Id::new("scroll-direct-voice")));
         }
         controls::description(ui, "Direct voice currently supports rooms with two people. Relay checks both participants and compares connection times; larger rooms, whispers and unavailable direct routes use the server.");
+        ui.checkbox(&mut self.prefs.audio.local_voice_gateways, "Allow approved local voice gateways").on_hover_text("Advanced. Turn this on before joining a call. Nothing is used until Relay has measured a complete working voice path through the gateway. You can turn it off during a call.");
+        controls::description(ui, "Advanced. In a community, helpers need the accepted Voice gateway role under Hosts. In a private Friends call, either joined participant can volunteer by enabling this option; no server role is granted. Only people in that exact live call can use its gateway. Relay measures the full voice path before using it and falls back to the normal route if it fails. Relay's built-in private connection uses a separate gateway route, keeping your own call untouched. Other per-person tunnels keep their normal route. Voice stays encrypted as usual. Video uses a separate path.");
         ui.checkbox(
             &mut self.prefs.audio.voice_qos,
             "Mark voice packets as high priority",

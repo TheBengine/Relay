@@ -60,11 +60,24 @@ pub(super) fn access(
     }
     Ok(None)
 }
+/// The conversations one member belongs to, and the rooms hanging off them.
+/// The Friends service keeps every member's groups in one database, so it must
+/// never test a member against conversations they are not in.
+pub(super) const MINE: &str = "WITH mine(id) AS (SELECT channel_id FROM conversation_members WHERE user_id=?1), rooms(id) AS (SELECT channel_id FROM conversations WHERE parent_id IN (SELECT id FROM mine))";
 pub(super) fn list(db: &Connection, user: &str) -> ApiResult<Vec<ConversationInfo>> {
-    let mut q = db.prepare("SELECT channel_id FROM conversations ORDER BY channel_id")?;
-    let ids = q
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
+    let ids = if people::enabled(db) {
+        let mut q = db.prepare(&format!("{MINE} SELECT channel_id FROM conversations WHERE channel_id IN (SELECT id FROM mine) OR channel_id IN (SELECT id FROM rooms) ORDER BY channel_id"))?;
+        let ids = q
+            .query_map([user], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids
+    } else {
+        let mut q = db.prepare("SELECT channel_id FROM conversations ORDER BY channel_id")?;
+        let ids = q
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids
+    };
     let mut result = vec![];
     for id in ids {
         if channel_access(db, &id, user, READ).is_ok() {
@@ -133,6 +146,11 @@ pub(super) async fn create(
         let mut db = lock(&state.0.db);
         let tx = db.transaction()?;
         active_user(&tx, &auth.user.id)?;
+        // The Friends service offers one kind of conversation: a group of friends.
+        let people = people::enabled(&tx);
+        if people && input.kind != "group" {
+            return Err(forbidden());
+        }
         let count: u32 = tx.query_row(
             "SELECT COUNT(*) FROM conversations WHERE owner_id=?1",
             [&auth.user.id],
@@ -142,15 +160,26 @@ pub(super) async fn create(
             return Err(bad("You can own up to 200 conversations"));
         }
         if input.kind == "group" {
+            let (fewest, most) = if people {
+                (1, relay_protocol::PEOPLE_GROUP_MAX_MEMBERS - 1)
+            } else {
+                (1, 9)
+            };
             if input.parent_id.is_some()
-                || input.member_ids.is_empty()
-                || input.member_ids.len() > 9
+                || input.member_ids.len() < fewest
+                || input.member_ids.len() > most
             {
-                return Err(bad("Choose between 1 and 9 other group members"));
+                return Err(bad(if people {
+                    "Invite between 1 and 7 friends to a group of up to 8 people"
+                } else {
+                    "Choose between 1 and 9 other group members"
+                }));
             }
+            if people {group_invites::prune_expired(&tx)?;}
             let mut unique = HashSet::new();
             for peer in &input.member_ids {
                 social::direct_access(&tx, &auth.user.id, peer)?;
+                if people {group_invites::reserve_invitee(&tx,peer)?;}
                 if !unique.insert(peer) {
                     return Err(bad("Duplicate group member"));
                 }
@@ -202,19 +231,37 @@ pub(super) async fn create(
             params![channel, input.kind, auth.user.id, input.parent_id],
         )?;
         if input.kind == "group" {
-            for member in input
-                .member_ids
-                .iter()
-                .chain(std::iter::once(&auth.user.id))
-            {
+            // In the Friends service only the creator is in the group: the friends
+            // named are invited, and join when each accepts.
+            if people {
                 tx.execute(
                     "INSERT INTO conversation_members VALUES(?1,?2)",
-                    params![channel, member],
+                    params![channel, auth.user.id],
                 )?;
+                for invitee in &input.member_ids {
+                    tx.execute(
+                        "INSERT INTO group_invitations(channel_id,invitee,inviter,created) VALUES(?1,?2,?3,?4)",
+                        params![channel, invitee, auth.user.id, now()],
+                    )?;
+                }
+            } else {
+                for member in input
+                    .member_ids
+                    .iter()
+                    .chain(std::iter::once(&auth.user.id))
+                {
+                    tx.execute(
+                        "INSERT INTO conversation_members VALUES(?1,?2)",
+                        params![channel, member],
+                    )?;
+                }
             }
-            let voice = id();
-            tx.execute("INSERT INTO channels(id,name,kind,topic,visibility) VALUES(?1,?2,'voice','','private')",params![voice,format!("{} call",input.name.trim())])?;
-            tx.execute("INSERT INTO conversations(channel_id,kind,owner_id,parent_id) VALUES(?1,'group_voice',?2,?3)",params![voice,auth.user.id,channel])?;
+            // Friends groups are text only: group calls are not offered there.
+            if !people {
+                let voice = id();
+                tx.execute("INSERT INTO channels(id,name,kind,topic,visibility) VALUES(?1,?2,'voice','','private')",params![voice,format!("{} call",input.name.trim())])?;
+                tx.execute("INSERT INTO conversations(channel_id,kind,owner_id,parent_id) VALUES(?1,'group_voice',?2,?3)",params![voice,auth.user.id,channel])?;
+            }
         }
         if input.kind == "stage" {
             tx.execute(
@@ -231,6 +278,11 @@ pub(super) async fn create(
         result
     };
     state.notify("channels", Some(result.channel_id.clone()), None, None);
+    if state.0.config.people && !input.member_ids.is_empty() {
+        let mut audience = input.member_ids.clone();
+        audience.push(auth.user.id.clone());
+        state.notify("members", None, None, Some(audience));
+    }
     Ok(Json(result))
 }
 #[derive(Deserialize)]
@@ -284,7 +336,30 @@ pub(super) async fn edit(
                 params![channel, archived],
             )?;
         }
-        if let Some(members) = input.member_ids {
+        let mut member_ids = input.member_ids;
+        if people::enabled(&tx) {
+            // In the Friends service the owner can only take people out; adding
+            // someone is an invitation they must accept.
+            if let Some(members) = member_ids.take() {
+                let unique: HashSet<_> = members.iter().collect();
+                if c.kind != "group"
+                    || unique.len() != members.len()
+                    || !members.contains(&auth.user.id)
+                    || members.iter().any(|member| !c.member_ids.contains(member))
+                {
+                    return Err(bad(
+                        "Invite people to add them; this can only remove members and keeps the owner",
+                    ));
+                }
+                for removed in c.member_ids.iter().filter(|id| !members.contains(id)) {
+                    tx.execute(
+                        "DELETE FROM conversation_members WHERE channel_id=?1 AND user_id=?2",
+                        params![channel, removed],
+                    )?;
+                }
+            }
+        }
+        if let Some(members) = member_ids {
             if c.kind != "group"
                 || members.is_empty()
                 || members.len() > 10
@@ -356,11 +431,65 @@ pub(super) async fn leave(
                 )?;
             }
         }
+        // Invitations were issued under the leaving owner's authority; they do
+        // not pass to the next owner.
+        if c.owner_id == auth.user.id {
+            group_invites::drop_channel(&tx, &channel)?;
+        }
+        // The last person to leave a Friends group takes it with them.
+        if people::enabled(&tx) && c.member_ids.iter().all(|id| *id == auth.user.id) {
+            delete_tree(&tx, &channel)?;
+        }
         tx.commit()?;
     }
     state.enforce_voice_permissions()?;
     state.notify("channels", None, None, None);
     Ok(StatusCode::NO_CONTENT)
+}
+/// In the Friends service, whoever blocks someone leaves the groups the two of
+/// them share. The other person is never removed and
+/// never gains anything: a member cannot evict an owner by blocking them. If
+/// the one who leaves owned a group, ownership passes by the usual rule (the
+/// first remaining member by id). Pair call rooms (a group with a call room)
+/// keep their own friend-pair rule. Returns whether any group changed.
+pub(super) fn leave_shared_groups(db: &Connection, actor: &str, peer: &str) -> ApiResult<bool> {
+    if !people::enabled(db) {
+        return Ok(false);
+    }
+    let mut q = db.prepare("SELECT a.channel_id FROM conversation_members a JOIN conversation_members b ON a.channel_id=b.channel_id JOIN conversations c ON c.channel_id=a.channel_id WHERE a.user_id=?1 AND b.user_id=?2 AND c.kind='group' AND NOT EXISTS(SELECT 1 FROM conversations v WHERE v.parent_id=a.channel_id AND v.kind='group_voice')")?;
+    let shared = q
+        .query_map(params![actor, peer], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for channel in &shared {
+        let owned: bool = db.query_row(
+            "SELECT owner_id=?2 FROM conversations WHERE channel_id=?1",
+            params![channel, actor],
+            |r| r.get(0),
+        )?;
+        db.execute(
+            "DELETE FROM conversation_members WHERE channel_id=?1 AND user_id=?2",
+            params![channel, actor],
+        )?;
+        if owned {
+            group_invites::drop_channel(db, channel)?;
+        }
+        // The next owner is chosen as `leave` chooses: the first remaining
+        // active member by id. The peer is always one of them.
+        let next: Option<String> = db
+            .query_row(
+                "SELECT m.user_id FROM conversation_members m JOIN membership u ON u.user_id=m.user_id WHERE m.channel_id=?1 AND u.status='active' ORDER BY m.user_id LIMIT 1",
+                [channel],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(next) = next {
+            db.execute(
+                "UPDATE conversations SET owner_id=?2 WHERE (channel_id=?1 OR parent_id=?1) AND owner_id=?3",
+                params![channel, next, actor],
+            )?;
+        }
+    }
+    Ok(!shared.is_empty())
 }
 pub(super) fn stage_speaker(db: &Connection, channel: &str, user: &str) -> ApiResult<bool> {
     if info(db, channel)?.is_none_or(|c| c.kind != "stage") {

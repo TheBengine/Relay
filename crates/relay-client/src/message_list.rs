@@ -5,7 +5,7 @@ use super::*;
 impl RelayApp {
     pub(super) fn chat_view(&mut self, ui: &mut egui::Ui, name: &str) {
         let can_send = self.current.as_ref().is_some_and(|target| match target {
-            Target::Direct(id) => !self.is_blocked(id),
+            Target::Direct(id) => !self.is_blocked(id) && self.can_message(id),
             Target::Channel(id) => self.bootstrap.as_ref().is_some_and(|bootstrap| {
                 bootstrap
                     .channels
@@ -19,13 +19,15 @@ impl RelayApp {
                 self.composer_activity(ui);
                 if !can_send {
                     ui.label(
-                        RichText::new(
-                            if matches!(self.current, Some(Target::Direct(_))) {
+                        RichText::new(match &self.current {
+                            Some(Target::Direct(id)) if self.is_blocked(id) => {
                                 "You blocked this person. Unblock them from their profile to send a message."
-                            } else {
-                                "Read-only channel · You do not have permission to send messages."
-                            },
-                        )
+                            }
+                            Some(Target::Direct(_)) => {
+                                "Only friends can send private messages. Add them as a friend to message them."
+                            }
+                            _ => "Read-only channel · You do not have permission to send messages.",
+                        })
                         .color(c_muted())
                         .size(font_size(12.0)),
                     );

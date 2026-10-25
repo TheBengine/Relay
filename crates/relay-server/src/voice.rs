@@ -6,7 +6,7 @@ use chacha20poly1305::{
 use relay_protocol::direct_voice::{self, Peer, Roster};
 use relay_protocol::{
     User, VoiceState, AUDIO_PACKET_V2, AUDIO_PACKET_V3, AUDIO_V2_HEADER_LEN, AUDIO_WHISPER,
-    UDP_HEADER_LEN, UDP_MAX_PACKET, UDP_PING,
+    UDP_HEADER_LEN, UDP_MAX_PACKET, UDP_PATH_PROBE, UDP_PING,
 };
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
@@ -185,6 +185,13 @@ fn revoke_direct(state: &AppState, socket: &tokio::net::UdpSocket) {
     }
 }
 
+pub(crate) fn revoke_all_direct(state: &AppState) {
+    let socket = lock(&state.0.voice_socket).clone();
+    if let Some(socket) = socket {
+        revoke_direct(state, &socket);
+    }
+}
+
 fn nonce(direction: u32, sequence: u64) -> [u8; 12] {
     let mut result = [0; 12];
     result[..4].copy_from_slice(&direction.to_le_bytes());
@@ -223,7 +230,10 @@ pub(crate) fn relay_packet(
     source: SocketAddr,
     packet: &[u8],
 ) -> Vec<(SocketAddr, Vec<u8>)> {
-    if packet.len() < UDP_HEADER_LEN + 17 || packet.len() > UDP_MAX_PACKET {
+    if !state.0.handover.writes_allowed()
+        || packet.len() < UDP_HEADER_LEN + 17
+        || packet.len() > UDP_MAX_PACKET
+    {
         return vec![];
     }
     let session_id = u64::from_le_bytes(packet[..8].try_into().expect("fixed header"));
@@ -262,6 +272,9 @@ pub(crate) fn relay_packet(
         }
         Some(1) if payload.len() >= 10 && sender.remote == Some(source) => {}
         Some(&UDP_PING) if payload.len() == 9 && sender.remote == Some(source) => {}
+        // The ticket authenticates this challenge from a candidate transport;
+        // only an ordinary keepalive may commit a new voice/NAT binding.
+        Some(&UDP_PATH_PROBE) if payload.len() == 17 => {}
         Some(&direct_voice::REQUEST)
             if sender.remote == Some(source) && direct_voice::parse_request(&payload).is_some() => {
         }
@@ -317,7 +330,7 @@ pub(crate) fn relay_packet(
             .map(|reply| vec![(source, reply)])
             .unwrap_or_default();
     }
-    if payload.first() == Some(&UDP_PING) {
+    if matches!(payload.first(), Some(&UDP_PING | &UDP_PATH_PROBE)) {
         return seal_packet(session_id, sender, &payload)
             .map(|reply| vec![(source, reply)])
             .unwrap_or_default();
@@ -378,6 +391,15 @@ fn seal_packet(id: u64, recipient: &mut VoiceSession, payload: &[u8]) -> Option<
     Some(result)
 }
 
+fn sealed_path_probe(recipient: &VoiceSession, bytes: &[u8]) -> bool {
+    if bytes.len() != UDP_HEADER_LEN + 16 + 17 { return false; }
+    let sequence = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    ChaCha20Poly1305::new_from_slice(&recipient.key).ok()
+        .and_then(|cipher| cipher.decrypt(Nonce::from_slice(&nonce(1, sequence)),
+            Payload { msg: &bytes[16..], aad: &bytes[..16] }).ok())
+        .is_some_and(|clear| clear.len() == 17 && clear[0] == UDP_PATH_PROBE)
+}
+
 fn sealed_whisper(recipient: &VoiceSession, bytes: &[u8]) -> bool {
     if bytes.len() < UDP_HEADER_LEN + 17 {
         return false;
@@ -409,6 +431,9 @@ fn deliver(
     socket: &tokio::net::UdpSocket,
     tunneled: bool,
 ) {
+    if !state.0.handover.writes_allowed() {
+        return;
+    }
     for (address, bytes) in outgoing {
         let sessions = lock(&state.0.voice);
         let receiver_id = u64::from_le_bytes(bytes[..8].try_into().expect("sealed reply header"));
@@ -416,6 +441,20 @@ fn deliver(
             (sessions.get(&sender_id), sessions.get(&receiver_id))
         {
             let echo = sender_id == receiver_id;
+            if echo
+                && source == address
+                && sender.alive_at(now())
+                && sealed_path_probe(receiver, &bytes)
+            {
+                if tunneled {
+                    if let Some(tunnel) = &receiver.tunnel_sender {
+                        let _ = tunnel.try_send((sender_id, false, bytes));
+                    }
+                } else {
+                    let _ = socket.try_send_to(&bytes, source);
+                }
+                continue;
+            }
             let whisper = sealed_whisper(receiver, &bytes);
             if sender.remote == Some(source)
                 && receiver.remote == Some(address)
@@ -521,6 +560,7 @@ pub(crate) async fn tunnel(
 ) -> Result<axum::response::Response, axum::http::StatusCode> {
     use axum::{http::StatusCode, response::IntoResponse};
     use base64::Engine;
+    let authority = state.0.handover.watch_transports();
     let session: u64 = headers
         .get("x-relay-voice-session")
         .and_then(|s| s.to_str().ok())
@@ -559,14 +599,22 @@ pub(crate) async fn tunnel(
         .max_frame_size(UDP_MAX_PACKET)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            tunnel_session(socket, state, session).await
+            tunnel_session(socket, state, session, authority).await
         })
         .into_response())
 }
 
-async fn tunnel_session(socket: axum::extract::ws::WebSocket, state: AppState, session_id: u64) {
+async fn tunnel_session(
+    socket: axum::extract::ws::WebSocket,
+    state: AppState,
+    session_id: u64,
+    mut authority: tokio::sync::watch::Receiver<()>,
+) {
     use axum::extract::ws::Message;
     use futures_util::{SinkExt, StreamExt};
+    if !state.0.handover.writes_allowed() || authority.has_changed().unwrap_or(true) {
+        return;
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<(u64, bool, Vec<u8>)>(32);
     {
@@ -580,6 +628,8 @@ async fn tunnel_session(socket: axum::extract::ws::WebSocket, state: AppState, s
     let (mut output, mut input) = socket.split();
     loop {
         tokio::select! {
+            biased;
+            _ = authority.changed() => break,
             packet = receiver.recv() => {
                 let Some((sender_id, whisper, packet)) = packet else { break; };
                 let allowed = {
@@ -625,6 +675,42 @@ async fn tunnel_session(socket: axum::extract::ws::WebSocket, state: AppState, s
 mod tests {
     use super::*;
     use crate::id;
+
+    #[tokio::test]
+    async fn candidate_path_probe_is_authenticated_and_never_moves_the_active_voice_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::open(temp.path(), "path-probe", 0).unwrap();
+        let active = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let candidate = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        lock(&state.0.voice).insert(1, session(1, "room", active.local_addr().unwrap()));
+        lock(&state.0.voice).insert(2, session(2, "room", receiver.local_addr().unwrap()));
+        let task = tokio::spawn(run_udp(socket, state.clone()));
+        let mut probe = vec![UDP_PATH_PROBE]; probe.extend(77u128.to_le_bytes());
+        let good = encrypted(1, 1, [1; 32], &probe);
+        let mut bad = good.clone(); *bad.last_mut().unwrap() ^= 1;
+        candidate.send_to(&bad, address).await.unwrap();
+        candidate.send_to(&good, address).await.unwrap();
+        let mut bytes = [0; UDP_MAX_PACKET];
+        let (n, from) = tokio::time::timeout(std::time::Duration::from_secs(1), candidate.recv_from(&mut bytes)).await.unwrap().unwrap();
+        assert_eq!(from, address);
+        let seq = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let clear = ChaCha20Poly1305::new_from_slice(&[1; 32]).unwrap().decrypt(
+            Nonce::from_slice(&nonce(1, seq)), Payload { msg: &bytes[16..n], aad: &bytes[..16] }).unwrap();
+        assert_eq!(clear, probe);
+        assert_eq!(lock(&state.0.voice).get(&1).unwrap().remote, Some(active.local_addr().unwrap()));
+        candidate.send_to(&good, address).await.unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(60), candidate.recv_from(&mut bytes)).await.is_err(), "replay gets no echo");
+        // The original path still delivers voice immediately after probing.
+        let mut audio = vec![1]; audio.extend(0u64.to_le_bytes()); audio.extend([0xf8,0xff,0xfe]);
+        active.send_to(&encrypted(1, 2, [1; 32], &audio), address).await.unwrap();
+        let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv_from(&mut bytes)).await.unwrap().unwrap();
+        assert!(n > UDP_HEADER_LEN);
+        assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 2);
+        state.request_shutdown(); task.abort(); let _ = task.await;
+    }
 
     #[tokio::test]
     async fn voice_delivery_and_notices_do_not_wait_for_a_database_backup() {

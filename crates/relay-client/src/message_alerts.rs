@@ -1,9 +1,9 @@
 //! Friends-message metadata only. This observer never opens a crypto actor,
 //! reads message bodies, changes unread state, or acknowledges a conversation.
 use super::*;
-use crate::notifications::{direct_policy_allows, GenerationGuard};
+use crate::notifications::{direct_policy_allows, group_policy_allows, GenerationGuard};
 use relay_protocol::{ChangePage, MessageChange};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const MAX_IDS: usize = 512;
 const MAX_PENDING: usize = 64;
@@ -19,12 +19,32 @@ pub(super) struct Messages {
     claimed_through: u64,
     owned_until: Option<Instant>,
     peers: HashMap<String, String>,
+    /// The groups of friends this account belongs to right now. Only these
+    /// channels can alert, and only for a message by a current member.
+    groups: HashMap<String, Group>,
+    /// People this account blocked: never an author of an alert.
+    blocked: HashSet<String>,
     seen: VecDeque<String>,
     pending: Vec<Pending>,
+}
+#[derive(Clone, PartialEq, Eq)]
+struct Group {
+    name: String,
+    members: HashSet<String>,
+    /// Names of the members, for the alert text. Group members need not be friends.
+    names: HashMap<String, String>,
+}
+/// Why a change may alert: who wrote it, and the group when it is not a private message.
+struct Candidate {
+    peer: String,
+    group: Option<String>,
+    mentioned: bool,
 }
 struct Pending {
     id: String,
     peer: String,
+    group: Option<String>,
+    mentioned: bool,
     deadline: Instant,
     sent: bool,
     retry_at: Option<Instant>,
@@ -52,26 +72,51 @@ impl Messages {
         // Rebinding the same authenticated account keeps bounded unsent
         // retries. The fresh bootstrap revalidates peers/DnD before delivery.
     }
-    fn candidate(&self, origin: &CommandOrigin, change: &MessageChange) -> Option<String> {
+    fn candidate(&self, origin: &CommandOrigin, change: &MessageChange) -> Option<Candidate> {
         let message = change.message.as_ref()?;
         if change.kind != "created"
             || change.deleted
-            || change.channel_id.is_some()
-            || message.channel_id.is_some()
             || message.id != change.message_id
             || message.id.is_empty()
             || message.id.len() > 128
             || change.user_id != message.author.id
             || change.user_id == origin.user_id
-            || change.recipient_id.as_deref() != Some(origin.user_id.as_str())
-            || message.recipient_id.as_deref() != Some(origin.user_id.as_str())
-            || !self.peers.contains_key(&message.author.id)
+            || self.blocked.contains(&message.author.id)
         {
             return None;
         }
-        Some(message.author.id.clone())
+        let group = match &change.channel_id {
+            // A private message to this account.
+            None => {
+                if message.channel_id.is_some()
+                    || change.recipient_id.as_deref() != Some(origin.user_id.as_str())
+                    || message.recipient_id.as_deref() != Some(origin.user_id.as_str())
+                    || !self.peers.contains_key(&message.author.id)
+                {
+                    return None;
+                }
+                None
+            }
+            // A message in one of this account's groups, from a current member.
+            Some(channel) => {
+                let known = self.groups.get(channel)?;
+                if message.channel_id.as_ref() != Some(channel)
+                    || change.recipient_id.is_some()
+                    || message.recipient_id.is_some()
+                    || !known.members.contains(&message.author.id)
+                {
+                    return None;
+                }
+                Some(channel.clone())
+            }
+        };
+        Some(Candidate {
+            peer: message.author.id.clone(),
+            group,
+            mentioned: message.mentions.iter().any(|id| id == &origin.user_id),
+        })
     }
-    fn claim(&mut self, change: &MessageChange, peer: String, now: Instant, queue: bool) -> bool {
+    fn claim(&mut self, change: &MessageChange, who: Candidate, now: Instant, queue: bool) -> bool {
         let fresh = self.baseline.is_some_and(|b| change.sequence > b)
             && change.sequence > self.claimed_through
             && !self.seen.contains(&change.message_id);
@@ -86,7 +131,9 @@ impl Messages {
         if queue && self.pending.len() < MAX_PENDING {
             self.pending.push(Pending {
                 id: change.message_id.clone(),
-                peer,
+                peer: who.peer,
+                group: who.group,
+                mentioned: who.mentioned,
                 deadline: now + RETRY_LIFETIME,
                 sent: false,
                 retry_at: None,
@@ -131,6 +178,54 @@ impl Account {
             })
             .take(1024)
             .collect();
+        let groups: HashMap<String, Group> = if b
+            .capabilities
+            .iter()
+            .any(|c| c == relay_protocol::PEOPLE_GROUPS_CAPABILITY)
+        {
+            b.conversations
+                .iter()
+                .filter(|c| {
+                    c.kind == "group"
+                        && !c.archived
+                        && c.member_ids.contains(&b.user.id)
+                        && !b.conversations.iter().any(|room| {
+                            room.kind == "group_voice"
+                                && room.parent_id.as_ref() == Some(&c.channel_id)
+                        })
+                })
+                .filter_map(|c| {
+                    let channel = b
+                        .channels
+                        .iter()
+                        .find(|channel| channel.id == c.channel_id && channel.can_send)?;
+                    Some((
+                        c.channel_id.clone(),
+                        Group {
+                            name: channel.name.chars().take(64).collect(),
+                            members: c.member_ids.iter().take(16).cloned().collect(),
+                            names: b
+                                .members
+                                .iter()
+                                .filter(|u| c.member_ids.contains(&u.id))
+                                .map(|u| {
+                                    let shown = if u.profile.display_name.trim().is_empty() {
+                                        &u.username
+                                    } else {
+                                        &u.profile.display_name
+                                    };
+                                    (u.id.clone(), shown.chars().take(128).collect::<String>())
+                                })
+                                .take(16)
+                                .collect(),
+                        },
+                    ))
+                })
+                .take(256)
+                .collect()
+        } else {
+            HashMap::new()
+        };
         if self.messages.is_none() {
             // Only response parsing knows whether serde defaulted a missing
             // cursor. Explicit zero is a valid baseline for the very first DM.
@@ -145,6 +240,8 @@ impl Account {
                 claimed_through: cursor.value.unwrap_or(0),
                 owned_until: None,
                 peers: HashMap::new(),
+                groups: HashMap::new(),
+                blocked: HashSet::new(),
                 seen: VecDeque::new(),
                 pending: Vec::new(),
             });
@@ -153,14 +250,30 @@ impl Account {
             .messages
             .as_mut()
             .expect("message observer initialized");
-        if messages.peers != peers || self.quiet {
+        let blocked: HashSet<String> = b.social.blocked.iter().take(1024).cloned().collect();
+        if messages.peers != peers
+            || messages.groups != groups
+            || messages.blocked != blocked
+            || self.quiet
+        {
             self.message_guard.revoke();
             self.message_guard = GenerationGuard::new();
         }
         messages.peers = peers;
-        messages
-            .pending
-            .retain(|p| messages.peers.contains_key(&p.peer));
+        messages.groups = groups;
+        messages.blocked = blocked;
+        // Someone who stopped being a friend, or a group this account left,
+        // can no longer alert.
+        messages.pending.retain(|p| match &p.group {
+            None => messages.peers.contains_key(&p.peer),
+            Some(g) => {
+                !messages.blocked.contains(&p.peer)
+                    && messages
+                        .groups
+                        .get(g)
+                        .is_some_and(|group| group.members.contains(&p.peer))
+            }
+        });
         if cursor.is_some_and(|sample| {
             sample.value.is_some_and(|value| value < messages.cursor)
                 && sample.requested.is_some_and(|requested| {
@@ -298,8 +411,13 @@ impl State {
                 if stopped || !guard.valid() {
                     return Err(());
                 }
-                // Community messages keep their existing UI notification path.
-                if change.channel_id.is_some() {
+                // Community messages keep their existing UI notification path; only
+                // a group of this account's friends is claimed like a private message.
+                if change
+                    .channel_id
+                    .as_ref()
+                    .is_some_and(|channel| !messages.groups.contains_key(channel))
+                {
                     return Ok(None);
                 }
                 let Some(peer) = messages.candidate(origin, change) else {
@@ -341,33 +459,72 @@ impl State {
                 if pending.sent || pending.retry_at.is_some_and(|at| now < at) {
                     continue;
                 }
-                let Some(name) = messages.peers.get(&pending.peer) else {
-                    pending.sent = true;
-                    continue;
+                // Names are shown only with previews on; the message itself never is.
+                let (target, body) = match &pending.group {
+                    None => {
+                        let Some(name) = messages.peers.get(&pending.peer) else {
+                            pending.sent = true;
+                            continue;
+                        };
+                        if !direct_policy_allows(
+                            &self.policy.message_policies,
+                            &account.origin,
+                            &pending.peer,
+                            self.policy.mentions_only,
+                            unix,
+                        ) {
+                            pending.sent = true;
+                            continue;
+                        }
+                        (
+                            Target::Direct(pending.peer.clone()),
+                            if self.policy.previews {
+                                format!("{name} sent you a private message. Open Relay to read it.")
+                            } else {
+                                "Open Relay to read your private message.".into()
+                            },
+                        )
+                    }
+                    Some(channel) => {
+                        let Some(group) = messages.groups.get(channel) else {
+                            pending.sent = true;
+                            continue;
+                        };
+                        let Some(name) = group.names.get(&pending.peer) else {
+                            pending.sent = true;
+                            continue;
+                        };
+                        if !group.members.contains(&pending.peer)
+                            || !group_policy_allows(
+                                &self.policy.message_policies,
+                                &account.origin,
+                                channel,
+                                pending.mentioned,
+                                unix,
+                            )
+                        {
+                            pending.sent = true;
+                            continue;
+                        }
+                        (
+                            Target::Channel(channel.clone()),
+                            if self.policy.previews {
+                                format!("{name} wrote in {}. Open Relay to read it.", group.name)
+                            } else {
+                                "Open Relay to read your group message.".into()
+                            },
+                        )
+                    }
                 };
-                if !direct_policy_allows(
-                    &self.policy.message_policies,
-                    &account.origin,
-                    &pending.peer,
-                    self.policy.mentions_only,
-                    unix,
-                ) {
-                    pending.sent = true;
-                    continue;
-                }
                 pending.sent = true;
                 effects.push(Delivery {
                     origin: account.origin.clone(),
                     id: pending.id.clone(),
                     notification: Notification {
                         title: "New Relay message".into(),
-                        body: if self.policy.previews {
-                            format!("{name} sent you a private message. Open Relay to read it.")
-                        } else {
-                            "Open Relay to read your private message.".into()
-                        },
+                        body,
                         origin: account.origin.clone(),
-                        target: Target::Direct(pending.peer.clone()),
+                        target,
                         guard: Some(account.message_guard.clone()),
                         background_only: true,
                     },
@@ -455,7 +612,7 @@ impl Alerts {
         let Some(messages) = &mut account.messages else {
             return;
         };
-        let Some(peer) = messages.candidate(origin, change) else {
+        let Some(who) = messages.candidate(origin, change) else {
             return;
         };
         if messages.pending.len() < MAX_PENDING
@@ -463,7 +620,9 @@ impl Alerts {
         {
             messages.pending.push(Pending {
                 id: change.message_id.clone(),
-                peer,
+                peer: who.peer,
+                group: who.group,
+                mentioned: who.mentioned,
                 deadline: Instant::now() + RETRY_LIFETIME,
                 sent: false,
                 retry_at: Some(Instant::now() + Duration::from_secs(1)),

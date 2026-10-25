@@ -1,0 +1,760 @@
+diff --git a/pkg/service/turn.go b/pkg/service/turn.go
+--- a/pkg/service/turn.go
++++ b/pkg/service/turn.go
+@@ -254,6 +254,10 @@
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "could not listen on TURN TCP port")
+ 	}
++	// Keep TLS outermost: Pion detects *tls.Conn before its TURN read loop.
++	// Wrap the raw TCP socket before PROXY's lazy header processing, whose
++	// existing read timeout remains separate from this socket-write cap.
++	listener = &relayTURNWriteListener{Listener: listener}
+ 	if proxyPolicy != nil {
+ 		listener = &proxyproto.Listener{Listener: listener, ConnPolicy: proxyPolicy}
+ 	}
+diff --git a/pkg/service/relay_turn_write_budget.go b/pkg/service/relay_turn_write_budget.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/service/relay_turn_write_budget.go
+@@ -0,0 +1,232 @@
++// Copyright 2026 LiveKit, Inc.
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
++
++package service
++
++import (
++	"errors"
++	"io"
++	"net"
++	"os"
++	"sync"
++	"time"
++)
++
++const (
++	relayTURNWriteStall = 2 * time.Second
++	relayTURNWriteCalls = 16
++	relayTURNWriteBytes = 256 * 1024
++)
++
++var errRelayTURNWriteAdmission = errors.New("TURN TCP write admission budget exceeded")
++
++// No copied queue or worker: each admitted caller owns its synchronous write.
++// This sits below crypto/tls and PROXY, and bounds only this layer's pending
++// buffers and socket-write/gate age. TLS's upstream mutex, kernel, proxy and
++// network buffering are outside this contract; this is not a latency bound.
++type relayTURNWriteListener struct{ net.Listener }
++
++func (l *relayTURNWriteListener) Accept() (net.Conn, error) {
++	conn, err := l.Listener.Accept()
++	if err != nil {
++		return nil, err
++	}
++	return newRelayTURNWriteConn(conn), nil
++}
++
++type relayTURNWriteConn struct {
++	net.Conn
++	mu                 sync.Mutex
++	closed             bool
++	done               chan struct{}
++	changed            chan struct{}
++	gate               chan struct{}
++	callerDeadline     time.Time
++	activeCap          time.Time
++	calls, bytes       int
++	stall              time.Duration
++	maxCalls, maxBytes int
++}
++
++func newRelayTURNWriteConn(conn net.Conn) *relayTURNWriteConn {
++	c := &relayTURNWriteConn{Conn: conn, done: make(chan struct{}), changed: make(chan struct{}),
++		gate: make(chan struct{}, 1), stall: relayTURNWriteStall, maxCalls: relayTURNWriteCalls, maxBytes: relayTURNWriteBytes}
++	c.gate <- struct{}{}
++	return c
++}
++
++func earlierTURNDeadline(a, b time.Time) time.Time {
++	if a.IsZero() || !b.IsZero() && b.Before(a) {
++		return b
++	}
++	return a
++}
++
++// Mark terminal while holding the same lock as admission and deadline state.
++// Closing the underlying socket happens outside this lock and never waits to
++// acquire the write gate.
++func (c *relayTURNWriteConn) markClosedLocked() bool {
++	if c.closed {
++		return false
++	}
++	c.closed = true
++	close(c.done)
++	return true
++}
++
++func (c *relayTURNWriteConn) Close() error {
++	c.mu.Lock()
++	closeRaw := c.markClosedLocked()
++	c.mu.Unlock()
++	if !closeRaw {
++		return net.ErrClosed
++	}
++	// There is no worker to join, and Close never waits for the write gate.
++	return c.Conn.Close()
++}
++
++func (c *relayTURNWriteConn) SetWriteDeadline(t time.Time) error {
++	return c.setCallerDeadline(t, false)
++}
++
++func (c *relayTURNWriteConn) SetDeadline(t time.Time) error {
++	return c.setCallerDeadline(t, true)
++}
++
++func (c *relayTURNWriteConn) setCallerDeadline(t time.Time, includeRead bool) error {
++	c.mu.Lock()
++	if c.closed {
++		c.mu.Unlock()
++		return net.ErrClosed
++	}
++	c.callerDeadline = t
++	close(c.changed)
++	c.changed = make(chan struct{})
++	var err error
++	if includeRead {
++		err = c.Conn.SetReadDeadline(t)
++	}
++	if err == nil {
++		err = c.Conn.SetWriteDeadline(earlierTURNDeadline(t, c.activeCap))
++	}
++	closeRaw := err != nil && c.markClosedLocked()
++	c.mu.Unlock()
++	if closeRaw {
++		_ = c.Conn.Close()
++	}
++	return err
++}
++
++func (c *relayTURNWriteConn) acquire(cap time.Time) error {
++	for {
++		c.mu.Lock()
++		if c.closed {
++			c.mu.Unlock()
++			return net.ErrClosed
++		}
++		deadline := earlierTURNDeadline(cap, c.callerDeadline)
++		changed := c.changed
++		c.mu.Unlock()
++		remaining := time.Until(deadline)
++		if remaining <= 0 {
++			return os.ErrDeadlineExceeded
++		}
++		timer := time.NewTimer(remaining)
++		var err error
++		acquired := false
++		select {
++		case <-c.done:
++			err = net.ErrClosed
++		case <-timer.C:
++			err = os.ErrDeadlineExceeded
++		case <-changed:
++		case <-c.gate:
++			acquired = true
++		}
++		if !timer.Stop() {
++			select {
++			case <-timer.C:
++			default:
++			}
++		}
++		if err != nil || acquired {
++			return err
++		}
++	}
++}
++
++func (c *relayTURNWriteConn) Write(p []byte) (n int, err error) {
++	cap := time.Now().Add(c.stall)
++	c.mu.Lock()
++	if c.closed {
++		c.mu.Unlock()
++		return 0, net.ErrClosed
++	}
++	if len(p) == 0 {
++		c.mu.Unlock()
++		return 0, nil
++	}
++	if c.calls >= c.maxCalls || len(p) > c.maxBytes || c.bytes > c.maxBytes-len(p) {
++		closeRaw := c.markClosedLocked()
++		c.mu.Unlock()
++		if closeRaw {
++			_ = c.Conn.Close()
++		}
++		return 0, errRelayTURNWriteAdmission
++	}
++	c.calls++
++	c.bytes += len(p)
++	c.mu.Unlock()
++	defer func() {
++		c.mu.Lock()
++		c.calls--
++		c.bytes -= len(p)
++		c.mu.Unlock()
++	}()
++	if err = c.acquire(cap); err != nil {
++		_ = c.Close()
++		return 0, err
++	}
++	defer func() {
++		c.mu.Lock()
++		c.activeCap = time.Time{}
++		if err == nil && !c.closed {
++			err = c.Conn.SetWriteDeadline(c.callerDeadline)
++		}
++		closeRaw := err != nil && c.markClosedLocked()
++		c.mu.Unlock()
++		if closeRaw {
++			_ = c.Conn.Close()
++		}
++		c.gate <- struct{}{}
++	}()
++	c.mu.Lock()
++	if c.closed {
++		err = net.ErrClosed
++	} else {
++		c.activeCap = cap
++		err = c.Conn.SetWriteDeadline(earlierTURNDeadline(cap, c.callerDeadline))
++	}
++	c.mu.Unlock()
++	if err != nil {
++		return 0, err
++	}
++	// Preserve exact bytes, including TURN padding and unknown control traffic.
++	// Serialize partial writes; after any error no subsequent frame is allowed.
++	for n < len(p) {
++		written, writeErr := c.Conn.Write(p[n:])
++		if written < 0 || written > len(p)-n {
++			return n, io.ErrShortWrite
++		}
++		n += written
++		if writeErr != nil {
++			return n, writeErr
++		}
++		if written == 0 {
++			return n, io.ErrShortWrite
++		}
++	}
++	return n, nil
++}
+diff --git a/pkg/service/relay_turn_write_budget_test.go b/pkg/service/relay_turn_write_budget_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/service/relay_turn_write_budget_test.go
+@@ -0,0 +1,504 @@
++// Copyright 2026 LiveKit, Inc.
++// Licensed under the Apache License, Version 2.0.
++
++package service
++
++import (
++	"bytes"
++	"crypto/ed25519"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
++	"errors"
++	"io"
++	"math/big"
++	"net"
++	"os"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/livekit/livekit-server/pkg/config"
++	"github.com/pion/stun/v3"
++	"github.com/stretchr/testify/require"
++)
++
++type relayTURNBudgetTestConn struct {
++	mu                          sync.Mutex
++	data                        []byte
++	step                        int
++	writeErr                    error
++	zero                        bool
++	failDeadline                bool
++	readDeadline, writeDeadline time.Time
++	changed                     chan struct{}
++	release                     <-chan struct{}
++	entered                     chan struct{}
++	closed                      chan struct{}
++	beforeClose                 func()
++	closeOnce                   sync.Once
++	closeCalls                  atomic.Int32
++}
++
++func newRelayTURNBudgetTestConn() *relayTURNBudgetTestConn {
++	return &relayTURNBudgetTestConn{changed: make(chan struct{}), entered: make(chan struct{}, 32), closed: make(chan struct{})}
++}
++func (c *relayTURNBudgetTestConn) Write(p []byte) (int, error) {
++	select {
++	case c.entered <- struct{}{}:
++	default:
++	}
++	if c.release != nil {
++		waiting := true
++		for waiting {
++			c.mu.Lock()
++			deadline, changed := c.writeDeadline, c.changed
++			c.mu.Unlock()
++			var timer *time.Timer
++			var timeout <-chan time.Time
++			if !deadline.IsZero() {
++				timer = time.NewTimer(time.Until(deadline))
++				timeout = timer.C
++			}
++			var err error
++			select {
++			case <-c.closed:
++				err = net.ErrClosed
++			case <-timeout:
++				err = os.ErrDeadlineExceeded
++			case <-changed:
++			case <-c.release:
++				waiting = false
++			}
++			if timer != nil && !timer.Stop() {
++				select {
++				case <-timer.C:
++				default:
++				}
++			}
++			if err != nil {
++				return 0, err
++			}
++		}
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	select {
++	case <-c.closed:
++		return 0, net.ErrClosed
++	default:
++	}
++	if c.zero {
++		return 0, nil
++	}
++	n := len(p)
++	if c.step > 0 && n > c.step {
++		n = c.step
++	}
++	c.data = append(c.data, p[:n]...)
++	return n, c.writeErr
++}
++func (c *relayTURNBudgetTestConn) Read(p []byte) (int, error) { return 0, io.EOF }
++func (c *relayTURNBudgetTestConn) Close() error {
++	c.closeOnce.Do(func() {
++		c.closeCalls.Add(1)
++		if c.beforeClose != nil {
++			c.beforeClose()
++		}
++		close(c.closed)
++	})
++	return nil
++}
++func (c *relayTURNBudgetTestConn) LocalAddr() net.Addr {
++	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 10000}
++}
++func (c *relayTURNBudgetTestConn) RemoteAddr() net.Addr {
++	return &net.TCPAddr{IP: net.IPv4(192, 0, 2, 9), Port: 40000}
++}
++func (c *relayTURNBudgetTestConn) SetReadDeadline(t time.Time) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.readDeadline = t
++	return nil
++}
++func (c *relayTURNBudgetTestConn) SetWriteDeadline(t time.Time) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.failDeadline {
++		return io.ErrClosedPipe
++	}
++	c.writeDeadline = t
++	close(c.changed)
++	c.changed = make(chan struct{})
++	return nil
++}
++func (c *relayTURNBudgetTestConn) SetDeadline(t time.Time) error {
++	if err := c.SetReadDeadline(t); err != nil {
++		return err
++	}
++	return c.SetWriteDeadline(t)
++}
++
++type relayTURNWriteResult struct {
++	n   int
++	err error
++}
++
++func startRelayTURNWrite(c net.Conn, p []byte) <-chan relayTURNWriteResult {
++	out := make(chan relayTURNWriteResult, 1)
++	go func() { n, err := c.Write(p); out <- relayTURNWriteResult{n, err} }()
++	return out
++}
++func awaitRelayTURNWrite(t *testing.T, out <-chan relayTURNWriteResult) relayTURNWriteResult {
++	t.Helper()
++	select {
++	case result := <-out:
++		return result
++	case <-time.After(3 * time.Second):
++		t.Fatal("owned TURN write did not terminate")
++		return relayTURNWriteResult{}
++	}
++}
++func awaitRelayTURNCalls(t *testing.T, c *relayTURNWriteConn, count int) {
++	t.Helper()
++	require.Eventually(t, func() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.calls == count && !c.activeCap.IsZero() }, time.Second, time.Millisecond)
++}
++func requireRelayTURNReleased(t *testing.T, c *relayTURNWriteConn) {
++	t.Helper()
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	require.Zero(t, c.calls)
++	require.Zero(t, c.bytes)
++}
++
++func TestRelayTURNWriteBudgetPartialWritesPreserveBytesAndSerialization(t *testing.T) {
++	release := make(chan struct{})
++	raw := newRelayTURNBudgetTestConn()
++	raw.step = 3
++	raw.release = release
++	c := newRelayTURNWriteConn(raw)
++	defer c.Close()
++	// Valid STUN plus ChannelData carrying DTLS-like bytes, including padding.
++	control := stun.MustBuild(stun.TransactionID, stun.BindingRequest).Raw
++	channel := append([]byte{0x40, 0x01, 0, 15}, append([]byte{22, 0xfe, 0xfd}, make([]byte, 12)...)...)
++	channel = append(channel, 0) // 4-byte stream padding, preserved verbatim
++	first := append(append([]byte{}, control...), channel...)
++	a := startRelayTURNWrite(c, first)
++	select {
++	case <-raw.entered:
++	case <-time.After(time.Second):
++		t.Fatal("first owned write not entered")
++	}
++	b := startRelayTURNWrite(c, control)
++	awaitRelayTURNCalls(t, c, 2)
++	close(release)
++	for _, result := range []relayTURNWriteResult{awaitRelayTURNWrite(t, a), awaitRelayTURNWrite(t, b)} {
++		require.NoError(t, result.err)
++	}
++	raw.mu.Lock()
++	observed := append([]byte{}, raw.data...)
++	raw.mu.Unlock()
++	require.Equal(t, append(first, control...), observed)
++	requireRelayTURNReleased(t, c)
++}
++
++func TestRelayTURNWriteBudgetSlowReaderClosesStream(t *testing.T) {
++	server, peer := net.Pipe()
++	defer peer.Close()
++	// Install the fixture read deadline while both ends are open. Go rejects
++	// deadline changes after the peer has already closed this pipe.
++	require.NoError(t, peer.SetReadDeadline(time.Now().Add(time.Second)))
++	c := newRelayTURNWriteConn(server)
++	c.stall = 40 * time.Millisecond
++	defer c.Close()
++	result := awaitRelayTURNWrite(t, startRelayTURNWrite(c, []byte("owned complete control frame")))
++	require.ErrorIs(t, result.err, os.ErrDeadlineExceeded)
++	require.Zero(t, result.n)
++	_, err := c.Write([]byte("later frame"))
++	require.ErrorIs(t, err, net.ErrClosed)
++	_, err = peer.Read(make([]byte, 1))
++	require.ErrorIs(t, err, io.EOF)
++	requireRelayTURNReleased(t, c)
++}
++
++func TestRelayTURNWriteBudgetCloseUnblocksActiveAndGateWaiters(t *testing.T) {
++	server, peer := net.Pipe()
++	defer peer.Close()
++	c := newRelayTURNWriteConn(server)
++	defer c.Close()
++	a := startRelayTURNWrite(c, []byte("first"))
++	awaitRelayTURNCalls(t, c, 1)
++	b := startRelayTURNWrite(c, []byte("second"))
++	awaitRelayTURNCalls(t, c, 2)
++	require.NoError(t, c.Close())
++	for _, result := range []relayTURNWriteResult{awaitRelayTURNWrite(t, a), awaitRelayTURNWrite(t, b)} {
++		require.Error(t, result.err)
++	}
++	requireRelayTURNReleased(t, c)
++}
++
++func TestRelayTURNWriteBudgetCallerDeadlinesDoNotResetActiveCap(t *testing.T) {
++	release := make(chan struct{})
++	raw := newRelayTURNBudgetTestConn()
++	raw.release = release
++	c := newRelayTURNWriteConn(raw)
++	defer c.Close()
++	future := time.Now().Add(time.Hour)
++	require.NoError(t, c.SetWriteDeadline(future))
++	out := startRelayTURNWrite(c, []byte("owned data"))
++	select {
++	case <-raw.entered:
++	case <-time.After(time.Second):
++		t.Fatal("owned write not entered")
++	}
++	c.mu.Lock()
++	cap := c.activeCap
++	c.mu.Unlock()
++	require.False(t, cap.IsZero())
++	for _, deadline := range []time.Time{time.Time{}, future} {
++		require.NoError(t, c.SetWriteDeadline(deadline))
++		raw.mu.Lock()
++		actual := raw.writeDeadline
++		raw.mu.Unlock()
++		require.Equal(t, cap, actual)
++	}
++	earlier := time.Now().Add(time.Second)
++	require.NoError(t, c.SetDeadline(earlier))
++	raw.mu.Lock()
++	read, write := raw.readDeadline, raw.writeDeadline
++	raw.mu.Unlock()
++	require.Equal(t, earlier, read)
++	require.Equal(t, earlier, write)
++	require.NoError(t, c.SetWriteDeadline(future))
++	close(release)
++	require.NoError(t, awaitRelayTURNWrite(t, out).err)
++	raw.mu.Lock()
++	restored := raw.writeDeadline
++	raw.mu.Unlock()
++	require.Equal(t, future, restored)
++	require.Equal(t, raw.LocalAddr(), c.LocalAddr())
++	require.Equal(t, raw.RemoteAddr(), c.RemoteAddr())
++	requireRelayTURNReleased(t, c)
++}
++
++func TestRelayTURNWriteBudgetQueuedCallerDeadlineWakesAllWriters(t *testing.T) {
++	raw := newRelayTURNBudgetTestConn()
++	raw.release = make(chan struct{})
++	c := newRelayTURNWriteConn(raw)
++	defer c.Close()
++	a := startRelayTURNWrite(c, []byte("first"))
++	select {
++	case <-raw.entered:
++	case <-time.After(time.Second):
++		t.Fatal("owned write not entered")
++	}
++	b := startRelayTURNWrite(c, []byte("second"))
++	awaitRelayTURNCalls(t, c, 2)
++	require.NoError(t, c.SetWriteDeadline(time.Now().Add(-time.Second)))
++	timeoutObserved := false
++	for _, result := range []relayTURNWriteResult{awaitRelayTURNWrite(t, a), awaitRelayTURNWrite(t, b)} {
++		require.Error(t, result.err)
++		timeoutObserved = timeoutObserved || errors.Is(result.err, os.ErrDeadlineExceeded)
++	}
++	require.True(t, timeoutObserved, "an expired caller deadline terminates an owned write, not just the later Close")
++	require.EqualValues(t, 1, raw.closeCalls.Load())
++	requireRelayTURNReleased(t, c)
++}
++
++func TestRelayTURNWriteBudgetAdmissionAndOversizeAreTerminalAndReleaseReservations(t *testing.T) {
++	for _, kind := range []string{"oversize", "calls", "bytes"} {
++		t.Run(kind, func(t *testing.T) {
++			raw := newRelayTURNBudgetTestConn()
++			raw.release = make(chan struct{})
++			c := newRelayTURNWriteConn(raw)
++			defer c.Close()
++			if kind == "oversize" {
++				n, err := c.Write(make([]byte, c.maxBytes+1))
++				require.Zero(t, n)
++				require.ErrorIs(t, err, errRelayTURNWriteAdmission)
++			} else {
++				if kind == "calls" {
++					c.maxCalls = 1
++				} else {
++					c.maxBytes = 3
++				}
++				first := startRelayTURNWrite(c, []byte("AA"))
++				select {
++				case <-raw.entered:
++				case <-time.After(time.Second):
++					t.Fatal("owned write not entered")
++				}
++				n, err := c.Write([]byte("BB"))
++				require.Zero(t, n)
++				require.ErrorIs(t, err, errRelayTURNWriteAdmission)
++				require.Error(t, awaitRelayTURNWrite(t, first).err)
++			}
++			require.EqualValues(t, 1, raw.closeCalls.Load())
++			requireRelayTURNReleased(t, c)
++			raw.mu.Lock()
++			require.Empty(t, raw.data)
++			raw.mu.Unlock()
++		})
++	}
++}
++
++func TestRelayTURNWriteBudgetPartialFailureZeroProgressAndDeadlineErrorsClose(t *testing.T) {
++	for _, kind := range []string{"partial", "zero", "deadline"} {
++		t.Run(kind, func(t *testing.T) {
++			raw := newRelayTURNBudgetTestConn()
++			if kind == "partial" {
++				raw.step = 2
++				raw.writeErr = io.ErrUnexpectedEOF
++			}
++			if kind == "zero" {
++				raw.zero = true
++			}
++			if kind == "deadline" {
++				raw.failDeadline = true
++			}
++			c := newRelayTURNWriteConn(raw)
++			defer c.Close()
++			n, err := c.Write([]byte("AAAA"))
++			require.Error(t, err)
++			if kind == "partial" {
++				require.Equal(t, 2, n)
++			} else {
++				require.Zero(t, n)
++			}
++			_, err = c.Write([]byte("BBBB"))
++			require.ErrorIs(t, err, net.ErrClosed)
++			require.EqualValues(t, 1, raw.closeCalls.Load())
++			requireRelayTURNReleased(t, c)
++			raw.mu.Lock()
++			require.False(t, bytes.Contains(raw.data, []byte("B")))
++			raw.mu.Unlock()
++		})
++	}
++}
++
++func TestRelayTURNWriteBudgetTerminalStatePrecedesUnderlyingClose(t *testing.T) {
++	raw := newRelayTURNBudgetTestConn()
++	c := newRelayTURNWriteConn(raw)
++	defer c.Close()
++	c.maxBytes = 1
++	type closeObservation struct {
++		closed, done          bool
++		writeErr, deadlineErr error
++		calls, bytes          int
++	}
++	observed := make(chan closeObservation, 1)
++	// The underlying Close can inspect wrapper state without waiting for its
++	// state mutex or the gate. New writes/deadlines must already be refused.
++	raw.beforeClose = func() {
++		var snapshot closeObservation
++		c.mu.Lock()
++		snapshot.closed, snapshot.calls, snapshot.bytes = c.closed, c.calls, c.bytes
++		c.mu.Unlock()
++		select {
++		case <-c.done:
++			snapshot.done = true
++		default:
++		}
++		_, snapshot.writeErr = c.Write([]byte("B"))
++		snapshot.deadlineErr = c.SetWriteDeadline(time.Now().Add(time.Hour))
++		observed <- snapshot
++	}
++	result := awaitRelayTURNWrite(t, startRelayTURNWrite(c, []byte("AA")))
++	require.ErrorIs(t, result.err, errRelayTURNWriteAdmission)
++	select {
++	case snapshot := <-observed:
++		require.True(t, snapshot.closed)
++		require.True(t, snapshot.done)
++		require.ErrorIs(t, snapshot.writeErr, net.ErrClosed)
++		require.ErrorIs(t, snapshot.deadlineErr, net.ErrClosed)
++		require.Zero(t, snapshot.calls)
++		require.Zero(t, snapshot.bytes)
++	case <-time.After(time.Second):
++		t.Fatal("underlying Close did not observe terminal wrapper state")
++	}
++	require.EqualValues(t, 1, raw.closeCalls.Load())
++	requireRelayTURNReleased(t, c)
++}
++
++func TestRelayTURNWriteBudgetInternalTLSRemainsOuterAndProxyAddressesSurvive(t *testing.T) {
++	public, private, err := ed25519.GenerateKey(rand.Reader)
++	require.NoError(t, err)
++	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "owned.invalid"},
++		DNSNames: []string{"owned.invalid"}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour),
++		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
++	der, err := x509.CreateCertificate(rand.Reader, template, template, public, private)
++	require.NoError(t, err)
++	key, err := x509.MarshalPKCS8PrivateKey(private)
++	require.NoError(t, err)
++	folder := t.TempDir()
++	certPath, keyPath := filepath.Join(folder, "owned-cert.pem"), filepath.Join(folder, "owned-key.pem")
++	require.NoError(t, os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
++	require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600))
++	listener, err := newTURNTCPListener(config.TURNConfig{CertFile: certPath, KeyFile: keyPath, ProxyProtocol: true,
++		ProxyProtocolTrustedCIDRs: []string{"127.0.0.0/8"}}, "127.0.0.1:0")
++	require.NoError(t, err)
++	defer listener.Close()
++	complete := make(chan error, 1)
++	go func() {
++		conn, err := listener.Accept()
++		if err != nil {
++			complete <- err
++			return
++		}
++		defer conn.Close()
++		tlsConn, ok := conn.(*tls.Conn)
++		if !ok {
++			complete <- errors.New("Pion TLS type no longer visible")
++			return
++		}
++		if err = conn.SetDeadline(time.Now().Add(3 * time.Second)); err == nil {
++			err = tlsConn.Handshake()
++		}
++		if err == nil && conn.RemoteAddr().String() != "203.0.113.9:40123" {
++			err = errors.New("PROXY remote address changed")
++		}
++		if err == nil && conn.LocalAddr().String() != "127.0.0.1:443" {
++			err = errors.New("PROXY local address changed")
++		}
++		payload := make([]byte, 4)
++		if err == nil {
++			_, err = io.ReadFull(conn, payload)
++		}
++		if err == nil && !bytes.Equal(payload, []byte("ping")) {
++			err = errors.New("control bytes changed")
++		}
++		if err == nil {
++			_, err = conn.Write([]byte("pong"))
++		}
++		complete <- err
++	}()
++	raw, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
++	require.NoError(t, err)
++	defer raw.Close()
++	require.NoError(t, raw.SetDeadline(time.Now().Add(3*time.Second)))
++	_, err = raw.Write([]byte("PROXY TCP4 203.0.113.9 127.0.0.1 40123 443\r\n"))
++	require.NoError(t, err)
++	cert, err := x509.ParseCertificate(der)
++	require.NoError(t, err)
++	roots := x509.NewCertPool()
++	roots.AddCert(cert)
++	client := tls.Client(raw, &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: "owned.invalid"})
++	defer client.Close()
++	require.NoError(t, client.Handshake())
++	_, err = client.Write([]byte("ping"))
++	require.NoError(t, err)
++	reply := make([]byte, 4)
++	_, err = io.ReadFull(client, reply)
++	require.NoError(t, err)
++	require.Equal(t, []byte("pong"), reply)
++	select {
++	case err := <-complete:
++		require.NoError(t, err)
++	case <-time.After(3 * time.Second):
++		t.Fatal("owned TLS/PROXY handler did not finish")
++	}
++}

@@ -38,6 +38,7 @@ struct Helper {
     control: String,
     token: String,
     routes: HashMap<String, Route>,
+    _group: crate::handover_runtime::ProcessGroup,
 }
 static HELPER: OnceLock<Mutex<Option<Helper>>> = OnceLock::new();
 // Keep closed local routes after a helper failure: existing requests must fail
@@ -102,6 +103,14 @@ fn api<T: for<'de> Deserialize<'de>>(
         .send()
         .map_err(|_| "The private connection did not respond.")?;
     if !response.status().is_success() {
+        if path == "/https-media" || path == "/close-https-media" {
+            return Err(if response.status() == reqwest::StatusCode::NOT_FOUND {
+                "Install the complete Relay update to use secure video on this server."
+            } else {
+                "The video connection could not be prepared. Join the call again to retry."
+            }
+            .into());
+        }
         return Err("The private connection is not ready. Open its setup and try again.".into());
     }
     let mut bytes = Vec::new();
@@ -124,6 +133,10 @@ fn launch() -> Result<Helper, String> {
         .parent()
         .ok_or("Cannot locate Relay.")?
         .join("relay-network.exe");
+    #[cfg(test)]
+    let binary = std::env::var_os("RELAY_NETWORK_HELPER")
+        .map(PathBuf::from)
+        .unwrap_or(binary);
     if !binary.is_file() {
         return Err(
             "Extract the complete Relay package to use its built-in private connection.".into(),
@@ -143,6 +156,8 @@ fn launch() -> Result<Helper, String> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
+    let group =
+        crate::handover_runtime::ProcessGroup::new().map_err(|_| "Cannot own the media helper")?;
     let mut child = Command::new(binary)
         .arg("--state-dir")
         .arg(state)
@@ -153,6 +168,11 @@ fn launch() -> Result<Helper, String> {
         .creation_flags(0x08000000)
         .spawn()
         .map_err(|_| "Cannot start the private connection.")?;
+    if group.add(&child).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Cannot own the media helper".into());
+    }
     let output = child
         .stdout
         .take()
@@ -180,6 +200,7 @@ fn launch() -> Result<Helper, String> {
             control,
             token,
             routes: HashMap::new(),
+            _group: group,
         }),
         None => {
             let _ = child.kill();
@@ -462,7 +483,7 @@ pub fn endpoint(address: &str) -> String {
     }
     target.set_path(original.path());
     target.set_query(original.query());
-    target.to_string()
+    same_form(address, &target)
 }
 pub(crate) fn blocked_endpoint(address: &str) -> String {
     let Ok(original) = url::Url::parse(address) else {
@@ -474,7 +495,18 @@ pub(crate) fn blocked_endpoint(address: &str) -> String {
     }
     target.set_path(original.path());
     target.set_query(original.query());
-    target.to_string()
+    same_form(address, &target)
+}
+/// The mapped loopback address in the caller's own form. `Url` always renders
+/// an empty path as "/", so a base address such as `http://host:4580` would come
+/// back as `http://127.0.0.1:N/` and every `{base}/api/...` join would become
+/// `//api/...`, which the private ingress rightly refuses.
+pub(crate) fn same_form(address: &str, mapped: &url::Url) -> String {
+    let mut text = mapped.to_string();
+    if mapped.path() == "/" && mapped.query().is_none() && !address.ends_with('/') {
+        text.pop();
+    }
+    text
 }
 pub fn rtc_turn(address: &str) -> Option<Turn> {
     if let Some((generation, turn)) = iroh_turns().lock().ok()?.get(address).cloned() {
@@ -503,6 +535,19 @@ pub fn prepare_iroh_rtc(
     server_id: &str,
     local: bool,
 ) -> Result<(), String> {
+    if ticket.media_bridge.is_some() && crate::iroh_route::is_iroh(&ticket.url) {
+        let address=ticket.url.replacen("ws://","http://",1);
+        if local {
+            if !crate::local_host::is_local_url(origin)
+                || crate::iroh_route::hosted(server_id).is_none_or(|h|h.address()!=address.trim_end_matches('/'))
+            {return Err("This private video endpoint is not owned by the local host.".into());}
+        }else if crate::iroh_route::endpoint_id(origin)!=crate::iroh_route::endpoint_id(&address){
+            return Err("Private video does not match this community connection.".into());
+        }
+        crate::iroh_route::ensure_route(&address)?;
+        crate::iroh_route::bind_identity(&address,server_id)?;
+        return Ok(());
+    }
     let actual = url::Url::parse(&ticket.url).map_err(|_| "Invalid video address")?;
     if actual.scheme() != "ws"
         || actual.host_str() != Some(crate::iroh_route::ONLY_ADDRESS)
@@ -594,6 +639,136 @@ pub fn prepare_iroh_rtc(
     ticket.url = signaling;
     Ok(())
 }
+/// A single call's local TURN lease. It is deliberately not cached under a
+/// server URL: late cleanup must never close a replacement account or call.
+pub(crate) struct HttpsMediaLease {
+    pub turn: Turn,
+    id: String,
+    generation: [u8; 32],
+}
+fn media_helper_generation(helper: &Helper) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(helper.token.as_bytes()).into()
+}
+impl HttpsMediaLease {
+    pub fn open(bridge: &relay_protocol::RtcMediaBridge, signaling: &str) -> Result<Self, String> {
+        let gateway=if crate::iroh_route::is_iroh(signaling){Some(crate::iroh_route::bound_media_gateway(signaling)?)}else{None};
+        Self::open_bound(bridge,signaling,gateway.as_deref())
+    }
+    pub(crate) fn open_prepared(bridge:&relay_protocol::RtcMediaBridge,signaling:&str,route:&crate::iroh_route::PreparedRoute)->Result<Self,String>{
+        route.signaling(signaling)?;
+        Self::open_bound(bridge,signaling,Some(&route.gateway()?))
+    }
+    fn open_bound(bridge:&relay_protocol::RtcMediaBridge,signaling:&str,gateway:Option<&str>)->Result<Self,String>{
+        let token = &bridge.token;
+        let signal = url::Url::parse(signaling).map_err(|_| "Invalid video signaling origin")?;
+        let media = url::Url::parse(&bridge.url).map_err(|_| "Invalid secure media origin")?;
+        if !(gateway.is_none()&&signal.scheme()=="wss" || gateway.is_some()&&signal.scheme()=="ws"&&crate::iroh_route::is_iroh(signaling))
+            || media.origin() != signal.origin()
+            || media.path() != "/api/rtc/media"
+            || signal.path() != "/"
+            || signal.query().is_some()
+            || signal.fragment().is_some()
+            || !signal.username().is_empty()
+            || signal.password().is_some()
+            || !media.username().is_empty()
+            || media.password().is_some()
+            || media.query().is_some()
+            || media.fragment().is_some()
+            || bridge.peer_ip != "100.127.255.254"
+            || bridge.peer_port == 0
+            || token.is_empty()
+            || token.len() > 16384
+        {
+            return Err(
+                "The secure media route does not match this call's signaling server.".into(),
+            );
+        }
+        #[derive(Deserialize)]
+        struct Reply {
+            id: String,
+            turn: Turn,
+        }
+        let (reply, generation): (Reply, [u8; 32]) = with_helper(true, |h| {
+            let mut body=serde_json::json!({"url":media.as_str(),"token":token,"peer_port":bridge.peer_port});
+            if let Some(gateway)=gateway{body["gateway"]=serde_json::json!(gateway);}
+            let reply = api(
+                h,
+                if gateway.is_some(){"/iroh-https-media"}else{"/https-media"},
+                Some(body),
+            )?;
+            Ok((reply, media_helper_generation(h)))
+        })?;
+        if reply.id.len() != 43
+            || !reply
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            || !valid_turn(&reply.turn)
+        {
+            return Err("The secure media lease could not be verified.".into());
+        }
+        Ok(Self {
+            turn: reply.turn,
+            id: reply.id,
+            generation,
+        })
+    }
+    pub fn alive(&self) -> Option<bool> {
+        let mut guard = slot().try_lock().ok()?;
+        Some(guard.as_mut().is_some_and(|h| {
+            media_helper_generation(h) == self.generation
+                && h.child.try_wait().is_ok_and(|s| s.is_none())
+        }))
+    }
+}
+impl Drop for HttpsMediaLease {
+    fn drop(&mut self) {
+        let id = self.id.clone();
+        let generation = self.generation;
+        let _ = std::thread::Builder::new()
+            .name("relay-close-media".into())
+            .spawn(move || {
+                let _ = with_helper(false, |h| {
+                    if media_helper_generation(h) != generation {
+                        return Ok(serde_json::Value::Null);
+                    }
+                    api::<serde_json::Value>(
+                        h,
+                        "/close-https-media",
+                        Some(serde_json::json!({"id":id})),
+                    )
+                });
+            });
+    }
+}
+
+#[cfg(test)]
+mod secure_media_tests {
+    use super::*;
+    #[test]
+    fn a_media_ticket_cannot_forward_its_bearer_to_a_different_origin_or_udp_peer() {
+        let original = relay_protocol::RtcMediaBridge {
+            url: "wss://calls.example/api/rtc/media".into(),
+            peer_ip: "100.127.255.254".into(),
+            peer_port: 7882,
+            token: "never-forward-this".into(),
+        };
+        for change in 0..6 {
+            let mut bridge = original.clone();
+            match change {
+                0 => bridge.url = "wss://unrelated.example/api/rtc/media".into(),
+                1 => bridge.url += "?access_token=forbidden",
+                2 => bridge.peer_ip = "127.0.0.1".into(),
+                3 => bridge.peer_port = 0,
+                4 => bridge.url = "wss://calls.example:9443/api/rtc/media".into(),
+                _ => bridge.url = "wss://calls.example/rtc".into(),
+            }
+            assert!(HttpsMediaLease::open(&bridge, "wss://calls.example/").is_err());
+        }
+    }
+}
+
 pub fn new_voice_route(address: &str) -> Result<(String, u16), String> {
     if crate::iroh_route::is_iroh(address) {
         return crate::iroh_route::new_voice_route(address);

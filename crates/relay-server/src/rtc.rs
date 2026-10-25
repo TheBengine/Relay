@@ -9,6 +9,7 @@ pub struct RtcConfig {
     pub api_url: String,
     pub api_key: String,
     pub api_secret: String,
+    pub(super) media_port: Option<u16>,
     client: reqwest::Client,
 }
 impl std::fmt::Debug for RtcConfig {
@@ -44,8 +45,10 @@ impl RtcConfig {
             api_url: api_url.trim_end_matches('/').to_owned(),
             api_key,
             api_secret,
+            media_port: None,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(3))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
         })
     }
@@ -66,7 +69,52 @@ impl RtcConfig {
                 .replacen("wss://", "https://", 1)
                 .replacen("ws://", "http://", 1);
         }
-        Ok(Some(Self::new(url, api, key, secret)?))
+        let mut config = Self::new(url, api, key, secret)?;
+        if let Ok(port) = std::env::var("RELAY_RTC_MEDIA_UDP_PORT") {
+            config = config.with_media_bridge(port.parse()?)?;
+        }
+        Ok(Some(config))
+    }
+    /// Explicitly opt in only for an app-owned SFU on numeric loopback. The
+    /// remote peer can never choose another UDP address or port.
+    pub fn with_media_bridge(mut self, port: u16) -> Result<Self, Box<dyn std::error::Error>> {
+        let api = reqwest::Url::parse(&self.api_url)?;
+        let public = reqwest::Url::parse(&self.url)?;
+        if port == 0
+            || !api
+                .host_str()
+                .is_some_and(|h| matches!(h, "127.0.0.1" | "[::1]" | "::1"))
+            || public.path() != "/"
+            || public.query().is_some()
+            || public.fragment().is_some()
+            || !(public.scheme() == "wss" || private_signaling(&public)
+                || cfg!(test) && public.scheme() == "ws" && public.host_str() == Some("127.0.0.1"))
+        {
+            return Err("Secure media requires the local SFU and its exact signaling origin".into());
+        }
+        self.media_port = Some(port);
+        Ok(self)
+    }
+    fn media_bridge(&self, claims: &Value) -> ApiResult<Option<relay_protocol::RtcMediaBridge>> {
+        let Some(port) = self.media_port else {
+            return Ok(None);
+        };
+        let mut url = reqwest::Url::parse(&self.url).map_err(|_| unavailable())?;
+        url.set_path("/api/rtc/media");
+        let mut media = claims.clone();
+        // An ongoing call may open another ICE allocation after the one-minute
+        // signaling admission expires. This capability opens only the fixed
+        // media route and is checked against live membership every second.
+        media["exp"] = json!(now() + VOICE_LIFETIME);
+        media["purpose"] = json!("relay-https-media-v1");
+        media["video"]["roomJoin"] = json!(false);
+        media["video"]["canSubscribe"] = json!(false);
+        Ok(Some(relay_protocol::RtcMediaBridge {
+            url: url.to_string(),
+            peer_ip: "100.127.255.254".into(),
+            peer_port: port,
+            token: self.sign(&media)?,
+        }))
     }
     pub(super) fn sign(&self, claims: &Value) -> ApiResult<String> {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
@@ -138,6 +186,13 @@ impl RtcConfig {
         }
         Err(unavailable())
     }
+}
+
+pub(super) fn private_signaling(url:&reqwest::Url)->bool{
+    url.scheme()=="ws"&&url.port()==Some(4580)&&url.username().is_empty()
+        &&url.password().is_none()&&url.path()=="/"&&url.query().is_none()&&url.fragment().is_none()
+        &&url.host_str().and_then(|h|h.strip_suffix(".iroh")).is_some_and(|key|
+            key.len()==64&&key.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)))
 }
 fn unavailable() -> ApiError {
     ApiError::new(
@@ -251,9 +306,11 @@ pub async fn rtc_token(
     }) {
         return Err(forbidden());
     }
-    let room = format!("relay-{}-{}", server_id(&db)?, input.channel_id);
+    let room = state.0.handover.media_room(&input.channel_id);
     let can_publish = channel_access(&db, &input.channel_id, &auth.user.id, STREAM).is_ok();
-    let token=config.sign(&json!({"iss":config.api_key,"sub":auth.user.id,"nbf":now().saturating_sub(5),"exp":now()+60,"attributes":{"relay_session":auth.token_hash,"relay_channel":input.channel_id,"relay_server":server_id(&db)?},"video":{"room":room,"roomJoin":true,"canSubscribe":true,"canPublish":can_publish,"canPublishData":false,"canUpdateOwnMetadata":false,"canPublishSources":["camera","screen_share","screen_share_audio"]}}))?;
+    let claims = json!({"iss":config.api_key,"sub":auth.user.id,"nbf":now().saturating_sub(5),"exp":now()+60,"attributes":{"relay_session":auth.token_hash,"relay_channel":input.channel_id,"relay_server":server_id(&db)?},"video":{"room":room,"roomJoin":true,"canSubscribe":true,"canPublish":can_publish,"canPublishData":false,"canUpdateOwnMetadata":false,"canPublishSources":["camera","screen_share","screen_share_audio"]}});
+    let token = config.sign(&claims)?;
+    let media_bridge = config.media_bridge(&claims)?;
     lock(&state.0.rtc_members).insert(
         auth.user.id,
         RtcMembership {
@@ -267,6 +324,7 @@ pub async fn rtc_token(
         url: config.url.clone(),
         token,
         room,
+        media_bridge,
     }))
 }
 #[derive(Deserialize)]
@@ -305,7 +363,25 @@ pub async fn rtc_authorize(
     validate_claims(&state, &claims)?;
     Ok(StatusCode::OK)
 }
-fn validate_claims(state: &AppState, claims: &Value) -> ApiResult<()> {
+pub(super) fn validate_claims(state: &AppState, claims: &Value) -> ApiResult<()> {
+    if claims["video"]["roomJoin"] != true || !claims["purpose"].is_null() {
+        return Err(forbidden());
+    }
+    validate_membership(state, claims)
+}
+pub(super) fn validate_media_claims(state: &AppState, claims: &Value) -> ApiResult<()> {
+    if claims["purpose"] != "relay-https-media-v1" || claims["video"]["roomJoin"] != false {
+        return Err(forbidden());
+    }
+    validate_membership(state, claims)
+}
+fn validate_membership(state: &AppState, claims: &Value) -> ApiResult<()> {
+    if !state.0.handover.writes_allowed() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "This host is paused for handover",
+        ));
+    }
     let user = claims["sub"].as_str().ok_or_else(unauthorized)?;
     let session = claims["attributes"]["relay_session"]
         .as_str()
@@ -315,8 +391,7 @@ fn validate_claims(state: &AppState, claims: &Value) -> ApiResult<()> {
         .ok_or_else(unauthorized)?;
     let db = lock(&state.0.db);
     if claims["attributes"]["relay_server"] != server_id(&db)?
-        || claims["video"]["room"] != format!("relay-{}-{channel}", server_id(&db)?)
-        || claims["video"]["roomJoin"] != true
+        || claims["video"]["room"] != state.0.handover.media_room(channel)
     {
         return Err(forbidden());
     }
@@ -367,18 +442,7 @@ pub async fn rtc_validate(
     let config = state.0.config.rtc.as_ref().ok_or_else(unavailable)?;
     let token = request_token(&uri, &headers)?;
     validate_claims(&state, &config.verify(&token)?)?;
-    let result = config
-        .client
-        .get(format!("{}{}", config.api_url, uri))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|_| unavailable())?;
-    let status = StatusCode::from_u16(result.status().as_u16()).map_err(|_| unavailable())?;
-    if !status.is_success() {
-        return Err(ApiError::new(status, "Video signaling validation failed"));
-    }
-    Ok("success".into_response())
+    config.validate_signal(&uri, &token).await
 }
 pub async fn rtc_proxy(
     State(state): State<AppState>,
@@ -386,7 +450,7 @@ pub async fn rtc_proxy(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
-    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig};
+    let authority = state.0.handover.watch_transports();
     let config = state.0.config.rtc.as_ref().ok_or_else(unavailable)?;
     let token = request_token(&uri, &headers)?;
     let claims = config.verify(&token)?;
@@ -406,10 +470,47 @@ pub async fn rtc_proxy(
             "Server is stopping",
         ));
     }
+    let upstream = config.connect_signal(&uri, &token).await?;
+    Ok(ws
+        .max_message_size(1024 * 1024)
+        .max_frame_size(1024 * 1024)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            bridge(state, claims, socket, upstream, authority).await
+        }))
+}
+pub(super) type SignalSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+impl RtcConfig {
+    pub(super) async fn validate_signal(
+        &self,
+        uri: &axum::http::Uri,
+        token: &str,
+    ) -> ApiResult<Response> {
+        let result = self
+            .client
+            .get(format!("{}{}", self.api_url, uri))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| unavailable())?;
+        let status = StatusCode::from_u16(result.status().as_u16()).map_err(|_| unavailable())?;
+        if !status.is_success() {
+            return Err(ApiError::new(status, "Video signaling validation failed"));
+        }
+        Ok("success".into_response())
+    }
+    pub(super) async fn connect_signal(
+        &self,
+        uri: &axum::http::Uri,
+        token: &str,
+    ) -> ApiResult<SignalSocket> {
+        use tokio_tungstenite::tungstenite::{
+            client::IntoClientRequest, protocol::WebSocketConfig,
+        };
     let upstream = format!(
         "{}{}",
-        config
-            .api_url
+            self.api_url
             .replacen("https://", "wss://", 1)
             .replacen("http://", "ws://", 1),
         uri
@@ -433,36 +534,69 @@ pub async fn rtc_proxy(
     .await
     .map_err(|_| unavailable())?
     .map_err(|_| unavailable())?;
-    Ok(ws
-        .max_message_size(1024 * 1024)
-        .max_frame_size(1024 * 1024)
-        .on_upgrade(move |socket| async move {
-            let _permit = permit;
-            bridge(state, claims, socket, upstream).await
-        }))
+        Ok(upstream)
+    }
 }
 async fn bridge(
     state: AppState,
     claims: Value,
-    mut socket: WebSocket,
-    mut upstream: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    socket: WebSocket,
+    upstream: SignalSocket,
+    mut authority: tokio::sync::watch::Receiver<()>,
 ) {
+    let stopped = state.clone();
+    let active = state.clone();
+    let checking = state.clone();
+    forward_signal(
+        socket,
+        upstream,
+        move || {
+            let state = checking.clone();
+            let claims = claims.clone();
+            async move {
+                let checked = state.clone();
+                let job = tokio::task::spawn_blocking(move || validate_claims(&checked, &claims));
+                wait_for_validation(&state, job).await
+            }
+        },
+        move || active.0.handover.writes_allowed() && !*active.0.shutdown.borrow(),
+        async move {
+            tokio::select! {_=authority.changed()=>{},_=stopped.shutdown_requested()=>{}}
+        },
+    )
+    .await;
+}
+pub(super) async fn forward_signal<C, CF, A, S>(
+    mut socket: WebSocket,
+    mut upstream: SignalSocket,
+    validate: C,
+    active: A,
+    stopped: S,
+) where
+    C: Fn() -> CF + Send + Sync,
+    CF: std::future::Future<Output = bool> + Send,
+    A: Fn() -> bool + Send + Sync,
+    S: std::future::Future<Output = ()> + Send,
+{
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as Upstream;
+    tokio::pin!(stopped);
     let mut check = tokio::time::interval(Duration::from_secs(1));
     loop {
+        if !active() {
+            break;
+        }
         tokio::select! {
-            _=state.shutdown_requested()=>break,
+            biased;
+            _=&mut stopped=>break,
             client=socket.recv()=>{let Some(Ok(client))=client else{break;};let message=match client{WsMessage::Text(text)=>Upstream::Text(text.to_string().into()),WsMessage::Binary(bytes)=>Upstream::Binary(bytes),WsMessage::Ping(bytes)=>Upstream::Ping(bytes),WsMessage::Pong(bytes)=>Upstream::Pong(bytes),WsMessage::Close(_)=>break};
                 if !matches!(tokio::time::timeout(Duration::from_secs(3),upstream.send(message)).await,Ok(Ok(()))){break;}}
             server=upstream.next()=>{let Some(Ok(server))=server else{break;};let message=match server{Upstream::Text(text)=>WsMessage::Text(text.to_string().into()),Upstream::Binary(bytes)=>WsMessage::Binary(bytes),Upstream::Ping(bytes)=>WsMessage::Ping(bytes),Upstream::Pong(bytes)=>WsMessage::Pong(bytes),Upstream::Close(_)=>break,Upstream::Frame(_)=>continue};
                 if !matches!(tokio::time::timeout(Duration::from_secs(3),socket.send(message)).await,Ok(Ok(()))){break;}}
             _=check.tick()=>{
-                let check_state=state.clone();let claims=claims.clone();
-                let validation=tokio::task::spawn_blocking(move||validate_claims(&check_state,&claims));
-                if !wait_for_validation(&state,validation).await {break;}
+                let valid=tokio::select!{biased;_=&mut stopped=>false,
+                    result=tokio::time::timeout(Duration::from_secs(3),validate())=>matches!(result,Ok(true))};
+                if !valid{break;}
             }
         }
     }
@@ -481,5 +615,100 @@ pub(super) async fn wait_for_validation(
         biased;
         _=state.shutdown_requested()=>false,
         result=tokio::time::timeout(Duration::from_secs(3),validation)=>matches!(result,Ok(Ok(Ok(())))),
+    }
+}
+
+impl RtcConfig {
+    pub(crate) fn handover_binding(&self) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"relay-handover-sfu-binding-v1\0");
+        for value in [&self.api_url, &self.api_key, &self.api_secret] {
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        hash.finalize().iter().map(|v| format!("{v:02x}")).collect()
+    }
+
+    /// Checks the destination's own administrative connection without changing
+    /// rooms, producing a media token, or touching capture/playback devices.
+    pub(crate) async fn handover_ready(&self) -> ApiResult<()> {
+        let prefix = format!("relay-preflight-{}-", Uuid::new_v4());
+        self.rooms_in_prefix(&prefix, false).await.map(|_| ())
+    }
+
+    async fn rooms_in_prefix(&self, prefix: &str, legacy: bool) -> ApiResult<Vec<String>> {
+        let token = self.sign(&json!({"iss":self.api_key,"nbf":now().saturating_sub(5),"exp":now()+30,"video":{"roomList":true}}))?;
+        let mut response = self
+            .client
+            .post(format!(
+                "{}/twirp/livekit.RoomService/ListRooms",
+                self.api_url
+            ))
+            .bearer_auth(token)
+            .json(&json!({}))
+            .send()
+            .await
+            .map_err(|_| unavailable())?;
+        if !response.status().is_success() {
+            return Err(unavailable());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
+            if body.len() + chunk.len() > 1024 * 1024 {
+                return Err(unavailable());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        #[derive(Deserialize)]
+        struct Room {
+            name: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Rooms {
+            #[serde(default)]
+            rooms: Vec<Room>,
+        }
+        let list: Rooms = serde_json::from_slice(&body).map_err(|_| unavailable())?;
+        if list.rooms.len() > 4096 {
+            return Err(unavailable());
+        }
+        let mut names = Vec::new();
+        for room in list.rooms {
+            let Some(channel) = room.name.strip_prefix(prefix) else {
+                continue;
+            };
+            if Uuid::parse_str(channel).is_ok_and(|id| id.to_string() == channel) {
+                names.push(room.name);
+            } else if !legacy {
+                return Err(unavailable());
+            }
+        }
+        Ok(names)
+    }
+    pub(crate) async fn drain_prefix(&self, prefix: &str, legacy: bool) -> ApiResult<()> {
+        let mut jobs = tokio::task::JoinSet::new();
+        for room in self
+            .rooms_in_prefix(prefix, legacy)
+            .await?
+            .into_iter()
+            .take(8)
+        {
+            let config = self.clone();
+            jobs.spawn(async move {
+                let token = config.sign(&json!({"iss":config.api_key,"nbf":now().saturating_sub(5),"exp":now()+30,"video":{"roomCreate":true}}))?;
+                let response = config.client.post(format!("{}/twirp/livekit.RoomService/DeleteRoom", config.api_url))
+                    .bearer_auth(token).json(&json!({"room":room})).send().await.map_err(|_| unavailable())?;
+                if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND { Ok(()) } else { Err(unavailable()) }
+            });
+        }
+        while let Some(result) = jobs.join_next().await {
+            result.map_err(|_| unavailable())??;
+        }
+        if self.rooms_in_prefix(prefix, legacy).await?.is_empty() {
+            Ok(())
+        } else {
+            Err(unavailable())
+        }
     }
 }

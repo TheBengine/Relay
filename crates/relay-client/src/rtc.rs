@@ -55,6 +55,8 @@ const MAX_VIDEO_BYTES: usize = 64 * 1024 * 1024;
 mod embedded_tests;
 const MAX_STREAMS: usize = 16;
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
+#[path = "rtc_handover.rs"]
+pub(crate) mod handover_probe;
 const RTC_ENDED: &str = "Video connection closed. Choose Connect Video to reconnect, then select your camera or screen again.";
 const RTC_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SOURCE_GENERATION: u64 = u64::MAX >> 2;
@@ -772,7 +774,26 @@ async fn worker(
     crate::tls_crypto::initialize();
     let mut options = protected_room_options(&state.call_keys)?;
     let private_route = crate::embedded_network::routed(&ticket.url);
-    if let Some(turn) = crate::embedded_network::rtc_turn(&ticket.url) {
+    let https_media = if let Some(bridge) = ticket.media_bridge.clone() {
+        let signaling = ticket.url.clone();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                crate::embedded_network::HttpsMediaLease::open(&bridge, &signaling)
+            })
+            .await
+            .map_err(|_| "Secure media setup could not finish")??,
+        )
+    } else {
+        None
+    };
+    if state.stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let turn = https_media
+        .as_ref()
+        .map(|m| m.turn.clone())
+        .or_else(|| crate::embedded_network::rtc_turn(&ticket.url));
+    if let Some(turn) = turn {
         use livekit::webrtc::peer_connection_factory::{IceServer, IceTransportsType};
         options.rtc_config.ice_servers = vec![IceServer {
             urls: vec![turn.url],
@@ -856,8 +877,11 @@ async fn worker(
         let local_work =
             !publications.is_empty() || !jobs.pending.is_empty() || !jobs.queued.is_empty();
         tokio::select! {
-            _=async {if private_route {private_connection_tick.tick().await;} else {std::future::pending::<()>().await;}}=>{
-                if crate::embedded_network::endpoint(&ticket.url)!=connection_url {
+            _=async {if private_route||https_media.is_some() {private_connection_tick.tick().await;} else {std::future::pending::<()>().await;}}=>{
+                if https_media.as_ref().is_some_and(|m|m.alive()==Some(false)) {
+                    terminal_error=Some("The video connection stopped. Join the call again to reconnect.".into());break;
+                }
+                if private_route&&crate::embedded_network::endpoint(&ticket.url)!=connection_url {
                     terminal_error=Some("The private video connection stopped. Reconnect the private network and join the call again.".into());
                     break;
                 }

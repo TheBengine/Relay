@@ -75,6 +75,13 @@ impl VoiceRecovery {
             self.confirm(now)
         }
     }
+    /// Retire evidence from a lost selected route. Do not grant extra recovery
+    /// time if the existing route was already reconnecting or expired.
+    pub fn route_lost(&mut self, now: Instant) {
+        if let Some(cutoff) = now.checked_sub(PROBE_TIMEOUT) {
+            self.last_reply = Some(self.last_reply.unwrap_or(self.started).min(cutoff));
+        }
+    }
     /// The caller must verify endpoint, AEAD, replay and the pending probe ID.
     /// A late reply cannot revive a transport that has reached its deadline.
     pub fn confirm(&mut self, now: Instant) -> bool {
@@ -89,6 +96,19 @@ impl VoiceRecovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn losing_a_selected_route_retires_its_proof_without_extending_recovery() {
+        let start = Instant::now();
+        let mut link = VoiceRecovery::new(start);
+        assert!(link.confirm(start + Duration::from_secs(2)));
+        link.route_lost(start + Duration::from_secs(3));
+        assert!(matches!(link.state(start + Duration::from_secs(3)), LinkState::Reconnecting { .. }));
+        let deadline = link.state(start + Duration::from_secs(12));
+        link.route_lost(start + Duration::from_secs(12));
+        assert_eq!(link.state(start + Duration::from_secs(12)), deadline);
+        link.route_lost(start + Duration::from_secs(40));
+        assert_eq!(link.state(start + Duration::from_secs(40)), LinkState::Expired);
+    }
     #[test]
     fn fresh_older_probes_can_reply_after_newer_sends_once_in_either_order() {
         let start = Instant::now();

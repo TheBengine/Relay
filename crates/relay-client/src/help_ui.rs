@@ -4,6 +4,8 @@
 //! network; only an explicit button click does what that button names.
 use super::*;
 use crate::settings_ui as controls;
+#[path = "recovery_help.rs"]
+mod recovery_help;
 
 /// What the viewer can do now; decides which steps and buttons apply.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -194,6 +196,9 @@ impl RelayApp {
             Some(HelpAction::KeyboardShortcuts) => self.settings_tab = SettingsTab::Keybinds,
             _ => {}
         }
+        self.connection_status_section(ui);
+        self.recovery_help_section(ui);
+        self.support_report_section(ui);
     }
 }
 

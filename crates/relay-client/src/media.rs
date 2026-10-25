@@ -115,6 +115,7 @@ struct AudioControls {
     whisper_ciphers: Mutex<HashMap<String, CallCipher>>,
     whisper_requested: Mutex<BTreeSet<String>>,
     direct_enabled: AtomicBool,
+    gateway_enabled: Arc<AtomicBool>,
     private_network: AtomicBool,
     direct: Mutex<Option<crate::direct_voice::DirectVoice>>,
     tcp_enabled: AtomicBool,
@@ -187,6 +188,7 @@ impl AudioControls {
             whisper_ciphers: Mutex::default(),
             whisper_requested: Mutex::default(),
             direct_enabled: AtomicBool::new(settings.direct_voice_enabled),
+            gateway_enabled: Arc::new(AtomicBool::new(settings.local_voice_gateways)),
             private_network: AtomicBool::new(false),
             direct: Mutex::new(None),
             tcp_enabled: AtomicBool::new(settings.tcp_fallback_enabled),
@@ -264,6 +266,7 @@ impl AudioControls {
             }
         }
         self.voice_qos.store(settings.voice_qos, Ordering::Release);
+        self.gateway_enabled.store(settings.local_voice_gateways, Ordering::Release);
         self.tcp_enabled
             .store(settings.tcp_fallback_enabled, Ordering::Relaxed);
         self.priority_enabled
@@ -406,6 +409,9 @@ pub struct NetworkStats {
     pub input_timing: Option<DeviceTiming>,
     pub output_timing: Option<DeviceTiming>,
     pub direct_active: bool,
+    pub gateway_active: bool,
+    pub gateway_round_trip_ms: Option<f32>,
+    pub gateway_round_trip_age: Option<Duration>,
     pub direct_round_trip_ms: Option<f32>,
     pub direct_round_trip_age: Option<Duration>,
     /// Authenticated voice probe over the WebSocket fallback, not an HTTP check.
@@ -456,6 +462,9 @@ struct Counters {
     udp_rtt_us: AtomicU64,
     udp_rtt_at: AtomicU64,
     direct_active: AtomicBool,
+    gateway_active: AtomicBool,
+    gateway_rtt_us: AtomicU64,
+    gateway_rtt_at: AtomicU64,
     direct_rtt_us: AtomicU64,
     direct_rtt_at: AtomicU64,
     tcp_rtt_us: AtomicU64,
@@ -515,6 +524,12 @@ impl Counters {
             input_timing: None,
             output_timing: None,
             direct_active: self.direct_active.load(Ordering::Acquire),
+            gateway_active: self.gateway_active.load(Ordering::Acquire),
+            gateway_round_trip_ms: match self.gateway_rtt_us.load(Ordering::Relaxed) {
+                0 => None,
+                us => Some(us as f32 / 1000.0),
+            },
+            gateway_round_trip_age: self.clock.age(self.gateway_rtt_at.load(Ordering::Acquire), now),
             direct_round_trip_ms: match self.direct_rtt_us.load(Ordering::Relaxed) {
                 0 => None,
                 us => Some(us as f32 / 1000.0),
@@ -566,6 +581,7 @@ struct VoiceStart {
     counters: Arc<Counters>,
     settings: AudioSettings,
     call_keys: Arc<CallKeys>,
+    gateway: Option<crate::gateway_control::Config>,
 }
 
 struct MicrophoneStart {
@@ -832,6 +848,15 @@ impl MediaEngine {
         ticket: VoiceTicket,
         call_keys: Arc<CallKeys>,
     ) -> Result<(), String> {
+        self.start_voice_with_gateway(host, ticket, call_keys, None)
+    }
+    pub fn start_voice_with_gateway(
+        &mut self,
+        host: &str,
+        ticket: VoiceTicket,
+        call_keys: Arc<CallKeys>,
+        gateway: Option<crate::gateway_control::Config>,
+    ) -> Result<(), String> {
         validate_call_keys(&call_keys)?;
         if ticket.wire_version < 3 {
             return Err("This server cannot relay protected voice. Update the host.".into());
@@ -842,6 +867,7 @@ impl MediaEngine {
         self.voice_queues = Some((capture.clone(), playback.clone()));
         self.counters = Arc::new(Counters::default());
         let request = VoiceStart {
+            gateway,
             host: host.into(),
             ticket,
             stop,
@@ -1605,6 +1631,7 @@ impl NativeAudio {
             counters,
             settings,
             call_keys,
+            gateway,
         } = request;
         self.stop_voice();
         let private = crate::embedded_network::routed(&host);
@@ -1694,6 +1721,9 @@ impl NativeAudio {
             });
         }
         let args = VoiceWorker {
+            gateway: gateway.and_then(|config| crate::gateway_control::Session::start(
+                config, remote, self.controls.gateway_enabled.clone(), stop.clone(),
+            )),
             playback_limit: playback_limit.clone(),
             socket,
             remote,
@@ -2914,6 +2944,7 @@ where
 }
 
 struct VoiceWorker {
+    gateway: Option<crate::gateway_control::Session>,
     playback_limit: Arc<AtomicUsize>,
     socket: UdpSocket,
     remote: SocketAddr,
@@ -3676,6 +3707,7 @@ fn voice_worker(mut w: VoiceWorker) {
     let mut pending_probes = crate::voice_recovery::PendingProbes::default();
     let mut pending_tcp_probes = crate::voice_recovery::PendingProbes::default();
     let mut last_tcp_reply: Option<Instant> = None;
+    let mut last_tcp_ready = false;
     let mut recovery = crate::voice_recovery::VoiceRecovery::new(started);
     while !w.stop.load(Ordering::Acquire) {
         let generation = w
@@ -3707,11 +3739,23 @@ fn voice_worker(mut w: VoiceWorker) {
                 w.socket.recv_from(&mut buffer)
             };
             match received {
-                Ok((n, from)) => {
+                Ok((n, mut from)) => {
                     if n > UDP_MAX_PACKET {
                         w.counters.rejected.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
+                    let via_gateway = !via_tcp && from != w.remote && buffer[..n].starts_with(b"RGW1")
+                        && w.gateway.as_ref().and_then(|gateway| gateway.with_path(|path| path.address == from)).unwrap_or(false);
+                    let n = if via_gateway {
+                        let inner = w.gateway.as_ref().and_then(|gateway| gateway.with_path(
+                            |path| path.receive(from, &buffer[..n], Instant::now())
+                        )).flatten();
+                        let Some(inner) = inner else { continue; };
+                        let n = inner.len();
+                        buffer[..n].copy_from_slice(&inner);
+                        from = w.remote;
+                        n
+                    } else { n };
                     let plaintext = if !via_tcp
                         && from != w.remote
                         && buffer[..n].starts_with(relay_protocol::direct_voice::MARKER)
@@ -3771,6 +3815,14 @@ fn voice_worker(mut w: VoiceWorker) {
                         continue;
                     }
                     w.counters.received.fetch_add(1, Ordering::Relaxed);
+                    if plaintext.first() == Some(&relay_protocol::UDP_PATH_PROBE) {
+                        if via_gateway {
+                            if let Some(gateway) = &w.gateway {
+                                gateway.with_path(|path| path.confirm_server(&plaintext, Instant::now()));
+                            }
+                        }
+                        continue;
+                    }
                     if plaintext.first() == Some(&UDP_PING) && plaintext.len() == 9 {
                         if via_tcp {
                             let now = Instant::now();
@@ -3800,7 +3852,8 @@ fn voice_worker(mut w: VoiceWorker) {
                                     .is_some_and(|reply| reply.elapsed() < Duration::from_secs(5)),
                             ) {
                                 let now = Instant::now();
-                                w.counters.udp_rtt_us.store(
+                                if !via_gateway {
+                                    w.counters.udp_rtt_us.store(
                                     now.duration_since(sent)
                                         .as_micros()
                                         .max(1)
@@ -3811,6 +3864,7 @@ fn voice_worker(mut w: VoiceWorker) {
                                 w.counters
                                     .udp_rtt_at
                                     .store(w.counters.clock.tick(now), Ordering::Release);
+                                }
                             }
                         }
                         continue;
@@ -3875,8 +3929,20 @@ fn voice_worker(mut w: VoiceWorker) {
             }
         }
         let now = Instant::now();
+        if gateway_tick(&w, &mut sequence, now) {
+            next_probe = now;
+            if !w.counters.gateway_active.load(Ordering::Acquire)
+                && !w.counters.clock.age(w.counters.udp_rtt_at.load(Ordering::Acquire), now)
+                    .is_some_and(|age| age < Duration::from_secs(5))
+            {
+                recovery.route_lost(now);
+                w.counters.publish_udp_link(recovery.state(now));
+                send_tunnel_control(&w, &mut sequence, &[0]);
+            }
+        }
         let direct_enabled = w.wire_version >= 4
             && w.controls.direct_enabled.load(Ordering::Acquire)
+            && !w.counters.gateway_active.load(Ordering::Acquire)
             && w.counters.udp_reachable();
         if direct_enabled != direct_was_enabled || (direct_enabled && now >= next_direct_request) {
             next_direct_request = now + Duration::from_millis(200);
@@ -3997,6 +4063,11 @@ fn voice_worker(mut w: VoiceWorker) {
             } else {
                 false
             };
+            if tcp_ready && !last_tcp_ready {
+                send_tunnel_control(&w, &mut sequence, &[0]);
+                next_probe = now;
+            }
+            last_tcp_ready = tcp_ready;
             w.counters.tcp_active.store(
                 tcp_ready
                     && last_tcp_reply.is_some_and(|reply| reply.elapsed() < Duration::from_secs(5)),
@@ -4402,6 +4473,7 @@ fn voice_worker(mut w: VoiceWorker) {
         }
     }
     w.counters.stop_udp_link();
+    w.counters.gateway_active.store(false, Ordering::Release);
     w.counters.direct_active.store(false, Ordering::Release);
     w.counters.direct_rtt_us.store(0, Ordering::Relaxed);
     if let Ok(mut direct) = w.controls.direct.lock() {
@@ -4443,8 +4515,54 @@ fn discard_encoder_history(encoder: &mut Encoder, errors: &ErrorSlot, stop: &Ato
     }
 }
 
+fn gateway_tick(w: &VoiceWorker, sequence: &mut u64, now: Instant) -> bool {
+    if w.stop.load(Ordering::Acquire) { return false; }
+    let Some(gateway) = &w.gateway else { return false; };
+    gateway.with_path(|path| {
+        if let Some(packet) = path.hop_probe(now) {
+            let _ = w.socket.send_to(&packet, path.address);
+        }
+        if let Some(probe) = path.server_challenge(now) {
+            // Reserve the ordinary session nonce even when the candidate fails.
+            if let Some(next) = sequence.checked_add(1) {
+                let reserved = *sequence;
+                *sequence = next;
+                if let Some(packet) = seal_packet(&w.cipher, w.session_id, reserved, 0, &probe)
+                    .and_then(|packet| path.wrap(&packet, now))
+                {
+                    let _ = w.socket.send_to(&packet, path.address);
+                }
+            }
+        }
+    });
+    let tcp = w.counters.tcp_active.load(Ordering::Acquire) && !w.counters.udp_reachable();
+    let previous = if w.counters.direct_active.load(Ordering::Acquire) {
+        w.counters.direct_rtt_us.load(Ordering::Relaxed)
+    } else if tcp {
+        w.counters.tcp_rtt_us.load(Ordering::Relaxed)
+    } else {
+        w.counters.udp_rtt_us.load(Ordering::Relaxed)
+    };
+    let failed = !tcp && w.counters.udp_link.load(Ordering::Acquire) & 2 != 0;
+    let (active, changed) = gateway.select(now, previous, failed);
+    w.counters.gateway_active.store(active, Ordering::Release);
+    let sample = gateway.with_path(|path| (path.server_rtt_us(), path.server_measured_at()));
+    w.counters.gateway_rtt_us.store(sample.and_then(|s| s.0).unwrap_or(0), Ordering::Relaxed);
+    w.counters.gateway_rtt_at.store(sample.and_then(|s| s.1).map(|at| w.counters.clock.tick(at)).unwrap_or(0), Ordering::Release);
+    if changed {
+        // Both selection and fallback must bind the new path before its first
+        // audio. A failed admission never changes the server's active binding.
+        send_packet(w, sequence, &[0]);
+        if !active && !w.counters.udp_reachable() {
+            send_tunnel_control(w, sequence, &[0]);
+        }
+    }
+    changed
+}
+
 fn send_tunnel_control(w: &VoiceWorker, sequence: &mut u64, plaintext: &[u8]) -> bool {
-    if w.stop.load(Ordering::Acquire) || !w.controls.tcp_allowed() {
+    if w.stop.load(Ordering::Acquire) || !w.controls.tcp_allowed()
+        || w.counters.gateway_active.load(Ordering::Acquire) {
         return false;
     }
     let Ok(tunnel) = w.controls.tunnel.lock() else {
@@ -4498,6 +4616,7 @@ fn send_packet_at(w: &VoiceWorker, sequence: &mut u64, plaintext: &[u8], generat
     *sequence += 1;
     if plaintext.first() == Some(&AUDIO_PACKET_V3)
         && w.controls.direct_enabled.load(Ordering::Acquire)
+        && !w.counters.gateway_active.load(Ordering::Acquire)
         && w.counters.udp_reachable()
     {
         let direct = w.controls.direct.lock().ok().and_then(|mut route| {
@@ -4531,6 +4650,24 @@ fn send_packet_at(w: &VoiceWorker, sequence: &mut u64, plaintext: &[u8], generat
             || (audio && w.controls.privacy_generation.load(Ordering::Acquire) != generation)
         {
             return false;
+        }
+        if let Some(gateway) = &w.gateway {
+            match gateway.wrap_selected(&packet, Instant::now()) {
+                Ok(Some((address, packet))) => {
+                    if !packet_send_allowed(w, plaintext)
+                        || (audio && w.controls.privacy_generation.load(Ordering::Acquire) != generation)
+                    { return false; }
+                    let sent = w.socket.send_to(&packet, address).is_ok();
+                    if sent {
+                        w.counters.sent.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(test)]
+                        if audio { w.counters.sent_microphone_audio.fetch_add(1, Ordering::Relaxed); }
+                    }
+                    return sent;
+                }
+                Err(()) => return false,
+                Ok(None) => {}
+            }
         }
         if !matches!(plaintext.first().copied(), Some(0 | UDP_PING))
             && !w.counters.udp_reachable()
@@ -8194,6 +8331,7 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let counters = Arc::new(Counters::default());
             let worker = VoiceWorker {
+                gateway: None,
                 playback_limit: Arc::new(AtomicUsize::new(MAX_PLAYBACK_SAMPLES)),
                 socket,
                 remote,
@@ -8285,6 +8423,7 @@ mod tests {
         let counters = Arc::new(Counters::default());
         (
             VoiceWorker {
+                gateway: None,
                 playback_limit: Arc::new(AtomicUsize::new(MAX_PLAYBACK_SAMPLES)),
                 socket,
                 remote,
@@ -8981,6 +9120,7 @@ mod tests {
         socket.set_nonblocking(true).unwrap();
         let counters = Arc::new(Counters::default());
         let worker = VoiceWorker {
+            gateway: None,
             playback_limit: Arc::new(AtomicUsize::new(MAX_PLAYBACK_SAMPLES)),
             socket,
             remote,
@@ -9026,6 +9166,7 @@ mod tests {
         audio.extend_from_slice(&7u64.to_le_bytes());
         audio.extend_from_slice(&opus[..size]);
         let worker = VoiceWorker {
+            gateway: None,
             playback_limit: Arc::new(AtomicUsize::new(MAX_PLAYBACK_SAMPLES)),
             socket,
             remote,

@@ -31,6 +31,8 @@ impl Worker {
             server_id: identity.server_id.clone(),
             mode: "local".into(),
             address: None,
+            // Saving where the server runs now must not undo the member's choice.
+            lan_discovery: crate::local_host::lan_choice(&data),
         };
         crate::local_host::validate_app_host(&plan, &managed, &data, &server)?;
         if managed["instance_id"].as_str() != Some(identity.instance_id.as_str())
@@ -81,6 +83,14 @@ impl Worker {
         data: PathBuf,
         expected: String,
     ) -> Result<(), String> {
+        if self.handover_runtime.is_some()
+            || self
+                .handover_job
+                .as_ref()
+                .is_some_and(|(j, _)| j.is_hosting())
+        {
+            return Err("The transferred community is already running or being prepared. No other local host was started.".into());
+        }
         let managed = crate::local_host::read_record(&data.join("managed-instance.json"))
             .map_err(|_| "Cannot read your local server's saved identity.")?;
         let plan = match AppHost::load(&data) {
@@ -95,6 +105,7 @@ impl Worker {
                     server_id: expected.clone(),
                     mode: "local".into(),
                     address: None,
+                    lan_discovery: false,
                 };
                 if let Ok(stack) = crate::local_host::read_record(&data.join("stack-instance.json"))
                 {
@@ -191,6 +202,34 @@ impl Worker {
         if !crate::local_host::is_local_url(url) || self.local_server_ready() {
             return Ok(());
         }
+        // A remembered login can arrive while the received host is still in
+        // standby. It must not silently launch this installation's old default
+        // database on the same port through the internal restore path.
+        if self
+            .handover_job
+            .as_ref()
+            .is_some_and(|(j, _)| j.is_hosting())
+        {
+            return Err("This PC's transferred community is still starting. Try connecting again when it is ready.".into());
+        }
+        if self.handover_runtime.is_some() {
+            return Err(
+                "The transferred community is not responding. Restart that host from Relay.".into(),
+            );
+        }
+        match crate::handover_runtime::remembered() {
+            Ok(Some(_)) => {
+                self.restore_handover_host()?;
+                return Err("This PC's transferred community is starting. Try connecting again when it is ready.".into());
+            }
+            Err(fault) => {
+                return Err(format!(
+                    "The saved transferred host could not be opened. {}",
+                    fault.message()
+                ))
+            }
+            Ok(None) => {}
+        }
         let data = crate::local_host::data_directory()?;
         let Some(expected) = expected
             .map(str::to_owned)
@@ -228,6 +267,7 @@ impl Worker {
             server_id: live.server_id.clone(),
             mode: "local".into(),
             address: None,
+            lan_discovery: false,
         };
         crate::local_host::validate_app_host(&plan, &managed, &owned.data, &owned.executable)?;
         for record in [&runtime, &managed] {

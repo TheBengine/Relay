@@ -21,6 +21,13 @@ directories = ["src"]
 [packages."crates/relay-updater"]
 directories = ["src"]
 
+[packages."crates/relay-server"]
+directories = ["src"]
+
+[packages."vendor/serenity-0.12.5"]
+directories = ["src"]
+files = ["build.rs"]
+
 [packages."vendor/audiopus_sys"]
 directories = ["src", "opus"]
 files = ["build.rs"]

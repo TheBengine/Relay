@@ -1,3 +1,76 @@
+/// How many other people a new group may start with: a Friends group holds 8
+/// including its creator and needs two friends; a community group holds 10 and
+/// needs one.
+fn group_selection_range(bootstrap: &Bootstrap) -> std::ops::RangeInclusive<usize> {
+    if friends_group_invites_offered(bootstrap) {
+        // Friends are invited and join by accepting; one is enough to start.
+        1..=relay_protocol::PEOPLE_GROUP_MAX_MEMBERS - 1
+    } else if bootstrap.capabilities.iter().any(|c| c == "people-v1") {
+        2..=relay_protocol::PEOPLE_GROUP_MAX_MEMBERS - 1
+    } else {
+        1..=9
+    }
+}
+
+/// The Friends service adds people to a group only by invitation and acceptance.
+fn friends_group_invites_offered(bootstrap: &Bootstrap) -> bool {
+    friends_groups_offered(bootstrap)
+        && bootstrap
+            .capabilities
+            .iter()
+            .any(|c| c == relay_protocol::PEOPLE_GROUP_INVITES_CAPABILITY)
+}
+
+/// People already invited to this group by its owner and not yet answered.
+fn waiting_invitees<'a>(bootstrap: &'a Bootstrap, channel: &str) -> Vec<&'a str> {
+    bootstrap
+        .group_invitations_sent
+        .iter()
+        .filter(|invitation| invitation.channel_id == channel)
+        .map(|invitation| invitation.invitee_id.as_str())
+        .collect()
+}
+
+/// Places left in a group of 8, counting invitations that have not been answered.
+fn free_places(bootstrap: &Bootstrap, group: &ConversationInfo) -> usize {
+    relay_protocol::PEOPLE_GROUP_MAX_MEMBERS.saturating_sub(
+        group.member_ids.len() + waiting_invitees(bootstrap, &group.channel_id).len(),
+    )
+}
+
+/// Friends the owner can still invite: not blocked, not inside, not already invited.
+fn invite_candidates<'a>(bootstrap: &'a Bootstrap, group: &ConversationInfo) -> Vec<&'a User> {
+    let waiting = waiting_invitees(bootstrap, &group.channel_id);
+    bootstrap
+        .members
+        .iter()
+        .filter(|member| {
+            member.id != bootstrap.user.id
+                && bootstrap.social.friends.contains(&member.id)
+                && !bootstrap.social.blocked.contains(&member.id)
+                && !group.member_ids.contains(&member.id)
+                && !waiting.contains(&member.id.as_str())
+        })
+        .collect()
+}
+
+/// The Friends service offers groups of friends (an older one does not).
+fn friends_groups_offered(bootstrap: &Bootstrap) -> bool {
+    bootstrap.capabilities.iter().any(|c| c == "people-v1")
+        && bootstrap
+            .capabilities
+            .iter()
+            .any(|c| c == relay_protocol::PEOPLE_GROUPS_CAPABILITY)
+}
+
+/// A Friends group is the kind with no call room; a pair's call room is not shown as a group.
+fn is_friends_group(bootstrap: &Bootstrap, group: &ConversationInfo) -> bool {
+    group.kind == "group"
+        && !bootstrap.conversations.iter().any(|room| {
+            room.kind == "group_voice" && room.parent_id.as_ref() == Some(&group.channel_id)
+        })
+}
+
 fn group_member_matches(member: &User, query: &str) -> bool {
     member.username.to_lowercase().contains(query)
         || profile_ui::display_name(member)
@@ -78,7 +151,8 @@ fn group_members_picker(
     selected: &mut Vec<String>,
     group: Option<&ConversationInfo>,
 ) {
-    let limit = if group.is_some() { 10 } else { 9 };
+    let limit = *group_selection_range(bootstrap).end() + usize::from(group.is_some());
+    let people = bootstrap.capabilities.iter().any(|c| c == "people-v1");
     let candidates = group_member_candidates(bootstrap, group);
     ui.horizontal(|ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -103,12 +177,27 @@ fn group_members_picker(
     });
     ui.label(if group.is_some() {
         format!(
-            "{} of 10 members · owner stays in the group",
+            "{} of {limit} members · owner stays in the group",
             selected.len()
         )
+    } else if friends_group_invites_offered(bootstrap) {
+        format!("{} of {limit} friends to invite", selected.len())
     } else {
-        format!("{} of 9 friends selected", selected.len())
+        format!("{} of {limit} friends selected", selected.len())
     });
+    if friends_group_invites_offered(bootstrap) {
+        ui.label(
+            RichText::new("Each friend you pick gets an invitation and joins only if they accept. They do not need to know each other. Until they accept, they see only who invited them and the group's name.")
+                .size(font_size(TEXT_CAPTION))
+                .color(c_muted()),
+        );
+    } else if people {
+        ui.label(
+            RichText::new("Everyone in a group has to be friends with everyone else in it. Friends who do not know each other cannot be put in the same group.")
+                .size(font_size(TEXT_CAPTION))
+                .color(c_muted()),
+        );
+    }
     let query = search.trim().to_lowercase();
     let list_height = (ui.ctx().screen_rect().height() - 380.0).clamp(56.0, 240.0);
     egui::ScrollArea::vertical()
@@ -195,6 +284,120 @@ mod group_picker_tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn friends_groups_use_their_own_limits_and_only_when_the_service_offers_them() {
+        let community = bootstrap();
+        assert_eq!(group_selection_range(&community), 1..=9);
+        let mut friends = bootstrap();
+        friends.capabilities.push("people-v1".into());
+        assert_eq!(group_selection_range(&friends), 2..=7);
+        // An older Friends service has no groups, and a community never offers them.
+        assert!(!friends_groups_offered(&friends));
+        friends
+            .capabilities
+            .push(relay_protocol::PEOPLE_GROUPS_CAPABILITY.into());
+        assert!(friends_groups_offered(&friends));
+        let mut other = bootstrap();
+        other
+            .capabilities
+            .push(relay_protocol::PEOPLE_GROUPS_CAPABILITY.into());
+        assert!(!friends_groups_offered(&other));
+    }
+
+    #[test]
+    fn a_pairs_call_room_is_not_listed_as_a_friends_group() {
+        let conversation =
+            |id: &str, kind: &str, parent: Option<&str>, members: &[&str]| ConversationInfo {
+                channel_id: id.into(),
+                kind: kind.into(),
+                owner_id: "me".into(),
+                parent_id: parent.map(str::to_owned),
+                archived: false,
+                member_ids: members.iter().map(|m| m.to_string()).collect(),
+            };
+        let mut b = bootstrap();
+        b.conversations = vec![
+            conversation("pair", "group", None, &["me", "a"]),
+            conversation("pair-call", "group_voice", Some("pair"), &[]),
+            conversation("trio", "group", None, &["me", "a", "b"]),
+            conversation("two-left", "group", None, &["me", "a"]),
+        ];
+        let shown: Vec<_> = b
+            .conversations
+            .iter()
+            .filter(|c| is_friends_group(&b, c))
+            .map(|c| c.channel_id.as_str())
+            .collect();
+        assert_eq!(shown, ["trio", "two-left"]);
+    }
+
+    fn invited(world: &mut Bootstrap) {
+        world.capabilities.push("people-v1".into());
+        world
+            .capabilities
+            .push(relay_protocol::PEOPLE_GROUPS_CAPABILITY.into());
+    }
+
+    #[test]
+    fn invitations_change_how_many_friends_a_new_group_needs_and_only_with_the_capability() {
+        let mut friends = bootstrap();
+        invited(&mut friends);
+        assert_eq!(group_selection_range(&friends), 2..=7);
+        assert!(!friends_group_invites_offered(&friends));
+        friends
+            .capabilities
+            .push(relay_protocol::PEOPLE_GROUP_INVITES_CAPABILITY.into());
+        assert!(friends_group_invites_offered(&friends));
+        assert_eq!(group_selection_range(&friends), 1..=7);
+        // A community, even one that claims the name, is never the Friends service.
+        let mut community = bootstrap();
+        community
+            .capabilities
+            .push(relay_protocol::PEOPLE_GROUP_INVITES_CAPABILITY.into());
+        assert!(!friends_group_invites_offered(&community));
+        assert_eq!(group_selection_range(&community), 1..=9);
+    }
+
+    #[test]
+    fn only_unblocked_friends_outside_the_group_and_not_already_invited_can_be_invited() {
+        let mut world = bootstrap();
+        invited(&mut world);
+        let group = ConversationInfo {
+            channel_id: "g".into(),
+            kind: "group".into(),
+            owner_id: "id0".into(),
+            member_ids: vec!["id0".into(), "id1".into()],
+            ..Default::default()
+        };
+        world.group_invitations_sent = vec![
+            relay_protocol::SentGroupInvitation {
+                channel_id: "g".into(),
+                invitee_id: "id2".into(),
+            },
+            relay_protocol::SentGroupInvitation {
+                channel_id: "another".into(),
+                invitee_id: "id3".into(),
+            },
+        ];
+        let ids: Vec<_> = invite_candidates(&world, &group)
+            .iter()
+            .map(|user| user.id.as_str())
+            .collect();
+        // id1 is inside, id2 is waiting here, id12 is blocked, id13 is not a friend.
+        assert!(!ids.contains(&"id0") && !ids.contains(&"id1") && !ids.contains(&"id2"));
+        assert!(!ids.contains(&"id12") && !ids.contains(&"id13"));
+        assert!(
+            ids.contains(&"id3"),
+            "an invitation to another group does not count"
+        );
+        assert_eq!(ids.len(), 9);
+        // Members and waiting invitations both hold a place out of eight.
+        assert_eq!(free_places(&world, &group), 8 - 2 - 1);
+        let mut full = group.clone();
+        full.member_ids = (0..8).map(|n| format!("m{n}")).collect();
+        assert_eq!(free_places(&world, &full), 0);
     }
 
     #[test]
@@ -571,6 +774,219 @@ mod group_picker_tests {
 }
 
 impl RelayApp {
+    /// The Friends service adds people to groups by invitation only.
+    pub(super) fn people_group_invites(&self) -> bool {
+        self.bootstrap
+            .as_ref()
+            .is_some_and(|b| friends_group_invites_offered(b))
+    }
+
+    /// Members, waiting invitations and a way to invite more, for a Friends group.
+    /// Only the owner changes anything; everyone else just sees who is in it.
+    fn friends_group_panel(&mut self, ui: &mut egui::Ui, b: &Bootstrap, info: &ConversationInfo) {
+        let is_owner = info.owner_id == b.user.id;
+        let name_of = |id: &str| {
+            b.members
+                .iter()
+                .find(|member| member.id == id)
+                .map(|member| profile_ui::display_name(member).to_owned())
+                .unwrap_or_else(|| "A member".into())
+        };
+        ui.label(RichText::new("Members").strong());
+        let mut remove: Option<String> = None;
+        for id in &info.member_ids {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "{}{}",
+                    name_of(id),
+                    if *id == info.owner_id {
+                        " · owner"
+                    } else if *id == b.user.id {
+                        " · you"
+                    } else {
+                        ""
+                    }
+                ));
+                if is_owner && *id != b.user.id && ui.small_button("Remove").clicked() {
+                    remove = Some(id.clone());
+                }
+            });
+        }
+        if let Some(removed) = remove {
+            let remaining: Vec<_> = info
+                .member_ids
+                .iter()
+                .filter(|id| **id != removed)
+                .cloned()
+                .collect();
+            self.admin_request(
+                AdminMethod::Patch,
+                format!("/api/conversations/{}", info.channel_id),
+                json!({ "member_ids": remaining }),
+                "action:conversation:edit".into(),
+            );
+        }
+        if !is_owner {
+            ui.label(
+                RichText::new("Only the group's owner can invite or remove people.")
+                    .size(font_size(TEXT_CAPTION))
+                    .color(c_muted()),
+            );
+            return;
+        }
+        let waiting: Vec<String> = waiting_invitees(b, &info.channel_id)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        if !waiting.is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new("Waiting for an answer").strong());
+            ui.label(
+                RichText::new("They are not in the group, and see only your name and the group's name, until they accept.")
+                    .size(font_size(TEXT_CAPTION))
+                    .color(c_muted()),
+            );
+        }
+        let mut revoke: Option<String> = None;
+        for id in &waiting {
+            ui.horizontal(|ui| {
+                ui.label(name_of(id));
+                if ui.small_button("Revoke").clicked() {
+                    revoke = Some(id.clone());
+                }
+            });
+        }
+        if let Some(id) = revoke {
+            self.admin_request(
+                AdminMethod::Delete,
+                format!("/api/conversations/{}/invitations/{id}", info.channel_id),
+                Value::Null,
+                "action:group-invite".into(),
+            );
+        }
+        let free = free_places(b, info);
+        ui.add_space(6.0);
+        ui.label(RichText::new("Invite friends").strong());
+        if free == 0 {
+            ui.label(
+                RichText::new(
+                    "The group is full: 8 people, counting invitations that are waiting.",
+                )
+                .size(font_size(TEXT_CAPTION))
+                .color(c_muted()),
+            );
+            return;
+        }
+        let candidates = invite_candidates(b, info);
+        if candidates.is_empty() {
+            ui.label(
+                RichText::new("None of your friends can be invited right now.")
+                    .size(font_size(TEXT_CAPTION))
+                    .color(c_muted()),
+            );
+            return;
+        }
+        for friend in candidates {
+            let mut chosen = self.admin_ui.conversation_members.contains(&friend.id);
+            let enabled = chosen || self.admin_ui.conversation_members.len() < free;
+            if ui
+                .add_enabled(
+                    enabled,
+                    egui::Checkbox::new(&mut chosen, profile_ui::display_name(friend)),
+                )
+                .changed()
+            {
+                self.admin_ui
+                    .conversation_members
+                    .retain(|id| *id != friend.id);
+                if chosen {
+                    self.admin_ui.conversation_members.push(friend.id.clone());
+                }
+            }
+        }
+        ui.label(
+            RichText::new(format!(
+                "{} place{} left. Each friend joins only if they accept.",
+                free,
+                if free == 1 { "" } else { "s" }
+            ))
+            .size(font_size(TEXT_CAPTION))
+            .color(c_muted()),
+        );
+        if ui
+            .add_enabled(
+                !self.admin_ui.conversation_members.is_empty(),
+                primary("Send invitations"),
+            )
+            .clicked()
+        {
+            for id in std::mem::take(&mut self.admin_ui.conversation_members) {
+                self.admin_request(
+                    AdminMethod::Post,
+                    format!("/api/conversations/{}/invitations", info.channel_id),
+                    json!({ "user_id": id }),
+                    "action:group-invite".into(),
+                );
+            }
+        }
+    }
+
+    /// Invitations to groups, in the Friends area: who invited you and the
+    /// group's name, and a plain statement of what accepting does and does not do.
+    pub(super) fn group_invitations_ui(&mut self, ui: &mut egui::Ui, b: &Bootstrap) {
+        if !friends_group_invites_offered(b) || b.group_invitations.is_empty() {
+            return;
+        }
+        ui.label(RichText::new("Group invitations").strong());
+        let mut answer: Option<(String, &'static str)> = None;
+        for invitation in &b.group_invitations {
+            let who = b
+                .members
+                .iter()
+                .find(|member| member.id == invitation.inviter_id)
+                .map(|member| profile_ui::display_name(member).to_owned())
+                .unwrap_or_else(|| "A friend".into());
+            ui.group(|ui| {
+                ui.label(format!("{who} invited you to “{}”", invitation.name));
+                ui.label(
+                    RichText::new("You will not see who else is in it, or any of its messages, until you accept. Accepting makes you a member of this group only: it does not make you friends with its members.")
+                        .size(font_size(TEXT_CAPTION))
+                        .color(c_muted()),
+                );
+                ui.horizontal(|ui| {
+                    if ui.add(primary("Accept")).clicked() {
+                        answer = Some((invitation.channel_id.clone(), "accept"));
+                    }
+                    if ui.add(secondary("Decline")).clicked() {
+                        answer = Some((invitation.channel_id.clone(), "decline"));
+                    }
+                });
+            });
+        }
+        if let Some((channel, action)) = answer {
+            self.admin_request(
+                AdminMethod::Post,
+                format!("/api/group-invitations/{channel}/{action}"),
+                Value::Null,
+                "action:group-invite".into(),
+            );
+        }
+        ui.separator();
+    }
+
+    pub(super) fn people_groups(&self) -> bool {
+        self.bootstrap.as_ref().is_some_and(|b| friends_groups_offered(b))
+    }
+    /// This channel is a group of friends on the Friends service shown right now.
+    pub(super) fn friends_group_channel(&self, url: &str, channel: &str) -> bool {
+        url == self.login.url
+            && self.bootstrap.as_ref().is_some_and(|b| {
+                friends_groups_offered(b)
+                    && b.conversations
+                        .iter()
+                        .any(|c| c.channel_id == channel && is_friends_group(b, c))
+            })
+    }
     pub(super) fn conversation_info(&self, channel: &str) -> Option<&ConversationInfo> {
         self.bootstrap
             .as_ref()?
@@ -650,6 +1066,8 @@ impl RelayApp {
             // The shared header (title, Close, Escape) stays above the scrolling body.
             if host_setup_ui::show_with_header(ctx, window, "Create Conversation", |ui| {
                 ui.label(match self.admin_ui.conversation_kind.as_str() {
+                    "group" if self.people_group_invites() => "New group: invite friends",
+                    "group" if self.in_people() => "New group of friends",
                     "group" => "New private group",
                     "thread" => "New Thread / Forum Post",
                     "forum" => "New Forum Channel",
@@ -675,11 +1093,16 @@ impl RelayApp {
                 ui.label(RichText::new(if b.protection.level == relay_protocol::ProtectionLevel::Open {
                     "End-to-end encryption is off for this server. Members accept its choice before joining calls."
                 } else {
-                    "Messages and calls use this conversation's own end-to-end encrypted group."
+                    if self.in_people() {
+                        "Messages in this group are end-to-end encrypted, so the Friends service cannot read them. Group calls are not offered here."
+                    } else {
+                        "Messages and calls use this conversation's own end-to-end encrypted group."
+                    }
                 }).color(c_muted()));
                 let valid = !self.admin_ui.conversation_name.trim().is_empty()
                     && (self.admin_ui.conversation_kind != "group"
-                        || (1..=9).contains(&self.admin_ui.conversation_members.len()));
+                        || group_selection_range(&b)
+                            .contains(&self.admin_ui.conversation_members.len()));
                 let pending = self
                     .admin_requests
                     .values()
@@ -687,7 +1110,14 @@ impl RelayApp {
                 ui.horizontal(|ui| {
                     cancel = ui.add_enabled(!pending, secondary("Cancel")).clicked();
                     create = ui
-                        .add_enabled(valid && !pending, primary("Create"))
+                        .add_enabled(
+                            valid && !pending,
+                            primary(if friends_group_invites_offered(&b) {
+                                "Send invitations"
+                            } else {
+                                "Create"
+                            }),
+                        )
                         .clicked();
                 });
             }) {
@@ -727,13 +1157,17 @@ impl RelayApp {
                             .desired_width(f32::INFINITY),
                     );
                     if info.kind == "group" {
-                        group_members_picker(
-                            ui,
-                            &b,
-                            &mut self.admin_ui.conversation_member_search,
-                            &mut self.admin_ui.conversation_edit_members,
-                            Some(&info),
-                        );
+                        if friends_group_invites_offered(&b) {
+                            self.friends_group_panel(ui, &b, &info);
+                        } else {
+                            group_members_picker(
+                                ui,
+                                &b,
+                                &mut self.admin_ui.conversation_member_search,
+                                &mut self.admin_ui.conversation_edit_members,
+                                Some(&info),
+                            );
+                        }
                     }
                     if info.kind == "thread"
                         && ui
@@ -753,11 +1187,13 @@ impl RelayApp {
                     }
                     let valid = !self.admin_ui.conversation_edit_name.trim().is_empty()
                         && (info.kind != "group"
-                            || (2..=10).contains(&self.admin_ui.conversation_edit_members.len()));
+                            || friends_group_invites_offered(&b)
+                            || (2..=*group_selection_range(&b).end() + 1)
+                                .contains(&self.admin_ui.conversation_edit_members.len()));
                     ui.horizontal(|ui| {
                         if ui.add_enabled(valid, primary("Save Changes")).clicked() {
                             let mut body = json!({"name":self.admin_ui.conversation_edit_name});
-                            if info.kind == "group" {
+                            if info.kind == "group" && !friends_group_invites_offered(&b) {
                                 body["member_ids"] = json!(self.admin_ui.conversation_edit_members);
                             }
                             self.admin_request(
@@ -802,6 +1238,7 @@ impl RelayApp {
             return;
         };
         self.admin_ui.conversation_member_search.clear();
+        self.admin_ui.conversation_members.clear();
         self.admin_ui.conversation_edit = Some(channel.into());
         self.admin_ui.conversation_edit_name = b
             .channels
@@ -822,7 +1259,21 @@ impl RelayApp {
         ui.horizontal_wrapped(|ui| {
             if let Some(info) = &info {
                 if info.kind == "group" {
-                    ui.label(format!("{} members", info.member_ids.len()));
+                    let waiting = if friends_group_invites_offered(&b) && info.owner_id == b.user.id
+                    {
+                        waiting_invitees(&b, &channel).len()
+                    } else {
+                        0
+                    };
+                    ui.label(if waiting > 0 {
+                        format!(
+                            "{} members · {waiting} invitation{} waiting for an answer",
+                            info.member_ids.len(),
+                            if waiting == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        format!("{} members", info.member_ids.len())
+                    });
                     if let Some(call) = b.conversations.iter().find(|c| {
                         c.kind == "group_voice" && c.parent_id.as_deref() == Some(&channel)
                     }) {
@@ -910,32 +1361,64 @@ impl RelayApp {
                     .color(c_muted()),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if !self.in_people()
-                    && icon_button(ui, Icon::Plus, false, "New group message").clicked()
+                if (!self.in_people() || self.people_groups())
+                    && icon_button(
+                        ui,
+                        Icon::Plus,
+                        false,
+                        if self.in_people() {
+                            "New group of friends"
+                        } else {
+                            "New group message"
+                        },
+                    )
+                    .clicked()
                 {
                     self.open_conversation_create("group", None);
                 }
             });
         });
+        if friends_group_invites_offered(&b) && !b.group_invitations.is_empty() {
+            let count = b.group_invitations.len();
+            if ui
+                .add(secondary(&format!(
+                    "{count} group invitation{} to answer",
+                    if count == 1 { "" } else { "s" }
+                )))
+                .clicked()
+            {
+                self.home_page = Some(SettingsTab::Friends);
+            }
+        }
         let people = self.in_people();
-        for group in b
-            .conversations
-            .iter()
-            .filter(|c| c.kind == "group" && !people)
-        {
+        let friends_groups = people && self.people_groups();
+        for group in b.conversations.iter().filter(|c| {
+            c.kind == "group" && (!people || (friends_groups && is_friends_group(&b, c)))
+        }) {
             if let Some(channel) = b.channels.iter().find(|c| c.id == group.channel_id) {
+                // The ordinary unread count of the conversation, shown in words as well.
+                let (unread, mentions) = self
+                    .read_state(&Target::Channel(channel.id.clone()))
+                    .map(|read| (read.unread_count, read.mention_count))
+                    .unwrap_or_default();
                 let clicked = ui
                     .horizontal(|ui| {
                         ui.add_space(6.0);
                         icon(ui, Icon::Users, 28.0, c_muted());
+                        let mut text =
+                            format!("{}  ·  {} members", channel.name, group.member_ids.len());
+                        if mentions > 0 {
+                            text.push_str(&format!("  ·  {mentions} mentions"));
+                        } else if unread > 0 {
+                            text.push_str(&format!("  ·  {unread} new"));
+                        }
+                        let mut label = RichText::new(text).size(font_size(14.0));
+                        if unread > 0 {
+                            label = label.strong();
+                        }
                         ui.selectable_label(
                             self.current == Some(Target::Channel(channel.id.clone())),
-                            RichText::new(format!(
-                                "{}  ·  {} members",
-                                channel.name,
-                                group.member_ids.len()
-                            ))
-                            .size(font_size(14.0)),
+                            label,
                         )
                         .clicked()
                     })

@@ -3,6 +3,16 @@ use crate::{chat_media, media::CaptureFrame};
 mod account_login;
 #[path = "network_call_switch.rs"]
 pub(crate) mod call_switch;
+#[path = "network_game_activity.rs"]
+mod game_activity;
+#[path = "network_handover.rs"]
+mod handover_work;
+#[path = "network_host_resume.rs"]
+mod host_resume;
+#[path = "network_host_locator.rs"]
+mod host_locator_publish;
+#[path = "network_lan_pairing.rs"]
+mod lan_pairing_work;
 #[path = "network_people_call.rs"]
 mod people_call;
 use relay_protocol::*;
@@ -26,7 +36,7 @@ pub enum Target {
 
 /// The identity visible when an account-bound action was queued. IDs alone are
 /// insufficient when an account or community switch precedes that action.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandOrigin {
     pub url: String,
     pub server_id: String,
@@ -44,7 +54,20 @@ impl From<&Connection> for CommandOrigin {
 }
 
 pub enum Command {
+    CreateLanPairing {origin:CommandOrigin,request_id:u64,cancel:Arc<AtomicBool>},
+    RevokeLanPairing {origin:CommandOrigin,id:String},
+    RestoreHandoverHost,
+    Handover {
+        origin: CommandOrigin,
+        action: crate::handover_client::Action,
+        request_id: u64,
+    },
+    StopHandover {
+        origin: CommandOrigin,
+        account_change: bool,
+    },
     AccountLoginBegin {
+        authority: Option<handover::RoutePin>,
         url: String,
         expected_server_id: Option<String>,
         invite: zeroize::Zeroizing<String>,
@@ -53,6 +76,7 @@ pub enum Command {
         request_id: u64,
     },
     AccountLoginFinish {
+        authority: Option<handover::RoutePin>,
         url: String,
         expected_server_id: String,
         challenge_id: String,
@@ -114,6 +138,7 @@ pub enum Command {
         asset: MediaAsset,
     },
     Auth {
+        authority: Option<handover::RoutePin>,
         url: String,
         expected_server_id: Option<String>,
         request: AuthRequest,
@@ -123,6 +148,9 @@ pub enum Command {
         request_id: u64,
     },
     CheckServer {
+        locator_invite: Option<String>,
+        cancel: Arc<AtomicBool>,
+        authority: Option<handover::RoutePin>,
         url: String,
         request_id: u64,
     },
@@ -279,6 +307,13 @@ pub enum Command {
     MarkCommunityRead {
         origin: CommandOrigin,
     },
+    /// Narrow activity write on this exact saved Friends session; it never
+    /// switches the selected community or borrows its credentials.
+    SetGameActivity {
+        origin: CommandOrigin,
+        share: Option<relay_protocol::game_activity::Share>,
+        request_id: u64,
+    },
     /// Decline only: a background call must never switch the active connection
     /// or borrow its credentials. Accepting still uses the ordinary call UI.
     DeclinePeopleCall {
@@ -327,6 +362,16 @@ pub enum Command {
     RememberSession {
         enabled: bool,
     },
+    /// Whether the next login is remembered. Unlike RememberSession it never
+    /// forgets the current server's remembered login.
+    RememberNextLogins {
+        enabled: bool,
+    },
+    /// Keep this server's current login on this PC: a host paused for a move
+    /// issues no new sessions, so the people moving it must be able to resume.
+    KeepSignedInForMove {
+        origin: CommandOrigin,
+    },
     Resume {
         url: String,
         expected_server_id: Option<String>,
@@ -341,6 +386,14 @@ pub enum Command {
         method: AdminMethod,
         path: String,
         body: serde_json::Value,
+        request_id: u64,
+    },
+    /// The member's own data-copy token: minted into the OS vault or revoked.
+    /// It has its own command so the token never travels as an admin result.
+    ReplicaToken {
+        origin: CommandOrigin,
+        action: ReplicaTokenAction,
+        replica_id: String,
         request_id: u64,
     },
     SaveBackup {
@@ -368,6 +421,25 @@ pub enum DiscordHostAction {
     Save(zeroize::Zeroizing<String>),
     Remove,
     Retry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicaTokenAction {
+    Mint,
+    Revoke,
+}
+
+/// What the app learns about the copy access. Never the token itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicaTokenOutcome {
+    Minted {
+        expires: u64,
+    },
+    /// `remote` is whether the community confirmed the revocation. The access
+    /// on this PC is gone either way.
+    Revoked {
+        remote: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -407,6 +479,11 @@ pub enum SendWait {
 }
 
 pub enum Update {
+    LanPairCreated {origin:CommandOrigin,request_id:u64,result:Result<crate::lan_pairing::Ready,String>},
+    HandoverHostReady {
+        remembered: bool,
+    },
+    Handover(crate::handover_client::View),
     AccountLoginChallenge {
         url: String,
         data: serde_json::Value,
@@ -451,6 +528,7 @@ pub enum Update {
         channel_id: String,
         ticket: VoiceTicket,
         keys: Arc<crate::e2ee::CallKeys>,
+        gateway: Option<crate::gateway_control::Config>,
     },
     VoiceEncryptionPaused {
         channel_id: String,
@@ -473,6 +551,12 @@ pub enum Update {
         user: Option<User>,
         request_id: u64,
         error: String,
+    },
+    CommunityMoved {
+        origin: CommandOrigin,
+        url: String,
+        session: Session,
+        bootstrap: Box<Bootstrap>,
     },
     Connected {
         url: String,
@@ -559,6 +643,7 @@ pub enum Update {
         error: String,
     },
     ServerChecked {
+        resolved: Option<String>,
         url: String,
         request_id: u64,
         result: Result<crate::connection_setup::ServerSummary, String>,
@@ -569,6 +654,7 @@ pub enum Update {
         channel_id: String,
         request_id: u64,
         keys: Arc<crate::e2ee::CallKeys>,
+        gateway: Option<crate::gateway_control::Config>,
     },
     VoiceJoinFailed {
         channel_id: String,
@@ -682,6 +768,11 @@ pub enum Update {
         url: String,
         bootstrap: Bootstrap,
     },
+    GameActivityResult {
+        origin: CommandOrigin,
+        request_id: u64,
+        result: Result<Option<relay_protocol::game_activity::GameActivity>, String>,
+    },
     PeopleCallDeclined {
         origin: CommandOrigin,
         call_id: String,
@@ -699,6 +790,12 @@ pub enum Update {
     AdminResult {
         request_id: u64,
         data: serde_json::Value,
+    },
+    ReplicaToken {
+        origin: CommandOrigin,
+        request_id: u64,
+        replica_id: String,
+        outcome: ReplicaTokenOutcome,
     },
     BackupSaved {
         operation_id: String,
@@ -746,6 +843,28 @@ pub struct Network {
     shutdown_started: Option<Instant>,
     shutdown_result: Option<Result<shutdown::Report, String>>,
     pending_updates: std::collections::VecDeque<Update>,
+}
+
+fn same_account_provider(a: Option<&AccountProvider>, b: Option<&AccountProvider>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.issuer == b.issuer && a.client_id == b.client_id,
+        _ => false,
+    }
+}
+
+struct MovingSession {
+    origin: CommandOrigin,
+    pin: relay_protocol::handover::RoutePin,
+    provider: Option<AccountProvider>,
+    aliases: Vec<String>,
+    remembered: bool,
+    resuming: bool,
+}
+struct PendingHostResume {
+    origin: CommandOrigin,
+    remembered: crate::credential_vault::RememberedSession,
+    job: crate::host_route::Job,
 }
 
 struct Connection {
@@ -861,6 +980,9 @@ impl Network {
                     Err(mpsc::TryRecvError::Disconnected) => break,
                     Err(mpsc::TryRecvError::Empty) => false,
                 };
+                worker.poll_host_resume();
+                worker.poll_handover();
+                worker.poll_host_locator();
                 worker.poll_chat_media_results();
                 worker.poll_transfers();
                 worker.poll_legacy_reactions();
@@ -959,11 +1081,18 @@ struct Worker {
     message_repair_at: Instant,
     socket_stop: Arc<AtomicBool>,
     connection: Option<Connection>,
+    pending_host_resume: Option<PendingHostResume>,
+    handover_job: Option<(crate::handover_client::Job, u64)>,
+    handover_runtime: Option<crate::handover_runtime::Runtime>,
     local_server: Option<std::process::Child>,
     owned_local: Option<local_lifecycle::OwnedLocal>,
     restoring_local: bool,
     local_sharing_instance: Option<(String, String)>,
     local_sharing_retry_at: Instant,
+    host_locator_service: Option<String>,
+    host_locator_retry_at: Instant,
+    host_locator_more: Arc<AtomicBool>,
+    host_locator_problem: Arc<AtomicBool>,
     local_sharing_failure_notified: bool,
     capture_epochs: [Arc<AtomicU64>; 2],
     chat_media_workers: Option<ChatMediaWorkers>,
@@ -1689,11 +1818,18 @@ impl Worker {
             message_repair_at: Instant::now(),
             socket_stop: Arc::new(AtomicBool::new(false)),
             connection: None,
+            pending_host_resume: None,
+            handover_job: None,
+            handover_runtime: None,
             local_server: None,
             owned_local: None,
             restoring_local: false,
             local_sharing_instance: None,
             local_sharing_retry_at: Instant::now(),
+            host_locator_service: crate::host_locator::directory(),
+            host_locator_retry_at: Instant::now(),
+            host_locator_more: Arc::new(AtomicBool::new(false)),
+            host_locator_problem: Arc::new(AtomicBool::new(false)),
             local_sharing_failure_notified: false,
             capture_epochs,
             chat_media_workers: None,
@@ -1768,6 +1904,25 @@ impl Worker {
             .bearer_auth(&c.session.token))
     }
 
+    fn voice_gateway(&self, ticket: &VoiceTicket) -> Option<crate::gateway_control::Config> {
+        let c = self.connection.as_ref()?;
+        let supported = if c.chat.supports("people-v1") {
+            c.chat.supports("friends-gateway-broker-v1")
+        } else {
+            c.chat.supports("gateway-broker-v1")
+        };
+        let private_route = crate::iroh_route::saved_for(&c.url);
+        if !supported
+            || crate::community::account_destination(&c.url).is_err()
+            || (crate::embedded_network::routed(&c.url) && private_route.is_none())
+        { return None; }
+        let config = crate::gateway_control::Config::new(ticket.session_id, |method, path| self.request(method, path))?;
+        Some(match private_route {
+            Some(saved) => config.with_private_route(saved, c.server_id.clone()),
+            None => config,
+        })
+    }
+
     fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
         parse(
             self.request(reqwest::Method::GET, path)?
@@ -1794,6 +1949,59 @@ impl Worker {
     }
 
     fn command(&mut self, command: Command) {
+        if matches!(&command, Command::RestoreHandoverHost) {
+            if let Err(error) = self.restore_handover_host() {
+                self.emit(Update::Error(error));
+            }
+            return;
+        }
+        if matches!(&command, Command::StopLocal) && self.handover_runtime.is_some() {
+            self.stop_handover_host();
+            return;
+        }
+        if matches!(&command, Command::HostIroh { .. }) && self.handover_runtime.is_some() {
+            if let Err(error)=self.share_handover_host() { self.emit(Update::Error(error)); }
+            return;
+        }
+        if matches!(
+            &command,
+            Command::HostLocal { .. }
+                | Command::HostIroh { .. }
+                | Command::HostTailscale { .. }
+                | Command::HostEmbedded { .. }
+                | Command::RestoreLocal { .. }
+        ) && (self.handover_runtime.is_some()
+            || self
+                .handover_job
+                .as_ref()
+                .is_some_and(|(j, _)| j.is_hosting()))
+        {
+            self.emit(Update::Error("This PC is preparing or running the transferred community. Stop that host before starting another local server.".into()));
+            return;
+        }
+        if let Command::Handover {
+            origin,
+            action,
+            request_id,
+        } = command
+        {
+            self.start_handover(origin, action, request_id);
+            return;
+        }
+        if let Command::StopHandover {
+            origin,
+            account_change,
+        } = command
+            {
+            if self.handover_job.as_ref().is_some_and(|(j, _)| {
+                j.view().origin == origin && (!account_change || !j.is_restore())
+            }) {
+                if let Some((job, _)) = &self.handover_job {
+                    job.cancel();
+                }
+            }
+            return;
+        }
         if let Command::LeaveAndAnswer(request) = command {
             let result = self.leave_and_answer(&request).map(Box::new);
             self.emit(Update::CallSwitchResult { request, result });
@@ -1813,9 +2021,9 @@ impl Worker {
                     && c.voice_channel.as_deref() == Some(channel.as_str())
                     && c.voice_device_id().as_deref() == Some(device.as_str())
                     && c.chat.open_revision() == open_revision
-                    && c.voice_admission.as_ref().is_some_and(|a| {
-                        a.session == session && a.instance == instance
-                    })
+                    && c.voice_admission
+                        .as_ref()
+                        .is_some_and(|a| a.session == session && a.instance == instance)
             });
             let _ = self.release_switched_call(
                 &origin, &instance, session, &channel, &device, open_revision,
@@ -1823,6 +2031,20 @@ impl Worker {
             if current {
                 self.clear_voice_intent();
             }
+            return;
+        }
+        if let Command::SetGameActivity {
+            origin,
+            share,
+            request_id,
+        } = command
+        {
+            let result = self.set_game_activity(&origin, share.as_ref());
+            self.emit(Update::GameActivityResult {
+                origin,
+                request_id,
+                result,
+            });
             return;
         }
         if let Command::DeclinePeopleCall {
@@ -1940,6 +2162,7 @@ impl Worker {
             | Command::FetchUserProfile { request_id, .. }
             | Command::SaveProfile { request_id, .. }
             | Command::Admin { request_id, .. }
+            | Command::ReplicaToken { request_id, .. }
             | Command::DiscordHost { request_id, .. }
             | Command::MentionInbox { request_id, .. }
             | Command::CommunitySearch { request_id, .. }
@@ -1989,7 +2212,7 @@ impl Worker {
         expected_server_id: Option<String>,
         session: Session,
     ) -> Result<(), String> {
-        self.adopt_session_checked(url, expected_server_id, session, None)
+        self.adopt_session_checked(url, expected_server_id, session, None, None, None)
     }
 
     fn adopt_session_checked(
@@ -1998,6 +2221,8 @@ impl Worker {
         expected_server_id: Option<String>,
         session: Session,
         account_attempt: Option<(Arc<AtomicBool>, u64)>,
+        moved: Option<MovingSession>,
+        login_authority: Option<handover::RoutePin>,
     ) -> Result<(), String> {
         let call_alerts::BootstrapReply {
             bootstrap,
@@ -2031,13 +2256,15 @@ impl Worker {
         {
             // Do not replace the active account or initialize its encryption.
             // Best-effort revoke the new session if the identity changed mid-login.
-            let _ = self
-                .http
-                .post(crate::embedded_network::endpoint(&format!(
-                    "{url}/api/logout"
-                )))
-                .bearer_auth(&session.token)
-                .send();
+            if moved.is_none() {
+                let _ = self
+                    .http
+                    .post(crate::embedded_network::endpoint(&format!(
+                        "{url}/api/logout"
+                    )))
+                    .bearer_auth(&session.token)
+                    .send();
+            }
             return Err(
                 "The community changed during sign-in. Ask the host for a new invitation.".into(),
             );
@@ -2048,7 +2275,49 @@ impl Worker {
         {
             return Err("The community returned a different account during sign-in. Confirm its address and try again.".into());
         }
+        let previous_pin = moved.as_ref().map(|m| &m.pin).or(login_authority.as_ref()).or_else(|| {
+            self.connection
+                .as_ref()
+                .filter(|c| c.url == url)
+                .and_then(|c| c.chat.authority.as_ref())
+                .or_else(|| {
+                    self.saved_connections
+                        .get(&url)
+                        .and_then(|c| c.connection.chat.authority.as_ref())
+                })
+        });
+        let authority = crate::host_route::bootstrap_pin(
+            &url,
+            &bootstrap.server_id,
+            bootstrap.host_authority.as_ref(),
+            previous_pin,
+        )?;
+        if let Some(moving) = &moved {
+            let origin = &moving.origin;
+            validate_bootstrap_identity(&origin.server_id, &origin.user_id, &bootstrap)?;
+            if !moving.resuming {
+                self.command_connection(origin)?;
+            }
+            if !same_account_provider(
+                moving.provider.as_ref(),
+                bootstrap.account_provider.as_ref(),
+            ) {
+                return Err(crate::host_route::REFUSED.into());
+            }
+        }
+        let remember = moved
+            .as_ref()
+            .map_or(self.remember_session, |m| m.remembered);
         crate::embedded_network::bind_identity(&url, &bootstrap.server_id)?;
+        if moved.as_ref().is_some_and(|m| m.origin.url == url)
+            && self.connection.as_ref().is_some_and(|c| c.url == url)
+        {
+            // A verified chain may return to an old address under a new term.
+            // Dropping the old transport must not revoke the transferred token.
+            self.cancel_transfers();
+            self.socket_stop.store(true, Ordering::SeqCst);
+            self.connection = None;
+        }
         self.park_connection(&url);
         self.chat_media_epoch.fetch_add(1, Ordering::SeqCst);
         self.chat_media_workers = None;
@@ -2070,7 +2339,7 @@ impl Worker {
             name: bootstrap.server_name.clone(),
             change_cursor: bootstrap.latest_change_sequence,
             protocol_version: bootstrap.protocol_version,
-            remembered: self.remember_session,
+            remembered: remember,
             chat: extended::ChatSession::new(&bootstrap),
             crypto: None,
             crypto_registered: false,
@@ -2078,8 +2347,19 @@ impl Worker {
             open_call_context: None,
             crypto_pending_join: None,
         });
+        self.connection.as_mut().unwrap().chat.authority = authority;
+        if let Some(m) = &moved {
+            self.connection.as_mut().unwrap().chat.authority_aliases = m.aliases.clone();
+        }
         self.live.epoch.fetch_add(1, Ordering::SeqCst);
         self.sync_live_transport()?;
+        if let Some(m) = &moved {
+            if let Some(old) = self.saved_connections.remove(&m.origin.url) {
+                old.stop.store(true, Ordering::SeqCst);
+                // This token moved with the database. Never log it out on either
+                // host merely because the old parked transport is being dropped.
+            }
+        }
         spawn_events_with_alerts(
             url.clone(),
             session.token.clone(),
@@ -2089,7 +2369,42 @@ impl Worker {
             self.wake.clone(),
             self.alert_watch(&bootstrap, call_received, alert_cursor),
         );
-        self.emit(if let Some((_, request_id)) = account_attempt {
+        // Persist a successful remembered destination before publishing the
+        // URL change. A crash after the UI/preferences switch must not point
+        // at an address whose corresponding vault record was never written.
+        let mut remember_error = None;
+        if remember {
+            if let Some(c) = &mut self.connection {
+                let authority =
+                    c.chat
+                        .authority
+                        .as_ref()
+                        .map(|pin| crate::host_route::RememberedAuthority {
+                            pin: pin.clone(),
+                            account_provider: c.chat.account_provider.clone(),
+                            previous_urls: c.chat.authority_aliases.clone(),
+                        });
+                if let Err(error) = crate::credential_vault::save_bound(
+                    &c.url,
+                    &c.server_id,
+                    &c.session,
+                    authority.as_ref(),
+                ) {
+                    c.remembered = false;
+                    remember_error = Some(format!(
+                        "You are signed in, but this login could not be remembered: {error}"
+                    ));
+                }
+            }
+        }
+        self.emit(if let Some(m) = moved {
+            Update::CommunityMoved {
+                origin: m.origin,
+                url: url.clone(),
+                session: session.clone(),
+                bootstrap: Box::new(bootstrap),
+            }
+        } else if let Some((_, request_id)) = account_attempt {
             Update::AccountLoginComplete {
                 url: url.clone(),
                 session: session.clone(),
@@ -2103,22 +2418,31 @@ impl Worker {
                 bootstrap: Box::new(bootstrap),
             }
         });
-        if self.remember_session {
-            if let Some(c) = &mut self.connection {
-                if let Err(error) = crate::credential_vault::save(&c.url, &c.server_id, &c.session)
-                {
-                    c.remembered = false;
-                    self.emit(Update::Error(format!(
-                        "You are signed in, but this login could not be remembered: {error}"
-                    )));
-                }
-            }
+        if let Some(error) = remember_error {
+            self.emit(Update::Error(error));
         }
         self.publish_communities();
         Ok(())
     }
 
     fn handle(&mut self, command: Command) -> Result<(), String> {
+        if matches!(
+            &command,
+            Command::Resume { .. }
+                | Command::SwitchCommunity { .. }
+                | Command::Auth { .. }
+                | Command::AccountLoginBegin { .. }
+                | Command::AccountLoginFinish { .. }
+                | Command::Logout
+                | Command::ForgetCommunity { .. }
+        ) {
+            self.pending_host_resume = None;
+            if let Some((job, _)) = &self.handover_job {
+                if !job.is_restore() {
+                job.cancel();
+                }
+            }
+        }
         if let Command::RestoreLocal {
             server,
             data,
@@ -2308,6 +2632,7 @@ impl Worker {
         };
         match command {
             Command::Auth {
+                authority,
                 url,
                 expected_server_id,
                 request,
@@ -2334,6 +2659,7 @@ impl Worker {
                     summary.validate(expected_server_id.as_deref())?;
                     crate::embedded_network::bind_identity(&url, &summary.server_id)?;
                 }
+                let authority = self.confirm_login_authority(&url,expected_server_id.as_deref(),authority.as_ref())?;
                 let endpoint = if register {
                     "/api/register"
                 } else {
@@ -2348,7 +2674,7 @@ impl Worker {
                         .send()
                         .map_err(network_error)?,
                 )?;
-                self.adopt_session(url, expected_server_id, session)?;
+                self.adopt_session_checked(url, expected_server_id, session, None, None, authority)?;
             }
             Command::Logout => {
                 self.cancel_transfers();
@@ -2473,10 +2799,11 @@ impl Worker {
                 let _: Channel = self.post("/api/channels", &request)?;
                 self.refresh();
             }
-            Command::CheckServer { url, request_id } => {
+            Command::CheckServer { url, request_id, authority, locator_invite, cancel } => {
                 let url = crate::community::normalize_url(&url)?;
                 if self.server_check_active.swap(true, Ordering::SeqCst) {
                     self.emit(Update::ServerChecked {
+                        resolved: None,
                         url,
                         request_id,
                         result: Err(
@@ -2493,8 +2820,23 @@ impl Worker {
                 if std::thread::Builder::new()
                     .name("relay-server-check".into())
                     .spawn(move || {
-                        let result = check_server(&http, &target);
+                        let checked = (|| {
+                            if cancel.load(Ordering::Acquire){return Err(crate::host_route::UNAVAILABLE.into());}
+                            let resolved=if let Some(pin)=&authority {
+                                match crate::host_route::discover(&target,pin,&cancel) {
+                                    Ok(value)=>value.map(|v|v.url),
+                                    Err(error) if error == crate::host_route::UNAVAILABLE && locator_invite.as_ref().is_some_and(|v|!v.is_empty()) =>
+                                        Some(crate::host_locator::discover(pin,locator_invite.as_deref().unwrap(),&cancel)?.url),
+                                    Err(error)=>return Err(error),
+                                }
+                            } else {None};
+                            let summary=check_server(&http,resolved.as_deref().unwrap_or(&target))?;
+                            summary.validate(authority.as_ref().map(|p|p.server_id.as_str()))?;
+                            Ok::<_,String>((summary,resolved))
+                        })();
+                        let (result,resolved)=match checked {Ok((s,r))=>(Ok(s),r),Err(e)=>(Err(e),None)};
                         let _ = updates.send(Update::ServerChecked {
+                            resolved,
                             url: target,
                             request_id,
                             result,
@@ -2506,12 +2848,19 @@ impl Worker {
                 {
                     self.server_check_active.store(false, Ordering::SeqCst);
                     self.emit(Update::ServerChecked {
+                        resolved: None,
                         url,
                         request_id,
                         result: Err("Unable to start a connection check. Try again.".into()),
                     });
                 }
             }
+            Command::CreateLanPairing {origin,request_id,cancel} => {
+                if let Err(error)=self.create_lan_pairing(origin.clone(),request_id,cancel){
+                    self.emit(Update::LanPairCreated{origin,request_id,result:Err(error)});
+                }
+            }
+            Command::RevokeLanPairing {origin,id} => {self.revoke_lan_pairing(&origin,&id);}
             Command::Invite { origin, request_id } => {
                 let result =
                     (|| -> Result<(String, Option<crate::invite_proof::InviteProof>), String> {
@@ -2534,6 +2883,7 @@ impl Worker {
                         } else {
                             None
                         };
+                        self.publish_invitation_locator(&code);
                         Ok((code, proof))
                     })();
                 match result {
@@ -2681,6 +3031,7 @@ impl Worker {
                     .as_ref()
                     .map(|c| format!("{}/api/voice/tunnel", c.url.trim_end_matches('/')));
                 self.emit(Update::VoiceJoined {
+                    gateway: self.voice_gateway(&ticket),
                     url,
                     ticket,
                     channel_id,
@@ -2840,9 +3191,11 @@ impl Worker {
             }
             Command::RotateIrohToken { origin } => {
                 let connection = self.command_connection(&origin)?;
-                if !crate::local_host::is_local_url(&connection.url)
+                let transferred=self.handover_runtime.as_ref().is_some_and(|r|
+                    r.matches_connection(&origin.server_id,&connection.url));
+                if !transferred && (!crate::local_host::is_local_url(&connection.url)
                     || self.local_identity().as_ref().map(|id| &id.server_id)
-                        != Some(&origin.server_id)
+                        != Some(&origin.server_id))
                 {
                     return Err(
                         "Only the PC hosting this server can stop its iroh invitations.".into(),
@@ -3118,6 +3471,12 @@ impl Worker {
         }
         let log_dir = data.join("logs");
         std::fs::create_dir_all(&log_dir).map_err(|_| "Cannot create server logs.")?;
+        // The member's saved opt-in, and only when the owner account already
+        // exists: the server refuses a network bind before that, and a start
+        // never listens more widely than the member chose.
+        let lan = crate::local_host::lan_choice(&data)
+            && crate::local_host::owner_ready(&server, &data);
+        let (bind, extra) = crate::local_host::local_launch(lan);
         let mut command = std::process::Command::new(&server);
         if let Ok(Some(provider)) = crate::central_account::Provider::configured() {
             provider.configure_host(&mut command);
@@ -3125,7 +3484,7 @@ impl Worker {
         command
             .args([
                 "--bind",
-                "127.0.0.1",
+                bind,
                 "--port",
                 "4580",
                 "--udp-port",
@@ -3134,7 +3493,8 @@ impl Worker {
                 "Relay House",
                 "--data",
             ])
-            .arg(&data);
+            .arg(&data)
+            .args(extra);
         let log = std::fs::File::create(log_dir.join("server.log"))
             .map_err(|_| "Cannot create the server log.")?;
         let error_log = log
@@ -3233,6 +3593,15 @@ impl Worker {
                 .arg(address)
                 .arg("-NetworkPeerPort")
                 .arg(port.to_string());
+        }
+        // Plain and iroh hosts keep their ordinary ports on loopback. LAN
+        // opt-in adds only the code redemption listener; Tailscale keeps its
+        // existing network binding and does not use this mode.
+        let lan = tailscale.is_none()
+            && crate::local_host::lan_choice(&data)
+            && crate::local_host::owner_ready(&server, &data);
+        if lan {
+            command.arg("-LanDiscovery");
         }
         let mut launcher = command
             .spawn()
@@ -3603,6 +3972,84 @@ impl Worker {
         crate::local_host::Identity::parse(&value)
     }
 
+    fn follow_host_move(&mut self) -> Result<bool, String> {
+        let c = self.connection.as_mut().ok_or(crate::host_route::REFUSED)?;
+        let Some(pin) = c.chat.authority.clone() else {
+            return Ok(false);
+        };
+        let origin = CommandOrigin::from(&*c);
+        let next = if let Some(job) = &c.chat.handover_probe {
+            let Some(result) = job.poll() else {
+                return Ok(false);
+            };
+            c.chat.handover_probe = None;
+            match result {
+                Ok(Some(next)) => next,
+                Ok(None) => return Ok(false),
+                Err(error)
+                    if error == crate::host_route::UNAVAILABLE
+                        || error == crate::host_route::PAUSED =>
+                {
+                    return Ok(false)
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            let now = Instant::now();
+            if c.chat
+                .handover_checked_at
+                .is_some_and(|at| now.duration_since(at) < Duration::from_secs(5))
+            {
+                return Ok(false);
+            }
+            c.chat.handover_checked_at = Some(now);
+            let wake = self.wake.clone();
+            let refresh = self.refresh_pending.clone();
+            c.chat.handover_probe = Some(crate::host_route::Job::start(
+                origin.url.clone(),
+                pin.clone(),
+                crate::host_locator::ReadCapability::session(&pin, &c.session.token),
+                self.background_active.clone(),
+                move || {
+                    refresh.store(true, Ordering::Release);
+                    wake.notify();
+                },
+            )?);
+            return Ok(false);
+        };
+        if self.saved_connections.contains_key(&next.url) {
+            return Err("The new host is already open in another server session. Switch to that session to continue.".into());
+        }
+        let session = self.connection.as_ref().unwrap().session.clone();
+        self.pause_voice_for_outage();
+        self.adopt_session_checked(
+            next.url,
+            Some(origin.server_id.clone()),
+            session,
+            None,
+            Some(MovingSession {
+                provider: self
+                    .connection
+                    .as_ref()
+                    .unwrap()
+                    .chat
+                    .account_provider
+                    .clone(),
+                aliases: crate::host_route::alias_history(
+                    &origin.url,
+                    &self.connection.as_ref().unwrap().chat.authority_aliases,
+                ),
+                origin,
+                pin: next.pin,
+                remembered: self.connection.as_ref().unwrap().remembered,
+                resuming: false,
+            }),
+            None,
+        )?;
+        self.emit(Update::Notice("The community moved to its new host. Your conversations and drafts have been kept; join voice again when you are ready.".into()));
+        Ok(true)
+    }
+
     fn refresh(&mut self) {
         if self.connection.is_none() {
             return;
@@ -3620,7 +4067,29 @@ impl Worker {
                     self.reject_active_identity(error);
                     return;
                 }
+                match crate::host_route::bootstrap_pin(
+                    &c.url,
+                    &c.server_id,
+                    b.host_authority.as_ref(),
+                    c.chat.authority.as_ref(),
+                ) {
+                    Ok(pin) => self.connection.as_mut().unwrap().chat.authority = pin,
+                    Err(error) => {
+                        self.reject_active_identity(error);
+                        return;
+                    }
+                }
+                let c = self.connection.as_ref().unwrap();
                 self.record_alert_bootstrap(&CommandOrigin::from(c), &b, call_received, cursor);
+                if b.host_paused {
+                    self.pause_voice_for_outage();
+                    self.set_status(ConnectionStatus::Reconnecting);
+                    if let Some(c) = &mut self.connection {
+                        c.chat.update_bootstrap(&b);
+                    }
+                    self.emit(Update::Bootstrap(b));
+                    return;
+                }
                 self.set_status(ConnectionStatus::Connected);
                 self.restore_local_sharing(&b);
                 if let Some(c) = &mut self.connection {
@@ -3656,6 +4125,13 @@ impl Worker {
                 }
             }
             Err(e) => {
+                // Only a durable source grant plus a fresh proof from the new
+                // key may send this session to a different address.
+                match self.follow_host_move() {
+                    Ok(true) => return,
+                    Err(error) => self.report_refresh_error(error),
+                    Ok(false) => {}
+                }
                 if e != "Sign in again" {
                     self.pause_voice_for_outage();
                 }
@@ -3991,6 +4467,20 @@ fn resume_remembered(
     )?;
     let received = Instant::now();
     validate_bootstrap_identity(&pin, &remembered.session.user.id, &bootstrap)?;
+    if let Some(saved) = &remembered.authority {
+        crate::host_route::bootstrap_pin(
+            url,
+            &pin,
+            bootstrap.host_authority.as_ref(),
+            Some(&saved.pin),
+        )?;
+        if !same_account_provider(
+            saved.account_provider.as_ref(),
+            bootstrap.account_provider.as_ref(),
+        ) {
+            return Err(crate::host_route::REFUSED.into());
+        }
+    }
     let mut session = remembered.session.clone();
     session.user = bootstrap.user.clone();
     Ok((session, bootstrap, received, cursor))
@@ -4181,6 +4671,8 @@ mod history_backup;
 mod legacy_reactions;
 #[path = "network_reactions.rs"]
 mod reactions;
+#[path = "network_replica.rs"]
+mod replica_token;
 #[path = "network_voice_recovery.rs"]
 mod voice_recovery;
 

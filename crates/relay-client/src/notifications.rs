@@ -59,6 +59,42 @@ impl NotificationPolicy {
         }
     }
 }
+impl NotificationPolicy {
+    /// A private group of friends notifies for every message unless the member
+    /// chose otherwise: "none" and mute silence it, "mentions" needs a mention.
+    pub fn allows_group(&self, mentioned: bool, at: u64) -> bool {
+        if self.muted_until > at {
+            return false;
+        }
+        match self.mode.as_str() {
+            "none" => false,
+            "mentions" => mentioned,
+            _ => true,
+        }
+    }
+}
+/// The group's own choice, else the account's community choice.
+pub(crate) fn group_policy_allows(
+    policies: &HashMap<String, NotificationPolicy>,
+    origin: &CommandOrigin,
+    channel: &str,
+    mentioned: bool,
+    at: u64,
+) -> bool {
+    let scope = crate::conversation_state::ConversationMemory::scope(&origin.url, &origin.user_id);
+    let fallback = NotificationPolicy::default();
+    let community = policies
+        .get(&format!("{scope}|community"))
+        .unwrap_or(&fallback);
+    if community.muted_until > at {
+        return false;
+    }
+    policies
+        .get(&format!("{scope}|{:?}", Target::Channel(channel.into())))
+        .filter(|p| !p.mode.is_empty() || p.muted_until > at)
+        .unwrap_or(community)
+        .allows_group(mentioned, at)
+}
 pub(crate) fn direct_policy_allows(
     policies: &HashMap<String, NotificationPolicy>,
     origin: &CommandOrigin,

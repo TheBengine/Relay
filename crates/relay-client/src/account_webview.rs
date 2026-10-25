@@ -22,7 +22,8 @@ struct Boundary {
 
 impl Boundary {
     fn new(authorization: Url) -> Option<Self> {
-        if authorization.scheme() != "https"
+        if (authorization.scheme() != "https"
+            && !crate::central_account::qa_loopback(&authorization))
             || authorization.host_str().is_none()
             || !authorization.username().is_empty()
             || authorization.password().is_some()

@@ -433,7 +433,7 @@ impl RelayApp {
             Target::Direct(id) => b
                 .members
                 .iter()
-                .any(|member| member.id == *id && member.id != b.user.id),
+                .any(|member| member.id == *id && crate::direct_targets::actionable(b, id)),
             Target::Channel(id) => b
                 .channels
                 .iter()

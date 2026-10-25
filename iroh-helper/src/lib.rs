@@ -15,6 +15,8 @@ mod media;
 pub mod path;
 pub mod policy;
 pub mod protocol;
+pub mod prepared_route;
+pub mod route_proof;
 pub mod token;
 
 use anyhow::Result;

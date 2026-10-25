@@ -1017,6 +1017,7 @@ impl RelayApp {
             profile_card_layout(ui, |ui, actions| {
                 if actions {
                     if self.session.as_ref().is_some_and(|s| s.user.id != user.id)
+                        && self.can_message(&user.id)
                         && ui
                             .add(primary("Message").min_size(Vec2::new(ui.available_width(), 36.0)))
                             .clicked()

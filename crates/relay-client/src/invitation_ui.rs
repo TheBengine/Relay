@@ -3,6 +3,111 @@ use crate::appearance::{TEXT_BODY, TEXT_CAPTION};
 use crate::connection_setup::FlowKind;
 use crate::{connection_setup::SetupState, invitation::Invitation};
 
+/// The "Find on local network" action and its results. Choosing a result only
+/// hands it back; the caller fills the ordinary address field.
+fn lan_find_controls(
+    ui: &mut egui::Ui,
+    finder: &mut crate::lan_discovery::Finder,
+    enabled: bool,
+    relay_account: bool,
+    saved: &[crate::community::SavedCommunity],
+) -> Option<crate::lan_discovery::Choice> {
+    finder.poll();
+    ui.add_space(10.0);
+    ui.horizontal_wrapped(|ui| {
+        if finder.searching() {
+            ui.add_enabled(false, secondary("Searching…"));
+            if ui.add(secondary("Cancel")).clicked() {
+                finder.cancel();
+            }
+        } else if ui
+            .add_enabled(enabled, secondary("Find on local network"))
+            .clicked()
+        {
+            finder.start();
+        }
+    });
+    ui.add(
+        egui::Label::new(
+            RichText::new("Looks for Relay servers on this Wi-Fi or wired network whose hosts turned on local discovery. It does not search the internet. Choosing one only fills in the address above; you still check the connection, and nothing is joined or trusted because it was found.")
+                .size(font_size(TEXT_CAPTION))
+                .color(c_muted()),
+        )
+        .wrap(true),
+    );
+    if finder.searching() {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(100));
+    }
+    let mut picked = None;
+    for (index, found) in finder.found.iter().enumerate() {
+        let joinable = crate::lan_discovery::joinable(relay_account, found);
+        let saved_route =
+            crate::lan_discovery::secure_route(saved, found, crate::lan_discovery::helper_available());
+        ui.push_id(("lan-found", index), |ui| {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(&found.name).strong());
+                ui.label(
+                    RichText::new(found.address())
+                        .size(font_size(TEXT_CAPTION))
+                        .color(c_muted()),
+                );
+                if ui
+                    .add_enabled(enabled && joinable, secondary("Use this server"))
+                    .clicked()
+                {
+                    picked = Some(crate::lan_discovery::Choice::Network(found.clone()));
+                }
+                if saved_route.is_none() && ui.add_enabled(enabled,secondary("Use host's local code")).clicked(){
+                    picked=Some(crate::lan_discovery::Choice::Pair(found.clone()));
+                }
+                if saved_route.is_some()
+                    && ui
+                        .add_enabled(enabled, secondary("Use my saved secure address"))
+                        .clicked()
+                {
+                    picked = Some(crate::lan_discovery::Choice::Saved(found.clone()));
+                }
+            });
+            if let Some(route) = &saved_route {
+                let stored = route.display_name();
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("You already saved a secure address for \u{201c}{stored}\u{201d} with this same server id. Using it checks the connection and the server's identity as usual."))
+                            .size(font_size(TEXT_CAPTION))
+                            .color(c_muted()),
+                    )
+                    .wrap(true),
+                );
+            } else if !joinable {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("This server answers on plain HTTP. Use the host's local code or a secure invitation to connect. Your Relay account still signs in only over HTTPS or Relay's private route.")
+                            .size(font_size(TEXT_CAPTION))
+                            .color(c_muted()),
+                    )
+                    .wrap(true),
+                );
+            }
+        });
+    }
+    if finder.failed {
+        ui.label(
+            RichText::new("Relay could not use the network to search.")
+                .size(font_size(TEXT_CAPTION))
+                .color(c_bad()),
+        );
+    } else if finder.finished && finder.found.is_empty() {
+        ui.label(
+            RichText::new("No servers answered. A server must be on this network, and its host must have turned on local discovery.")
+                .size(font_size(TEXT_CAPTION))
+                .color(c_muted()),
+        );
+    }
+    picked
+}
+
 fn setup_controls(
     ui: &mut egui::Ui,
     address: &mut String,
@@ -100,6 +205,7 @@ impl RelayApp {
         } else {
             self.login.setup.invitation.clone()
         };
+        self.lan_pairing_join_controls(ui,kind);
         let target = if kind == FlowKind::AddCommunity {
             setup_controls(
                 ui,
@@ -119,6 +225,50 @@ impl RelayApp {
                 !self.busy,
             )
         };
+        let relay_account = self.central_account.account.is_some();
+        let found = {
+            let state = if kind == FlowKind::AddCommunity {
+                &mut self.add_community.setup
+            } else {
+                &mut self.login.setup
+            };
+            lan_find_controls(
+                ui,
+                &mut state.lan,
+                !self.busy,
+                relay_account,
+                &self.prefs.communities,
+            )
+        };
+        if let Some(choice) = found {
+            let flow = if kind == FlowKind::AddCommunity {
+                &mut self.add_community
+            } else {
+                &mut self.login
+            };
+            // A saved identity for this address is never replaced by an answer.
+            let selected = match &choice {
+                crate::lan_discovery::Choice::Network(found) => {
+                    flow.select_discovered(&self.prefs.communities, found)
+                }
+                crate::lan_discovery::Choice::Pair(found) => {
+                    let selected=flow.select_discovered(&self.prefs.communities,found);
+                    if selected.is_ok(){flow.password.clear();flow.second_factor.clear();flow.factor_binding=None;flow.setup.lan_pairing.found=Some(found.clone());}
+                    selected
+                }
+                crate::lan_discovery::Choice::Saved(found) => {
+                    flow.select_saved_route(
+                        &self.prefs.communities,
+                        found,
+                        crate::lan_discovery::helper_available(),
+                    )
+                }
+            };
+            match selected {
+                Ok(()) => ui.ctx().request_repaint(),
+                Err(message) => self.error = Some(message),
+            }
+        }
         if let Some(url) = target {
             let request_id = self.next_request();
             let state = if kind == FlowKind::AddCommunity {
@@ -129,6 +279,9 @@ impl RelayApp {
             match state.begin_check(&url, request_id, true) {
                 Ok(Some(url)) => {
                     if let Err(error) = self.network.send(Command::CheckServer {
+                        cancel: state.check_cancellation(),
+                        authority: state.invitation.as_ref().and_then(|i|i.authority.clone()),
+                        locator_invite: state.invitation.as_ref().filter(|i|i.authority.is_some()).map(|i|i.code.clone()),
                         url: url.clone(),
                         request_id,
                     }) {
@@ -179,9 +332,13 @@ impl RelayApp {
                 .as_ref()
                 .and_then(|b| crate::local_host::shared_address(&b.server_id));
             if let Some(origin) = self.command_origin() {
+                let authority = match self.bootstrap.as_ref().map(|b|
+                    crate::host_route::bootstrap_pin(&origin.url,&b.server_id,b.host_authority.as_ref(),None)).transpose() {
+                    Ok(pin)=>pin.flatten(), Err(error)=>{self.error=Some(error);return;}
+                };
                 match self
                     .hosting_setup
-                    .finish_invitation_copy_with_proof(ctx, request_id, &origin, code, proof)
+                    .finish_invitation_copy_with_proof(ctx, request_id, &origin, code, proof, authority)
                 {
                     Ok(true) => {
                         self.notice = Some((
@@ -218,7 +375,9 @@ impl RelayApp {
         } else {
             &self.login.url
         };
-        match Invitation::new(address, &bootstrap.server_id, code) {
+        let invitation=Invitation::new(address, &bootstrap.server_id, code).and_then(|invite|
+            invite.with_authority(crate::host_route::bootstrap_pin(&self.login.url,&bootstrap.server_id,bootstrap.host_authority.as_ref(),None)?));
+        match invitation {
             Ok(mut invitation) => {
                 if let Some(proof) = proof {
                     invitation = invitation.with_proof(proof);
@@ -275,6 +434,7 @@ impl RelayApp {
                 &invitation.server_id,
                 &invitation.code,
             )
+            .and_then(|invite| invite.with_authority(invitation.authority.clone()))
             .map(|invite| match &invitation.proof {
                 Some(proof) => invite.with_proof(proof.clone()),
                 None => invite,
@@ -293,7 +453,7 @@ impl RelayApp {
             if local_only {
                 host_setup_ui::local_invitation_notice(ui);
             }
-            let link = final_invitation.map(|invite| invite.browser_link());
+            let link = final_invitation.map(|invite| invite.for_sharing().browser_link());
             if ui
                 .add_enabled(
                     link.is_ok(),

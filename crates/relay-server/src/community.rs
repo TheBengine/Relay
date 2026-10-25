@@ -3,7 +3,7 @@ use super::*;
 use axum::extract::OriginalUri;
 use std::path::PathBuf;
 
-pub const SCHEMA_VERSION: u32 = 23;
+pub const SCHEMA_VERSION: u32 = 27;
 pub const READ: u32 = 1;
 pub const SEND: u32 = 2;
 pub const JOIN: u32 = 4;
@@ -186,6 +186,22 @@ pub fn migrate_database(db: &mut Connection) -> rusqlite::Result<()> {
                 CREATE TABLE identity_link_challenges(user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE,challenge_id TEXT NOT NULL UNIQUE,nonce TEXT NOT NULL,password_hash TEXT NOT NULL,expires INTEGER NOT NULL,issuer TEXT NOT NULL);")?,
             22 => tx.execute_batch("CREATE TABLE identity_login_challenges(challenge_id TEXT PRIMARY KEY,nonce TEXT NOT NULL,issuer TEXT NOT NULL,invite_hash TEXT NOT NULL,register INTEGER NOT NULL,initial_protection TEXT,expires INTEGER NOT NULL);")?,
             23 => tx.execute_batch(include_str!("private_call_recovery.sql"))?,
+            // M2 slice 2: replica state, key-only change log and its triggers (off until enabled).
+            24 => crate::replica::migrate(&tx)?,
+            // Downgrade barrier: pre-handover hosts must refuse this database,
+            // rather than ignoring the external retirement journal.
+            25 => {},
+            // Friends groups: waiting invitations. Private to the two people and the group.
+            26 => tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS group_invitations(channel_id TEXT NOT NULL REFERENCES conversations(channel_id) ON DELETE CASCADE,invitee TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,inviter TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,created INTEGER NOT NULL,PRIMARY KEY(channel_id,invitee));
+                CREATE INDEX IF NOT EXISTS group_invitations_invitee ON group_invitations(invitee);",
+            )?,
+            // Host locator directory (Friends only): opaque encrypted, host-signed records.
+            27 => tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS host_locator_records(id TEXT PRIMARY KEY CHECK(length(id)=64),anchor TEXT NOT NULL,current_key TEXT NOT NULL,current_term INTEGER NOT NULL,issued_ms INTEGER NOT NULL,expires_ms INTEGER NOT NULL,record TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS host_locator_anchor ON host_locator_records(anchor,expires_ms);
+                CREATE INDEX IF NOT EXISTS host_locator_expiry ON host_locator_records(expires_ms);",
+            )?,
             _ => unreachable!(),
         }
         tx.execute(
@@ -235,11 +251,7 @@ pub fn channel_access(
             } else {
                 c
             };
-            if group.kind != "group"
-                || group.member_ids.len() != 2
-                || !group.member_ids.iter().any(|id| id == user_id)
-                || !people::friend(db, &group.member_ids[0], &group.member_ids[1])
-            {
+            if group.kind != "group" || !people::group_access(db, &group, user_id) {
                 return Err(forbidden());
             }
         } else {
@@ -322,10 +334,24 @@ pub fn get_channel(db: &Connection, channel_id: &str) -> ApiResult<Channel> {
     .ok_or_else(missing)
 }
 pub fn visible_channels(db: &Connection, user_id: &str) -> ApiResult<Vec<Channel>> {
-    let mut statement=db.prepare("SELECT id,name,kind,topic,visibility,category_id,position,slowmode_seconds,voice_parent_id FROM channels ORDER BY position,rowid")?;
-    let channels = statement
-        .query_map([], row_channel)?
-        .collect::<Result<Vec<_>, _>>()?;
+    // The Friends service holds every member's groups in one database, so a
+    // member is only ever asked about the conversations they belong to.
+    let people = people::enabled(db);
+    let sql = if people {
+        format!("{} SELECT id,name,kind,topic,visibility,category_id,position,slowmode_seconds,voice_parent_id FROM channels WHERE id IN (SELECT id FROM mine) OR id IN (SELECT id FROM rooms) OR voice_parent_id IN (SELECT id FROM rooms) ORDER BY position,rowid", conversations::MINE)
+    } else {
+        "SELECT id,name,kind,topic,visibility,category_id,position,slowmode_seconds,voice_parent_id FROM channels ORDER BY position,rowid".into()
+    };
+    let mut statement = db.prepare(&sql)?;
+    let channels = if people {
+        statement
+            .query_map([user_id], row_channel)?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        statement
+            .query_map([], row_channel)?
+            .collect::<Result<Vec<_>, _>>()?
+    };
     Ok(channels
         .into_iter()
         .filter(|c| channel_access(db, &c.id, user_id, READ).is_ok())
@@ -1262,6 +1288,8 @@ pub fn restore_database(
         None,
     )?;
     db.execute("DELETE FROM sessions", [])?;
+    // The restored file has another history: no earlier replica cursor is valid.
+    crate::replica::after_restore(db)?;
     Ok(())
 }
 pub async fn backups(
@@ -1425,6 +1453,12 @@ impl AppState {
         backup_database(&lock(&self.0.db), destination)
     }
     pub fn restore_from(&self, source: &FsPath) -> Result<(), Box<dyn std::error::Error>> {
+        if lock(&self.0.takeover).is_some() {
+            return Err("Protected hosting must be stopped before restoring a different database".into());
+        }
+        if !self.writes_allowed() {
+            return Err("Cancel handover preparation before restoring a database".into());
+        }
         std::fs::create_dir_all(self.0.data.join("backups"))?;
         let prepared = self
             .0
@@ -1444,7 +1478,27 @@ impl AppState {
                     .join("backups")
                     .join(format!("{}.sqlite3", id())),
             )?;
-            restore_database(&mut lock(&self.0.db), &prepared)
+            let mut db = lock(&self.0.db);
+            let incoming =
+                Connection::open_with_flags(&prepared, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            self.0
+                .handover
+                .begin_restore(server_id(&incoming)?)
+                .map_err(|error| Box::<dyn std::error::Error>::from(error.message))?;
+            self.0
+                .handover_exports
+                .recover(&self.0.data, &self.0.handover.status());
+            drop(incoming);
+            let result = restore_database(&mut db, &prepared);
+            self.0
+                .handover
+                .stamp_database(&db)
+                .map_err(|error| Box::<dyn std::error::Error>::from(error.message))?;
+            self.0
+                .handover
+                .finish_restore(server_id(&db)?)
+                .map_err(|error| Box::<dyn std::error::Error>::from(error.message))?;
+            result
         })();
         let _ = std::fs::remove_file(&prepared);
         result
@@ -1565,8 +1619,18 @@ pub async fn restore_backup(
                 "Cannot create recovery backup; restore cancelled",
             )
         })?;
-        restore_database(&mut db, &source)
-            .map_err(|_| bad("Restore failed: backup must be valid and match this schema"))?;
+        let incoming =
+            Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        state.0.handover.begin_restore(server_id(&incoming)?)?;
+        state
+            .0
+            .handover_exports
+            .recover(&state.0.data, &state.0.handover.status());
+        drop(incoming);
+        let result = restore_database(&mut db, &source);
+        state.0.handover.stamp_database(&db)?;
+        state.0.handover.finish_restore(server_id(&db)?)?;
+        result.map_err(|_| bad("Restore failed: backup must be valid and match this schema"))?;
     }
     state.revoke_all_rtc();
     lock(&state.0.voice).clear();
@@ -1624,12 +1688,25 @@ pub async fn dispatch(
                 | "/api/voice/leave"
         ) || path.starts_with("/api/members/")
             || path.starts_with("/api/channels/")
-            || path.starts_with("/api/sessions/"));
+            || path.starts_with("/api/sessions/")
+            || (path.starts_with("/api/hosting/handover/")
+                && !matches!(
+                    path,
+                    "/api/hosting/handover/export" | "/api/hosting/handover/part"
+                )));
+    let admission_path = path.to_owned();
     let handle = tokio::runtime::Handle::current();
     let work_state = state.clone();
     let run = move || {
         handle.block_on(async move {
             let _permit = permit;
+            if work_state.takeover_blocked() {
+                return ApiError::new(StatusCode::SERVICE_UNAVAILABLE,
+                    "Protected host is paused while its copies reconnect or recover").into_response();
+            }
+            if let Err(error) = work_state.0.handover.admit(&admission_path) {
+                return error.into_response();
+            }
             let mut response =
                 match tokio::time::timeout(Duration::from_secs(30), next.run(request)).await {
                     Ok(response) => response,
@@ -1641,7 +1718,7 @@ pub async fn dispatch(
                         .into_response()
                     }
                 };
-            if mutation {
+            if mutation && work_state.writes_allowed() {
                 if exclusive {
                     chat_controls::prune_typing(&work_state);
                 }
@@ -1654,6 +1731,10 @@ pub async fn dispatch(
                     )
                     .into_response();
                 }
+            }
+            if work_state.takeover_blocked() {
+                return ApiError::new(StatusCode::SERVICE_UNAVAILABLE,
+                    "Protected write is not confirmed. Retry with the same message client_id").into_response();
             }
             response
         })

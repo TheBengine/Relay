@@ -1,6 +1,14 @@
+pub mod host_locator;
 use serde::{Deserialize, Serialize};
 pub mod direct_voice;
+pub mod game_activity;
+pub mod gateway_broker;
+pub mod handover;
+pub mod hosting;
 pub mod installation;
+pub mod lan_discovery;
+pub mod lan_pairing;
+pub mod takeover;
 
 pub const CRYPTO_MAX_OPERATION_JSON_BYTES: usize = 1536 * 1024;
 pub const CRYPTO_MAX_OPERATION_DECODED_BYTES: usize = 1024 * 1024;
@@ -432,6 +440,12 @@ pub struct SetProtection {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Bootstrap {
+    /// A frozen source offers a read-only view for resuming/cancelling the move.
+    /// It never renews a voice lease or permits a mutation.
+    #[serde(default)]
+    pub host_paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_authority: Option<handover::RoutePin>,
     #[serde(default)]
     pub account_login_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -446,6 +460,14 @@ pub struct Bootstrap {
     pub assets: Vec<MediaAsset>,
     #[serde(default)]
     pub conversations: Vec<ConversationInfo>,
+    /// Friends groups: invitations waiting for this account, and this account's own as an owner.
+    #[serde(default)]
+    pub group_invitations: Vec<GroupInvitation>,
+    #[serde(default)]
+    pub group_invitations_sent: Vec<SentGroupInvitation>,
+    /// Coarse state of the other people in this account's own Friends groups.
+    #[serde(default)]
+    pub group_presence: Vec<GroupPresence>,
     #[serde(default)]
     pub scheduled_events: Vec<ScheduledEvent>,
     #[serde(default)]
@@ -597,6 +619,9 @@ pub struct UserPresence {
     pub text: String,
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// Opt-in game activity, set by the Friends service for current friends only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<game_activity::GameActivity>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserReport {
@@ -915,6 +940,29 @@ pub struct RtcTicket {
     pub url: String,
     pub token: String,
     pub room: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_bridge: Option<RtcMediaBridge>,
+}
+
+/// An optional fixed SFU route over the same HTTPS origin as signaling. Uses
+/// a media-only call capability, never the community account bearer.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RtcMediaBridge {
+    pub url: String,
+    pub peer_ip: String,
+    pub peer_port: u16,
+    pub token: String,
+}
+impl std::fmt::Debug for RtcMediaBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RtcMediaBridge")
+            .field("url", &self.url)
+            .field("peer_ip", &self.peer_ip)
+            .field("peer_port", &self.peer_port)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -956,7 +1004,47 @@ pub const AUDIO_V2_HEADER_LEN: usize = 26;
 /// Authenticated nine-byte probe: type plus little-endian u64 client ID. Echoes
 /// only to its registered session source with a unique direction-one nonce.
 pub const UDP_PING: u8 = 3;
+/// Authenticated path challenge echoed to its source WITHOUT replacing the
+/// selected voice address. Tests a candidate gateway while the call continues.
+pub const UDP_PATH_PROBE: u8 = 8;
 pub const API_PROTOCOL_VERSION: u32 = 2;
+/// Friends group conversations. Only the Friends service advertises it.
+pub const PEOPLE_GROUPS_CAPABILITY: &str = "people-groups-v1";
+/// A Friends group has at most this many members, its creator included.
+pub const PEOPLE_GROUP_MAX_MEMBERS: usize = 8;
+/// Friends groups are joined by explicit invitation and acceptance.
+pub const PEOPLE_GROUP_INVITES_CAPABILITY: &str = "people-group-invites-v1";
+/// A waiting invitation lapses after this many days.
+pub const PEOPLE_GROUP_INVITE_DAYS: u64 = 7;
+/// One person can have this many invitations waiting at once.
+pub const PEOPLE_GROUP_PENDING_PER_PERSON: usize = 50;
+/// Members of an accepted Friends group see each other's coarse state there only.
+pub const PEOPLE_GROUP_PRESENCE_CAPABILITY: &str = "people-group-presence-v1";
+/// The event kind that says someone's coarse state changed in a group.
+pub const GROUP_PRESENCE_EVENT: &str = "group-presence";
+
+/// What an invited person may see before accepting: who invited them and the
+/// group's name. Nothing about its members, messages, keys or files.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GroupInvitation {
+    pub channel_id: String,
+    pub name: String,
+    pub inviter_id: String,
+}
+/// One person's coarse state inside one group: `online`, `idle`, `dnd` or `offline`.
+/// Never a status text, expiry, time, device, activity or anything global.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GroupPresence {
+    pub channel_id: String,
+    pub user_id: String,
+    pub status: String,
+}
+/// A group owner's own waiting invitation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SentGroupInvitation {
+    pub channel_id: String,
+    pub invitee_id: String,
+}
 pub const UDP_HEADER_LEN: usize = 16;
 pub const UDP_MAX_PACKET: usize = 1500;
 pub const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;

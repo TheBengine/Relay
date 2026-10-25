@@ -468,12 +468,13 @@ impl RelayApp {
             .get(&key)
             .filter(|p| !p.mode.is_empty() || p.muted_until > unix_time())
             .unwrap_or(community_policy);
-        policy.allows(
-            message.mentions.iter().any(|id| id == user),
-            direct,
-            self.prefs.mentions_only,
-            unix_time(),
-        )
+        let mentioned = message.mentions.iter().any(|id| id == user);
+        if let Target::Channel(channel) = target {
+            if self.friends_group_channel(url, channel) {
+                return policy.allows_group(mentioned, unix_time());
+            }
+        }
+        policy.allows(mentioned, direct, self.prefs.mentions_only, unix_time())
     }
     pub(super) fn notification_scopes_ui(&mut self, ui: &mut egui::Ui) {
         let Some(b) = self.bootstrap.clone() else {
@@ -557,6 +558,12 @@ impl RelayApp {
         self.bootstrap
             .as_ref()
             .is_some_and(|b| b.social.blocked.iter().any(|id| id == user))
+    }
+    /// A private message may be opened or sent only to who `direct_targets` allows.
+    pub(super) fn can_message(&self, user: &str) -> bool {
+        self.bootstrap
+            .as_ref()
+            .is_some_and(|b| crate::direct_targets::actionable(b, user))
     }
     fn friend_action_button(
         &mut self,
@@ -725,6 +732,7 @@ impl RelayApp {
             ui.label("Update the community server to use friends and status.");
             return;
         }
+        self.group_invitations_ui(ui, &b);
         ui.horizontal_wrapped(|ui| {
             icon(ui, Icon::Users, 22.0, c_muted());
             ui.label(
@@ -1072,6 +1080,37 @@ impl RelayApp {
                 .size(font_size(TEXT_CAPTION))
                 .color(color),
             );
+            // Opt-in game activity: only what the Friends service shows this account.
+            if let Some(activity) = &p.activity {
+                let own = self.bootstrap.as_ref().is_some_and(|b| b.user.id == user);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} {}",
+                            if own { "Sharing" } else { "Playing" },
+                            activity.name
+                        ))
+                        .size(font_size(TEXT_CAPTION))
+                        .color(c_good()),
+                    );
+                    if let (false, Some(link)) = (own, &activity.join) {
+                        if ui
+                            .small_button("Join…")
+                            .on_hover_text(
+                                "Ask to open this invitation. Nothing opens until you confirm.",
+                            )
+                            .clicked()
+                        {
+                            ui.ctx().data_mut(|data| {
+                                data.insert_temp(
+                                    egui::Id::new(super::game_activity_ui::JOIN_REQUEST),
+                                    (user.to_owned(), activity.game_id.clone(), link.clone()),
+                                )
+                            });
+                        }
+                    }
+                });
+            }
         }
     }
     pub(super) fn paint_presence_badge(
@@ -1104,6 +1143,37 @@ impl RelayApp {
                 }
             ));
         }
+    }
+    /// A group member's coarse state, from that group's own list. It is not the
+    /// friends presence: nothing is drawn when the server sent no row.
+    pub(super) fn paint_group_presence_badge(
+        &self,
+        ui: &egui::Ui,
+        channel: &str,
+        user: &str,
+        response: &egui::Response,
+    ) {
+        let Some(status) = self.bootstrap.as_ref().filter(|b|
+            b.capabilities.iter().any(|c|c == relay_protocol::PEOPLE_GROUP_PRESENCE_CAPABILITY)).and_then(|b| {
+            b.group_presence
+                .iter()
+                .find(|p| p.channel_id == channel && p.user_id == user)
+                .map(|p| p.status.as_str())
+        }) else {
+            return;
+        };
+        let color = match status {
+            "online" => c_good(),
+            "idle" => Color32::from_rgb(240, 178, 50),
+            "dnd" => c_bad(),
+            _ => c_muted(),
+        };
+        let pos = egui::Pos2::new(response.rect.left() + 31.0, response.rect.center().y + 10.0);
+        ui.painter().circle_filled(pos, 6.0, c_panel());
+        ui.painter().circle_filled(pos, 4.0, color);
+        response
+            .clone()
+            .on_hover_text(presence_name(if status == "idle" { "away" } else { status }));
     }
     pub(super) fn reports_ui(&mut self, ui: &mut egui::Ui) {
         self.ensure_admin_data("reports", "/api/reports");

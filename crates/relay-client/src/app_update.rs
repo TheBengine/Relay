@@ -118,7 +118,38 @@ impl RelayApp {
             .pop_front()
             .or_else(|| self.network.try_update().ok())
         {
+            #[cfg(feature = "qa-automation")]
+            crate::qa_automation::log_update(&update);
+            let mut verified_move = None;
             let update = match update {
+                Update::CommunityMoved {
+                    origin,
+                    url,
+                    session,
+                    bootstrap,
+                } => {
+                    let requested = self.resume_destination.as_deref() == Some(origin.url.as_str())
+                        && self
+                            .prefs
+                            .communities
+                            .iter()
+                            .any(|v| v.url == origin.url && v.server_id == origin.server_id);
+                    if self.command_origin().as_ref() != Some(&origin) && !requested {
+                        continue;
+                    }
+                    if bootstrap.server_id != origin.server_id
+                        || bootstrap.user.id != origin.user_id
+                        || session.user.id != origin.user_id
+                    {
+                        continue;
+                    }
+                    verified_move = Some(origin);
+                    Update::Connected {
+                        url,
+                        session,
+                        bootstrap,
+                    }
+                }
                 Update::AccountLoginComplete {
                     url,
                     session,
@@ -158,7 +189,14 @@ impl RelayApp {
                 continue;
             }
             match update {
-                Update::AccountLoginComplete { .. } => unreachable!("resolved above"),
+                Update::HandoverHostReady { remembered } => {
+                    self.own_local_server = true;
+                    self.notice=Some((if remembered{"This PC is hosting the transferred community."}else{"This PC is hosting the transferred community, but automatic restart could not be saved. Its data and keys were kept."}.into(),Instant::now()));
+                }
+                Update::Handover(view) => self.handover_received(view),
+                Update::AccountLoginComplete { .. } | Update::CommunityMoved { .. } => {
+                    unreachable!("resolved above")
+                }
                 Update::AccountLoginChallenge {
                     url,
                     data,
@@ -185,8 +223,18 @@ impl RelayApp {
                     // Consume the explicit answer before normal connection
                     // adoption tears down the previous idle media context.
                     let background_answer = self.take_background_people_answer(&url, &bootstrap);
-                    self.account_start.pending = None;
-                    self.account_start.home = false;
+                    self.resume_destination = None;
+                    let people = self
+                        .account_start
+                        .pending
+                        .take()
+                        .is_some_and(|attempt| attempt.is_people());
+                    // During automatic entry a reconnected saved server stays in the
+                    // background while the start page waits for Friends.
+                    self.account_start.home = self.account_start.auto.is_some() && !people;
+                    if people {
+                        self.account_start.auto = None;
+                    }
                     self.voice_retry = None;
                     self.voice_join_attempt = None;
                     let created_open = self.hosting_setup.new_host
@@ -196,6 +244,14 @@ impl RelayApp {
                         && crate::local_host::is_local_url(&url)
                         && bootstrap.user.role == "admin"
                         && bootstrap.protection.level == relay_protocol::ProtectionLevel::Open;
+                    if self.hosting_setup.new_host
+                        && self.login.registering
+                        && crate::local_host::is_local_url(&url)
+                        && bootstrap.user.role == "admin"
+                    {
+                        // The first account exists: tie the chosen connection to this exact server.
+                        self.remember_creation_route(&bootstrap.server_id);
+                    }
                     self.account_feedback.finished();
                     self.hosting_setup.cancel_invitation_copy();
                     // The link used to join this community may carry device verification.
@@ -213,6 +269,8 @@ impl RelayApp {
                         self.hosting_setup.open = true;
                     }
                     self.hosting_setup.new_host = false;
+                    // The first account committed the choices; the next server starts afresh.
+                    self.hosting_setup.creation_confirmed = false;
                     let bootstrap = *bootstrap;
                     if let Some(previous) = &self.bootstrap {
                         cache_community_snapshot(
@@ -234,13 +292,25 @@ impl RelayApp {
                         self.save_preferences();
                         self.stop_media();
                     }
+                    if let Some(origin) = &verified_move {
+                        crate::community::moved(&mut self.prefs.communities, origin, &url);
+                        self.community_statuses.remove(&origin.url);
+                        self.community_reads.remove(&origin.url);
+                        self.community_social.remove(&origin.url);
+                        self.community_friends.remove(&origin.url);
+                    }
                     self.login.url = url;
                     self.login.username = session.user.username.clone();
                     self.login.password.clear();
                     self.login.invite.clear();
                     let initial_channel = self.initial_channel.take();
                     let initial_direct = self.initial_direct.take();
-                    let scope = ConversationMemory::scope(&self.login.url, &session.user.id);
+                    let scope = crate::community::conversation_scope(
+                        &self.prefs.communities,
+                        &self.login.url,
+                        &bootstrap.server_id,
+                        &session.user.id,
+                    );
                     let remembered =
                         self.prefs
                             .conversations
@@ -250,7 +320,8 @@ impl RelayApp {
                                     bootstrap.channels.iter().any(|channel| &channel.id == id)
                                 }
                                 Target::Direct(id) => bootstrap.members.iter().any(|member| {
-                                    &member.id == id && member.id != bootstrap.user.id
+                                    &member.id == id
+                                        && crate::direct_targets::actionable(&bootstrap, id)
                                 }),
                             });
                     let target = initial_direct
@@ -258,7 +329,10 @@ impl RelayApp {
                             bootstrap
                                 .members
                                 .iter()
-                                .find(|m| m.username == name && m.id != bootstrap.user.id)
+                                .find(|m| {
+                                    m.username == name
+                                        && crate::direct_targets::actionable(&bootstrap, &m.id)
+                                })
                                 .map(|m| Target::Direct(m.id.clone()))
                         })
                         .or_else(|| {
@@ -325,9 +399,14 @@ impl RelayApp {
                     self.marked_read.clear();
                     self.uploads.clear();
                     self.send_ids.clear();
-                    self.connection_status = ConnectionStatus::Connected;
+                    self.connection_status =
+                        if self.bootstrap.as_ref().is_some_and(|b| b.host_paused) {
+                            ConnectionStatus::Reconnecting
+                        } else {
+                            ConnectionStatus::Connected
+                        };
                     self.community_statuses
-                        .insert(self.login.url.clone(), ConnectionStatus::Connected);
+                        .insert(self.login.url.clone(), self.connection_status.clone());
                     self.add_community_open = false;
                     self.add_community.password.clear();
                     self.admin_data.clear();
@@ -337,6 +416,21 @@ impl RelayApp {
                     self.login.second_factor.clear();
                     self.add_community.second_factor.clear();
                     self.admin_ui = admin_ui::ServerUi::default();
+                    if self.bootstrap.as_ref().is_some_and(|b| b.host_paused) {
+                        // Reopen the recovery controls without normal startup's
+                        // invitation attestation, consent, history or call writes.
+                        // Keep the saved conversation selection for after resume.
+                        self.profile_ui.clear_session();
+                        self.encryption_ui.clear_session();
+                        self.message_protection.clear();
+                        self.protection_ui.forget_connection();
+                        self.error = None;
+                        self.settings_open = true;
+                        self.settings_tab = SettingsTab::Server;
+                        self.admin_ui.select_section("hosts");
+                        self.finish_server_action();
+                        continue;
+                    }
                     if !self.in_people() {
                         self.maybe_open_welcome();
                     }
@@ -815,6 +909,9 @@ impl RelayApp {
                     }
                 }
                 Update::RequestFailed { request_id, error } => {
+                    if self.replica_request_failed(request_id, &error) {
+                        continue;
+                    }
                     if self.account_login_failed(request_id, &error) {
                         continue;
                     }
@@ -874,6 +971,10 @@ impl RelayApp {
                         self.search_pending = None;
                         self.error = Some(error);
                     } else if let Some(key) = self.admin_requests.remove(&request_id) {
+                        if key == "hosting" || key == "action:hosting" {
+                            self.hosting_failed(&key, error);
+                            continue;
+                        }
                         if key == "action:people-request" {
                             self.people_request_failed(error);
                             continue;
@@ -1028,6 +1129,13 @@ impl RelayApp {
                     self.community_friends.retain(&owners);
                     self.defer_preferences();
                 }
+                Update::GameActivityResult {
+                    origin,
+                    request_id,
+                    result,
+                } => {
+                    self.game_activity_result(origin, request_id, result);
+                }
                 Update::PeopleCallDeclined {
                     origin,
                     call_id,
@@ -1038,6 +1146,7 @@ impl RelayApp {
                 }
                 Update::CommunityBootstrap { url, bootstrap } => {
                     self.remember_people_call(&url, &bootstrap);
+                    self.remember_game_service(&url, &bootstrap);
                     cache_community_snapshot(
                         &mut self.community_reads,
                         &mut self.community_social,
@@ -1202,6 +1311,12 @@ impl RelayApp {
                         self.handle_admin_result(key, data);
                     }
                 }
+                Update::ReplicaToken {
+                    origin,
+                    request_id,
+                    replica_id,
+                    outcome,
+                } => self.replica_token_result(origin, request_id, replica_id, outcome),
                 Update::MentionInbox {
                     request_id,
                     messages,
@@ -1385,11 +1500,12 @@ impl RelayApp {
                     channel_id,
                     ticket,
                     keys,
+                    gateway,
                 } => {
                     if url == self.login.url && self.voice_channel.as_ref() == Some(&channel_id) {
                         self.stop_media_for_call_change();
                         self.voice_channel = Some(channel_id);
-                        self.start_protected_voice(&url, ticket, keys);
+                        self.start_protected_voice_with_gateway(&url, ticket, keys, gateway);
                         self.request_video_connection();
                     }
                 }
@@ -1559,6 +1675,7 @@ impl RelayApp {
                     self.pending_edits.remove(&message_id);
                     self.error = Some(error);
                 }
+                Update::LanPairCreated {origin,request_id,result} => self.lan_pair_created(origin,request_id,result),
                 Update::Invite {
                     origin,
                     code,
@@ -1581,19 +1698,13 @@ impl RelayApp {
                     }
                 }
                 Update::ServerChecked {
+                    resolved,
                     url,
                     request_id,
                     result,
                 } => {
-                    self.login
-                        .setup
-                        .accept(&self.login.url, &url, request_id, result.clone());
-                    self.add_community.setup.accept(
-                        &self.add_community.url,
-                        &url,
-                        request_id,
-                        result,
-                    );
+                    self.login.accept_checked(&url,request_id,result.clone(),resolved.clone());
+                    self.add_community.accept_checked(&url,request_id,result,resolved);
                 }
                 Update::CallSwitchResult { request, result } => {
                     self.call_switch_result(request, result, &mut call_transitions)
@@ -1605,6 +1716,7 @@ impl RelayApp {
                     channel_id,
                     request_id,
                     keys,
+                    gateway,
                 } => {
                     if !crate::voice_ui_state::accepts_join(
                         self.joining_voice.as_deref(),
@@ -1618,7 +1730,7 @@ impl RelayApp {
                     self.video.clear();
                     self.voice_join_attempt = Some(request_id);
                     self.voice_channel = Some(channel_id);
-                    self.start_protected_voice(&url, ticket, keys);
+                    self.start_protected_voice_with_gateway(&url, ticket, keys, gateway);
                     self.request_video_connection();
                 }
                 Update::VoiceLeft => {
@@ -1853,6 +1965,9 @@ impl RelayApp {
                             .local_account_ready(&mut self.login, setup_required);
                     } else {
                         self.hosting_setup.local_ready = true;
+                        if self.hosting_setup.new_host {
+                            self.claim_new_server(setup_required);
+                        }
                     }
                     self.hosting_setup.entry = host_setup_ui::LoginEntry::Account;
                     self.own_local_server |= created;
@@ -2140,6 +2255,8 @@ impl eframe::App for RelayApp {
             self.native_close(_ctx, raw_input.viewport().close_requested());
         }
         desktop_ui::preserve_minimized_layout(raw_input);
+        #[cfg(feature = "qa-automation")]
+        crate::qa_automation::hook(&mut self.qa_input, _ctx, raw_input);
         if self
             .focused_stream
             .as_ref()
@@ -2173,6 +2290,10 @@ impl eframe::App for RelayApp {
             self.network.reopen_if_stopped(ctx);
         }
         self.updates(ctx);
+        self.replica_copy_tick();
+        self.handover_tick();
+        self.lan_pairing_tick();
+        self.game_activity_tick(ctx);
         self.central_account_tick(ctx);
         self.account_login_tick(ctx);
         self.account_link_tick(ctx);

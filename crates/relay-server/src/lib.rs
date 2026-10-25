@@ -1,4 +1,5 @@
 mod account_identity;
+mod activity;
 mod assets;
 mod authenticator;
 mod chat_controls;
@@ -8,18 +9,46 @@ mod discord_bridge;
 mod discord_channel_status;
 mod discord_host;
 mod e2ee;
+mod gateway_admission;
+mod group_invites;
+mod group_presence;
+mod handover_locator_page;
+mod host_locator_directory;
+mod lan_pairing;
+mod handover;
+mod handover_locator;
+pub mod handover_readiness;
+pub mod handover_target;
+pub mod handover_transfer;
+mod hosting;
+pub mod lan_discovery;
+// Internal data-copy core; no pull agent or handover is activated by this module.
 mod ordering;
 mod password_policy;
 mod people;
 mod private_calls;
 mod profiles;
 mod protection;
+#[allow(dead_code)]
+mod replica;
+pub mod replica_agent;
 mod request_host;
 pub use request_host::validate_names as validate_allowed_hosts;
 mod roles;
 mod rtc;
+mod rtc_media;
 mod server_settings;
 mod social;
+mod takeover_voter;
+mod takeover_store;
+mod takeover_signer;
+mod takeover_transaction;
+mod takeover_inflight;
+mod takeover_commit;
+mod takeover_runtime;
+mod takeover_standby;
+mod takeover_transport;
+mod takeover_wal_vfs;
 mod voice;
 mod voice_chat;
 mod voice_recovery;
@@ -91,6 +120,11 @@ struct Inner {
     voice_socket: Mutex<Option<Arc<tokio::net::UdpSocket>>>,
     frames: Mutex<HashMap<(String, String), StoredFrame>>,
     auth_rates: Mutex<HashMap<String, (u64, u32)>>,
+    route_rates: Mutex<HashMap<String, (u64, u32)>>,
+    /// Per-ingress budgets of the host locator directory; bounded and pruned.
+    locator_rates: Mutex<HashMap<String, (u64, u32)>>,
+    /// Short-lived LAN pairing entries and per-peer counters. In memory only.
+    lan_pairing: lan_pairing::Store,
     mutation_rates: Mutex<HashMap<String, (u64, u32)>>,
     password_jobs: Arc<tokio::sync::Semaphore>,
     transfer_jobs: Arc<tokio::sync::Semaphore>,
@@ -113,6 +147,8 @@ struct Inner {
     rtc_members: Mutex<HashMap<String, rtc::RtcMembership>>,
     rtc_removals: Mutex<HashMap<(String, String), ()>>,
     typing: Mutex<HashMap<chat_controls::TypingKey, chat_controls::TypingEntry>>,
+    /// Opt-in game activity: in memory only, short-lived, never stored.
+    activity: activity::Store,
     private_calls: Mutex<HashMap<String, PrivateCall>>,
     identity_jobs: Arc<tokio::sync::Semaphore>,
     /// Further own addresses for account sign-in proofs, told by the host app
@@ -120,7 +156,14 @@ struct Inner {
     account_destinations: Mutex<std::collections::HashSet<String>>,
     event_connections: ws_limits::ConnectionBudget,
     rtc_connections: ws_limits::ConnectionBudget,
+    rtc_media_connections: ws_limits::ConnectionBudget,
     voice_connections: ws_limits::ConnectionBudget,
+    gateways: gateway_admission::Broker,
+    replica: replica::service::Service,
+    handover: handover::Authority,
+    handover_exports: handover_transfer::Service,
+    takeover: Mutex<Option<Arc<takeover_runtime::Source>>>,
+    takeover_failed: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -301,6 +344,7 @@ impl AppState {
         udp_port: u16,
         mut config: ServerConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        takeover_runtime::require_ordinary_boot(data)?;
         if config.people && config.account_provider.is_none() {
             return Err("Friends require a configured Relay account provider".into());
         }
@@ -320,8 +364,27 @@ impl AppState {
         let existing = data.join("relay.sqlite3").exists();
         let mut connection = Connection::open(data.join("relay.sqlite3"))?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let previous: u32 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if previous > SCHEMA_VERSION {
+            return Err("Database belongs to a newer Relay release; retained unchanged".into());
+        }
+        let existing_authority = if previous > 0 {
+            Some(handover::Authority::open_database(data, &connection)?)
+        } else {
+            None
+        };
+        if existing_authority
+            .as_ref()
+            .is_some_and(|authority| !authority.writes_allowed())
+        {
+            if previous != SCHEMA_VERSION {
+                return Err("This host is paused for handover; cancel preparation before upgrading its database".into());
+            }
+            connection.pragma_update(None, "query_only", true)?;
+        } else {
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+        }
         let populated = connection.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
             [],
@@ -338,46 +401,58 @@ impl AppState {
             )?;
         }
         migrate_database(&mut connection)?;
+        let authority = match existing_authority {
+            Some(authority) => authority,
+            None => handover::Authority::open_database(data, &connection)?,
+        };
+        let handover_exports = handover_transfer::Service::default();
+        handover_exports.recover(data, &authority.status());
+        replica::service::startup(data);
         people::initialize(&connection, &config, existing)?;
-        // Rebase only implausible future timestamps after a clock adjustment.
-        // A restart never grants a free send; rebasing retains one full cooldown.
-        connection.execute(
-            "UPDATE channel_send_cooldowns SET last_sent_ms=?1 WHERE last_sent_ms>?1",
-            [now_ms()],
-        )?;
-        connection.execute(
-            "UPDATE message_send_log SET sent_at_ms=?1 WHERE sent_at_ms>?1",
-            [now_ms()],
-        )?;
-        connection.execute(
-            "DELETE FROM message_send_log WHERE sent_at_ms<=?1",
-            [now_ms().saturating_sub(chat_controls::MESSAGE_BURST_WINDOW_MS)],
-        )?;
-        if !config.people
-            && connection.query_row("SELECT COUNT(*) FROM channels", [], |r| r.get::<_, i64>(0))?
-                == 0
-        {
-            for (name, kind, topic) in [
-                ("general", "text", "The place for everything"),
-                ("clips", "text", "Share what you are playing"),
-                ("Lounge", "voice", "Join the conversation"),
-            ] {
-                connection.execute(
-                    "INSERT INTO channels(id,name,kind,topic) VALUES(?1,?2,?3,?4)",
-                    params![id(), name, kind, topic],
-                )?;
+        if authority.writes_allowed() {
+            // Rebase only implausible future timestamps after a clock adjustment.
+            // A restart never grants a free send; rebasing retains one full cooldown.
+            connection.execute(
+                "UPDATE channel_send_cooldowns SET last_sent_ms=?1 WHERE last_sent_ms>?1",
+                [now_ms()],
+            )?;
+            connection.execute(
+                "UPDATE message_send_log SET sent_at_ms=?1 WHERE sent_at_ms>?1",
+                [now_ms()],
+            )?;
+            connection.execute(
+                "DELETE FROM message_send_log WHERE sent_at_ms<=?1",
+                [now_ms().saturating_sub(chat_controls::MESSAGE_BURST_WINDOW_MS)],
+            )?;
+            if !config.people
+                && connection
+                    .query_row("SELECT COUNT(*) FROM channels", [], |r| r.get::<_, i64>(0))?
+                    == 0
+            {
+                for (name, kind, topic) in [
+                    ("general", "text", "The place for everything"),
+                    ("clips", "text", "Share what you are playing"),
+                    ("Lounge", "voice", "Join the conversation"),
+                ] {
+                    connection.execute(
+                        "INSERT INTO channels(id,name,kind,topic) VALUES(?1,?2,?3,?4)",
+                        params![id(), name, kind, topic],
+                    )?;
+                }
             }
+            connection.execute("DELETE FROM sessions WHERE expires <= ?1", [now()])?;
+            connection.execute(
+                "DELETE FROM authenticator_setup WHERE expires <= ?1",
+                [now()],
+            )?;
+            voice_chat::ensure_rooms(&connection)?;
+            connection.execute(
+                "DELETE FROM uploads WHERE message_id IS NULL AND created < ?1",
+                [now().saturating_sub(86400)],
+            )?;
+        } else {
+            connection.pragma_update(None, "query_only", true)?;
         }
-        connection.execute("DELETE FROM sessions WHERE expires <= ?1", [now()])?;
-        connection.execute(
-            "DELETE FROM authenticator_setup WHERE expires <= ?1",
-            [now()],
-        )?;
-        voice_chat::ensure_rooms(&connection)?;
-        connection.execute(
-            "DELETE FROM uploads WHERE message_id IS NULL AND created < ?1",
-            [now().saturating_sub(86400)],
-        )?;
         let discord_credential = discord_host::Store::new(data, server_id(&connection)?)?;
         let (events, _) = broadcast::channel(256);
         Ok(Self(Arc::new(Inner {
@@ -391,6 +466,9 @@ impl AppState {
             voice_socket: Mutex::new(None),
             frames: Mutex::new(HashMap::new()),
             auth_rates: Mutex::new(HashMap::new()),
+            route_rates: Mutex::new(HashMap::new()),
+            locator_rates: Mutex::new(HashMap::new()),
+            lan_pairing: lan_pairing::Store::default(),
             mutation_rates: Mutex::new(HashMap::new()),
             password_jobs: Arc::new(tokio::sync::Semaphore::new(4)),
             transfer_jobs: Arc::new(tokio::sync::Semaphore::new(8)),
@@ -413,12 +491,20 @@ impl AppState {
             rtc_members: Mutex::new(HashMap::new()),
             rtc_removals: Mutex::new(HashMap::new()),
             typing: Mutex::new(HashMap::new()),
+            activity: Default::default(),
             private_calls: Mutex::new(HashMap::new()),
             identity_jobs: Arc::new(tokio::sync::Semaphore::new(2)),
             account_destinations: Mutex::new(std::collections::HashSet::new()),
             event_connections: ws_limits::ConnectionBudget::new(256, 4),
             rtc_connections: ws_limits::ConnectionBudget::new(128, 2),
+            rtc_media_connections: ws_limits::ConnectionBudget::new(256, 8),
             voice_connections: ws_limits::ConnectionBudget::new(128, 2),
+            gateways: Default::default(),
+            replica: Default::default(),
+            handover: authority,
+            handover_exports,
+            takeover: Mutex::new(None),
+            takeover_failed: std::sync::atomic::AtomicBool::new(false),
         })))
     }
 
@@ -432,7 +518,11 @@ impl AppState {
             Ok(Auth { user: row_user(r)?, permissions: 0, token_hash: hash.clone(), expires:r.get(8)? })
         }).optional()?.ok_or_else(unauthorized)?;
         auth.permissions = roles::permissions(&db, &auth.user.id)?;
-        social::heartbeat(&db, &auth.user.id)?;
+        // Handover status/cancellation still authenticate while the source DB
+        // is read-only. Presence must not turn that read into a hidden write.
+        if self.writes_allowed() {
+            social::heartbeat(&db, &auth.user.id)?;
+        }
         Ok(auth)
     }
 
@@ -452,6 +542,7 @@ impl AppState {
         user_id: Option<String>,
         audience: Option<Vec<String>>,
     ) {
+        if self.takeover_blocked() { return; }
         if self.0.discord_activity.receiver_count() > 0
             && matches!(
                 kind,
@@ -573,6 +664,7 @@ impl AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .merge(handover::routes())
         .route("/health", get(health))
         .route("/api/health", get(health))
         .route("/api/register", post(register))
@@ -645,6 +737,70 @@ pub fn router(state: AppState) -> Router {
             post(social::block_user).delete(social::unblock_user),
         )
         .route("/api/presence", put(social::set_presence))
+        .route(
+            "/api/activity",
+            put(activity::share).delete(activity::withdraw),
+        )
+        .route(
+            "/api/conversations/{id}/invitations",
+            post(group_invites::invite),
+        )
+        .route(
+            "/api/conversations/{id}/invitations/{user}",
+            delete(group_invites::revoke),
+        )
+        .route(
+            "/api/group-invitations/{id}/accept",
+            post(group_invites::accept),
+        )
+        .route(
+            "/api/group-invitations/{id}/decline",
+            post(group_invites::decline),
+        )
+        // The independent host locator: exact POST routes, signed by hosts, no bearer.
+        .route(
+            relay_protocol::host_locator::LOOKUP_PATH,
+            post(host_locator_directory::lookup).layer(DefaultBodyLimit::max(
+                host_locator_directory::LOOKUP_BODY_BYTES,
+            )),
+        )
+        .route(
+            relay_protocol::host_locator::PUBLISH_PATH,
+            post(host_locator_directory::publish).layer(DefaultBodyLimit::max(
+                relay_protocol::host_locator::MAX_RECORD_BYTES,
+            )),
+        )
+        // LAN pairing: administrators create and revoke; a LAN peer redeems with a MAC.
+        .route(
+            relay_protocol::lan_pairing::CREATE_PATH,
+            post(lan_pairing::create).layer(DefaultBodyLimit::max(
+                relay_protocol::lan_pairing::MAX_CREATE_BYTES,
+            )),
+        )
+        .route(
+            relay_protocol::lan_pairing::REDEEM_PATH,
+            post(lan_pairing::redeem).layer(DefaultBodyLimit::max(
+                relay_protocol::lan_pairing::MAX_REDEEM_BYTES,
+            )),
+        )
+        .route(
+            relay_protocol::lan_pairing::REVOKE_PATH,
+            post(lan_pairing::revoke).layer(DefaultBodyLimit::max(lan_pairing::REVOKE_BODY_BYTES)),
+        )
+        // Local operator control only: authenticated by the private local-control secret
+        // in its own extractor, never by a community session.
+        .route(
+            relay_protocol::host_locator::LOCAL_PAGE_PATH,
+            post(handover_locator_page::page).layer(DefaultBodyLimit::max(
+                handover_locator_page::BODY_BYTES,
+            )),
+        )
+        .route(
+            relay_protocol::host_locator::LOCAL_SESSION_PAGE_PATH,
+            post(handover_locator_page::session_page).layer(DefaultBodyLimit::max(
+                handover_locator_page::BODY_BYTES,
+            )),
+        )
         .route("/api/reports", post(social::report).get(social::reports))
         .route("/api/reports/{id}", put(social::resolve_report))
         .route("/api/roles", get(roles::get_roles).post(roles::create_role))
@@ -667,6 +823,65 @@ pub fn router(state: AppState) -> Router {
             get(server_settings::get_settings).patch(server_settings::save_settings),
         )
         .route("/api/system-events", get(server_settings::system_events))
+        .route("/api/hosting/voice-gateways", get(gateway_admission::list))
+        .route(
+            "/api/hosting/voice-gateways/registration",
+            post(gateway_admission::register)
+                .delete(gateway_admission::deregister)
+                .layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/api/hosting/voice-gateways/grants",
+            get(gateway_admission::grants),
+        )
+        .route(
+            "/api/hosting/voice-gateways/leases",
+            post(gateway_admission::lease)
+                .delete(gateway_admission::release)
+                .layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/api/replica/token",
+            post(replica::service::mint_token).delete(replica::service::revoke_token),
+        )
+        .route("/api/replica/pull/info", get(replica::service::info))
+        .route(
+            "/api/replica/pull/exports",
+            post(replica::service::create_export).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/api/replica/pull/exports/{id}",
+            get(replica::service::get_export).delete(replica::service::cancel_export),
+        )
+        .route(
+            "/api/replica/pull/exports/{id}/parts/{index}",
+            get(replica::service::get_part),
+        )
+        .route(
+            "/api/replica/pull/exports/{id}/files/{table}/{file_id}",
+            get(replica::service::get_file),
+        )
+        .route(
+            "/api/replica/pull/exports/{id}/done",
+            post(replica::service::finish_export).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/api/replica/pull/status",
+            post(replica::service::post_status).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route("/api/hosting", get(hosting::get_hosting))
+        .route(
+            "/api/hosting/offers",
+            post(hosting::offer_roles).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/api/hosting/answer",
+            post(hosting::answer_offer).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/api/hosting/candidates/{user}",
+            axum::routing::delete(hosting::revoke_roles),
+        )
         .route(
             "/api/discord",
             get(discord_bridge::get_settings).patch(discord_bridge::save_settings),
@@ -756,6 +971,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/local/shutdown", post(local_shutdown))
         .route("/api/admin/backup", get(snapshot_backup))
         .route("/api/rtc/token", post(rtc::rtc_token))
+        .route("/api/rtc/media", get(rtc_media::upgrade))
         .route("/rtc", get(rtc::rtc_proxy))
         .route("/rtc/v1", get(rtc::rtc_proxy))
         .route("/rtc/validate", get(rtc::rtc_validate))
@@ -814,10 +1030,20 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The router of the explicit pairing-only LAN listener of a desktop host which keeps its
+/// ordinary HTTP and voice on loopback: the ordinary router behind a filter which admits
+/// exactly `POST` of the LAN pairing redemption path and nothing else.
+pub fn lan_pairing_router(state: AppState) -> Router {
+    lan_pairing::narrow(router(state))
+}
+
 pub fn network_ingress_router(state: AppState, token: String) -> Router {
+    network_ingress_gate(router(state), token)
+}
+pub(crate) fn network_ingress_gate(routes: Router, token: String) -> Router {
     let valid_token = (32..=256).contains(&token.len());
     let token_digest = Sha256::digest(token.as_bytes());
-    router(state).layer(middleware::from_fn(
+    routes.layer(middleware::from_fn(
         move |mut request: axum::extract::Request, next: Next| {
             let expected_digest = token_digest;
             async move {
@@ -925,6 +1151,33 @@ async fn rate_limit(
     {
         return forbidden().into_response();
     }
+    // The replica pull routes use their own token, checked by the handler on every
+    // request; a login token does not open them and their token opens nothing else.
+    if request.uri().path().starts_with("/api/replica/pull/") {
+        return next.run(request).await;
+    }
+    // The operator pages are authenticated by the local-control secret in their own extractor,
+    // before any body is read. Only these two exact POSTs, and only after the network-helper
+    // check above has already refused every ingress request on /api/local.
+    if !state.0.config.people
+        && handover_locator_page::is_route(request.uri().path(), request.method())
+    {
+        return next.run(request).await;
+    }
+    // A LAN redemption has no session: its own extractor admits only a real LAN socket and
+    // the handler checks a MAC made with the shared code. Exact POST, communities only.
+    if !state.0.config.people
+        && lan_pairing::is_redeem_route(request.uri().path(), request.method())
+    {
+        return next.run(request).await;
+    }
+    // The host locator takes no bearer: a host's signature authenticates it and the
+    // handler bounds each ingress before reading the body. Exact POST routes, Friends only.
+    if state.0.config.people
+        && host_locator_directory::is_route(request.uri().path(), request.method())
+    {
+        return next.run(request).await;
+    }
     // Authenticate protected requests before body extraction can allocate upload buffers.
     if !matches!(
         request.uri().path(),
@@ -934,9 +1187,11 @@ async fn rate_limit(
             | "/api/login"
             | "/api/account-login"
             | "/api/account-login/challenge"
+            | "/api/hosting/handover/route"
             | "/api/events"
             | "/api/voice/tunnel"
             | "/api/rtc/authorize"
+            | "/api/rtc/media"
             | "/api/local/shutdown"
             | "/api/local/account-destination"
             | "/rtc"
@@ -978,10 +1233,14 @@ async fn rate_limit(
         path,
         "/api/media/frame"
             | "/api/voice/state"
+            // Authenticated, recipient-encrypted file reads use POST for their
+            // bounded proof body; they must not inherit the mutation/minute cap.
+            | "/api/hosting/handover/part"
             | "/api/local/shutdown"
             | "/api/local/account-destination"
     );
-    if signin || mutation {
+    let route_probe = path == "/api/hosting/handover/route";
+    if signin || route_probe || mutation {
         let direct = request
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
@@ -1013,7 +1272,9 @@ async fn rate_limit(
                 }
             }
         }
-        let key = if signin {
+        let key = if route_probe {
+            format!("route:{remote}")
+        } else if signin {
             format!("auth:{remote}")
         } else {
             match state.auth(request.headers()) {
@@ -1021,12 +1282,20 @@ async fn rate_limit(
                 Err(error) => return error.into_response(),
             }
         };
-        let maximum = if signin { 15 } else { 300 };
+        let maximum = if route_probe {
+            60
+        } else if signin {
+            15
+        } else {
+            300
+        };
         let retry_after_ms = {
             // Unauthenticated source churn cannot consume signed-in users' slots.
             // Keep both budgets bounded and fail closed instead of evicting a
             // source that could then get a fresh brute-force allowance.
-            let mut rates = lock(if signin {
+            let mut rates = lock(if route_probe {
+                &state.0.route_rates
+            } else if signin {
                 &state.0.auth_rates
             } else {
                 &state.0.mutation_rates
@@ -1369,8 +1638,11 @@ async fn bootstrap(
 ) -> ApiResult<Json<Bootstrap>> {
     let auth = state.auth(&headers)?;
     let db = lock(&state.0.db);
-    private_calls::reconcile(&state, &db)?;
-    voice_recovery::renew_lease(&state, &db, &auth)?;
+    let host_paused = state.0.handover.paused_view();
+    if !host_paused {
+        private_calls::reconcile(&state, &db)?;
+        voice_recovery::renew_lease(&state, &db, &auth)?;
+    }
     let channels = visible_channels(&db, &auth.user.id)?;
     let mut statement=db.prepare("SELECT u.id,u.username,u.role,p.display_name,p.bio,p.version,p.avatar IS NOT NULL,p.appearance FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id JOIN membership m ON m.user_id=u.id WHERE m.status='active' ORDER BY username COLLATE NOCASE")?;
     let members = statement
@@ -1382,6 +1654,8 @@ async fn bootstrap(
         .filter(|v| visible.contains(&v.channel_id.as_str()))
         .collect();
     let mut result = Bootstrap {
+        host_paused,
+        host_authority: (!state.0.config.people).then(|| state.0.handover.route_pin()),
         account_login_only: db.query_row(
             "SELECT password_hash=?2 FROM users WHERE id=?1",
             params![auth.user.id, account_identity::login::ACCOUNT_ONLY],
@@ -1396,9 +1670,25 @@ async fn bootstrap(
         server_presentation: server_settings::for_user(&db, &state.0.name, &auth.user.id)?,
         assets: assets::list(&db)?,
         conversations: conversations::list(&db, &auth.user.id)?,
+        group_invitations: if state.0.config.people {
+            group_invites::incoming(&db, &auth.user.id)?
+        } else {
+            vec![]
+        },
+        group_invitations_sent: if state.0.config.people {
+            group_invites::sent(&db, &auth.user.id)?
+        } else {
+            vec![]
+        },
+        // Filled for the Friends service by people::snapshot.
+        group_presence: vec![],
         scheduled_events: conversations::events(&db, &auth.user.id)?,
         stage_members: conversations::stage_members(&db, &auth.user.id)?,
-        social: private_calls::social(&state, &db, &auth.user.id)?,
+        social: if host_paused {
+            social::relationships(&db, &auth.user.id)?
+        } else {
+            private_calls::social(&state, &db, &auth.user.id)?
+        },
         presence: social::presence(&db, &auth.user.id)?,
         roles: roles::list(&db)?,
         member_roles: roles::assignments(&db)?,
@@ -1427,6 +1717,11 @@ async fn bootstrap(
                 "profiles-v1".into(),
                 "profiles-v2".into(),
                 "server-settings-v1".into(),
+                "hosting-v1".into(),
+                "handover-preparation-v1".into(),
+                "handover-private-setup-v1".into(),
+                "gateway-broker-v1".into(),
+                "replica-pull-v1".into(),
                 "discord-command-v1".into(),
                 "discord-host-credentials-v1".into(),
                 "discord-channel-status-v1".into(),
@@ -1457,8 +1752,20 @@ async fn bootstrap(
         read_states: all_read_states(&db, &auth.user.id)?,
         latest_change_sequence: latest_change(&db)?,
     };
+    if !state.0.config.people { result.capabilities.push("host-locator-issuer-v1".into()); }
+    if !state.0.config.people {
+        result
+            .capabilities
+            .push(relay_protocol::lan_pairing::CAPABILITY.into());
+    }
     if state.0.config.people {
         people::snapshot(&db, &auth.user.id, &mut result);
+        activity::overlay(
+            &state,
+            &auth.user.id,
+            &result.social.friends,
+            &mut result.presence,
+        );
     }
     Ok(Json(result))
 }
@@ -2001,6 +2308,7 @@ async fn events(
     upgrade: WebSocketUpgrade,
 ) -> ApiResult<Response> {
     let auth = state.auth(&headers)?;
+    let authority = state.0.handover.watch_transports();
     let permit = state
         .0
         .event_connections
@@ -2024,22 +2332,33 @@ async fn events(
         .max_frame_size(16 * 1024)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            events_socket(socket, state, auth).await
+            events_socket(socket, state, auth, authority).await
         })
         .into_response())
 }
-async fn events_socket(mut socket: WebSocket, state: AppState, auth: Auth) {
+async fn events_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    auth: Auth,
+    mut authority: tokio::sync::watch::Receiver<()>,
+) {
+    if !state.writes_allowed() || authority.has_changed().unwrap_or(true) {
+        let _ = send_event(&mut socket, WsMessage::Close(None)).await;
+        return;
+    }
     let mut events = state.0.events.subscribe();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
     let mut auth_check = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
+            biased;
+            _=authority.changed()=>{let _=send_event(&mut socket,WsMessage::Close(None)).await;break;},
             _=state.shutdown_requested()=>{let _=send_event(&mut socket,WsMessage::Close(None)).await;break;},
             notice=events.recv()=>match notice {
                 Ok(notice)=>{
                     let active=lock(&state.0.db).query_row("SELECT COUNT(*) FROM sessions WHERE token_hash=?1 AND expires>?2",params![auth.token_hash,now()],|r|r.get::<_,i64>(0)).unwrap_or(0)>0;
                     if !active {let _=send_event(&mut socket,WsMessage::Close(None)).await;break;}
-                    if state.0.config.people && notice.event.user_id.as_ref().is_some_and(|peer| !people::visible(&lock(&state.0.db), &auth.user.id, peer)) { continue; }
+                    if state.0.config.people && !people::event_visible(&lock(&state.0.db), &auth.user.id, &notice.event) { continue; }
                     if notice.audience.as_ref().is_some_and(|users|!users.contains(&auth.user.id)){continue;}
                     if notice.event.channel_id.as_ref().is_some_and(|channel|channel_access(&lock(&state.0.db),channel,&auth.user.id,READ).is_err()){continue;}
                     if notice.event.kind=="typing" && !chat_controls::typing_notice_valid(&state,&notice.event){continue;}
@@ -2336,10 +2655,22 @@ pub async fn run_discord_bridge(state: AppState, token: Option<String>) {
     discord_bridge::run(state, token).await;
 }
 
+/// The replica retention pass runs once every this many 10-second cleanup ticks.
+const REPLICA_MAINTENANCE_TICKS: u32 = 60;
+
 pub async fn cleanup_loop(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(10));
+    let mut ticks = 0u32;
     loop {
         interval.tick().await;
+        ticks = ticks.wrapping_add(1);
+        let _ = state.flush_handover_media().await;
+        if !state.writes_allowed() {
+            // External media removals must still drain while database writes are
+            // barred. Otherwise a freeze would leave LiveKit seats connected.
+            let _ = state.flush_rtc_removals().await;
+            continue;
+        }
         // Persist an expired/private call's end and invalidate its exact leases
         // before the ordinary sweep removes runtime seats. Failed storage must
         // not silently discard signalling while its durable state is accepted.
@@ -2363,6 +2694,9 @@ pub async fn cleanup_loop(state: AppState) {
         }
         state.enforce_rtc_permissions();
         let _ = state.flush_rtc_removals().await;
+        if ticks % REPLICA_MAINTENANCE_TICKS == 0 {
+            replica::service::maintain(&state);
+        }
         let db = lock(&state.0.db);
         let _ = db.execute("DELETE FROM voice_resume_leases WHERE expires<=?1", [now()]);
         let _ = db.execute("DELETE FROM sessions WHERE expires<=?1", [now()]);
@@ -2531,6 +2865,8 @@ mod network_ingress_tests {
             "/api/local/shutdown",
             "/api/local/discord-credentials",
             "/api/local/future-private-api",
+            "/api/local/handover/locator-page",
+            "/api/local/handover/session-locator-page",
         ] {
             for method in ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"] {
                 let polled = Arc::new(AtomicBool::new(false));

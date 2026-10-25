@@ -110,6 +110,7 @@ pub(super) fn run() {
     eprintln!("owned threaded fixture: normal login");
     network
         .send(Command::Auth {
+            authority: None,
             url: server.url.clone(),
             expected_server_id: Some(origin.server_id.clone()),
             request: AuthRequest {
@@ -163,6 +164,9 @@ pub(super) fn run() {
             .unwrap();
         network
             .send(Command::CheckServer {
+                locator_invite: None,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                authority: None,
                 url: server.url.clone(),
                 request_id,
             })

@@ -11,6 +11,7 @@ const MAX_AGE: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
     DirectPeer,
+    LocalGateway,
     Udp,
     WebSocket,
     Reconnecting,
@@ -25,7 +26,9 @@ pub struct Status {
 
 impl Status {
     pub fn from_stats(stats: &NetworkStats) -> Self {
-        let (route, rtt, age) = if stats.direct_active && stats.udp_reachable {
+        let (route, rtt, age) = if stats.gateway_active {
+            (Route::LocalGateway, stats.gateway_round_trip_ms, stats.gateway_round_trip_age)
+        } else if stats.direct_active && stats.udp_reachable {
             (
                 Route::DirectPeer,
                 stats.direct_round_trip_ms,
@@ -64,6 +67,7 @@ impl Status {
     pub fn headline_for(&self, transport: Transport) -> String {
         let name = match self.route {
             Route::DirectPeer => "Voice · direct peer",
+            Route::LocalGateway => "Voice · local gateway",
             Route::Udp => match transport {
                 Transport::Iroh => "Voice · iroh",
                 Transport::Tailscale => "Voice · Tailscale",
@@ -94,6 +98,7 @@ impl Status {
     pub fn explanation(&self, stats: &NetworkStats) -> String {
         let mut text = match self.route {
             Route::DirectPeer => "Measured to the other person's voice endpoint.",
+            Route::LocalGateway => "Measured through your approved local gateway to the voice server. This is not mouth-to-ear delay; video uses its own route.",
             Route::Udp | Route::WebSocket => {
                 "Measured to the voice server, not all the way to the other person."
             }

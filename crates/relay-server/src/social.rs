@@ -73,6 +73,7 @@ pub(super) fn presence(db: &Connection, viewer: &str) -> ApiResult<Vec<UserPrese
                     status: r.get(1)?,
                     text: r.get(2)?,
                     expires_at: r.get(3)?,
+                    activity: None,
                 },
                 r.get::<_, u64>(4)?,
             ))
@@ -177,13 +178,23 @@ pub(super) async fn remove_friend(
     Path(peer): Path<String>,
 ) -> ApiResult<Json<SocialState>> {
     let auth = state.auth(&headers)?;
-    let db = lock(&state.0.db);
-    db.execute("DELETE FROM friendships WHERE (sender=?1 AND recipient=?2) OR (sender=?2 AND recipient=?1)",params![auth.user.id,peer])?;
-    let result = relationships(&db, &auth.user.id)?;
-    drop(db);
+    let (result, left) = {
+        let mut db = lock(&state.0.db);
+        let tx = db.transaction()?;
+        tx.execute("DELETE FROM friendships WHERE (sender=?1 AND recipient=?2) OR (sender=?2 AND recipient=?1)",params![auth.user.id,peer])?;
+        // Ending a friendship removes nobody from a group they share (group
+        // membership never depended on it); it only ends invitations between them.
+        let left = group_invites::drop_pair(&tx, &auth.user.id, &peer)?;
+        let result = relationships(&tx, &auth.user.id)?;
+        tx.commit()?;
+        (result, left)
+    };
     state.enforce_voice_permissions()?;
     private_calls::end_matching(&state, &auth.user.id, Some(&peer), None)?;
     state.notify("members", None, None, Some(vec![auth.user.id, peer]));
+    if left {
+        state.notify("channels", None, None, None);
+    }
     Ok(Json(result))
 }
 pub(super) async fn block_user(
@@ -192,7 +203,7 @@ pub(super) async fn block_user(
     Path(peer): Path<String>,
 ) -> ApiResult<Json<SocialState>> {
     let auth = state.auth(&headers)?;
-    let result = {
+    let (result, left) = {
         let mut db = lock(&state.0.db);
         let tx = db.transaction()?;
         active_user(&tx, &peer)?;
@@ -212,13 +223,20 @@ pub(super) async fn block_user(
             params![auth.user.id, peer],
         )?;
         tx.execute("DELETE FROM friendships WHERE (sender=?1 AND recipient=?2) OR (sender=?2 AND recipient=?1)",params![auth.user.id,peer])?;
+        // Waiting invitations between the two, or into a group the other is in, go
+        // first; then the one who blocked leaves the groups they share.
+        let dropped = group_invites::drop_between(&tx, &auth.user.id, &peer)?;
+        let left = conversations::leave_shared_groups(&tx, &auth.user.id, &peer)? || dropped;
         let result = relationships(&tx, &auth.user.id)?;
         tx.commit()?;
-        result
+        (result, left)
     };
     state.enforce_voice_permissions()?;
     private_calls::end_matching(&state, &auth.user.id, Some(&peer), None)?;
     state.notify("members", None, None, Some(vec![auth.user.id, peer]));
+    if left {
+        state.notify("channels", None, None, None);
+    }
     Ok(Json(result))
 }
 pub(super) async fn unblock_user(
@@ -256,22 +274,40 @@ pub(super) async fn set_presence(
             "Choose a supported status, up to 128 characters, and an expiry within 30 days",
         ));
     }
+    // Activity is shared only through its own route, never smuggled in a status.
     let result = UserPresence {
         user_id: auth.user.id.clone(),
+        activity: None,
         ..input
     };
-    let audience = {
+    let (audience, groups) = {
         let db = lock(&state.0.db);
+        let previous:Option<(String,u64)>=db.query_row("SELECT status,last_seen FROM user_presence WHERE user_id=?1",[&auth.user.id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let before=previous.as_ref().map(|(status,last)|group_presence::coarse(status,*last,now())).unwrap_or("offline");
+        let changed=before != group_presence::coarse(&result.status,now(),now());
         db.execute("INSERT INTO user_presence VALUES(?1,?2,?3,?4,?5) ON CONFLICT(user_id) DO UPDATE SET status=excluded.status,text=excluded.text,expires_at=excluded.expires_at,last_seen=excluded.last_seen",params![result.user_id,result.status,result.text,result.expires_at,now()])?;
         if state.0.config.people {
             // Pending requests may see a profile, but not presence-update timing.
             let mut users = relationships(&db, &auth.user.id)?.friends;
             users.push(auth.user.id.clone());
-            Some(users)
+            (
+                Some(users),
+                if changed {group_presence::groups(&db, &auth.user.id).unwrap_or_default()} else {vec![]},
+            )
         } else {
-            None
+            (None, vec![])
         }
     };
+    // Each group the person is currently in hears of the change on its own, and
+    // only its current members; the event carries no state.
+    for group in groups {
+        state.notify(
+            relay_protocol::GROUP_PRESENCE_EVENT,
+            Some(group.channel_id),
+            Some(auth.user.id.clone()),
+            Some(group.member_ids),
+        );
+    }
     state.notify("members", None, Some(auth.user.id), audience);
     Ok(Json(result))
 }

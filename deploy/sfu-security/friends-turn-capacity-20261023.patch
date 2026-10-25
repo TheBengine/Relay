@@ -1,0 +1,392 @@
+diff --git a/pkg/service/relay_turn_capacity_test.go b/pkg/service/relay_turn_capacity_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/service/relay_turn_capacity_test.go
+@@ -0,0 +1,185 @@
++package service
++
++import (
++	"encoding/json"
++	"fmt"
++	"net"
++	"net/http/httptest"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/livekit/livekit-server/pkg/config"
++	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
++	"github.com/pion/turn/v5"
++	"github.com/stretchr/testify/require"
++)
++
++func TestTURNQuotaObservationTransitions(t *testing.T) {
++	q := newTURNAllocationQuota(2)
++	a, b, c := udpAddr(t, 5100), udpAddr(t, 5101), udpAddr(t, 5102)
++	require.True(t, q.Allow("qa-private-id", LivekitRealm, a))
++	require.True(t, q.Allow("qa-private-id", LivekitRealm, a)) // retry does not reserve twice
++	require.True(t, q.Allow("qa-private-id", LivekitRealm, b))
++	require.False(t, q.Allow("qa-private-id", LivekitRealm, c))
++	first := q.snapshot()
++	require.Equal(t, turnQuotaObservation{Limit: 2, Reserved: 2, Pending: 2, ReservedPeak: 2, PerIdentityPeak: 2, Denied: 1}, first)
++	q.OnCreated(a, nil, "udp", "qa-private-id", LivekitRealm, nil, 0)
++	q.OnCreated(a, nil, "udp", "qa-private-id", LivekitRealm, nil, 0)
++	q.OnCreated(c, nil, "udp", "qa-private-id", LivekitRealm, nil, 0)
++	confirmed := q.snapshot()
++	require.Equal(t, 1, confirmed.Pending)
++	require.Equal(t, 1, confirmed.Confirmed)
++	require.Equal(t, 1, confirmed.ConfirmedPeak)
++	q.OnDeleted(a, nil, "udp", "qa-private-id", LivekitRealm)
++	q.OnDeleted(a, nil, "udp", "qa-private-id", LivekitRealm)
++	q.OnDeleted(b, nil, "udp", "qa-private-id", LivekitRealm)
++	final := q.snapshot()
++	require.Zero(t, final.Reserved)
++	require.Zero(t, final.Pending)
++	require.Zero(t, final.Confirmed)
++	require.Equal(t, first.ReservedPeak, final.ReservedPeak)
++	require.Equal(t, uint64(1), final.Denied)
++}
++
++func TestTURNQuotaObservationReclaimDoesNotEvictReplacement(t *testing.T) {
++	q := newTURNAllocationQuota(1)
++	a := udpAddr(t, 5200)
++	require.True(t, q.Allow("qa", LivekitRealm, a))
++	q.mu.Lock()
++	stale := q.users["qa"][srcAddrKey(a)]
++	q.mu.Unlock()
++	q.OnDeleted(a, nil, "udp", "qa", LivekitRealm)
++	require.True(t, q.Allow("qa", LivekitRealm, a))
++	q.reclaimPending("qa", srcAddrKey(a), stale)
++	require.Equal(t, 1, q.snapshot().Pending)
++	q.mu.Lock()
++	current := q.users["qa"][srcAddrKey(a)]
++	q.mu.Unlock()
++	q.reclaimPending("qa", srcAddrKey(a), current)
++	require.Zero(t, q.snapshot().Reserved)
++	require.Zero(t, q.snapshot().Pending)
++}
++
++func TestTURNQuotaObservationConcurrentSnapshotsStayCoherent(t *testing.T) {
++	q := newTURNAllocationQuota(4)
++	var workers sync.WaitGroup
++	for worker := 0; worker < 8; worker++ {
++		workers.Add(1)
++		go func(worker int) {
++			defer workers.Done()
++			id := fmt.Sprintf("qa-%d", worker)
++			for step := 0; step < 100; step++ {
++				addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5300 + worker*100 + step}
++				if q.Allow(id, LivekitRealm, addr) {
++					q.OnCreated(addr, nil, "udp", id, LivekitRealm, nil, 0)
++					q.OnDeleted(addr, nil, "udp", id, LivekitRealm)
++				}
++			}
++		}(worker)
++	}
++	done := make(chan struct{})
++	go func() { workers.Wait(); close(done) }()
++	for {
++		value := q.snapshot()
++		require.Equal(t, value.Reserved, value.Pending+value.Confirmed)
++		require.GreaterOrEqual(t, value.Pending, 0)
++		require.GreaterOrEqual(t, value.Confirmed, 0)
++		require.GreaterOrEqual(t, value.ReservedPeak, value.Reserved)
++		require.LessOrEqual(t, value.PerIdentityPeak, value.Limit)
++		select {
++		case <-done:
++			require.Zero(t, q.snapshot().Reserved)
++			return
++		default:
++		}
++	}
++}
++
++func TestTURNCapacitySnapshotRedactsAndKeepsDisabledUnknown(t *testing.T) {
++	before := currentRelayTURNObservation.Load()
++	t.Cleanup(func() { currentRelayTURNObservation.Store(before) })
++	o := newRelayTURNObservation(nil, false)
++	o.relayRange = portRange{30000, 30127}
++	for _, enabled := range []bool{false, true} {
++		if enabled {
++			o.quota = newTURNAllocationQuota(12)
++			addr := udpAddr(t, 6100)
++			require.True(t, o.quota.Allow("qa-sensitive-identity", LivekitRealm, addr))
++			t.Cleanup(func() { o.quota.OnDeleted(addr, nil, "udp", "qa-sensitive-identity", LivekitRealm) })
++		}
++		currentRelayTURNObservation.Store(o)
++		r := httptest.NewRequest("GET", "/relay/turn-status", nil)
++		r.RemoteAddr = "127.0.0.1:9999"
++		w := httptest.NewRecorder()
++		relayTURNObservationHandler(w, r)
++		require.Equal(t, 200, w.Code)
++		var value map[string]any
++		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &value))
++		require.Equal(t, enabled, value["quota_tracking_enabled"])
++		require.Equal(t, float64(128), value["configured_port_numbers_per_relay_address"])
++		require.NotContains(t, w.Body.String(), "qa-sensitive-identity")
++		require.NotContains(t, w.Body.String(), "127.0.0.1")
++		require.NotEmpty(t, value["observed_at"])
++		if enabled {
++			quota := value["allocation_quota"].(map[string]any)
++			require.Equal(t, float64(12), quota["limit_per_identity"])
++			require.Equal(t, float64(1), quota["pending_current"])
++			require.Equal(t, float64(0), quota["confirmed_current"])
++		} else {
++			require.Nil(t, value["allocation_quota"])
++		}
++	}
++	for _, bounds := range []portRange{{}, {30127, 30000}} {
++		o.relayRange = bounds
++		require.Nil(t, o.configuredPortNumbersPerAddress())
++	}
++}
++
++func TestTURNQuotaObservationActual486Response(t *testing.T) {
++	before := currentRelayTURNObservation.Load()
++	t.Cleanup(func() { currentRelayTURNObservation.Store(before) })
++	serverConn := listenUDP(t)
++	serverAddr := serverConn.LocalAddr().String()
++	serverPort := serverConn.LocalAddr().(*net.UDPAddr).Port
++	require.NoError(t, serverConn.Close())
++	h := newTestTurnAuthHandler()
++	server, err := NewTurnServer(&config.Config{
++		RTC: config.RTCConfig{RTCConfig: rtcconfig.RTCConfig{NodeIP: rtcconfig.NodeIP{V4: "127.0.0.1"},
++			UDPPort: rtcconfig.PortRange{Start: 7882}}},
++		TURN: config.TURNConfig{Enabled: true, UDPPort: serverPort, BindAddresses: []string{"127.0.0.1"},
++			RelayPortRangeStart: 40000, RelayPortRangeEnd: 40100,
++			PerUserRelayAllocationLimit: 1, AllowRestrictedPeerCIDRs: []string{"127.0.0.0/8"}},
++	}, h.HandleAuth, false)
++	require.NoError(t, err)
++	t.Cleanup(func() { require.NoError(t, server.Close()) })
++	username, expiry := h.CreateUsername(turnTestAPIKey, "PA_quota_observation", 300)
++	password, err := h.CreatePassword(turnTestAPIKey, "PA_quota_observation", expiry)
++	require.NoError(t, err)
++	makeClient := func() *turn.Client {
++		client, err := turn.NewClient(&turn.ClientConfig{
++			Conn: listenUDP(t), STUNServerAddr: serverAddr, TURNServerAddr: serverAddr,
++			Username: username, Password: password, Realm: LivekitRealm, RTO: 100 * time.Millisecond,
++		})
++		require.NoError(t, err)
++		t.Cleanup(client.Close)
++		require.NoError(t, client.Listen())
++		return client
++	}
++	first := makeClient()
++	relay, err := first.Allocate()
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = relay.Close() })
++	second := makeClient()
++	_, err = second.Allocate()
++	require.ErrorContains(t, err, "error 486")
++	observation := currentRelayTURNObservation.Load()
++	require.NotNil(t, observation)
++	require.NotNil(t, observation.quota)
++	require.Equal(t, 101, *observation.configuredPortNumbersPerAddress())
++	value := observation.quota.snapshot()
++	require.Equal(t, 1, value.Reserved)
++	require.Equal(t, 1, value.Confirmed)
++	require.Zero(t, value.Pending)
++	require.GreaterOrEqual(t, value.Denied, uint64(1))
++}
+diff --git a/pkg/service/relay_turn_observation.go b/pkg/service/relay_turn_observation.go
+--- a/pkg/service/relay_turn_observation.go
++++ b/pkg/service/relay_turn_observation.go
+@@ -15,6 +15,8 @@
+ 	startedAt           time.Time
+ 	standalone          bool
+ 	mediaPorts          []portRange
++	quota               *turnAllocationQuota
++	relayRange          portRange
+ 	permissionAllowed   atomic.Uint64
+ 	permissionDenied    atomic.Uint64
+ 	portDenied          atomic.Uint64
+@@ -85,6 +87,22 @@
+ 
+ var currentRelayTURNObservation atomic.Pointer[relayTURNObservation]
+ 
++func (o *relayTURNObservation) quotaSnapshot() *turnQuotaObservation {
++	if o.quota == nil {
++		return nil // Tracking disabled is unknown occupancy, not zero use.
++	}
++	value := o.quota.snapshot()
++	return &value
++}
++
++func (o *relayTURNObservation) configuredPortNumbersPerAddress() *int {
++	if o.relayRange.start == 0 || o.relayRange.end < o.relayRange.start {
++		return nil
++	}
++	count := int(o.relayRange.end) - int(o.relayRange.start) + 1
++	return &count
++}
++
+ func newRelayTURNObservation(ports []portRange, standalone bool) *relayTURNObservation {
+ 	return &relayTURNObservation{startedAt: time.Now().UTC(), standalone: standalone,
+ 		mediaPorts: append([]portRange(nil), ports...)}
+@@ -107,7 +125,7 @@
+ 	w.Header().Set("Cache-Control", "no-store")
+ 	observation := currentRelayTURNObservation.Load()
+ 	if observation == nil {
+-		_ = json.NewEncoder(w).Encode(map[string]any{"schema": 2, "turn_observation_ready": false})
++		_ = json.NewEncoder(w).Encode(map[string]any{"schema": 3, "turn_observation_ready": false})
+ 		return
+ 	}
+ 	ports := make([]map[string]uint16, 0, len(observation.mediaPorts))
+@@ -115,25 +133,32 @@
+ 		ports = append(ports, map[string]uint16{"start": port.start, "end": port.end})
+ 	}
+ 	_ = json.NewEncoder(w).Encode(map[string]any{
+-		"schema": 2, "turn_observation_ready": true, "started_at": observation.startedAt,
++		"schema": 3, "turn_observation_ready": true, "started_at": observation.startedAt,
++		"observed_at":          time.Now().UTC(),
+ 		"approximate_snapshot": true, "standalone": observation.standalone,
+-		"allowed_local_media_port_ranges":   ports,
+-		"permission_allowed":                observation.permissionAllowed.Load(),
+-		"permission_denied":                 observation.permissionDenied.Load(),
+-		"local_port_policy_denied_packets":  observation.portDenied.Load(),
+-		"relay_udp_writes":                  observation.udpWrites.Load(),
+-		"relay_udp_write_bytes":             observation.udpWriteBytes.Load(),
+-		"relay_udp_write_errors":            observation.udpWriteErrors.Load(),
+-		"relay_udp_reads":                   observation.udpReads.Load(),
+-		"relay_udp_read_bytes":              observation.udpReadBytes.Load(),
+-		"relay_udp_reads_from_loopback":     observation.readLoopback.Load(),
+-		"relay_udp_reads_from_node_ip":      observation.readNodeIP.Load(),
+-		"relay_udp_reads_from_other_ip":     observation.readOtherIP.Load(),
+-		"relay_udp_write_binding_requests":  observation.writeBindingRequest.Load(),
+-		"relay_udp_write_binding_successes": observation.writeBindingSuccess.Load(),
+-		"relay_udp_write_binding_errors":    observation.writeBindingError.Load(),
+-		"relay_udp_read_binding_requests":   observation.readBindingRequest.Load(),
+-		"relay_udp_read_binding_successes":  observation.readBindingSuccess.Load(),
+-		"relay_udp_read_binding_errors":     observation.readBindingError.Load(),
++		"quota_tracking_enabled":                    observation.quota != nil,
++		"allocation_quota":                          observation.quotaSnapshot(),
++		"quota_snapshot_scope":                      "reservations and confirmed callbacks; not available ports or call capacity",
++		"relay_port_range_start":                    observation.relayRange.start,
++		"relay_port_range_end":                      observation.relayRange.end,
++		"configured_port_numbers_per_relay_address": observation.configuredPortNumbersPerAddress(),
++		"allowed_local_media_port_ranges":           ports,
++		"permission_allowed":                        observation.permissionAllowed.Load(),
++		"permission_denied":                         observation.permissionDenied.Load(),
++		"local_port_policy_denied_packets":          observation.portDenied.Load(),
++		"relay_udp_writes":                          observation.udpWrites.Load(),
++		"relay_udp_write_bytes":                     observation.udpWriteBytes.Load(),
++		"relay_udp_write_errors":                    observation.udpWriteErrors.Load(),
++		"relay_udp_reads":                           observation.udpReads.Load(),
++		"relay_udp_read_bytes":                      observation.udpReadBytes.Load(),
++		"relay_udp_reads_from_loopback":             observation.readLoopback.Load(),
++		"relay_udp_reads_from_node_ip":              observation.readNodeIP.Load(),
++		"relay_udp_reads_from_other_ip":             observation.readOtherIP.Load(),
++		"relay_udp_write_binding_requests":          observation.writeBindingRequest.Load(),
++		"relay_udp_write_binding_successes":         observation.writeBindingSuccess.Load(),
++		"relay_udp_write_binding_errors":            observation.writeBindingError.Load(),
++		"relay_udp_read_binding_requests":           observation.readBindingRequest.Load(),
++		"relay_udp_read_binding_successes":          observation.readBindingSuccess.Load(),
++		"relay_udp_read_binding_errors":             observation.readBindingError.Load(),
+ 	})
+ }
+diff --git a/pkg/service/turn.go b/pkg/service/turn.go
+--- a/pkg/service/turn.go
++++ b/pkg/service/turn.go
+@@ -99,8 +99,9 @@
+ 
+ 	// cap concurrent relay allocations per participant so one credential cannot
+ 	// exhaust the shared relay-port range (a value <= 0 disables the quota)
++	var quota *turnAllocationQuota
+ 	if turnConf.PerUserRelayAllocationLimit > 0 {
+-		quota := newTURNAllocationQuota(turnConf.PerUserRelayAllocationLimit)
++		quota = newTURNAllocationQuota(turnConf.PerUserRelayAllocationLimit)
+ 		serverConfig.QuotaHandler = quota.Allow
+ 		serverConfig.EventHandler = quota.eventHandler()
+ 	}
+@@ -121,6 +122,8 @@
+ 		mediaPorts = getTURNMediaPorts(&conf.RTC)
+ 	}
+ 	observation := newRelayTURNObservation(mediaPorts, standalone)
++	observation.quota = quota
++	observation.relayRange = portRange{turnConf.RelayPortRangeStart, turnConf.RelayPortRangeEnd}
+ 	observation.nodeIPs = []net.IP{net.ParseIP(conf.RTC.NodeIP.V4), net.ParseIP(conf.RTC.NodeIP.V6)}
+ 	currentRelayTURNObservation.Store(observation)
+ 
+diff --git a/pkg/service/turnquota.go b/pkg/service/turnquota.go
+--- a/pkg/service/turnquota.go
++++ b/pkg/service/turnquota.go
+@@ -57,8 +57,30 @@
+ 	limit          int
+ 	reservationTTL time.Duration
+ 
+-	mu    sync.Mutex
+-	users map[string]map[string]*turnAllocationSlot // userID -> source-address key -> slot
++	mu          sync.Mutex
++	users       map[string]map[string]*turnAllocationSlot // userID -> source-address key -> slot
++	observation turnQuotaObservation
++}
++
++// Counts track quota reservations and confirmed callbacks, not a census of OS
++// sockets or available relay ports. All fields are protected by q.mu.
++type turnQuotaObservation struct {
++	Limit           int    `json:"limit_per_identity"`
++	Reserved        int    `json:"reserved_current"`
++	Pending         int    `json:"pending_current"`
++	Confirmed       int    `json:"confirmed_current"`
++	ReservedPeak    int    `json:"reserved_peak"`
++	ConfirmedPeak   int    `json:"confirmed_peak"`
++	PerIdentityPeak int    `json:"per_identity_reserved_peak"`
++	Denied          uint64 `json:"quota_denied_decisions_total"`
++}
++
++func (q *turnAllocationQuota) snapshot() turnQuotaObservation {
++	q.mu.Lock()
++	defer q.mu.Unlock()
++	value := q.observation
++	value.Limit = q.limit
++	return value
+ }
+ 
+ type turnAllocationSlot struct {
+@@ -98,6 +120,7 @@
+ 		return true
+ 	}
+ 	if len(slots) >= q.limit {
++		q.observation.Denied++
+ 		logger.Infow("TURN allocation quota reached",
+ 			"participantID", userID,
+ 			"limit", q.limit,
+@@ -115,6 +138,10 @@
+ 		q.reclaimPending(userID, key, slot)
+ 	})
+ 	slots[key] = slot
++	q.observation.Reserved++
++	q.observation.Pending++
++	q.observation.ReservedPeak = max(q.observation.ReservedPeak, q.observation.Reserved)
++	q.observation.PerIdentityPeak = max(q.observation.PerIdentityPeak, len(slots))
+ 	return true
+ }
+ 
+@@ -127,10 +154,13 @@
+ 	defer q.mu.Unlock()
+ 
+ 	slot := q.users[userID][key]
+-	if slot == nil {
++	if slot == nil || slot.confirmed {
+ 		return
+ 	}
+ 	slot.confirmed = true
++	q.observation.Pending--
++	q.observation.Confirmed++
++	q.observation.ConfirmedPeak = max(q.observation.ConfirmedPeak, q.observation.Confirmed)
+ 	if slot.timer != nil {
+ 		slot.timer.Stop()
+ 		slot.timer = nil
+@@ -170,6 +200,12 @@
+ 	}
+ 	if slot.timer != nil {
+ 		slot.timer.Stop()
++	}
++	q.observation.Reserved--
++	if slot.confirmed {
++		q.observation.Confirmed--
++	} else {
++		q.observation.Pending--
+ 	}
+ 	delete(slots, key)
+ 	if len(slots) == 0 {

@@ -122,3 +122,38 @@ pub async fn http(to: SocketAddr, request: &str) -> (String, String) {
 pub fn get(path: &str, extra: &str) -> String {
     format!("GET {path} HTTP/1.1\r\nHost: friend.example\r\nConnection: close\r\n{extra}\r\n")
 }
+
+/// Exclusively created scratch storage; no pre-existing folder is ever removed.
+pub struct Scratch {
+    pub path: std::path::PathBuf,
+    base: std::path::PathBuf,
+}
+fn direct_scratch(path:&std::path::Path)->bool {
+    path.is_absolute() && path.ancestors().all(|part|match std::fs::symlink_metadata(part) {
+        Ok(info)=>{
+            #[cfg(windows)]
+            {use std::os::windows::fs::MetadataExt; if info.file_attributes()&0x400!=0 {return false;}}
+            !info.file_type().is_symlink()
+        },
+        Err(e)=>e.kind()==std::io::ErrorKind::NotFound,
+    })
+}
+impl Scratch {
+    pub fn new(name:&str)->Self {
+        assert!(name.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-'));
+        let base=std::env::temp_dir(); assert!(direct_scratch(&base));
+        let mut random=[0u8;16];getrandom::fill(&mut random).unwrap();
+        let suffix:String=random.iter().map(|b|format!("{b:02x}")).collect();
+        let path=base.join(format!("relay-iroh-{name}-{suffix}"));
+        assert!(direct_scratch(&path)&&path.parent()==Some(base.as_path()));
+        std::fs::create_dir(&path).unwrap();
+        Self{path,base}
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if self.path.parent()==Some(self.base.as_path()) && direct_scratch(&self.path) {
+            let _=std::fs::remove_dir_all(&self.path);
+        }
+    }
+}

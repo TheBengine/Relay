@@ -69,14 +69,24 @@ mod emoji_ui;
 mod encryption_ui;
 #[path = "entry_surface.rs"]
 mod entry_surface;
+#[path = "game_activity_ui.rs"]
+mod game_activity_ui;
+#[path = "handover_ui.rs"]
+mod handover_ui;
 #[path = "help_ui.rs"]
 mod help_ui;
 #[path = "host_setup_ui.rs"]
 mod host_setup_ui;
+#[path = "host_ui.rs"]
+mod host_ui;
 #[path = "invitation_launch_ui.rs"]
 mod invitation_launch_ui;
 #[path = "invitation_ui.rs"]
 mod invitation_ui;
+#[path = "lan_host_ui.rs"]
+mod lan_host_ui;
+#[path = "lan_pairing_ui.rs"]
+mod lan_pairing_ui;
 #[path = "main_view.rs"]
 mod main_view;
 #[path = "members_ui.rs"]
@@ -103,6 +113,8 @@ mod protection_ui;
 mod quick_switch_ui;
 #[path = "routing_ui.rs"]
 mod routing_ui;
+#[path = "server_creation.rs"]
+mod server_creation;
 #[path = "server_menu.rs"]
 mod server_menu;
 #[path = "settings_pages.rs"]
@@ -112,6 +124,8 @@ mod sidebar_tooltip;
 #[cfg(feature = "native-rtc")]
 #[path = "source_preview.rs"]
 pub(crate) mod source_preview;
+#[path = "support_report.rs"]
+mod support_report;
 #[path = "voice_room_ui.rs"]
 mod voice_room_ui;
 #[path = "voice_view.rs"]
@@ -209,6 +223,17 @@ struct Preferences {
     appearance: AppearanceSettings,
     #[serde(default)]
     connection: crate::route_choice::ConnectionPrefs,
+    /// The connection chosen for the newest server, until it is in place. A
+    /// damaged value is dropped instead of discarding the other preferences.
+    #[serde(default, deserialize_with = "server_creation::lenient_pending")]
+    pending_creation: Option<server_creation::Pending>,
+    /// Copies the member chose to keep on this PC: community, account and the
+    /// copy's id. Never a token; that lives in the OS vault.
+    #[serde(default)]
+    replica_copies: Vec<crate::replica_copy::Choice>,
+    /// Opt-in game activity for Friends: both choices off unless turned on.
+    #[serde(default)]
+    game_activity: crate::game_activity::Settings,
 }
 
 fn default_remember_drafts() -> bool {
@@ -437,6 +462,9 @@ impl Default for Preferences {
             online_gif_previews: true,
             appearance: AppearanceSettings::default(),
             connection: Default::default(),
+            pending_creation: None,
+            replica_copies: Vec::new(),
+            game_activity: Default::default(),
         }
     }
 }
@@ -628,6 +656,12 @@ pub struct RelayApp {
     #[cfg(feature = "native-rtc")]
     rtc: Option<crate::rtc::RtcSession>,
     rtc_request: Option<(u64, u64)>,
+    support_report: support_report::State,
+    lan_host: lan_host_ui::State,
+    lan_pairing_host: lan_pairing_ui::HostState,
+    game_ui: game_activity_ui::Ui,
+    replica_copy: host_ui::copy_ui::CopyUi,
+    handover: handover_ui::State,
     last_source_state: [bool; 2],
     media: Option<MediaEngine>,
     media_error: Option<String>,
@@ -696,6 +730,7 @@ pub struct RelayApp {
     community_social: HashMap<String, (String, SocialState, String)>,
     community_friends: crate::community_friends::Directory,
     connection_status: ConnectionStatus,
+    resume_destination: Option<String>,
     community_statuses: HashMap<String, ConnectionStatus>,
     add_community_open: bool,
     people_search: String,
@@ -824,6 +859,8 @@ pub struct RelayApp {
     selected_nav: bool,
     scroll_to_end: bool,
     capture_path: Option<PathBuf>,
+    #[cfg(feature = "qa-automation")]
+    pub(crate) qa_input: crate::qa_automation::Pending,
     native_render_probe: Option<crate::native_render_probe::Probe>,
     capture_requested: bool,
     capture_icons: bool,
@@ -968,6 +1005,7 @@ impl RelayApp {
                 Ok(prefs) => (prefs, None),
                 Err(error) => (Preferences::default(), Some(error)),
             };
+        crate::replica_copy::sanitize(&mut prefs.replica_copies);
         // Communities joined through the account-free route can be opened again.
         for community in &prefs.communities {
             if let Some(route) = &community.iroh {
@@ -1056,6 +1094,12 @@ impl RelayApp {
             #[cfg(feature = "native-rtc")]
             rtc: None,
             rtc_request: None,
+            support_report: Default::default(),
+            lan_host: Default::default(),
+            lan_pairing_host: Default::default(),
+            game_ui: Default::default(),
+            replica_copy: host_ui::copy_ui::CopyUi::new(cc.egui_ctx.clone()),
+            handover: handover_ui::State::default(),
             last_source_state: [false; 2],
             media,
             media_error,
@@ -1131,6 +1175,7 @@ impl RelayApp {
             community_social: HashMap::new(),
             community_friends: crate::community_friends::Directory::default(),
             connection_status: ConnectionStatus::Offline,
+            resume_destination: None,
             community_statuses: HashMap::new(),
             add_community_open: false,
             people_search: String::new(),
@@ -1277,6 +1322,8 @@ impl RelayApp {
             selected_nav: true,
             scroll_to_end: false,
             capture_path: capture_path.clone(),
+            #[cfg(feature = "qa-automation")]
+            qa_input: Default::default(),
             native_render_probe: crate::native_render_probe::path_from_args(&args)
                 .ok()
                 .flatten()
@@ -1330,7 +1377,18 @@ impl RelayApp {
         }
         // Start our saved local host before attempting a remembered login.
         // Merely joining someone else's server never starts a local server.
-        if capture_path.is_none() {
+        let received_host = if capture_path.is_none() {
+            crate::handover_runtime::remembered()
+        } else {
+            Ok(None)
+        };
+        if capture_path.is_none() && matches!(&received_host, Ok(Some(_))) {
+            app.send(Command::RestoreHandoverHost);
+        } else if capture_path.is_none() && received_host.is_err() {
+            if let Err(fault) = received_host {
+                app.error=Some(format!("The saved transferred host could not start. {}", fault.message()));
+            }
+        } else if capture_path.is_none() {
             if let (Some(server), Ok(data)) = (
                 crate::local_host::server_binary(),
                 crate::local_host::data_directory(),
@@ -1386,6 +1444,16 @@ impl RelayApp {
     }
 
     fn send(&mut self, command: Command) {
+        let resume_intent = match &command {
+            Command::Resume { url, .. } => Some(Some(url.clone())),
+            Command::Auth { .. }
+            | Command::AccountLoginBegin { .. }
+            | Command::AccountLoginFinish { .. }
+            | Command::Logout
+            | Command::ForgetCommunity { .. }
+            | Command::SwitchCommunity { .. } => Some(None),
+            _ => None,
+        };
         let forget_alerts = match &command {
             Command::Logout => Some(self.login.url.clone()),
             Command::ForgetCommunity { url } => Some(url.clone()),
@@ -1394,9 +1462,15 @@ impl RelayApp {
         if forget_alerts.is_some() {
             self.cancel_background_people_answer();
         }
+        if matches!(command, Command::Logout) {
+            self.replica_before_logout();
+        }
         match self.network.send(command) {
             Err(e) => self.error = Some(e),
             Ok(()) => {
+                if let Some(intent) = resume_intent {
+                    self.resume_destination = intent;
+                }
                 if let Some(url) = forget_alerts {
                     self.call_alerts.forget_url(&url);
                 }
@@ -1432,10 +1506,11 @@ impl RelayApp {
             return;
         }
         self.busy = true;
-        self.send(Command::RememberSession {
+        self.send(Command::RememberNextLogins {
             enabled: self.prefs.remember_session,
         });
         self.send(Command::Auth {
+            authority: self.login.setup.invitation.as_ref().and_then(|i|i.authority.clone()),
             url: self.login.url.trim().into(),
             expected_server_id,
             request: AuthRequest {
@@ -1605,9 +1680,14 @@ impl RelayApp {
     }
 
     fn conversation_scope(&self) -> Option<String> {
-        self.session
-            .as_ref()
-            .map(|session| ConversationMemory::scope(&self.login.url, &session.user.id))
+        let session = self.session.as_ref()?;
+        let bootstrap = self.bootstrap.as_ref()?;
+        Some(crate::community::conversation_scope(
+            &self.prefs.communities,
+            &self.login.url,
+            &bootstrap.server_id,
+            &session.user.id,
+        ))
     }
 
     fn defer_preferences(&mut self) {
@@ -2325,11 +2405,12 @@ impl RelayApp {
             })
     }
 
-    fn start_protected_voice(
+    fn start_protected_voice_with_gateway(
         &mut self,
         url: &str,
         ticket: VoiceTicket,
         keys: std::sync::Arc<crate::e2ee::CallKeys>,
+        gateway: Option<crate::gateway_control::Config>,
     ) {
         self.voice_encryption_error = None;
         self.voice_recovery_pending = false;
@@ -2342,7 +2423,7 @@ impl RelayApp {
             media.set_muted(self.muted);
             media.set_deafened(self.deafened);
             media.set_push_to_talk_key(self.prefs.ptt_key);
-            match media.start_voice(url, ticket, keys) {
+            match media.start_voice_with_gateway(url, ticket, keys, gateway) {
                 Ok(()) => {
                     self.audio_connecting = true;
                     self.media_error = None;
@@ -2754,6 +2835,20 @@ impl RelayApp {
     }
 
     fn host_local(&mut self) {
+        match crate::handover_runtime::remembered() {
+            Ok(Some(_)) => {
+                self.send(Command::RestoreHandoverHost);
+                return;
+            }
+            Err(fault) => {
+                self.error = Some(format!(
+                    "The saved transferred host could not be opened. {}",
+                    fault.message()
+                ));
+                return;
+            }
+            Ok(None) => {}
+        }
         let Some(server) = crate::local_host::server_binary() else {
             self.error =
                 Some("The bundled server is missing. Reinstall Relay to restore it.".into());
@@ -3092,6 +3187,7 @@ fn release_capture(capture: Option<CaptureSession>) {
 impl Drop for RelayApp {
     fn drop(&mut self) {
         self.call_alerts.stop();
+        self.replica_copy.shutdown();
         self.hide_for_exit();
         self.save_preferences();
         self.stop_media();

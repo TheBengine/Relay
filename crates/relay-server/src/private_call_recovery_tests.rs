@@ -1093,7 +1093,7 @@ async fn schema_23_migration_is_atomic_and_interrupts_only_unbound_legacy_privat
     {
         let mut db = lock(&f.state.0.db);
         crate::tests::discard_private_call_schema(&db);
-        db.execute_batch("DROP INDEX private_call_lease;ALTER TABLE voice_resume_leases DROP COLUMN private_call_id;DELETE FROM schema_migrations WHERE version=23;PRAGMA user_version=22;CREATE TABLE private_call_recovery(owned_conflict TEXT);").unwrap();
+        db.execute_batch("DROP INDEX private_call_lease;ALTER TABLE voice_resume_leases DROP COLUMN private_call_id;DELETE FROM schema_migrations WHERE version>=23;PRAGMA user_version=22;CREATE TABLE private_call_recovery(owned_conflict TEXT);").unwrap();
         assert!(migrate_database(&mut db).is_err());
         assert_eq!(
             db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
@@ -1112,7 +1112,7 @@ async fn schema_23_migration_is_atomic_and_interrupts_only_unbound_legacy_privat
         assert_eq!(
             db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            23
+            crate::SCHEMA_VERSION
         );
         assert_eq!(
             db.query_row("SELECT COUNT(*) FROM voice_resume_leases", [], |r| r

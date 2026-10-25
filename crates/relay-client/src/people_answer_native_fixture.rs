@@ -37,6 +37,7 @@ struct OwnedApp {
 
 fn auth(url: String, request_id: u64) -> Command {
     Command::Auth {
+        authority: None,
         url,
         expected_server_id: None,
         register: false,

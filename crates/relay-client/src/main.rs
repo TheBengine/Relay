@@ -4,6 +4,8 @@
 )]
 
 mod accessible_input;
+#[cfg(feature = "qa-automation")]
+mod qa_automation;
 mod audio_wake;
 mod build_metadata;
 #[cfg(windows)]
@@ -38,17 +40,27 @@ mod connection_errors;
 mod connection_path;
 mod connection_setup;
 mod conversation_state;
+mod direct_targets;
 mod credential_vault;
 mod direct_voice;
 mod e2ee;
 mod embedded_network;
 mod emoji;
 mod firewall_check;
+mod game_activity;
+mod gateway_control;
 mod gif_library;
 #[cfg(all(windows, feature = "native-rtc"))]
 mod graphics_capture;
+mod handover_client;
+mod handover_runtime;
 #[cfg(all(windows, feature = "native-rtc"))]
 mod hardware_encoder;
+mod host_route;
+mod host_locator;
+mod host_locator_ack;
+mod host_locator_outbox;
+mod host_locator_renewal;
 mod installation_recovery_ui;
 #[cfg(windows)]
 mod instance_identity;
@@ -59,7 +71,10 @@ mod invitation_probe;
 mod invitation_routes;
 mod invite_proof;
 mod iroh_route;
+mod lan_discovery;
+mod lan_pairing;
 mod local_host;
+mod local_voice_gateway;
 mod media;
 mod message_format;
 #[cfg(windows)]
@@ -73,6 +88,7 @@ mod process_audio;
 mod profile_paths;
 mod protection;
 mod recovery;
+mod replica_copy;
 mod route_choice;
 #[cfg(feature = "native-rtc")]
 mod rtc;

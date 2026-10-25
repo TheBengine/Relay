@@ -639,6 +639,7 @@ impl Worker {
                                     pending.filter(|(wanted, _)| wanted == &channel_id)
                                 {
                                     self.emit(Update::VoiceJoined {
+                                        gateway: self.voice_gateway(&ticket),
                                         url,
                                         ticket,
                                         channel_id: wanted,
@@ -647,6 +648,7 @@ impl Worker {
                                     });
                                 } else {
                                     self.emit(Update::VoiceEncryptionChanged {
+                                        gateway: self.voice_gateway(&ticket),
                                         url,
                                         channel_id,
                                         ticket,

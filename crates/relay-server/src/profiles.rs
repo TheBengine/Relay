@@ -71,7 +71,10 @@ pub async fn member_profile(
 ) -> ApiResult<Json<User>> {
     let auth = state.auth(&headers)?;
     let db = lock(&state.0.db);
-    if state.0.config.people && !people::visible(&db, &auth.user.id, &user_id) {
+    if state.0.config.people
+        && !people::visible(&db, &auth.user.id, &user_id)
+        && !people::group_visible(&db, &auth.user.id, &user_id)
+    {
         return Err(forbidden());
     }
     active_user(&db, &user_id)?;
@@ -368,7 +371,10 @@ pub async fn download_avatar(
 ) -> ApiResult<Response> {
     let auth = state.auth(&headers)?;
     let db = lock(&state.0.db);
-    if state.0.config.people && !people::visible(&db, &auth.user.id, &user_id) {
+    if state.0.config.people
+        && !people::visible(&db, &auth.user.id, &user_id)
+        && !people::group_visible(&db, &auth.user.id, &user_id)
+    {
         return Err(forbidden());
     }
     active_user(&db, &user_id)?;

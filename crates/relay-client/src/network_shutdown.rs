@@ -175,6 +175,8 @@ impl Network {
 
 impl Worker {
     pub(super) fn finish_normal(&mut self, deadline: Instant) -> Report {
+        if let Some((job,_))=&self.handover_job {job.cancel();}
+        self.pending_host_resume = None;
         self.cancel_transfers();
         self.socket_stop.store(true, Ordering::Release);
         self.live.shutdown.store(true, Ordering::Release);
@@ -223,6 +225,9 @@ impl Worker {
         }
         for saved in self.saved_connections.values() {
             close(&saved.connection, false);
+        }
+        if let Some(mut host) = self.handover_runtime.take() {
+            host.shutdown();
         }
         if let Err(error) = self.close_app_host() {
             eprintln!("{error}");

@@ -246,8 +246,10 @@ impl RelayApp {
                 ui.close_menu();
             }
             if self.session.as_ref().is_some_and(|s| s.user.id != user.id) {
+                let can_message = !self.is_blocked(&user.id) && self.can_message(&user.id);
                 if ui
-                    .add_enabled(!self.is_blocked(&user.id), egui::Button::new("Message"))
+                    .add_enabled(can_message, egui::Button::new("Message"))
+                    .on_disabled_hover_text("You can message friends you have not blocked.")
                     .clicked()
                 {
                     self.select(Target::Direct(user.id.clone()));

@@ -414,7 +414,6 @@ async fn people_friend_request_private_call_block_and_restart_without_a_communit
         ("POST", "/api/invites"),
         ("GET", "/api/members"),
         ("PUT", "/api/protection"),
-        ("POST", "/api/conversations"),
         ("GET", "/api/admin/backup"),
     ] {
         assert_eq!(
@@ -594,5 +593,11 @@ async fn people_exact_name_probe_budget_is_shared_with_uuid_requests() {
     );
 }
 
+#[path = "game_activity_tests.rs"]
+mod game_activity;
+#[path = "group_tests.rs"]
+mod groups;
+#[path = "host_locator_tests.rs"]
+mod host_locator;
 #[path = "security_review_tests.rs"]
 mod security_review;

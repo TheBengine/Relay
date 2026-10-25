@@ -272,7 +272,7 @@ impl RelayApp {
             bootstrap
                 .members
                 .iter()
-                .filter(|user| user.id != bootstrap.user.id)
+                .filter(|user| crate::direct_targets::actionable(bootstrap, &user.id))
                 .map(|user| Entry {
                     target: Target::Direct(user.id.clone()),
                     name: profile_ui::display_name(user).to_owned(),

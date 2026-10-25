@@ -450,7 +450,7 @@ pub async fn consume_package(
 }
 
 /// Returns the current permission roster, never a cached historic roster.
-fn roster(
+pub(crate) fn roster(
     state: &AppState,
     db: &Connection,
     user: &str,
@@ -466,6 +466,23 @@ fn roster(
                 _ => return Err(bad("Unsupported encrypted channel kind")),
             };
             channel_access(db, channel, user, permission)?;
+            if channel_info.kind == "text" {
+                if let Some(group) = conversations::info(db, channel)?.filter(|c| c.kind == "group")
+                {
+                    let mut result = vec![];
+                    for member in &group.member_ids {
+                        if channel_access(db, channel, member, permission).is_ok() {
+                            result.push(get_user(db, member)?);
+                        }
+                    }
+                    if result.len() > MAX_ROSTER {
+                        return Err(conflict(
+                            "Encrypted conversations support at most 64 authorized members",
+                        ));
+                    }
+                    return Ok(("channel".into(), channel.clone(), result));
+                }
+            }
             let live_users: HashSet<String> = if channel_info.kind == "voice" {
                 lock(&state.0.voice)
                     .values()
