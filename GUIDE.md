@@ -1,6 +1,6 @@
 # Using Relay
 
-[Back to the short overview](README.md) Â· [Relay vs Discord](COMPARISON.md) Â· [Privacy](SECURITY.md)
+[Back to the short overview](README.md) · [Relay vs Discord](COMPARISON.md) · [Privacy](SECURITY.md)
 
 ## Download
 
@@ -16,7 +16,7 @@ This is an **unsigned preview**. Real audio hardware, extended streaming and cal
 
 1. **Sign in or create a Relay account.** No invitation is needed. Sign-in opens inside the app, with a browser option available.
 2. **Create or join a server.** Keep the recommended end-to-end encryption setting, or deliberately choose the alternative when creating your server.
-3. **Invite your friends.** Open **Invite friends â†’ Share and copy invitation**, then send the link. Your friend signs in with their Relay account and joins your server.
+3. **Invite your friends.** Open **Invite friends**, choose a reachable connection and copy the invitation, then send the link. Your friend signs in with their Relay account and joins your server.
 
 With an HTTPS invitation and Relay installed, your friend chooses **Open Relay** in the browser. Already have a `relay://` invitation? The [invitation page](https://thebengine.github.io/Relay/) can turn it into a clickable link. Pasting the original invitation in **Join friends** remains available.
 
@@ -29,7 +29,7 @@ With an HTTPS invitation and Relay installed, your friend chooses **Open Relay**
 - **With Tailscale:** both friends sign in with their own Tailscale accounts and accept sharing. A separate Tailscale app is not required.
 - **Direct address:** for the same network or a server that is already reachable. Public hosting can require additional network configuration.
 
-Use **Invite friends â†’ Change connection** to change the route, then copy a new invitation. Relay can choose between routes included in an invitation. If a browser does not open the app, use **Join friends** and paste the invitation.
+Use **Invite friends → Change connection** to change the route, then copy a new invitation. Relay can choose between routes included in an invitation. If a browser does not open the app, use **Join friends** and paste the invitation.
 
 </details>
 
@@ -42,7 +42,7 @@ Use **Invite friends â†’ Change connection** to change the route, then copy
 | Files and GIF search | Camera and screen sharing | Profile and server settings |
 | Search on your own PC | Quality controls | Themes and adjustable text size |
 
-New one-use invitations can confirm the host's and friend's devices automatically. Send them through a trusted contact route. You can compare the security number under **Settings â†’ Encryption**, in person or over a call you already trust.
+New one-use invitations can confirm the host's and friend's devices automatically. Send them through a trusted contact route. You can compare the security number under **Settings → Encryption**, in person or over a call you already trust.
 
 ## Update Relay
 

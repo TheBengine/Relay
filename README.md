@@ -1,9 +1,9 @@
 <picture>
   <source media="(max-width: 640px)" srcset="assets/relay-banner-compact.svg">
-  <img src="assets/relay-banner-en.svg" alt="Relay â€” Your friends. Your server. A self-hosted Discord alternative for chat, voice and screen sharing." width="100%">
+  <img src="assets/relay-banner-en.svg" alt="Relay — Your friends. Your server. A self-hosted Discord alternative for chat, voice and screen sharing." width="100%">
 </picture>
 
-**[Download for Windows](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261025.1/Relay-Setup.exe)** Â· [Portable version](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261025.1/Relay-Portable.zip)
+**[Download for Windows](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261025.1/Relay-Setup.exe)** · [Portable version](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261025.1/Relay-Portable.zip)
 
 Experimental, unsigned Windows x64 preview.
 
@@ -19,7 +19,7 @@ Experimental, unsigned Windows x64 preview.
 
 Protected mode is recommended by default. Keep your host online. Actual video quality depends on hardware and connection.
 
-[Full comparison & sources](COMPARISON.md) Â· [Setup & updates](GUIDE.md) Â· [Privacy & security](SECURITY.md)
+[Full comparison & sources](COMPARISON.md) · [Setup & updates](GUIDE.md) · [Privacy & security](SECURITY.md)
 ## Source and contributions
 
 Relay's client, server, connection helpers and reviewed dependency patches are
@@ -28,7 +28,7 @@ You can inspect the code and contribute fixes. Using the covered code to offer a
 competing product is excluded, including free competing products. This is
 **source available**, rather than OSI open source.
 
-[License and earlier MIT rights](LICENSING.md) Â· [Contribute](CONTRIBUTING.md) Â·
+[License and earlier MIT rights](LICENSING.md) · [Contribute](CONTRIBUTING.md) ·
 [Build from source](docs/building.md)
 
 The latest preview includes the matching application source. Hardware, WAN latency
