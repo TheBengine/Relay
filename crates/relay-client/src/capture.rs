@@ -191,6 +191,11 @@ pub struct CaptureDiagnostics {
     pub adaptive_output: Option<String>,
     #[cfg_attr(not(feature = "native-rtc"), allow(dead_code))]
     pub adaptive_samples: u64,
+    /// Recent outbound RTP payload rate, sampled locally; not the configured ceiling.
+    #[cfg_attr(not(feature = "native-rtc"), allow(dead_code))]
+    pub outbound_mbps: Option<f64>,
+    #[cfg_attr(not(feature = "native-rtc"), allow(dead_code))]
+    pub outbound_sample_at: Option<Instant>,
 }
 
 #[derive(Debug)]

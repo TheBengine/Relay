@@ -157,6 +157,7 @@ impl GuiWorker {
         self.prepare(target);
         let client_id = uuid::Uuid::new_v4().to_string();
         let updates = self.handle(Command::SendRich {
+            binding: None,
             origin: CommandOrigin::from(self.worker.connection.as_ref().unwrap()),
             target: target.clone(),
             content: text.into(),

@@ -66,8 +66,13 @@ pub fn resolve(
     let port = url
         .port_or_known_default()
         .ok_or("Invalid invitation port")?;
+    // A public HTTPS invitation can also offer the same Relay community on
+    // its ordinary API port at home. Keep this exception tied to the parser's
+    // exact validated Relay service, not to arbitrary alternative ports.
+    let relay_api = port == 4580
+        && crate::invitation_routes::valid_direct_address(address).is_ok();
     if !matches!(url.scheme(), "http" | "https")
-        || !(port == primary_port || url.scheme() == "https" && port == 443)
+        || !(port == primary_port || relay_api || url.scheme() == "https" && port == 443)
     {
         return Err("This extra address uses an unrelated port".into());
     }
@@ -256,7 +261,20 @@ mod tests {
         assert!(resolve("https://10.0.0.1:22", 4580, &subnets).is_err());
         assert!(resolve("http://10.0.0.1:4580", 4580, &subnets).is_err());
         assert!(resolve("https://192.168.111.6:443", 8443, &subnets).is_ok());
-        assert!(resolve("https://192.168.111.6:4580", 8443, &subnets).is_err());
+        assert!(resolve("https://192.168.111.6:4580", 8443, &subnets).is_ok());
+        assert!(resolve("http://192.168.111.6:4580", 443, &subnets).is_ok());
+        assert!(resolve("https://192.168.111.6:8444", 8443, &subnets).is_err());
+        // An advertised Relay port does not authorize other private networks,
+        // mapped addresses, CGNAT services or credentials in a probe URL.
+        for address in [
+            "http://10.0.0.1:4580",
+            "https://[::ffff:10.0.0.1]:4580",
+            "https://100.64.0.5:4580",
+            "http://synthetic:synthetic@192.168.111.6:4580",
+            "http://192.168.111.6:4580?token=synthetic",
+        ] {
+            assert!(resolve(address, 443, &subnets).is_err(), "{address}");
+        }
     }
 
     #[cfg(windows)]

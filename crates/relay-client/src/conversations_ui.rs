@@ -1320,7 +1320,12 @@ impl RelayApp {
                         .selectable_label(
                             self.current == Some(Target::Channel(channel.id.clone())),
                             format!(
-                                "{}{}",
+                                "{}{}{}",
+                                if self.conversation_has_draft(&Target::Channel(channel.id.clone())) {
+                                    "Draft · "
+                                } else {
+                                    ""
+                                },
                                 channel.name,
                                 if thread.archived { " · Archived" } else { "" }
                             ),
@@ -1407,6 +1412,9 @@ impl RelayApp {
                         icon(ui, Icon::Users, 28.0, c_muted());
                         let mut text =
                             format!("{}  ·  {} members", channel.name, group.member_ids.len());
+                        if self.conversation_has_draft(&Target::Channel(channel.id.clone())) {
+                            text = format!("Draft · {text}");
+                        }
                         if mentions > 0 {
                             text.push_str(&format!("  ·  {mentions} mentions"));
                         } else if unread > 0 {

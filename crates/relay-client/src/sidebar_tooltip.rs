@@ -146,7 +146,7 @@ mod tests {
                                 index == 2,
                                 false,
                                 false,
-                                (0, 0),
+                                (0, 0, false),
                             );
                             result.rows.push(response.rect);
                             if response.clicked() {

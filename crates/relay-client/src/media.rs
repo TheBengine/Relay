@@ -1,5 +1,5 @@
 //! Native device capture and encrypted, bounded 2.5/5/10/20 ms Opus voice packets.
-//! Streams open only for an explicit voice join, microphone level test, or speaker cue.
+//! Streams open only for an explicit voice join, local microphone preview, or speaker cue.
 
 #[cfg(feature = "native-rtc")]
 pub use crate::application_audio::ApplicationAudioSink;
@@ -35,6 +35,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "microphone_preview.rs"]
+mod microphone_preview;
+
 const FRAME_TIME: Duration = Duration::from_millis(20);
 // Keep at most two codec frames locally. The receive jitter target belongs to
 // the packet reorder buffer; adding it again to device playout doubles buffering.
@@ -50,7 +53,7 @@ const PLAYBACK_QUANTUM_SAMPLES: usize = 120;
 const MAX_DEVICE_PLAYBACK_SAMPLES: usize = AUDIO_SAMPLE_RATE as usize / 5
     + PLAYBACK_QUANTUM_SAMPLES
     + crate::voice_output::DEFAULT_RESERVE_SAMPLES;
-const MAX_TONE_SAMPLES: usize = AUDIO_SAMPLE_RATE as usize;
+const MAX_TONE_SAMPLES: usize = crate::sound_customization::MAX_SAMPLES;
 const MAX_SPEAKERS: usize = 32;
 type SampleQueue = Arc<crate::device_queue::Queue>;
 type ToneQueue = Arc<Mutex<VecDeque<f32>>>;
@@ -69,6 +72,8 @@ fn received_audio_activity(power: f32) -> bool {
 }
 
 struct AudioControls {
+    /// Only the isolated local preview clears rendered history on PTT changes.
+    local_preview: bool,
     call_tones: ToneQueue,
     call_tone_epoch: AtomicU64,
     gain: AtomicU32,
@@ -144,6 +149,7 @@ impl AudioControls {
 
     fn new(settings: &AudioSettings) -> Self {
         Self {
+            local_preview: false,
             call_tones: Arc::new(Mutex::new(VecDeque::new())),
             call_tone_epoch: AtomicU64::new(0),
             gain: AtomicU32::new(settings.microphone_gain.to_bits()),
@@ -592,6 +598,7 @@ struct VoiceStart {
 struct MicrophoneStart {
     stop: Arc<AtomicBool>,
     settings: AudioSettings,
+    ptt_key: i32,
     errors: ErrorSlot,
 }
 
@@ -700,8 +707,7 @@ impl CallAlertAudio {
     }
     pub fn play(&self, cue: AudioCue, settings: AudioSettings) {
         if self.deafened.load(Ordering::Acquire)
-            || !settings.sounds_enabled
-            || settings.sound_volume <= 0.0
+            || !crate::sound_customization::audible(&settings, cue)
         {
             return;
         }
@@ -914,6 +920,9 @@ impl MediaEngine {
     }
     pub fn configure(&mut self, settings: AudioSettings) -> bool {
         let settings = settings.normalized();
+        let sounds_changed = self.settings.sounds_enabled != settings.sounds_enabled
+            || self.settings.sound_volume != settings.sound_volume
+            || self.settings.event_sounds != settings.event_sounds;
         let changed = self.settings.input_device != settings.input_device
             || self.settings.output_device != settings.output_device
             || self.settings.low_latency_device != settings.low_latency_device;
@@ -925,8 +934,12 @@ impl MediaEngine {
         }
         self.shared.controls.apply(&settings);
         self.settings = settings;
-        if changed {
+        if changed || sounds_changed {
             self.cancel_sound();
+            if sounds_changed {
+                self.shared.controls.call_tone_epoch.fetch_add(1, Ordering::AcqRel);
+                self.shared.controls.call_tones.lock().unwrap_or_else(|error| error.into_inner()).clear();
+            }
             if let Some(sender) = &self.sender {
                 let _ = sender.try_send(AudioCommand::StopSound);
             }
@@ -1014,6 +1027,7 @@ impl MediaEngine {
         let request = MicrophoneStart {
             stop,
             settings: settings.normalized(),
+            ptt_key: self.shared.controls.ptt_key.load(Ordering::Acquire),
             errors: self.errors.clone(),
         };
         if let Err(error) = self.enqueue(AudioCommand::Microphone {
@@ -1039,12 +1053,20 @@ impl MediaEngine {
             AudioPhase::StartingMicrophone | AudioPhase::ActiveMicrophone
         )
     }
+    pub fn is_microphone_test_starting(&self) -> bool {
+        self.phase() == AudioPhase::StartingMicrophone
+    }
     pub fn play_tone(&mut self, cue: AudioCue) -> Result<(), String> {
         self.queue_tone(cue, self.settings.clone(), false)
     }
     /// Output-only preview; never changes the microphone or the active call.
+    #[cfg(test)]
     pub fn preview_sound(&mut self, settings: AudioSettings) -> Result<(), String> {
-        self.queue_tone(AudioCue::Unmute, settings.normalized(), true)
+        self.preview_cue(AudioCue::Unmute, settings)
+    }
+    /// Preview exactly one event's edited sound without applying audio settings.
+    pub fn preview_cue(&mut self, cue: AudioCue, settings: AudioSettings) -> Result<(), String> {
+        self.queue_tone(cue, settings.normalized(), true)
     }
     fn queue_tone(
         &mut self,
@@ -1052,7 +1074,7 @@ impl MediaEngine {
         settings: AudioSettings,
         preview: bool,
     ) -> Result<(), String> {
-        if !settings.sounds_enabled || settings.sound_volume <= 0.0 {
+        if !crate::sound_customization::audible(&settings, cue) {
             return Ok(());
         }
         let generation = self.state.lock().map(|state| state.generation).unwrap_or(0);
@@ -1578,8 +1600,7 @@ struct NativeAudio {
     sound_stop: Arc<AtomicBool>,
     sound_errors: ErrorSlot,
     sound_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
-    microphone_stop: Option<Arc<AtomicBool>>,
-    microphone_test: Option<DeviceStream>,
+    microphone_test: Option<microphone_preview::Session>,
 }
 
 struct VoiceSession {
@@ -1620,7 +1641,6 @@ impl NativeAudio {
             sound_stop: Arc::new(AtomicBool::new(false)),
             sound_errors: Arc::new(Mutex::new(None)),
             sound_cancel: Arc::new(Mutex::new(None)),
-            microphone_stop: None,
             microphone_test: None,
         })
     }
@@ -1990,52 +2010,24 @@ impl NativeAudio {
         self.controls.echo_reference.clear();
     }
 
-    /// Explicit local level test: opens the chosen microphone, with no UDP or speaker output.
+    /// Explicit local processed preview. Its devices, queues and DSP are isolated from calls.
     fn start_microphone_test(
         &mut self,
         stop: Arc<AtomicBool>,
         settings: AudioSettings,
+        ptt_key: i32,
         errors: ErrorSlot,
     ) -> Result<(), String> {
         if self.is_active() {
             return Err("Leave voice before starting a microphone test.".into());
         }
         self.stop_microphone_test();
-        ensure_not_cancelled(&stop)?;
-        let host = cpal::default_host();
-        let device = audio_device(&host, &settings.input_device, true)?;
-        ensure_not_cancelled(&stop)?;
-        let config = device
-            .default_input_config()
-            .map_err(|e| format!("Microphone format: {e}"))?;
-        ensure_not_cancelled(&stop)?;
-        let input = make_input(
-            &device,
-            &config,
-            InputState {
-                queue: sample_queue(VecDeque::with_capacity(MAX_CAPTURE_SAMPLES)),
-                level: self.level.clone(),
-                muted: Arc::new(AtomicBool::new(false)),
-                deafened: Arc::new(AtomicBool::new(false)),
-                counters: self.counters.clone(),
-                errors,
-                controls: Arc::new(AudioControls::new(&settings)),
-                stop: stop.clone(),
-            },
-        )?;
-        ensure_not_cancelled(&stop)?;
-        input
-            .play()
-            .map_err(|e| format!("Start microphone test: {e}"))?;
-        ensure_not_cancelled(&stop)?;
-        self.microphone_stop = Some(stop);
-        self.microphone_test = Some(input);
+        self.microphone_test = Some(microphone_preview::Session::start(
+            stop, &settings, ptt_key, self.level.clone(), errors,
+        )?);
         Ok(())
     }
     pub fn stop_microphone_test(&mut self) {
-        if let Some(stop) = self.microphone_stop.take() {
-            stop.store(true, Ordering::Release);
-        }
         self.microphone_test.take();
         if !self.is_active() {
             self.level.store(0, Ordering::Relaxed);
@@ -2048,7 +2040,7 @@ impl NativeAudio {
         settings: AudioSettings,
         preview: bool,
     ) -> Result<(), String> {
-        if !settings.sounds_enabled || settings.sound_volume <= 0.0 {
+        if !crate::sound_customization::audible(&settings, cue) {
             return Ok(());
         }
         if preview || (self.sound_preview && !self.is_active()) {
@@ -2061,16 +2053,14 @@ impl NativeAudio {
         } else {
             self.tones.clone()
         };
-        let queued = if matches!(cue, AudioCue::Ring | AudioCue::Ringback) {
+        let queued = if !preview && matches!(cue, AudioCue::Ring | AudioCue::Ringback) {
             self.controls.call_tones.clone()
         } else {
             tones.clone()
         };
-        let samples = tone_samples(cue, settings.sound_volume);
+        let samples = crate::sound_customization::samples(cue, &settings);
         if let Ok(mut tones) = queued.lock() {
-            let excess = (tones.len() + samples.len()).saturating_sub(MAX_TONE_SAMPLES);
-            tones.drain(..excess);
-            tones.extend(samples);
+            append_tone(&mut tones, samples);
         }
         if !preview
             && (self.is_active()
@@ -2129,13 +2119,24 @@ impl NativeAudio {
                         stream.play().map_err(|e| format!("Play cue: {e}"))?;
                         ensure_not_cancelled(&stop)?;
                         let began = Instant::now();
-                        while !stop.load(Ordering::Acquire)
-                            && began.elapsed() < Duration::from_secs(2)
-                        {
+                        let mut last_progress = began;
+                        let mut previous_queued = usize::MAX;
+                        while !stop.load(Ordering::Acquire) {
+                            let queued_samples = tones.lock().map(|q| q.len()).unwrap_or(0)
+                                + call_queue.lock().map(|q| q.len()).unwrap_or(0);
+                            if queued_samples != previous_queued {
+                                last_progress = Instant::now();
+                                previous_queued = queued_samples;
+                            }
                             if began.elapsed() > Duration::from_millis(200)
-                                && tones.lock().map(|q| q.is_empty()).unwrap_or(true)
-                                && call_queue.lock().map(|q| q.is_empty()).unwrap_or(true)
+                                && queued_samples == 0
                             {
+                                break;
+                            }
+                            // A new event can arrive while output is already
+                            // playing. Let it finish; only a stalled device is
+                            // subject to a fixed watchdog.
+                            if last_progress.elapsed() > Duration::from_secs(crate::sound_customization::MAX_SECONDS as u64 + 1) {
                                 break;
                             }
                             thread::sleep(Duration::from_millis(10));
@@ -2192,7 +2193,7 @@ impl AudioBackend for NativeAudio {
         NativeAudio::stop_voice(self);
     }
     fn microphone(&mut self, request: MicrophoneStart) -> Result<(), String> {
-        self.start_microphone_test(request.stop, request.settings, request.errors)
+        self.start_microphone_test(request.stop, request.settings, request.ptt_key, request.errors)
     }
     fn stop_microphone(&mut self) {
         self.stop_microphone_test();
@@ -2217,9 +2218,9 @@ impl AudioBackend for NativeAudio {
             self.stop_voice();
         }
         if self
-            .microphone_stop
+            .microphone_test
             .as_ref()
-            .is_some_and(|stop| stop.load(Ordering::Acquire))
+            .is_some_and(microphone_preview::Session::stopped)
         {
             self.stop_microphone_test();
         }
@@ -2238,8 +2239,16 @@ impl AudioBackend for NativeAudio {
     }
 }
 
+#[cfg(test)]
 fn tone_samples(cue: AudioCue, volume: f32) -> Vec<f32> {
     crate::sound_cues::samples(cue, volume)
+}
+
+fn append_tone(queue: &mut VecDeque<f32>, mut samples: Vec<f32>) {
+    samples.truncate(MAX_TONE_SAMPLES);
+    let excess = (queue.len() + samples.len()).saturating_sub(MAX_TONE_SAMPLES);
+    queue.drain(..excess.min(queue.len()));
+    queue.extend(samples);
 }
 
 fn record_error(errors: &ErrorSlot, message: String) {
@@ -2746,6 +2755,7 @@ where
         controls.output_reserve.load(Ordering::Acquire),
     );
     let mut voice_seen = false;
+    let mut preview_generation = controls.privacy_generation.load(Ordering::Acquire);
     let mut output_limiter = crate::voice_limiter::OutputLimiter::new(config.sample_rate.0);
     let mut previous_tone = 0.0f32;
     let mut next_tone = 0.0f32;
@@ -2771,11 +2781,29 @@ where
             data.fill(T::from_sample(0.0));
             return;
         }
-        let muted = deafened.load(Ordering::Relaxed);
+        let preview_closed = controls.local_preview
+            && controls.transmission.load(Ordering::Acquire) == TransmissionMode::PushToTalk as u32
+            && !controls.ptt_pressed.load(Ordering::Acquire);
+        let muted = deafened.load(Ordering::Relaxed) || preview_closed;
         let volume = f32::from_bits(controls.playback_volume.load(Ordering::Relaxed));
         let mut tone_samples = tones.try_lock().ok();
         let mut call_tone_samples = controls.call_tones.try_lock().ok();
         consumer.synchronize();
+        if controls.local_preview {
+            let generation = controls.privacy_generation.load(Ordering::Acquire);
+            if generation != preview_generation {
+                consumer.clear();
+                voice_output.reset();
+                voice_seen = false;
+                output_limiter.reset();
+                #[cfg(feature = "native-rtc")]
+                {
+                    echo_samples.clear();
+                    echo_resampler.reset();
+                }
+                preview_generation = generation;
+            }
+        }
         let mut samples = Some(&mut consumer);
         #[cfg(feature = "native-rtc")]
         let mut application_samples = controls.application_audio.try_queues();
@@ -5609,6 +5637,7 @@ mod tests {
         }
         .normalized();
         engine.configure(applied.clone());
+        engine.set_push_to_talk_key(0x06);
         let draft = AudioSettings {
             input_device: Some("test microphone".into()),
             transmission: TransmissionMode::Continuous,
@@ -5624,6 +5653,7 @@ mod tests {
             _ => panic!("expected microphone preview"),
         };
         assert_eq!(request.settings, draft);
+        assert_eq!(request.ptt_key, 0x06);
         assert_eq!(engine.settings, applied);
         assert_eq!(
             engine.shared.controls.transmission.load(Ordering::Relaxed),
@@ -6097,6 +6127,79 @@ mod tests {
             engine.preview_sound(settings).unwrap();
             assert!(engine.owner.is_none() && engine.sender.is_none());
             assert_eq!(engine.settings, applied);
+        }
+    }
+    #[test]
+    fn chosen_event_preview_keeps_the_selected_event_and_applied_settings() {
+        let mut engine = MediaEngine::new().unwrap();
+        let applied = engine.settings.clone();
+        let (sender, receiver) = mpsc::sync_channel(8);
+        engine.sender = Some(sender);
+        let mut edited = applied.clone();
+        edited.event_sounds.get_mut(AudioCue::Ring).source =
+            crate::sound_customization::SoundSource::BuiltIn { cue: AudioCue::Join };
+        engine.preview_cue(AudioCue::Ring, edited.clone()).unwrap();
+        match receiver.recv().unwrap() {
+            AudioCommand::Tone { cue, settings, preview, .. } => {
+                assert_eq!(cue, AudioCue::Ring);
+                assert!(preview);
+                assert_eq!(settings, edited);
+            }
+            _ => panic!("expected selected event preview"),
+        }
+        assert_eq!(engine.settings, applied);
+        assert!(!engine.is_active() && !engine.is_microphone_test_active());
+    }
+
+    #[test]
+    fn disabled_individual_events_open_no_audio_owner() {
+        for cue in AudioCue::ALL {
+            let mut settings = AudioSettings::default();
+            settings.event_sounds.get_mut(cue).enabled = false;
+            let mut engine = MediaEngine::new().unwrap();
+            engine.configure(settings.clone());
+            engine.preview_cue(cue, settings).unwrap();
+            engine.play_tone(cue).unwrap();
+            assert!(engine.owner.is_none() && engine.sender.is_none());
+        }
+    }
+
+    #[test]
+    fn applying_sound_choices_stops_queued_cues_without_restarting_the_active_call() {
+        for change in 0..4 {
+            let mut engine = MediaEngine::new().unwrap();
+            let applied = engine.settings.clone();
+            let (sender, receiver) = mpsc::sync_channel(8);
+            engine.sender = Some(sender);
+            engine.start_voice("ready", voice_ticket(), test_call_keys("local")).unwrap();
+            let (generation, voice) = match receiver.recv().unwrap() {
+                AudioCommand::Voice { generation, request } => (generation, request),
+                _ => panic!("expected active voice request"),
+            };
+            assert!(publish_phase(&engine.state, generation, AudioPhase::ActiveVoice));
+            engine.shared.tones.lock().unwrap().push_back(0.25);
+            engine.shared.controls.call_tones.lock().unwrap().push_back(0.5);
+            let preview_stop = Arc::new(AtomicBool::new(false));
+            *engine.shared.sound_cancel.lock().unwrap() = Some(preview_stop.clone());
+            let privacy = engine.shared.controls.privacy_generation.load(Ordering::Acquire);
+            let old_ring = engine.shared.controls.call_tone_epoch.load(Ordering::Acquire);
+            let mut edited = applied;
+            match change {
+                0 => edited.sounds_enabled = false,
+                1 => edited.sound_volume = 0.0,
+                2 => edited.event_sounds.get_mut(AudioCue::Message).enabled = false,
+                _ => edited.event_sounds.get_mut(AudioCue::Join).source =
+                    crate::sound_customization::SoundSource::BuiltIn { cue: AudioCue::Leave },
+            }
+            assert!(!engine.configure(edited), "Sound changes must not reopen voice devices");
+            assert!(matches!(receiver.recv().unwrap(), AudioCommand::StopSound));
+            assert!(preview_stop.load(Ordering::Acquire));
+            assert!(engine.shared.tones.lock().unwrap().is_empty());
+            assert!(engine.shared.controls.call_tones.lock().unwrap().is_empty());
+            assert!(engine.shared.controls.call_tone_epoch.load(Ordering::Acquire) > old_ring);
+            assert_eq!(engine.shared.controls.privacy_generation.load(Ordering::Acquire), privacy);
+            assert!(engine.is_active() && !voice.stop.load(Ordering::Acquire));
+            assert!(Arc::ptr_eq(&engine.voice_queues.as_ref().unwrap().0, &voice.capture));
         }
     }
     #[test]
@@ -7973,6 +8076,21 @@ mod tests {
         engine.play_tone(AudioCue::Join).unwrap();
         assert!(engine.owner.is_none());
         assert!(!engine.is_microphone_test_active() && !engine.is_active());
+    }
+    #[test]
+    fn long_custom_events_and_repeated_appends_keep_a_bounded_cue_queue() {
+        let mut queue = VecDeque::new();
+        // Longer than the former one-second cap: previously drain(..excess)
+        // indexed beyond an empty queue and panicked.
+        append_tone(&mut queue, vec![0.25; AUDIO_SAMPLE_RATE as usize * 3]);
+        assert_eq!(queue.len(), AUDIO_SAMPLE_RATE as usize * 3);
+        append_tone(&mut queue, vec![0.5; AUDIO_SAMPLE_RATE as usize * 3]);
+        assert_eq!(queue.len(), MAX_TONE_SAMPLES);
+        assert_eq!(queue.front(), Some(&0.25));
+        assert_eq!(queue.back(), Some(&0.5));
+        append_tone(&mut queue, vec![0.75; MAX_TONE_SAMPLES + 1]);
+        assert_eq!(queue.len(), MAX_TONE_SAMPLES);
+        assert!(queue.iter().all(|sample| *sample == 0.75));
     }
     #[test]
     fn capture_resampling_keeps_a_fixed_queue_under_a_slow_consumer() {

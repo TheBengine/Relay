@@ -77,6 +77,7 @@ pub(super) fn run() {
     // A file prepared while encryption was on cannot be sent plainly: nobody could open it.
     let origin = bob.origin();
     let refused = bob.worker.handle(Command::SendRich {
+        binding: None,
         origin,
         target: channel.clone(),
         content: "with old file".into(),

@@ -23,6 +23,8 @@ pub(super) fn clear_recovered_connection_error(
 
 impl RelayApp {
     pub(super) fn updates(&mut self, ctx: &egui::Context) {
+        self.poll_sound_settings();
+        self.poll_outbox(ctx);
         self.poll_background_people_answer(ctx);
         if self
             .preview_release
@@ -399,6 +401,7 @@ impl RelayApp {
                     self.marked_read.clear();
                     self.uploads.clear();
                     self.send_ids.clear();
+                    self.restore_outbox();
                     self.connection_status =
                         if self.bootstrap.as_ref().is_some_and(|b| b.host_paused) {
                             ConnectionStatus::Reconnecting
@@ -537,6 +540,7 @@ impl RelayApp {
                     self.drafts = DraftStore::default();
                     self.pending_sends.clear();
                     self.outgoing_messages.clear();
+                    self.outbox_pending.clear();
                     self.pending_edits.clear();
                     self.joining_voice = None;
                     self.share_picker = None;
@@ -1001,7 +1005,11 @@ impl RelayApp {
                         self.notice = Some((format!("Video connection: {error}"), Instant::now()));
                     }
                 }
-                Update::SentRich { target, client_id } => {
+                Update::SentRich { origin, target, client_id } => {
+                    if self.command_origin().as_ref() != Some(&origin) {
+                        continue;
+                    }
+                    self.acknowledge_outbox(&origin, &target, &client_id);
                     if !self
                         .send_ids
                         .get(&target)
@@ -1562,7 +1570,10 @@ impl RelayApp {
                         self.scroll_to_end = true;
                     }
                 }
-                Update::SendFailed { target, error } => {
+                Update::SendFailed { origin, target, error } => {
+                    if origin.as_ref() != self.command_origin().as_ref() {
+                        continue;
+                    }
                     // A real failure replaces any wait shown for this conversation.
                     if let Some(key) = self.readiness_key(&target) {
                         self.readiness.settled(&key);
@@ -1595,6 +1606,9 @@ impl RelayApp {
                     code,
                     retry_after_ms,
                 } => {
+                    if origin.as_ref() != self.command_origin().as_ref() {
+                        continue;
+                    }
                     // The newest result for this conversation and connection.
                     self.readiness.rate_limited(origin, &target);
                     self.fail_outgoing(&target);
@@ -1926,6 +1940,43 @@ impl RelayApp {
                         }
                     }
                 }
+                Update::ReadMarked { origin, target, requested_sequence, result } => {
+                    if self.command_origin().as_ref() != Some(&origin) {
+                        continue;
+                    }
+                    if requested_sequence == u64::MAX {
+                        self.finish_inbox_read(&target, result.is_ok());
+                    }
+                    let now = Instant::now();
+                    let first_failure = self.marked_read.get_mut(&target).is_some_and(|attempt| {
+                        attempt.completed(requested_sequence, result.is_ok(), now)
+                    });
+                    match result {
+                        Ok(state) => {
+                            if let Some(bootstrap) = self.bootstrap.as_mut() {
+                                let reads = &mut Arc::make_mut(bootstrap).read_states;
+                                if let Some(old) = reads.iter_mut().find(|old| {
+                                    old.channel_id == state.channel_id && old.peer_id == state.peer_id
+                                }) {
+                                    if state.last_read_sequence >= old.last_read_sequence {
+                                        *old = state;
+                                    }
+                                } else {
+                                    reads.push(state);
+                                }
+                                self.community_reads.insert(origin.url, reads.clone());
+                            }
+                        }
+                        Err(error) if requested_sequence == u64::MAX => self.error = Some(error),
+                        Err(_) if first_failure => {
+                            self.notice = Some((
+                                "Read status could not be saved yet. Relay will retry while this conversation is open.".into(),
+                                now,
+                            ));
+                        }
+                        Err(_) => {}
+                    }
+                }
                 Update::Notice(text) => self.notice = Some((text, Instant::now())),
                 Update::LocalHostFailed(error) => {
                     self.hosting_setup.local_ready = false;
@@ -2204,13 +2255,21 @@ impl RelayApp {
             self.save_preferences();
         }
         if let Some(error) = self.media.as_mut().and_then(MediaEngine::take_error) {
-            let channel = self
-                .voice_channel
-                .clone()
-                .or_else(|| self.joining_voice.clone());
-            self.stop_media();
-            self.voice_failure(channel, error);
-            self.send(Command::LeaveVoice);
+            if self.voice_channel.is_none() && self.joining_voice.is_none() {
+                if let Some(media) = &mut self.media {
+                    media.stop_microphone_test();
+                }
+                self.mic_test = false;
+                self.error = Some(format!("Microphone preview: {error}"));
+            } else {
+                let channel = self
+                    .voice_channel
+                    .clone()
+                    .or_else(|| self.joining_voice.clone());
+                self.stop_media();
+                self.voice_failure(channel, error);
+                self.send(Command::LeaveVoice);
+            }
         }
         if let Some(error) = self.media.as_mut().and_then(MediaEngine::take_sound_error) {
             self.error = Some(format!("Sound effect: {error}"));
@@ -2364,6 +2423,26 @@ impl eframe::App for RelayApp {
         if self.capture_path.is_some() && !self.capture_authenticated && self.session.is_none() {
             if let Some(panel) = self.initial_capture_panel.take() {
                 self.prepare_join_capture_panel(&panel);
+            }
+        }
+        if self.session.is_some() && !self.modal_open() {
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+                self.settings_open = true;
+            } else if ctx.input_mut(|input| {
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::Slash)
+            }) {
+                self.settings_tab = SettingsTab::Keybinds;
+                self.settings_open = true;
+            } else if matches!(self.current, Some(Target::Channel(_)))
+                && self.home_page.is_none()
+                && !self.current_name().2
+                && self.has_chat_capability("pins-v1")
+                && ctx.input_mut(|input| {
+                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::P)
+                })
+            {
+                self.pins.open = true;
+                self.request_pins();
             }
         }
         if self.session.is_some() && !self.modal_open() {

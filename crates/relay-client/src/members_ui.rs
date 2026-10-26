@@ -105,7 +105,7 @@ impl RelayApp {
                             && group_members.as_ref().is_none_or(|ids| ids.contains(&m.id))
                     }) {
                         let texture = self.avatar_texture(user);
-                        let response = user_row(ui, user, false, 0, 0, texture.as_ref());
+                        let response = user_row(ui, user, false, 0, 0, false, texture.as_ref());
                         match &group_channel {
                             // In a Friends group, people who are not friends show the
                             // group's coarse state; friends and you keep your own list.

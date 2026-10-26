@@ -35,6 +35,14 @@ fn sharing_status_row(
 }
 
 impl RelayApp {
+    pub(super) fn conversation_has_draft(&self, target: &Target) -> bool {
+        if self.current.as_ref() == Some(target) {
+            !self.draft.trim().is_empty() || !self.attachments.is_empty() || self.reply.is_some()
+        } else {
+            self.drafts.has_draft(target)
+        }
+    }
+
     pub(super) fn sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("channels")
             .default_width(240.0)
@@ -457,6 +465,21 @@ impl RelayApp {
                                         .read_state(&Target::Channel(channel.id.clone()))
                                         .map(|read| (read.unread_count, read.mention_count))
                                         .unwrap_or_default();
+                                    let draft_target = if kind == "voice" {
+                                        b.channels
+                                            .iter()
+                                            .find(|chat| {
+                                                chat.kind == "text"
+                                                    && chat.voice_parent_id.as_ref()
+                                                        == Some(&channel.id)
+                                            })
+                                            .map(|chat| Target::Channel(chat.id.clone()))
+                                    } else {
+                                        Some(Target::Channel(channel.id.clone()))
+                                    };
+                                    let draft = draft_target
+                                        .as_ref()
+                                        .is_some_and(|target| self.conversation_has_draft(target));
                                     let channel_response = channel_row(
                                         ui,
                                         &channel.name,
@@ -465,7 +488,7 @@ impl RelayApp {
                                         self.current.as_ref()
                                             == Some(&Target::Channel(channel.id.clone())),
                                         self.voice_channel.as_ref() == Some(&channel.id),
-                                        unread,
+                                        (unread.0, unread.1, draft),
                                     );
                                     self.channel_interactions(ui, channel, &channel_response);
                                     let chat = (kind == "voice")
@@ -593,6 +616,7 @@ impl RelayApp {
                                         == Some(&Target::Direct(member.id.clone())),
                                     unread,
                                     mentions,
+                                    self.conversation_has_draft(&Target::Direct(member.id.clone())),
                                     texture.as_ref(),
                                 );
                                 self.paint_presence_badge(ui, &member.id, &response);
@@ -612,5 +636,89 @@ impl RelayApp {
                         }
                     });
             });
+    }
+}
+
+#[cfg(test)]
+mod draft_sidebar_tests {
+    use super::*;
+
+    fn text_bounds(shape: &egui::Shape, label: &str, found: &mut Vec<Rect>) {
+        match shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                found.push(Rect::from_min_size(text.pos, text.galley.size()));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    text_bounds(shape, label, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn channel_and_direct_draft_labels_preserve_unread_badges_and_accessible_names() {
+        for width in [180.0, 240.0] {
+            for scale in [1.0, 1.4] {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                let old_scale = UI_FONT_SCALE.with(|value| value.replace(scale));
+                let user = User {
+                    username: "Mira".into(),
+                    ..Default::default()
+                };
+                let mut rows = Vec::new();
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 300.0))),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::SidePanel::left("draft-test")
+                            .exact_width(width)
+                            .show(ctx, |ui| {
+                                rows.push(
+                                    channel_row(
+                                        ui,
+                                        "general",
+                                        egui::Id::new("draft-channel"),
+                                        false,
+                                        false,
+                                        false,
+                                        (120, 120, true),
+                                    )
+                                    .rect,
+                                );
+                                rows.push(user_row(ui, &user, false, 120, 120, true, None).rect);
+                            });
+                    },
+                );
+                UI_FONT_SCALE.with(|value| value.set(old_scale));
+                let mut drafts = Vec::new();
+                let mut unread = Vec::new();
+                for shape in &output.shapes {
+                    text_bounds(&shape.shape, "Draft", &mut drafts);
+                    text_bounds(&shape.shape, "99+", &mut unread);
+                }
+                assert_eq!(drafts.len(), 2);
+                assert_eq!(unread.len(), 2);
+                for ((draft, unread), row) in drafts.iter().zip(&unread).zip(&rows) {
+                    assert!(row.contains_rect(*draft));
+                    assert!(row.contains_rect(*unread));
+                    assert!(
+                        draft.right() < unread.left(),
+                        "Draft must not cover unread count"
+                    );
+                }
+                let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+                assert!(nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some("general, draft")));
+                assert!(nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some("Mira, draft")));
+            }
+        }
     }
 }

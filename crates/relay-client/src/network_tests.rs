@@ -3,6 +3,10 @@
 mod call_switch_tests;
 #[path = "network_message_alert_tests.rs"]
 mod message_alert_tests;
+#[path = "network_read_receipt_tests.rs"]
+mod read_receipt_tests;
+#[path = "network_send_binding_tests.rs"]
+mod send_binding_tests;
 #[cfg(windows)]
 #[path = "network_status_problem_tests.rs"]
 mod status_problem_tests;
@@ -2581,6 +2585,7 @@ fn queued_private_chat_actions_reject_switched_identity_before_http_or_ratchet_c
         }
         let commands = [
             Command::SendRich {
+                binding: None,
                 origin: stale.clone(),
                 target: target.clone(),
                 content: "private queued draft must not cross accounts".into(),
@@ -2670,6 +2675,7 @@ fn forged_send_acknowledgements_never_commit_or_clear_the_exact_pending_cipherte
         let origin = client.command_origin();
         let client_id = operation_id();
         let attempt = || Command::SendRich {
+            binding: None,
             origin: origin.clone(),
             target: target.clone(),
             content: "protected draft preserved after forged acknowledgement".into(),
@@ -3252,6 +3258,7 @@ fn rich_send_retries_a_lost_commit_response_with_exactly_the_same_identifier() {
     client.worker.connection.as_mut().unwrap().protocol_version = API_PROTOCOL_VERSION;
     let target = Target::Channel("sent-room".into());
     let updates = client.handle(Command::SendRich {
+        binding: None,
         origin: client.command_origin(),
         target: target.clone(),
         content: "retry fixture".into(),
@@ -3261,7 +3268,7 @@ fn rich_send_retries_a_lost_commit_response_with_exactly_the_same_identifier() {
         mentions: vec!["other-user".into()],
     });
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    assert!(updates.iter().any(|u| matches!(u, Update::SentRich{client_id, target:t} if client_id == "stable-client-id" && t==&target)));
+    assert!(updates.iter().any(|u| matches!(u, Update::SentRich{client_id, target:t, ..} if client_id == "stable-client-id" && t==&target)));
     let requests = server.message_requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0], requests[1]);
@@ -3642,6 +3649,7 @@ fn definite_send_rejection_and_history_failure_keep_their_request_scope() {
     client.worker.connection.as_mut().unwrap().protocol_version = API_PROTOCOL_VERSION;
     let target = Target::Channel("private-room".into());
     client.worker.command(Command::SendRich {
+        binding: None,
         origin: client.command_origin(),
         target: target.clone(),
         content: "fixture".into(),
@@ -3651,7 +3659,7 @@ fn definite_send_rejection_and_history_failure_keep_their_request_scope() {
         mentions: Vec::new(),
     });
     let updates = client.drain();
-    assert!(updates.iter().any(|u| matches!(u, Update::SendFailed{target:t,error} if t==&target && error=="private channel denied")));
+    assert!(updates.iter().any(|u| matches!(u, Update::SendFailed{target:t,error,..} if t==&target && error=="private channel denied")));
     assert_eq!(
         server.message_requests().len(),
         1,
@@ -3692,6 +3700,7 @@ fn enable_chat_features(client: &mut TestWorker, slowmode_seconds: u32) {
 
 fn retry_message(origin: CommandOrigin, target: Target) -> Command {
     Command::SendRich {
+        binding: None,
         origin,
         target,
         content: "unchanged draft".into(),
@@ -3754,7 +3763,7 @@ fn http_429_keeps_send_payload_and_suppresses_queued_sends_until_explicit_retry(
     );
     let updates = client.handle(retry_message(client.command_origin(), target.clone()));
     assert!(updates.iter().any(
-        |u| matches!(u, Update::SentRich { client_id, target: sent_target }
+        |u| matches!(u, Update::SentRich { client_id, target: sent_target, .. }
         if client_id == "rate-limited-stable-id" && sent_target == &target)
     ));
     let requests = server.message_requests();
@@ -3875,6 +3884,7 @@ fn successful_slowmode_send_blocks_new_ids_but_allows_committed_idempotent_retry
     let target = Target::Channel("sent-room".into());
     client.handle(retry_message(client.command_origin(), target.clone()));
     client.worker.command(Command::SendRich {
+        binding: None,
         origin: client.command_origin(),
         target: target.clone(),
         content: "next draft".into(),
@@ -3899,6 +3909,7 @@ fn successful_slowmode_send_blocks_new_ids_but_allows_committed_idempotent_retry
     );
     server.enable_encrypted_target(&mut client, Target::Direct("separate-conversation".into()));
     client.handle(Command::SendRich {
+        binding: None,
         origin: client.command_origin(),
         target: Target::Direct("separate-conversation".into()),
         content: "separate conversation".into(),
@@ -5089,7 +5100,7 @@ fn failed_send_acknowledges_the_submitted_conversation_without_success() {
     });
     let updates = client.drain();
     let failure = updates.iter().find_map(|update| match update {
-        Update::SendFailed { target, error } => Some((target, error.as_str())),
+        Update::SendFailed { target, error, .. } => Some((target, error.as_str())),
         _ => None,
     });
     assert_eq!(failure, Some((&target, "send denied")));
@@ -5108,7 +5119,7 @@ fn failed_send_acknowledges_the_submitted_conversation_without_success() {
         attachment_ids: Vec::new(),
     });
     let updates = client.drain();
-    assert!(updates.iter().any(|u| matches!(u, Update::SendFailed {target:t,error} if t==&target && error=="Connect to a server first.")));
+    assert!(updates.iter().any(|u| matches!(u, Update::SendFailed {target:t,error,..} if t==&target && error=="Connect to a server first.")));
     assert!(!updates.iter().any(|u| matches!(u, Update::Sent { .. })));
     assert_eq!(server.requests.lock().unwrap().len(), 1);
 }

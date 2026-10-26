@@ -106,6 +106,10 @@ fn unrelated_preference_saves_do_not_commit_pending_audio_edits() {
     let mut prefs = Preferences::default();
     prefs.audio.microphone_gain = 2.0;
     prefs.audio.input_device = Some("A different input".into());
+    prefs.audio.event_sounds.get_mut(AudioCue::Message).source =
+        crate::sound_customization::SoundSource::BuiltIn { cue: AudioCue::Join };
+    prefs.audio.event_sounds.get_mut(AudioCue::Leave).enabled = false;
+    prefs.audio.event_sounds.get_mut(AudioCue::Ring).volume = 0.4;
     prefs.appearance.theme = Theme::Onyx;
     let stored: Preferences =
         serde_json::from_slice(&preferences_snapshot(&prefs, &applied).unwrap()).unwrap();
@@ -224,13 +228,13 @@ fn pre_theme_preferences_keep_real_devices_communities_and_privacy_choices() {
 }
 
 #[test]
-fn older_preferences_get_automatic_connection_and_keep_a_chosen_mode() {
+fn older_preferences_prefer_iroh_and_keep_a_chosen_mode() {
     let mut legacy = serde_json::to_value(Preferences::default()).unwrap();
     legacy.as_object_mut().unwrap().remove("connection");
     let migrated: Preferences = serde_json::from_value(legacy).unwrap();
     assert_eq!(
         migrated.connection.mode,
-        crate::route_choice::ConnectionMode::Automatic
+        crate::route_choice::ConnectionMode::PreferIroh
     );
     assert!(!migrated.connection.allow_plain_public_login);
     let chosen = Preferences {

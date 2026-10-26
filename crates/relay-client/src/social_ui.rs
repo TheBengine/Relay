@@ -100,6 +100,43 @@ struct InboxUnreadRow {
     mentions: u64,
 }
 
+/// Send bulk inbox actions one at a time; the network queue has a fixed capacity.
+#[derive(Default)]
+struct InboxReadQueue {
+    pending: Option<Target>,
+    remaining: std::collections::VecDeque<Target>,
+}
+
+impl InboxReadQueue {
+    fn start(&mut self, targets: Vec<Target>) {
+        if self.pending.is_some() {
+            return;
+        }
+        let mut seen = HashSet::new();
+        self.remaining = targets
+            .into_iter()
+            .filter(|target| seen.insert(target.clone()))
+            .collect();
+        self.pending = self.remaining.pop_front();
+    }
+
+    fn complete(&mut self, target: &Target, succeeded: bool) -> bool {
+        if self.pending.as_ref() != Some(target) {
+            return false;
+        }
+        if !succeeded {
+            self.remaining.clear();
+        }
+        self.pending = self.remaining.pop_front();
+        true
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+        self.remaining.clear();
+    }
+}
+
 fn inbox_unread_rows(bootstrap: &Bootstrap, query: &str) -> Vec<InboxUnreadRow> {
     let query = query.trim().to_lowercase();
     let mut rows: HashMap<Target, InboxUnreadRow> = HashMap::new();
@@ -133,6 +170,51 @@ fn inbox_unread_rows(bootstrap: &Bootstrap, query: &str) -> Vec<InboxUnreadRow> 
 }
 
 impl RelayApp {
+    fn begin_inbox_read(&mut self, targets: Vec<Target>) {
+        if self.admin_ui.inbox_read_queue.pending.is_some()
+            || self.connection_status != ConnectionStatus::Connected
+        {
+            return;
+        }
+        self.admin_ui.inbox_read_queue.start(targets);
+        self.send_inbox_read();
+    }
+
+    fn send_inbox_read(&mut self) {
+        let Some(target) = self.admin_ui.inbox_read_queue.pending.clone() else {
+            return;
+        };
+        let Some(origin) = self.command_origin() else {
+            self.admin_ui.inbox_read_queue.clear();
+            return;
+        };
+        if self
+            .bootstrap
+            .as_ref()
+            .is_none_or(|bootstrap| inbox_conversation_label(bootstrap, &target).is_none())
+        {
+            self.admin_ui.inbox_read_queue.clear();
+            self.error = Some(
+                "That conversation is no longer available. Refresh Inbox and try again.".into(),
+            );
+            return;
+        }
+        if let Err(error) = self.network.send(Command::MarkRead {
+            origin,
+            target,
+            last_read_sequence: u64::MAX,
+        }) {
+            self.admin_ui.inbox_read_queue.clear();
+            self.error = Some(error);
+        }
+    }
+
+    pub(super) fn finish_inbox_read(&mut self, target: &Target, succeeded: bool) {
+        if self.admin_ui.inbox_read_queue.complete(target, succeeded) {
+            self.send_inbox_read();
+        }
+    }
+
     fn social_action_pending(&self) -> bool {
         self.admin_requests
             .values()
@@ -389,19 +471,45 @@ impl RelayApp {
     }
     fn unread_inbox_page(&mut self, ui: &mut egui::Ui, bootstrap: &Bootstrap) {
         let rows = inbox_unread_rows(bootstrap, &self.admin_ui.inbox_filter);
-        ui.label(
-            RichText::new(format!(
-                "{} unread {}",
-                rows.len(),
-                if rows.len() == 1 {
-                    "conversation"
+        let marking = self.admin_ui.inbox_read_queue.pending.is_some();
+        let can_mark = self.connection_status == ConnectionStatus::Connected && !marking;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} unread {}",
+                    rows.len(),
+                    if rows.len() == 1 {
+                        "conversation"
+                    } else {
+                        "conversations"
+                    }
+                ))
+                .size(font_size(TEXT_CAPTION))
+                .color(c_muted()),
+            );
+            let filtered = !self.admin_ui.inbox_filter.trim().is_empty();
+            if ui
+                .add_enabled(
+                    can_mark && !rows.is_empty(),
+                    secondary(if filtered {
+                        "Mark filtered as read"
+                    } else {
+                        "Mark all as read"
+                    }),
+                )
+                .on_hover_text(if filtered {
+                    "Mark only the conversations matching this filter as read."
                 } else {
-                    "conversations"
-                }
-            ))
-            .size(font_size(TEXT_CAPTION))
-            .color(c_muted()),
-        );
+                    "Mark all unread conversations in this community as read."
+                })
+                .clicked()
+            {
+                self.begin_inbox_read(rows.iter().map(|row| row.target.clone()).collect());
+            }
+            if marking {
+                ui.spinner().on_hover_text("Saving read status");
+            }
+        });
         let list_height = ui.available_height().max(0.0);
         egui::ScrollArea::vertical()
             .id_source("inbox-unread-results")
@@ -431,39 +539,32 @@ impl RelayApp {
                                     ui.available_width(),
                                 );
                                 ui.label(label).on_hover_text(&row.label);
-                                ui.horizontal(|ui| {
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if ui.add(secondary("View Unreads")).clicked() {
-                                            self.select_at(row.target.clone(), true);
-                                            self.settings_open = false;
-                                        }
-                                        ui.allocate_ui_with_layout(
-                                            Vec2::new(
-                                                ui.available_width(),
-                                                ui.spacing().interact_size.y,
-                                            ),
-                                            Layout::left_to_right(Align::Center),
-                                            |ui| {
-                                                ui.horizontal_wrapped(|ui| {
-                                                    ui.label(format!("{} unread", row.unread));
-                                                    if row.mentions > 0 {
-                                                        ui.label(
-                                                            RichText::new(format!(
-                                                                "{} {}",
-                                                                row.mentions,
-                                                                if row.mentions == 1 {
-                                                                    "mention"
-                                                                } else {
-                                                                    "mentions"
-                                                                }
-                                                            ))
-                                                            .color(c_accent()),
-                                                        );
-                                                    }
-                                                });
-                                            },
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.add(secondary("View Unreads")).clicked() {
+                                        self.select_at(row.target.clone(), true);
+                                        self.settings_open = false;
+                                    }
+                                    if ui
+                                        .add_enabled(can_mark, secondary("Mark as Read"))
+                                        .clicked()
+                                    {
+                                        self.begin_inbox_read(vec![row.target.clone()]);
+                                    }
+                                    ui.label(format!("{} unread", row.unread));
+                                    if row.mentions > 0 {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} {}",
+                                                row.mentions,
+                                                if row.mentions == 1 {
+                                                    "mention"
+                                                } else {
+                                                    "mentions"
+                                                }
+                                            ))
+                                            .color(c_accent()),
                                         );
-                                    });
+                                    }
                                 });
                             });
                         ui.add_space(8.0);
@@ -1364,6 +1465,41 @@ mod friends_flow_tests {
 #[cfg(test)]
 mod inbox_context_tests {
     use super::*;
+
+    #[test]
+    fn bulk_read_waits_for_each_acknowledgement_and_deduplicates_targets() {
+        let a = Target::Channel("general".into());
+        let b = Target::Direct("friend".into());
+        let mut queue = InboxReadQueue::default();
+        queue.start(vec![a.clone(), b.clone(), a.clone()]);
+        assert_eq!(queue.pending, Some(a.clone()));
+        assert_eq!(queue.remaining.len(), 1);
+        assert!(!queue.complete(&b, true));
+        assert_eq!(queue.pending, Some(a.clone()));
+        queue.start(vec![Target::Channel("unrelated".into())]);
+        assert_eq!(queue.pending, Some(a.clone()));
+        assert!(queue.complete(&a, true));
+        assert_eq!(queue.pending, Some(b.clone()));
+        assert!(queue.complete(&b, true));
+        assert!(queue.pending.is_none());
+        assert!(queue.remaining.is_empty());
+    }
+
+    #[test]
+    fn bulk_read_failure_stops_the_batch_without_claiming_unsent_targets_read() {
+        let a = Target::Channel("general".into());
+        let b = Target::Direct("friend".into());
+        let mut queue = InboxReadQueue::default();
+        queue.start(vec![a.clone(), b.clone()]);
+        assert!(queue.complete(&a, false));
+        assert!(queue.pending.is_none());
+        assert!(queue.remaining.is_empty());
+        queue.start(vec![a.clone(), b]);
+        assert_eq!(queue.pending, Some(a));
+        queue.clear();
+        assert!(queue.pending.is_none());
+        assert!(queue.remaining.is_empty());
+    }
 
     #[test]
     fn unreads_ignore_blocked_stale_ambiguous_and_unjoined_targets_without_double_counting() {

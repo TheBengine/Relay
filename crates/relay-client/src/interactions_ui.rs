@@ -9,6 +9,21 @@ struct CategoryDrag {
     scope: String,
     id: String,
 }
+
+// A voice room's messages belong to its linked text channel, not to the room.
+// Only use channels present in the current account's accessible bootstrap.
+fn channel_chat_target(channel: &Channel, channels: &[Channel]) -> Option<Target> {
+    let chat = channels.iter().find(|candidate| {
+        candidate.kind == "text"
+            && if channel.kind == "voice" {
+                candidate.voice_parent_id.as_ref() == Some(&channel.id)
+            } else {
+                channel.kind == "text" && candidate.id == channel.id
+            }
+    })?;
+    Some(Target::Channel(chat.id.clone()))
+}
+
 impl RelayApp {
     pub(super) fn channel_interactions(
         &mut self,
@@ -23,6 +38,7 @@ impl RelayApp {
         let Some(scope) = self.conversation_scope() else {
             return;
         };
+        let chat_target = channel_chat_target(channel, &b.channels);
         response.context_menu(|ui| {
             if ui.button("Open Channel").clicked() {
                 self.select(Target::Channel(channel.id.clone()));
@@ -47,46 +63,78 @@ impl RelayApp {
                     }
                 }
             }
-            ui.menu_button("Notifications", |ui| {
-                let key = format!("{scope}|{:?}", Target::Channel(channel.id.clone()));
-                for (mode, label) in [
-                    ("", "Use Community Default"),
-                    ("all", "All Messages"),
-                    ("mentions", "Only Mentions"),
-                    ("none", "Nothing"),
-                ] {
-                    if ui.button(label).clicked() {
-                        self.prefs
-                            .notification_policies
-                            .entry(key.clone())
-                            .or_default()
-                            .mode = mode.into();
-                        self.defer_preferences();
-                        ui.close_menu();
+            if let Some(target) = chat_target.as_ref() {
+                if ui.button("Mark as Read").clicked() {
+                    // The server bounds this explicit request to the latest message.
+                    // Its refreshed read state supplies the actual sequence; never
+                    // put this sentinel into the client's automatic-read cache.
+                    if let Some(origin) = self.command_origin() {
+                        self.send(Command::MarkRead {
+                            origin,
+                            target: target.clone(),
+                            last_read_sequence: u64::MAX,
+                        });
                     }
-                }
-                let muted = self
-                    .prefs
-                    .notification_policies
-                    .get(&key)
-                    .is_some_and(|p| p.muted_until > unix_time());
-                if ui
-                    .button(if muted {
-                        "Unmute Channel"
-                    } else {
-                        "Mute Channel"
-                    })
-                    .clicked()
-                {
-                    self.prefs
-                        .notification_policies
-                        .entry(key)
-                        .or_default()
-                        .muted_until = if muted { 0 } else { u64::MAX };
-                    self.defer_preferences();
                     ui.close_menu();
                 }
-            });
+                ui.menu_button("Notifications", |ui| {
+                    let key = format!("{scope}|{target:?}");
+                    let before = self
+                        .prefs
+                        .notification_policies
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_default();
+                    for (mode, label) in [
+                        ("", "Use Community Default"),
+                        ("all", "All Messages"),
+                        ("mentions", "Only Mentions"),
+                        ("none", "Nothing"),
+                    ] {
+                        if ui.selectable_label(before.mode == mode, label).clicked() {
+                            self.prefs
+                                .notification_policies
+                                .entry(key.clone())
+                                .or_default()
+                                .mode = mode.into();
+                            self.defer_preferences();
+                            ui.close_menu();
+                        }
+                    }
+                    if before.muted_until > unix_time() {
+                        if ui.button("Unmute Channel").clicked() {
+                            self.prefs
+                                .notification_policies
+                                .entry(key.clone())
+                                .or_default()
+                                .muted_until = 0;
+                            self.defer_preferences();
+                            ui.close_menu();
+                        }
+                    } else {
+                        ui.menu_button("Mute Channel", |ui| {
+                            for (seconds, label) in [
+                                (900, "15 minutes"),
+                                (3600, "1 hour"),
+                                (10800, "3 hours"),
+                                (28800, "8 hours"),
+                                (86400, "24 hours"),
+                                (u64::MAX, "Until I turn it back on"),
+                            ] {
+                                if ui.button(label).clicked() {
+                                    self.prefs
+                                        .notification_policies
+                                        .entry(key.clone())
+                                        .or_default()
+                                        .muted_until = unix_time().saturating_add(seconds);
+                                    self.defer_preferences();
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    }
+                });
+            }
             if channel.kind == "text" && channel.can_send && ui.button("Create Thread").clicked() {
                 self.open_conversation_create("thread", Some(channel.id.clone()));
                 ui.close_menu();
@@ -306,5 +354,54 @@ impl RelayApp {
                 ui.close_menu();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod channel_context_tests {
+    use super::*;
+
+    fn channel(id: &str, kind: &str, voice_parent: Option<&str>) -> Channel {
+        Channel {
+            id: id.into(),
+            kind: kind.into(),
+            voice_parent_id: voice_parent.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn voice_read_and_notification_actions_use_the_linked_text_conversation() {
+        let room = channel("voice", "voice", None);
+        let channels = vec![
+            channel("unrelated", "text", None),
+            channel("other-room-chat", "text", Some("another-room")),
+            room.clone(),
+            channel("voice-chat", "text", Some("voice")),
+        ];
+        assert_eq!(
+            channel_chat_target(&room, &channels),
+            Some(Target::Channel("voice-chat".into()))
+        );
+        assert_eq!(
+            channel_chat_target(&channels[0], &channels),
+            Some(Target::Channel("unrelated".into()))
+        );
+    }
+
+    #[test]
+    fn inaccessible_or_non_text_channels_cannot_be_used_for_chat_actions() {
+        let room = channel("voice", "voice", None);
+        let invalid_child = channel("not-text", "voice", Some("voice"));
+        let channels = vec![room.clone(), invalid_child];
+        assert_eq!(channel_chat_target(&room, &channels), None);
+        assert_eq!(
+            channel_chat_target(&channel("revoked", "text", None), &channels),
+            None
+        );
+        assert_eq!(
+            channel_chat_target(&channel("category", "category", None), &channels),
+            None
+        );
     }
 }

@@ -43,6 +43,16 @@ pub struct CommandOrigin {
     pub user_id: String,
 }
 
+/// The protection and local device selected when a message was staged. A
+/// restored retry must not silently become a new send under another identity.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SendBinding {
+    pub protection: CommunityProtection,
+    pub plain: bool,
+    pub device_id: String,
+    pub fingerprint: String,
+}
+
 impl From<&Connection> for CommandOrigin {
     fn from(connection: &Connection) -> Self {
         Self {
@@ -303,6 +313,7 @@ pub enum Command {
         request_id: u64,
     },
     MarkRead {
+        origin: CommandOrigin,
         target: Target,
         last_read_sequence: u64,
     },
@@ -339,6 +350,7 @@ pub enum Command {
     },
     SendRich {
         origin: CommandOrigin,
+        binding: Option<SendBinding>,
         target: Target,
         content: String,
         attachment_ids: Vec<String>,
@@ -567,6 +579,12 @@ pub enum Update {
     },
     Disconnected,
     Bootstrap(Bootstrap),
+    ReadMarked {
+        origin: CommandOrigin,
+        target: Target,
+        requested_sequence: u64,
+        result: Result<ReadState, String>,
+    },
     CommunitySearch {
         request_id: u64,
         query: String,
@@ -597,6 +615,7 @@ pub enum Update {
     },
     SendFailed {
         target: Target,
+        origin: Option<CommandOrigin>,
         error: String,
     },
     /// The send was held back by `SendWait`, for the connection it ran on.
@@ -746,6 +765,7 @@ pub enum Update {
         error: String,
     },
     SentRich {
+        origin: CommandOrigin,
         target: Target,
         client_id: String,
     },
@@ -1953,6 +1973,15 @@ impl Worker {
     }
 
     fn command(&mut self, command: Command) {
+        if let Command::MarkRead { origin, target, last_read_sequence } = command {
+            let result = self.mark_read(&origin, &target, last_read_sequence);
+            // Automatic read receipts must not flicker the global busy state or
+            // turn every retry into an unrelated dismiss-only error banner.
+            self.emit(Update::ReadMarked {
+                origin, target, requested_sequence: last_read_sequence, result,
+            });
+            return;
+        }
         if matches!(&command, Command::RestoreHandoverHost) {
             if let Err(error) = self.restore_handover_host() {
                 self.emit(Update::Error(error));
@@ -2147,6 +2176,12 @@ impl Worker {
             Command::SendRich { target, .. } => Some(target.clone()),
             _ => None,
         };
+        let send_origin = match &command {
+            Command::SendRich { origin, .. } => Some(origin.clone()),
+            #[cfg(test)]
+            Command::Send { .. } => self.connection.as_ref().map(CommandOrigin::from),
+            _ => None,
+        };
         let edit_message_id = match &command {
             Command::EditMessage { message_id, .. } => Some(message_id.clone()),
             _ => None,
@@ -2187,8 +2222,7 @@ impl Worker {
         if let Err(error) = result {
             if let Some(target) = send_target {
                 let wait = self.send_wait.take();
-                let origin = self.connection.as_ref().map(CommandOrigin::from);
-                self.emit(send_failure(target, error, wait, origin));
+                self.emit(send_failure(target, error, wait, send_origin));
             } else if let Some(message_id) = edit_message_id {
                 self.emit(Update::EditFailed { message_id, error });
             } else if let Some((channel_id, request_id)) = join_channel_id {
@@ -4482,7 +4516,11 @@ fn send_failure(
             origin,
             wait,
         },
-        _ => Update::SendFailed { target, error },
+        (_, origin) => Update::SendFailed {
+            target,
+            origin,
+            error,
+        },
     }
 }
 

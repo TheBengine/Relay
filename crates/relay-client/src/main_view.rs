@@ -299,7 +299,7 @@ impl RelayApp {
                             }
                             if matches!(self.current, Some(Target::Channel(_)))
                                 && self.has_chat_capability("pins-v1")
-                                && icon_button(ui, Icon::Pin, self.pins.open, "Pinned messages")
+                                && icon_button(ui, Icon::Pin, self.pins.open, "Pinned messages · Ctrl+P")
                                     .clicked()
                             {
                                 self.pins.open = true;

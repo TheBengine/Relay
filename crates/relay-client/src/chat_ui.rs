@@ -81,6 +81,54 @@ fn reply_mentions(
     explicit
 }
 
+// A retry must preserve the exact request, including reply notifications and
+// mention IDs captured before a member was renamed. Re-parsing the composer can
+// change those fields and turn an uncertain acknowledgement into a duplicate.
+pub(super) fn outgoing_retry(
+    target: &Target,
+    message: &Message,
+    origin: CommandOrigin,
+) -> Option<(SendAttempt, Command)> {
+    let client_id = message.client_id.as_ref()?;
+    let matches_target = match target {
+        Target::Channel(id) => {
+            message.channel_id.as_ref() == Some(id) && message.recipient_id.is_none()
+        }
+        Target::Direct(id) => {
+            message.recipient_id.as_ref() == Some(id) && message.channel_id.is_none()
+        }
+    };
+    if client_id.is_empty()
+        || message.id != format!("local:{client_id}")
+        || message.author.id != origin.user_id
+        || !matches_target
+    {
+        return None;
+    }
+    let attempt = SendAttempt {
+        client_id: client_id.clone(),
+        content: message.content.clone(),
+        attachments: message
+            .attachments
+            .iter()
+            .map(|file| file.id.clone())
+            .collect(),
+        reply_to_id: message.reply_to_id.clone(),
+        mentions: message.mentions.clone(),
+    };
+    let command = Command::SendRich {
+        binding: None,
+        origin,
+        target: target.clone(),
+        content: attempt.content.clone(),
+        attachment_ids: attempt.attachments.clone(),
+        client_id: attempt.client_id.clone(),
+        reply_to_id: attempt.reply_to_id.clone(),
+        mentions: attempt.mentions.clone(),
+    };
+    Some((attempt, command))
+}
+
 pub(super) fn dismiss_inline_on_escape(
     closing_overlay: bool,
     editing: &mut Option<(String, String)>,
@@ -428,11 +476,8 @@ impl RelayApp {
         }
     }
 
-    pub(super) fn submit_composer(&mut self) {
-        let Some(target) = self.current.clone() else {
-            return;
-        };
-        let can_send = self.bootstrap.as_ref().is_some_and(|b| match &target {
+    pub(super) fn can_send_message(&self, target: &Target) -> bool {
+        self.bootstrap.as_ref().is_some_and(|b| match target {
             Target::Direct(id) => b
                 .members
                 .iter()
@@ -441,20 +486,52 @@ impl RelayApp {
                 .channels
                 .iter()
                 .any(|channel| channel.id == *id && channel.kind == "text" && channel.can_send),
-        });
-        if !can_send
-            || self.pending_sends.contains(&target)
-            || self.cooldowns.remaining(&target, Instant::now()).is_some()
-            || (self.draft.trim().is_empty() && self.attachments.is_empty())
-        {
+        }) && !self.pending_sends.contains(target)
+            && self.cooldowns.remaining(target, Instant::now()).is_none()
+    }
+
+    pub(super) fn retry_outgoing(&mut self, message_id: &str) {
+        let Some(target) = self
+            .current
+            .clone()
+            .filter(|target| self.can_send_message(target))
+        else {
             return;
+        };
+        let Some((_, message, _, _)) =
+            self.outgoing_messages
+                .iter()
+                .find(|(saved, message, failed, confirmed)| {
+                    saved == &target && message.id == message_id && *failed && !*confirmed
+                })
+        else {
+            return;
+        };
+        // Persist the original request without touching a newer composer draft.
+        self.stage_outgoing(target, message.clone(), false);
+    }
+
+    pub(super) fn submit_composer(&mut self) {
+        self.submit_message_content(self.draft.clone(), self.attachments.clone(), true);
+    }
+
+    /// GIF actions pass their own payload without temporarily replacing the
+    /// editor. The persistence barrier must see the user's real newer draft.
+    pub(super) fn submit_message_content(
+        &mut self,
+        content: String,
+        attachments: Vec<Attachment>,
+        clear_composer: bool,
+    ) -> bool {
+        let Some(target) = self.current.clone() else {
+            return false;
+        };
+        if !self.can_send_message(&target)
+            || (content.trim().is_empty() && attachments.is_empty())
+        {
+            return false;
         }
-        let content = self.expand_message_shortcodes(self.draft.trim());
-        let attachment_ids: Vec<_> = self
-            .attachments
-            .iter()
-            .map(|attachment| attachment.id.clone())
-            .collect();
+        let content = self.expand_message_shortcodes(content.trim());
         let reply_to_id = self.reply.as_ref().map(|reply| reply.message_id.clone());
         let mentions = self
             .bootstrap
@@ -468,29 +545,13 @@ impl RelayApp {
                 )
             })
             .unwrap_or_default();
-        let attempt = self
-            .send_ids
-            .get(&target)
-            .filter(|attempt| {
-                attempt.content == content
-                    && attempt.attachments == attachment_ids
-                    && attempt.reply_to_id == reply_to_id
-                    && attempt.mentions == mentions
-            })
-            .cloned()
-            .unwrap_or_else(|| SendAttempt {
-                client_id: crate::network::operation_id(),
-                content: content.clone(),
-                attachments: attachment_ids.clone(),
-                reply_to_id: reply_to_id.clone(),
-                mentions: mentions.clone(),
-            });
-        let Some(origin) = self.command_origin() else {
-            return;
-        };
+        let client_id = crate::network::operation_id();
+        if self.command_origin().is_none() {
+            return false;
+        }
         let message = Message {
-            id: format!("local:{}", attempt.client_id),
-            client_id: Some(attempt.client_id.clone()),
+            id: format!("local:{client_id}"),
+            client_id: Some(client_id),
             channel_id: match &target {
                 Target::Channel(id) => Some(id.clone()),
                 _ => None,
@@ -500,49 +561,131 @@ impl RelayApp {
                 _ => None,
             },
             author: self.bootstrap.as_ref().unwrap().user.clone(),
-            content: content.clone(),
-            attachments: self.attachments.clone(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            reply_to_id: reply_to_id.clone(),
-            mentions: mentions.clone(),
-            ..Default::default()
-        };
-        self.outgoing_messages
-            .retain(|(_, local, _, _)| local.id != message.id);
-        self.outgoing_messages
-            .push((target.clone(), message, false, false));
-        self.send_ids.insert(target.clone(), attempt.clone());
-        self.scroll_to_end = true;
-        match self.network.send(Command::SendRich {
-            origin,
-            target: target.clone(),
             content,
-            attachment_ids,
-            client_id: attempt.client_id.clone(),
+            attachments,
+            created_at: chrono::Utc::now().to_rfc3339(),
             reply_to_id,
             mentions,
-        }) {
-            Ok(()) => {
-                self.send_ids.insert(target.clone(), attempt);
-                self.pending_sends.insert(target);
-                self.stop_typing();
-                self.draft.clear();
-                self.attachments.clear();
-                self.reply = None;
-                self.store_current_draft();
-                self.defer_preferences();
-            }
-            Err(error) => {
-                self.fail_outgoing(&target);
-                self.error = Some(error);
-            }
-        }
+            ..Default::default()
+        };
+        self.stage_outgoing(target.clone(), message, clear_composer);
+        self.pending_sends.contains(&target)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outgoing_retry_preserves_reply_notification_and_original_request_identity() {
+        let origin = CommandOrigin {
+            url: "https://relay.example".into(),
+            server_id: "server".into(),
+            user_id: "self".into(),
+        };
+        let message = Message {
+            id: "local:uncertain-send".into(),
+            client_id: Some("uncertain-send".into()),
+            channel_id: Some("general".into()),
+            author: User {
+                id: "self".into(),
+                ..Default::default()
+            },
+            content: "Yes, @old-name :wave:".into(),
+            reply_to_id: Some("original-message".into()),
+            mentions: vec!["renamed-member".into(), "reply-author".into()],
+            attachments: vec![Attachment {
+                id: "uploaded-file".into(),
+                name: "image.png".into(),
+                mime: "image/png".into(),
+                size: 12,
+                url: "opaque-file".into(),
+            }],
+            ..Default::default()
+        };
+        // The old composer round-trip could no longer find @old-name and lost
+        // the reply's notification setting. Neither may change the saved send.
+        let renamed = vec![User {
+            id: "renamed-member".into(),
+            username: "new-name".into(),
+            ..Default::default()
+        }];
+        assert!(mentioned_users(&message.content, &renamed).is_empty());
+        for target in [
+            Target::Channel("general".into()),
+            Target::Direct("friend".into()),
+        ] {
+            let mut message = message.clone();
+            if let Target::Direct(id) = &target {
+                message.channel_id = None;
+                message.recipient_id = Some(id.clone());
+            }
+            for _ in 0..2 {
+                let (attempt, command) = outgoing_retry(&target, &message, origin.clone()).unwrap();
+                assert_eq!(attempt.client_id, "uncertain-send");
+                let Command::SendRich {
+                    origin: actual_origin,
+                    target: actual_target,
+                    content,
+                    attachment_ids,
+                    client_id,
+                    reply_to_id,
+                    mentions,
+                    ..
+                } = command
+                else {
+                    panic!("Retry must use the idempotent rich-message request");
+                };
+                assert_eq!(actual_origin, origin);
+                assert_eq!(actual_target, target);
+                assert_eq!(client_id, "uncertain-send");
+                assert_eq!(content, "Yes, @old-name :wave:");
+                assert_eq!(attachment_ids, ["uploaded-file"]);
+                assert_eq!(reply_to_id.as_deref(), Some("original-message"));
+                assert_eq!(mentions, ["renamed-member", "reply-author"]);
+            }
+        }
+    }
+
+    #[test]
+    fn outgoing_retry_rejects_messages_from_other_accounts_or_conversations() {
+        let origin = CommandOrigin {
+            url: "https://relay.example".into(),
+            server_id: "server".into(),
+            user_id: "self".into(),
+        };
+        let target = Target::Channel("general".into());
+        let message = Message {
+            id: "local:send".into(),
+            client_id: Some("send".into()),
+            channel_id: Some("general".into()),
+            author: User {
+                id: "self".into(),
+                ..Default::default()
+            },
+            content: "Message".into(),
+            ..Default::default()
+        };
+        assert!(outgoing_retry(&target, &message, origin.clone()).is_some());
+        assert!(
+            outgoing_retry(&Target::Direct("general".into()), &message, origin.clone()).is_none()
+        );
+        assert!(
+            outgoing_retry(&Target::Channel("other".into()), &message, origin.clone()).is_none()
+        );
+        for invalid in 0..5 {
+            let mut message = message.clone();
+            match invalid {
+                0 => message.author.id = "another-account".into(),
+                1 => message.client_id = None,
+                2 => message.client_id = Some(String::new()),
+                3 => message.id = "server-confirmed-message".into(),
+                _ => message.recipient_id = Some("ambiguous-target".into()),
+            }
+            assert!(outgoing_retry(&target, &message, origin.clone()).is_none());
+        }
+    }
 
     #[test]
     fn message_menu_lower_action_stays_above_other_message_toolbars() {

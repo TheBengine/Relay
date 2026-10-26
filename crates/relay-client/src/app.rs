@@ -63,6 +63,8 @@ mod connection_path_ui;
 mod conversation_readiness_ui;
 #[path = "desktop_ui.rs"]
 mod desktop_ui;
+#[path = "durable_outbox.rs"]
+mod durable_outbox;
 #[path = "emoji_ui.rs"]
 mod emoji_ui;
 #[path = "encryption_ui.rs"]
@@ -95,10 +97,17 @@ mod members_ui;
 mod message_list;
 #[path = "message_preview_ui.rs"]
 mod message_preview_ui;
+#[path = "read_receipts.rs"]
+mod read_receipts;
 #[path = "onboarding_ui.rs"]
 mod onboarding_ui;
 #[path = "online_gif_ui.rs"]
 mod online_gif_ui;
+#[path = "outbox_ui.rs"]
+mod outbox_ui;
+#[cfg(test)]
+#[path = "outbox_lifecycle_tests.rs"]
+mod outbox_lifecycle_tests;
 #[path = "people_ui.rs"]
 mod people_ui;
 #[path = "preference_writer.rs"]
@@ -119,6 +128,8 @@ mod server_creation;
 mod server_menu;
 #[path = "settings_pages.rs"]
 mod settings_pages;
+#[path = "sound_settings_ui.rs"]
+mod sound_settings_ui;
 #[path = "sidebar_tooltip.rs"]
 mod sidebar_tooltip;
 #[cfg(feature = "native-rtc")]
@@ -189,6 +200,8 @@ struct Preferences {
     host_checklist: admin_ui::HostChecklistMemory,
     #[serde(default)]
     conversations: ConversationMemory,
+    #[serde(default)]
+    outbox: durable_outbox::Outbox,
     #[serde(default = "default_remember_drafts")]
     remember_drafts: bool,
     #[serde(default)]
@@ -447,6 +460,7 @@ impl Default for Preferences {
             welcome_seen: Vec::new(),
             host_checklist: Default::default(),
             conversations: ConversationMemory::default(),
+            outbox: Default::default(),
             remember_drafts: true,
             remember_session: false,
             communities: Vec::new(),
@@ -626,6 +640,7 @@ enum SettingsTab {
     Appearance,
     Accessibility,
     Notifications,
+    Sounds,
     Keybinds,
     Advanced,
     Server,
@@ -688,6 +703,8 @@ pub struct RelayApp {
     preference_writer: preference_writer::PreferenceWriter,
     preferences_storage_error: Option<String>,
     preferences_dirty_at: Option<Instant>,
+    outbox: durable_outbox::Outbox,
+    outbox_pending: Vec<outbox_ui::PendingDispatch>,
     /// The sign-in form. Its `url` is also the active community's address,
     /// exactly as the former `url` field was.
     login: crate::connection_setup::JoinFlow,
@@ -724,7 +741,7 @@ pub struct RelayApp {
     search_applied: String,
     search_changed_at: Option<Instant>,
     request_id: u64,
-    marked_read: HashMap<Target, u64>,
+    marked_read: HashMap<Target, read_receipts::Attempt>,
     uploads: HashMap<String, UploadView>,
     transfers_open: bool,
     send_ids: HashMap<Target, SendAttempt>,
@@ -818,6 +835,7 @@ pub struct RelayApp {
     inventory_rx: Option<Receiver<DeviceInventory>>,
     inventory_loaded: bool,
     audio_applied: AudioSettings,
+    sound_settings: sound_settings_ui::State,
     mic_test: bool,
     joining_voice: Option<String>,
     voice_request: u64,
@@ -1039,6 +1057,11 @@ impl RelayApp {
             Err(e) => (None, Some(e)),
         };
         let audio_applied = prefs.audio.clone().normalized();
+        let sound_settings = sound_settings_ui::State::new(
+            crate::sound_customization::library_root(&prefs_path),
+            prefs.audio.event_sounds.clone(),
+            cc.egui_ctx.clone(),
+        );
         if let Some(engine) = &mut media {
             engine.configure(audio_applied.clone());
             engine.set_push_to_talk_key(prefs.ptt_key);
@@ -1118,6 +1141,8 @@ impl RelayApp {
             screen_pending: false,
             camera_pending: false,
             video_restart_needed: [false; 2],
+            outbox: if prefs.remember_drafts { prefs.outbox.clone() } else { Default::default() },
+            outbox_pending: Vec::new(),
             prefs,
             #[cfg(windows)]
             profile_quit_on_close: crate::profile_paths::quit_on_close(&args).unwrap_or(false),
@@ -1256,6 +1281,7 @@ impl RelayApp {
                 Some("connections") => SettingsTab::Connections,
                 Some("accessibility") => SettingsTab::Accessibility,
                 Some("notifications") => SettingsTab::Notifications,
+                Some("sounds") => SettingsTab::Sounds,
                 Some("keybinds") => SettingsTab::Keybinds,
                 Some("help") => SettingsTab::Help,
                 Some("advanced") => SettingsTab::Advanced,
@@ -1280,6 +1306,7 @@ impl RelayApp {
             inventory_rx: None,
             inventory_loaded: false,
             audio_applied,
+            sound_settings,
             mic_test: false,
             joining_voice: None,
             voice_request: 0,
@@ -1652,8 +1679,20 @@ impl RelayApp {
     }
 
     fn save_preferences(&mut self) {
+        self.prepare_preferences();
+        if let Ok(bytes) = preferences_snapshot(&self.prefs, &self.audio_applied) {
+            self.preference_writer.save(bytes);
+        }
+    }
+
+    fn prepare_preferences(&mut self) {
         self.sync_call_alert_preferences();
         self.preferences_dirty_at = None;
+        self.prefs.outbox = if self.prefs.remember_drafts {
+            self.outbox.clone()
+        } else {
+            Default::default()
+        };
         if let Some(scope) = self.conversation_scope() {
             let mut drafts = self.drafts.snapshot();
             if let Some(target) = &self.current {
@@ -1676,9 +1715,6 @@ impl RelayApp {
         if !self.prefs.hosts.contains(&self.login.url) {
             self.prefs.hosts.push(self.login.url.clone());
             self.prefs.hosts.truncate(12);
-        }
-        if let Ok(bytes) = preferences_snapshot(&self.prefs, &self.audio_applied) {
-            self.preference_writer.save(bytes);
         }
     }
 
@@ -3459,7 +3495,7 @@ fn channel_row(
     voice: bool,
     selected: bool,
     joined: bool,
-    (unread, mentions): (u64, u64),
+    (unread, mentions, draft): (u64, u64, bool),
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), 34.0),
@@ -3467,7 +3503,15 @@ fn channel_row(
     );
     let r = rect.shrink2(Vec2::new(10.0, 1.0));
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, selected, name)
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            selected,
+            if draft {
+                format!("{name}, draft")
+            } else {
+                name.to_owned()
+            },
+        )
     });
     if selected || response.hovered() || response.has_focus() {
         ui.painter().rect_filled(
@@ -3496,12 +3540,13 @@ fn channel_row(
             c_muted(),
         );
     }
+    let name_right = sidebar_draft_marker(ui, r, unread > 0 || voice, draft);
     row_name(
         ui,
         name,
         Rect::from_min_max(
             Pos2::new(r.left() + 40.0, r.top()),
-            Pos2::new(r.right() - if unread > 0 { 42.0 } else { 8.0 }, r.bottom()),
+            Pos2::new(name_right.max(r.left() + 40.0), r.bottom()),
         ),
         14.0,
         if selected || unread > 0 {
@@ -3533,6 +3578,7 @@ fn user_row(
     selected: bool,
     unread: u64,
     mentions: u64,
+    draft: bool,
     texture: Option<&egui::TextureHandle>,
 ) -> egui::Response {
     let (rect, response) =
@@ -3541,7 +3587,11 @@ fn user_row(
         egui::WidgetInfo::selected(
             egui::WidgetType::SelectableLabel,
             selected,
-            profile_ui::display_name(user),
+            if draft {
+                format!("{}, draft", profile_ui::display_name(user))
+            } else {
+                profile_ui::display_name(user).to_owned()
+            },
         )
     });
     if selected || response.hovered() || response.has_focus() {
@@ -3557,15 +3607,13 @@ fn user_row(
         texture,
         false,
     );
+    let name_right = sidebar_draft_marker(ui, rect, unread > 0, draft);
     row_name(
         ui,
         profile_ui::display_name(user),
         Rect::from_min_max(
             Pos2::new(rect.left() + 44.0, rect.top()),
-            Pos2::new(
-                rect.right() - if unread > 0 { 42.0 } else { 8.0 },
-                rect.bottom(),
-            ),
+            Pos2::new(name_right.max(rect.left() + 44.0), rect.bottom()),
         ),
         14.0,
         if selected || unread > 0 {
@@ -3583,6 +3631,23 @@ fn user_row(
         );
     }
     response.on_hover_text(&user.username)
+}
+fn sidebar_draft_marker(ui: &egui::Ui, rect: Rect, unread: bool, draft: bool) -> f32 {
+    let right = rect.right() - if unread { 42.0 } else { 8.0 };
+    if !draft {
+        return right;
+    }
+    let marker = ui
+        .painter()
+        .with_clip_rect(rect.intersect(ui.clip_rect()))
+        .text(
+            Pos2::new(right, rect.center().y),
+            Align2::RIGHT_CENTER,
+            "Draft",
+            FontId::proportional(font_size(11.0)),
+            c_accent(),
+        );
+    marker.left() - 8.0
 }
 fn unread_badge(ui: &egui::Ui, center: Pos2, count: u64, mentioned: bool) {
     let rect = Rect::from_center_size(
@@ -3811,6 +3876,9 @@ fn preferences_snapshot(
     applied_audio: &AudioSettings,
 ) -> serde_json::Result<Vec<u8>> {
     let mut stored = prefs.clone();
+    if !stored.remember_drafts {
+        stored.outbox.clear();
+    }
     stored.audio = applied_audio.clone();
     serde_json::to_vec(&stored)
 }

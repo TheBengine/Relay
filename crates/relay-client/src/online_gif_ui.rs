@@ -463,15 +463,7 @@ impl RelayApp {
         {
             return false;
         }
-        let saved = std::mem::take(&mut self.draft);
-        let attachments = std::mem::replace(&mut self.attachments, vec![attachment]);
-        self.submit_composer();
-        self.draft = saved;
-        self.attachments = attachments;
-        self.defer_preferences();
-        self.current
-            .as_ref()
-            .is_some_and(|target| self.pending_sends.contains(target))
+        self.submit_message_content(String::new(), vec![attachment], false)
     }
 
     pub(super) fn online_gifs_tick(&mut self, ctx: &egui::Context) {
@@ -836,15 +828,7 @@ impl RelayApp {
             self.error = Some("Wait for your current message before sending this GIF.".into());
             return false;
         }
-        let saved = std::mem::replace(&mut self.draft, link);
-        let attachments = std::mem::take(&mut self.attachments);
-        self.submit_composer();
-        self.draft = saved;
-        self.attachments = attachments;
-        self.defer_preferences();
-        self.current
-            .as_ref()
-            .is_some_and(|target| self.pending_sends.contains(target))
+        self.submit_message_content(link, Vec::new(), false)
     }
 
     pub(super) fn online_gif_message(&mut self, ui: &mut egui::Ui, content: &str) -> bool {

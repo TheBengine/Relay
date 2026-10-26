@@ -1,10 +1,10 @@
 //! Which of the ways to reach a community Relay should use.
 //!
 //! An invitation may offer several routes: a direct address, Tailscale, and an
-//! account-free (iroh) route. In Automatic mode the friend never chooses. Relay
-//! tries the cheap ones in parallel, checks that each answers as the right
-//! community, and uses the fastest. The decisions here are pure and tested;
-//! only `HealthProber` touches the network, and only with a health request that
+//! account-free (iroh) route. New preferences favour iroh, with an offered direct
+//! address as a fallback. Explicit Automatic mode tries the routes in parallel
+//! and uses the fastest. Every probe checks the community identity. Decisions
+//! are pure and tested; only `HealthProber` touches the network with a request that
 //! carries no secret.
 use crate::{
     community::normalize_url, connection_path, connection_setup::ServerSummary,
@@ -17,8 +17,10 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionMode {
-    /// Relay picks the fastest route that works.
+    /// Prefer iroh, retaining direct invitations without starting Tailscale.
     #[default]
+    PreferIroh,
+    /// Relay picks the fastest route that works.
     Automatic,
     Tailscale,
     Direct,
@@ -26,7 +28,8 @@ pub enum ConnectionMode {
 }
 
 impl ConnectionMode {
-    pub const ALL: [ConnectionMode; 4] = [
+    pub const ALL: [ConnectionMode; 5] = [
+        ConnectionMode::PreferIroh,
         ConnectionMode::Automatic,
         ConnectionMode::Tailscale,
         ConnectionMode::Direct,
@@ -35,19 +38,21 @@ impl ConnectionMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Automatic => "Automatic (recommended)",
+            Self::PreferIroh => "iroh first (recommended)",
+            Self::Automatic => "Automatic (fastest available)",
             Self::Tailscale => "Tailscale",
             Self::Direct => "Direct address",
-            Self::Iroh => "iroh (no account)",
+            Self::Iroh => "iroh only",
         }
     }
 
     pub fn explanation(self) -> &'static str {
         match self {
-            Self::Automatic => "Relay tries every route your friend offers and uses the fastest one that works. You never have to choose.",
+            Self::PreferIroh => "Use iroh when your friend's invitation offers it and it works. Otherwise use an offered direct address. Tailscale is a separate choice.",
+            Self::Automatic => "Use the fastest working route offered by the invitation. If no direct or iroh route works, fall back to Tailscale, which needs a separate sign-in.",
             Self::Tailscale => "Needs a free Tailscale account for you and your friend. Works almost everywhere.",
             Self::Direct => "The fastest when it works: your friend's address on the home network or the internet. It needs your friend's router to allow it.",
-            Self::Iroh => "No account and no address. Relay finds your friend by a key and connects directly when it can.",
+            Self::Iroh => "Use only iroh. The invitation must include an iroh connection, and this copy of Relay must support it. No fallback to another connection.",
         }
     }
 }
@@ -145,12 +150,16 @@ pub fn candidates(invitation: &Invitation) -> Vec<Candidate> {
     let mut found: Vec<Candidate> = invitation
         .routes()
         .into_iter()
-        .map(|address| Candidate {
-            kind: match connection_path::transport_for(&address) {
+        .filter_map(|address| {
+            let kind = match connection_path::transport_for(&address) {
                 connection_path::Transport::Tailscale => RouteKind::Tailscale,
+                // A pseudo address is never a DNS/direct route. Only the
+                // explicit endpoint and admission token below may create an
+                // iroh candidate, even when the primary address names it too.
+                connection_path::Transport::Iroh => return None,
                 _ => RouteKind::Direct,
-            },
-            address,
+            };
+            Some(Candidate { kind, address })
         })
         .collect();
     if let Some(iroh) = &invitation.iroh {
@@ -204,6 +213,9 @@ pub fn plan(all: &[Candidate], mode: ConnectionMode, caps: Capabilities) -> Plan
     let wanted: Vec<Candidate> = all
         .iter()
         .filter(|c| match mode {
+            ConnectionMode::PreferIroh => {
+                c.kind == RouteKind::Direct || (c.kind == RouteKind::Iroh && caps.iroh)
+            }
             ConnectionMode::Automatic => c.kind != RouteKind::Iroh || caps.iroh,
             ConnectionMode::Tailscale => c.kind == RouteKind::Tailscale,
             ConnectionMode::Direct => c.kind == RouteKind::Direct,
@@ -218,7 +230,10 @@ pub fn plan(all: &[Candidate], mode: ConnectionMode, caps: Capabilities) -> Plan
         );
     }
     match wanted.len() {
-        0 if mode == ConnectionMode::Automatic => Plan::Unavailable(
+        0 if mode == ConnectionMode::PreferIroh && all.iter().any(|c| c.kind == RouteKind::Tailscale) => Plan::Unavailable(
+            "This invitation offers no usable iroh or direct connection. To use its Tailscale connection, choose Tailscale or Automatic in Settings → Connections.".into(),
+        ),
+        0 if matches!(mode, ConnectionMode::Automatic | ConnectionMode::PreferIroh) => Plan::Unavailable(
             "This invitation offers no route this version of Relay can use. Update Relay and try again."
                 .into(),
         ),
@@ -262,8 +277,8 @@ fn rank(candidate: &Candidate) -> u8 {
     }
 }
 
-/// The fastest reachable route which is allowed. Routes within a few
-/// milliseconds of each other count as equal, and the better kind wins, so the
+/// Prefer iroh for the default mode; otherwise use the fastest allowed route.
+/// Routes within a few milliseconds count as equal, and the better kind wins, so the
 /// choice does not flip between two almost identical paths.
 pub fn choose(probes: &[Probe], prefs: &ConnectionPrefs) -> Result<Candidate, String> {
     let reachable: Vec<(&Candidate, f32)> = probes
@@ -278,6 +293,15 @@ pub fn choose(probes: &[Probe], prefs: &ConnectionPrefs) -> Result<Candidate, St
         .iter()
         .filter(|(c, _)| allowed(c, prefs))
         .collect();
+    if prefs.mode == ConnectionMode::PreferIroh {
+        if let Some((candidate, _)) = usable
+            .iter()
+            .filter(|(candidate, _)| candidate.kind == RouteKind::Iroh)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            return Ok((*candidate).clone());
+        }
+    }
     if let Some(fastest) = usable.iter().map(|(_, rtt)| *rtt).min_by(f32::total_cmp) {
         let window = fastest + (fastest * 0.25).max(5.0);
         let best = usable
@@ -290,7 +314,7 @@ pub fn choose(probes: &[Probe], prefs: &ConnectionPrefs) -> Result<Candidate, St
     // Nothing else answers: Tailscale needs a sign-in, so it is the last resort.
     if let Some(tailscale) = probes
         .iter()
-        .find(|p| p.candidate.kind == RouteKind::Tailscale)
+        .find(|p| p.candidate.kind == RouteKind::Tailscale && prefs.mode != ConnectionMode::PreferIroh)
     {
         return Ok(tailscale.candidate.clone());
     }
@@ -418,14 +442,28 @@ pub fn decide(
     caps: Capabilities,
     prober: &dyn Prober,
 ) -> Outcome {
+    decide_for_login(invitation, prefs, caps, prober, false)
+}
+
+/// Shared-account proofs require an authenticated transport even for an older
+/// invitation which has no authority pin. This is a join requirement, not a
+/// saved connection preference or an authority granted to the invitation.
+pub fn decide_for_login(
+    invitation: &Invitation,
+    prefs: &ConnectionPrefs,
+    caps: Capabilities,
+    prober: &dyn Prober,
+    shared_account: bool,
+) -> Outcome {
+    let authenticated_login = shared_account || invitation.authority.is_some();
     let all: Vec<_> = candidates(invitation).into_iter().filter(|candidate|
-        invitation.authority.is_none() || crate::community::account_destination(&candidate.address).is_ok()).collect();
+        !authenticated_login || crate::community::account_destination(&candidate.address).is_ok()).collect();
     let fail = |message: String| Outcome {
         needs_consent: message == PLAIN_PUBLIC_MESSAGE,
         invitation: Err(message.clone()),
         summary: message,
     };
-    if all.is_empty() && invitation.authority.is_some() {
+    if all.is_empty() && authenticated_login {
         return fail("This invitation needs an HTTPS or iroh connection. Ask the host to enable sharing for friends.".into());
     }
     let (chosen, rtt) = match plan(&all, prefs.mode, caps) {
@@ -486,6 +524,7 @@ pub fn decide(
 pub struct Job {
     /// What the user pasted, kept so a refusal can offer to continue anyway.
     pub original: Invitation,
+    pub shared_account: bool,
     rx: std::sync::mpsc::Receiver<Outcome>,
     started: std::time::Instant,
     /// Held only by a display-only preview, so it keeps waiting.
@@ -500,6 +539,7 @@ impl Job {
         let now = std::time::Instant::now();
         Self {
             original,
+            shared_account: false,
             rx,
             started: now.checked_sub(Duration::from_secs(3)).unwrap_or(now),
             _idle: Some(tx),
@@ -512,15 +552,26 @@ impl Job {
         caps: Capabilities,
         wake: impl Fn() + Send + 'static,
     ) -> Self {
+        Self::start_for_login(original, prefs, caps, false, wake)
+    }
+
+    pub fn start_for_login(
+        original: Invitation,
+        prefs: ConnectionPrefs,
+        caps: Capabilities,
+        shared_account: bool,
+        wake: impl Fn() + Send + 'static,
+    ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let invitation = original.clone();
         std::thread::spawn(move || {
             let prober = HealthProber::for_invitation(&invitation);
-            let _ = tx.send(decide(&invitation, &prefs, caps, &prober));
+            let _ = tx.send(decide_for_login(&invitation, &prefs, caps, &prober, shared_account));
             wake();
         });
         Self {
             original,
+            shared_account,
             rx,
             started: std::time::Instant::now(),
             _idle: None,
@@ -551,6 +602,7 @@ pub struct Refused {
     pub invitation: Invitation,
     pub message: String,
     pub overridable: bool,
+    pub shared_account: bool,
 }
 
 #[cfg(test)]
@@ -579,7 +631,10 @@ mod tests {
         }
     }
     fn auto() -> ConnectionPrefs {
-        ConnectionPrefs::default()
+        ConnectionPrefs {
+            mode: ConnectionMode::Automatic,
+            ..ConnectionPrefs::default()
+        }
     }
 
     const HOME: &str = "http://192.168.1.50:4580";
@@ -588,9 +643,9 @@ mod tests {
     const TAILNET: &str = "http://100.70.1.2:4580";
 
     #[test]
-    fn defaults_are_automatic_and_never_allow_a_plain_login_over_the_internet() {
+    fn defaults_prefer_iroh_and_never_allow_a_plain_login_over_the_internet() {
         let prefs = ConnectionPrefs::default();
-        assert_eq!(prefs.mode, ConnectionMode::Automatic);
+        assert_eq!(prefs.mode, ConnectionMode::PreferIroh);
         assert!(!prefs.allow_plain_public_login);
         // Old preference files without the new settings still load.
         let old: ConnectionPrefs = serde_json::from_str("{}").unwrap();
@@ -604,7 +659,92 @@ mod tests {
         assert_eq!(saved, r#"{"mode":"iroh","allow_plain_public_login":true}"#);
         for mode in ConnectionMode::ALL {
             assert!(!mode.label().is_empty() && !mode.explanation().is_empty());
+            let selected = ConnectionPrefs {
+                mode,
+                ..prefs.clone()
+            };
+            let restored: ConnectionPrefs =
+                serde_json::from_str(&serde_json::to_string(&selected).unwrap()).unwrap();
+            assert_eq!(restored.mode, mode, "a saved explicit choice must survive");
         }
+    }
+
+    #[test]
+    fn default_prefers_working_iroh_over_a_faster_direct_route_and_keeps_direct_fallback() {
+        let prefs = ConnectionPrefs::default();
+        let iroh = c(RouteKind::Iroh, &iroh_address(&"b".repeat(64)));
+        let direct = c(RouteKind::Direct, PUBLIC_TLS);
+        assert_eq!(
+            choose(&[ok(direct.clone(), 2.0), ok(iroh.clone(), 80.0)], &prefs).unwrap(),
+            iroh
+        );
+        assert_eq!(
+            choose(&[ok(direct.clone(), 2.0), no(iroh, "no answer")], &prefs).unwrap(),
+            direct
+        );
+        assert!(choose(&[no(c(RouteKind::Tailscale, TAILNET), "needs sign-in")], &prefs).is_err());
+    }
+
+    #[test]
+    fn default_plans_keep_direct_invitations_and_require_an_explicit_tailscale_choice() {
+        let mode = ConnectionMode::default();
+        let Plan::Probe(with_iroh) = plan(&all_routes(), mode, Capabilities { iroh: true }) else {
+            panic!()
+        };
+        assert_eq!(with_iroh.len(), 3);
+        assert!(with_iroh.iter().any(|route| route.kind == RouteKind::Iroh));
+        assert!(with_iroh.iter().all(|route| route.kind != RouteKind::Tailscale));
+        let Plan::Probe(without_iroh) = plan(&all_routes(), mode, Capabilities { iroh: false }) else {
+            panic!()
+        };
+        assert_eq!(without_iroh.len(), 2);
+        assert!(without_iroh.iter().all(|route| route.kind == RouteKind::Direct));
+        let direct = c(RouteKind::Direct, HOME);
+        assert_eq!(
+            plan(std::slice::from_ref(&direct), mode, Capabilities { iroh: false }),
+            Plan::Use(direct)
+        );
+        let tail = c(RouteKind::Tailscale, TAILNET);
+        let Plan::Unavailable(message) =
+            plan(std::slice::from_ref(&tail), mode, Capabilities { iroh: true })
+        else {
+            panic!()
+        };
+        assert!(message.contains("choose Tailscale or Automatic"));
+        assert_eq!(
+            plan(std::slice::from_ref(&tail), ConnectionMode::Tailscale, Capabilities { iroh: true }),
+            Plan::Use(tail)
+        );
+    }
+
+    #[test]
+    fn default_iroh_only_invitation_never_turns_into_a_direct_address_or_tailscale() {
+        let endpoint = "b".repeat(64);
+        let address = iroh_address(&endpoint);
+        let route = crate::invitation_routes::IrohRoute::new(
+            &endpoint,
+            None,
+            "abcdefghijklmnopqrstuvwxyzABCDEF0123456789_-",
+        )
+        .unwrap();
+        let invite = Invitation::new(&address, ID, "relay-secret")
+            .unwrap()
+            .with_iroh(route);
+        let prober = FakeProber {
+            delays: HashMap::new(),
+            started: Default::default(),
+        };
+        let chosen = decide(
+            &invite, &ConnectionPrefs::default(), Capabilities { iroh: true }, &prober,
+        );
+        assert_eq!(chosen.invitation.unwrap().server, address);
+        assert!(prober.started.lock().unwrap().is_empty());
+        let unavailable = decide(
+            &invite, &ConnectionPrefs::default(), Capabilities { iroh: false }, &prober,
+        );
+        assert!(unavailable.invitation.is_err());
+        assert!(unavailable.summary.contains("Update Relay"));
+        assert!(prober.started.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1160,6 +1300,72 @@ mod tests {
     }
 
     #[test]
+    fn account_free_primary_is_never_a_direct_dns_candidate() {
+        let endpoint = "b".repeat(64);
+        let address = iroh_address(&endpoint);
+        let route = crate::invitation_routes::IrohRoute::new(
+            &endpoint,
+            None,
+            "abcdefghijklmnopqrstuvwxyzABCDEF0123456789_-",
+        )
+        .unwrap();
+        let invite = Invitation::new(&address, ID, "relay-secret")
+            .unwrap()
+            .with_alternatives(&[iroh_address(&"c".repeat(64))])
+            .unwrap()
+            .with_iroh(route);
+        let list = candidates(&invite);
+        assert_eq!(list, vec![Candidate {
+            kind: RouteKind::Iroh,
+            address: address.clone(),
+        }]);
+        assert!(matches!(
+            plan(&list, ConnectionMode::Direct, Capabilities { iroh: true }),
+            Plan::Unavailable(_)
+        ));
+        assert!(matches!(
+            plan(&list, ConnectionMode::Automatic, Capabilities { iroh: false }),
+            Plan::Unavailable(_)
+        ));
+        // One account-free route needs no speculative DNS/health probe. The
+        // ordinary connection still verifies the endpoint and server identity.
+        let prober = FakeProber {
+            delays: HashMap::new(),
+            started: Default::default(),
+        };
+        let chosen = decide(&invite, &auto(), Capabilities { iroh: true }, &prober);
+        assert_eq!(chosen.invitation.unwrap().server, address);
+        assert!(prober.started.lock().unwrap().is_empty());
+        // A pseudo address without the invitation's explicit capability cannot
+        // borrow another connection's cached token or become an ordinary URL.
+        let incomplete = Invitation::new(&iroh_address(&endpoint), ID, "relay-secret").unwrap();
+        assert!(candidates(&incomplete).is_empty());
+    }
+
+    #[test]
+    fn a_shared_account_uses_the_secure_route_even_for_a_legacy_invitation() {
+        let invitation = Invitation::new(PUBLIC_TLS, ID, "relay-secret").unwrap()
+            .with_alternatives(&[HOME.into()]).unwrap();
+        assert!(invitation.authority.is_none());
+        let prober = FakeProber {
+            delays: [(PUBLIC_TLS.into(), Ok(60.0)), (HOME.into(), Ok(1.0))].into(),
+            started: Default::default(),
+        };
+        let legacy = decide_for_login(&invitation, &auto(), Capabilities { iroh: false }, &prober, false);
+        assert_eq!(legacy.invitation.unwrap().server, HOME);
+        let shared = decide_for_login(&invitation, &auto(), Capabilities { iroh: false }, &prober, true);
+        assert_eq!(shared.invitation.unwrap().server, PUBLIC_TLS);
+        // Plaintext consent never grants permission to carry a shared-account
+        // proof over HTTP. Without a secure option, explain before login.
+        let only_lan = Invitation::new(HOME, ID, "relay-secret").unwrap();
+        let once = ConnectionPrefs { allow_plain_public_login: true, ..auto() };
+        let refused = decide_for_login(&only_lan, &once, Capabilities { iroh: false }, &prober, true);
+        assert!(!refused.needs_consent);
+        assert!(refused.invitation.err().unwrap().contains("HTTPS or iroh"));
+        assert!(decide(&only_lan, &auto(), Capabilities { iroh: false }, &prober).invitation.is_ok());
+    }
+
+    #[test]
     fn a_background_job_delivers_one_decision_and_a_lost_thread_is_a_failure() {
         let prober_free = Invitation::new(HOME, ID, "relay-secret").unwrap();
         let woken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1203,6 +1409,7 @@ mod tests {
         drop(tx);
         let mut lost = Job {
             original: prober_free,
+            shared_account: false,
             rx,
             started: std::time::Instant::now(),
             _idle: None,

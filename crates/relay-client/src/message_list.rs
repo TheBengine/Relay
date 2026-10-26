@@ -330,8 +330,9 @@ impl RelayApp {
             if let Some(user) = &intro {
                 self.direct_intro(ui, user);
             }
-            self.outgoing_messages.retain(|(_, local, _, _)| {
-                !self.messages.iter().any(|remote| {
+            self.reconcile_outbox_history();
+            self.outgoing_messages.retain(|(target, local, _, _)| {
+                Some(target) != self.current.as_ref() || !self.messages.iter().any(|remote| {
                     remote.client_id == local.client_id && remote.author.id == local.author.id
                 })
             });
@@ -535,21 +536,34 @@ impl RelayApp {
                     self.defer_preferences();
                 }
                 let focused = ui.ctx().input(|input| input.focused);
+                let now = Instant::now();
+                let receipt_ready = self.marked_read.get(&target).is_none_or(|attempt| {
+                    if let Some(deadline) = attempt.retry_at() {
+                        if deadline > now {
+                            ui.ctx().request_repaint_after(deadline.duration_since(now));
+                        }
+                    }
+                    attempt.ready(highest_seen, now)
+                });
                 if focused
+                    && self.connection_status == ConnectionStatus::Connected
                     && !self.modal_open()
                     && !self.add_community_open
-                    && highest_seen
-                        > read_sequence
-                            .max(self.marked_read.get(&target).copied().unwrap_or_default())
-                    && self
-                        .network
-                        .send(Command::MarkRead {
+                    && highest_seen > read_sequence
+                    && receipt_ready
+                {
+                    if let Some(origin) = self.command_origin() {
+                        if self.network.send(Command::MarkRead {
+                            origin,
                             target: target.clone(),
                             last_read_sequence: highest_seen,
-                        })
-                        .is_ok()
-                {
-                    self.marked_read.insert(target, highest_seen);
+                        }).is_ok() {
+                            self.marked_read
+                                .entry(target)
+                                .and_modify(|attempt| attempt.sent(highest_seen))
+                                .or_insert_with(|| read_receipts::Attempt::queued(highest_seen));
+                        }
+                    }
                 }
             }
         }
@@ -676,45 +690,30 @@ impl RelayApp {
                             }
                             if !failed && !confirmed {
                                 ui.label(
-                                    RichText::new("Sending…")
+                                    RichText::new(if self.saving_outgoing(message) { "Saving before sending…" } else { "Sending…" })
                                         .size(font_size(TEXT_CAPTION))
                                         .color(c_muted()),
                                 );
                             }
                             if failed {
-                                ui.label(RichText::new("Message could not be sent").color(c_bad()));
+                                ui.label(RichText::new("Delivery not confirmed").color(c_bad()));
                                 let available = self
                                     .current
                                     .as_ref()
-                                    .is_some_and(|target| !self.pending_sends.contains(target))
-                                    && self.draft.is_empty()
-                                    && self.attachments.is_empty();
+                                    .is_some_and(|target| self.can_send_message(target));
                                 if ui.add_enabled(available, secondary("Retry")).clicked() {
-                                    if let Some(target) = self.current.clone() {
-                                        self.send_ids.insert(
-                                            target,
-                                            SendAttempt {
-                                                client_id: message.client_id.clone().unwrap(),
-                                                content: message.content.clone(),
-                                                attachments: message
-                                                    .attachments
-                                                    .iter()
-                                                    .map(|a| a.id.clone())
-                                                    .collect(),
-                                                reply_to_id: message.reply_to_id.clone(),
-                                                mentions: message.mentions.clone(),
-                                            },
-                                        );
-                                        self.draft = message.content.clone();
-                                        self.attachments = message.attachments.clone();
-                                        self.reply =
-                                            message.reply_to_id.as_ref().map(|id| ReplyDraft {
-                                                message_id: id.clone(),
-                                                ..Default::default()
-                                            });
-                                        self.submit_composer();
-                                    }
+                                    self.retry_outgoing(&message.id);
                                 }
+                                ui.horizontal_wrapped(|ui| {
+                                    if !message.content.is_empty() && ui.add(secondary("Copy text")).clicked() {
+                                        ui.output_mut(|output| output.copied_text = message.content.clone());
+                                    }
+                                    if ui.add_enabled(self.current.as_ref().is_some_and(|target| !self.pending_sends.contains(target)), secondary("Remove from list"))
+                                        .on_hover_text("Remove this saved attempt from this PC. A copy already delivered to the conversation is not deleted.")
+                                        .clicked() {
+                                        self.remove_outgoing(message);
+                                    }
+                                });
                             }
                         });
                     });

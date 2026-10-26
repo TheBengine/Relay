@@ -220,6 +220,58 @@ fn incoming_call_alert_is_once_across_foreground_background_and_duplicate_snapsh
 }
 
 #[test]
+fn custom_five_second_ring_and_ringback_finish_before_the_next_repeat() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("five-seconds.wav");
+    let data_bytes = crate::sound_customization::MAX_SAMPLES * 2;
+    let mut wav = include_bytes!("../assets/sounds/join.wav")[..44].to_vec();
+    wav[4..8].copy_from_slice(&(36 + data_bytes as u32).to_le_bytes());
+    wav[40..44].copy_from_slice(&(data_bytes as u32).to_le_bytes());
+    wav.resize(44 + data_bytes, 0);
+    std::fs::write(&source, wav).unwrap();
+    let imported = crate::sound_customization::import_wav(&temporary.path().join("sounds"), &source).unwrap();
+    // Scheduling must work from the cache even after both files disappear.
+    drop(temporary);
+    for incoming in [true, false] {
+        let (mut state, origin, generation, bootstrap, now) = fixture(incoming);
+        let cue = if incoming { AudioCue::Ring } else { AudioCue::Ringback };
+        let selected = state.policy.audio.event_sounds.install(imported.clone());
+        state.policy.audio.event_sounds.get_mut(cue).source = selected;
+        state.observe(&origin, generation, &bootstrap, now, 100);
+        assert_eq!(state.step(now).sound, Some(cue));
+        for elapsed in [3_000, 5_000, 5_149] {
+            assert!(state.step(now + Duration::from_millis(elapsed)).sound.is_none());
+        }
+        assert_eq!(state.step(now + Duration::from_millis(5_150)).sound, Some(cue));
+        assert!(state.step(now + Duration::from_secs(8)).sound.is_none());
+    }
+}
+
+#[test]
+fn muted_incoming_sound_keeps_its_toast_and_does_not_suppress_other_alerts() {
+    for zero_volume in [false, true] {
+        let (mut state, origin, generation, mut bootstrap, now) = fixture(true);
+        let sound = state.policy.audio.event_sounds.get_mut(AudioCue::Ring);
+        if zero_volume { sound.volume = 0.0; } else { sound.enabled = false; }
+        state.observe(&origin, generation, &bootstrap, now, 100);
+        let effect = state.step(now);
+        assert_eq!(effect.notifications.len(), 1);
+        assert!(effect.notifications[0].guard.as_ref().unwrap().valid());
+        assert!(effect.sound.is_none() && state.selected.is_none());
+        assert_eq!(messages::message_cue(&state.policy, true, state.selected.is_some()), Some(AudioCue::Message));
+        let mut outgoing = bootstrap.social.calls[0].clone();
+        outgoing.id = uuid::Uuid::new_v4().to_string();
+        outgoing.caller_id = "self".into();
+        outgoing.recipient_id = "friend".into();
+        bootstrap.social.calls.push(outgoing);
+        state.observe(&origin, generation, &bootstrap, now + Duration::from_secs(1), 101);
+        let effect = state.step(now + Duration::from_secs(1));
+        assert!(effect.notifications.is_empty());
+        assert_eq!(effect.sound, Some(AudioCue::Ringback));
+    }
+}
+
+#[test]
 fn ringing_cadence_stops_on_every_terminal_state_expiry_revocation_and_shutdown() {
     for terminal in [
         "accepted",

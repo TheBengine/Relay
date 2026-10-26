@@ -25,7 +25,7 @@ pub(super) const SCOPE: &str =
     "These choices are for this server only. They do not change your Relay account, your other servers or Friends.";
 
 pub(super) const IROH_UNAVAILABLE: &str =
-    "This copy of Relay does not include the account-free connection.";
+    "This copy of Relay does not include iroh. Install the complete Relay package, or choose Tailscale explicitly.";
 
 /// What is published when a server is shared without accounts. Precise, not a
 /// promise about what network services can observe.
@@ -49,23 +49,20 @@ pub(super) struct Choices {
 }
 
 impl Choices {
-    /// The defaults for every new server, whatever an earlier one used.
-    pub(super) fn recommended(iroh_available: bool) -> Self {
+    /// Missing support must not silently choose another transport. Confirmation
+    /// checks availability and leaves an explicit alternative to the user.
+    pub(super) fn recommended(_iroh_available: bool) -> Self {
         Self {
-            protection: ProtectionLevel::Open,
-            route: if iroh_available {
-                Choice::Iroh
-            } else {
-                Choice::Tailscale
-            },
+            protection: ProtectionLevel::Protected,
+            route: Choice::Iroh,
         }
     }
 }
 
 pub(super) fn protection_title(level: ProtectionLevel) -> &'static str {
     match level {
-        ProtectionLevel::Protected => "End-to-end encryption on",
-        ProtectionLevel::Open => "End-to-end encryption off (recommended)",
+        ProtectionLevel::Protected => "End-to-end encryption on (recommended)",
+        ProtectionLevel::Open => "End-to-end encryption off",
     }
 }
 
@@ -397,7 +394,7 @@ impl RelayApp {
         ui.add_space(14.0);
 
         ui.label(RichText::new("Server encryption").strong());
-        for level in [ProtectionLevel::Open, ProtectionLevel::Protected] {
+        for level in [ProtectionLevel::Protected, ProtectionLevel::Open] {
             ui.radio_value(
                 &mut self.hosting_setup.creation_protection,
                 level,
@@ -612,7 +609,7 @@ impl RelayApp {
         }
         let sharing = self
             .hosting_setup
-            .sharing(crate::iroh_route::hosted(&server_id).is_some());
+            .sharing(crate::iroh_route::hosted_status(&server_id).is_some());
         let busy = self.busy
             || self.voice_channel.is_some()
             || self.joining_voice.is_some()
@@ -748,15 +745,15 @@ mod tests {
         assert_eq!(
             Choices::recommended(true),
             Choices {
-                protection: ProtectionLevel::Open,
+                protection: ProtectionLevel::Protected,
                 route: Choice::Iroh
             }
         );
-        // Without the account-free connection the only way is Tailscale.
-        assert_eq!(Choices::recommended(false).route, Choice::Tailscale);
+        // A missing helper never turns an unchosen alternative into the default.
+        assert_eq!(Choices::recommended(false).route, Choice::Iroh);
         assert_eq!(
             Choices::recommended(false).protection,
-            ProtectionLevel::Open
+            ProtectionLevel::Protected
         );
     }
 
@@ -773,7 +770,7 @@ mod tests {
         state.new_host = false;
         state.begin_creation(true);
         assert!(state.choosing_creation && !state.creation_confirmed);
-        assert_eq!(state.creation_protection, ProtectionLevel::Open);
+        assert_eq!(state.creation_protection, ProtectionLevel::Protected);
         assert_eq!(state.creation_route, Choice::Iroh);
         assert_eq!(state.route_to_apply, None);
         // Visiting the choices changes no existing server and starts nothing.
@@ -815,11 +812,14 @@ mod tests {
     fn the_account_free_way_cannot_be_confirmed_when_this_copy_lacks_it() {
         let mut state = HostSetup::default();
         state.begin_creation(false);
-        assert_eq!(state.creation_route, Choice::Tailscale);
-        state.creation_route = Choice::Iroh;
+        assert_eq!(state.creation_route, Choice::Iroh);
         assert!(!state.confirm_creation(false));
         assert!(state.choosing_creation && !state.creation_confirmed);
         assert_eq!(state.route_to_apply, None);
+        // Tailscale remains available only after the person actually chooses it.
+        state.creation_route = Choice::Tailscale;
+        assert!(state.confirm_creation(false));
+        assert_eq!(state.route_to_apply, Some(Choice::Tailscale));
     }
 
     #[test]
@@ -830,7 +830,7 @@ mod tests {
         state.creation_route = Choice::Tailscale;
         state.local_account_ready(&mut login, Some(true));
         assert!(state.new_host && !state.creation_confirmed);
-        assert_eq!(state.creation_protection, ProtectionLevel::Open);
+        assert_eq!(state.creation_protection, ProtectionLevel::Protected);
         assert_eq!(
             state.creation_route,
             Choices::recommended(crate::iroh_route::available()).route
@@ -1102,8 +1102,8 @@ mod tests {
         ] {
             assert!(!text.contains("Tailscale"), "{text}");
         }
-        assert!(!protection_title(ProtectionLevel::Protected).contains("recommended"));
-        assert!(protection_title(ProtectionLevel::Open).contains("recommended"));
+        assert!(protection_title(ProtectionLevel::Protected).contains("recommended"));
+        assert!(!protection_title(ProtectionLevel::Open).contains("recommended"));
         assert!(
             SCOPE.contains("Relay account")
                 && SCOPE.contains("other servers")
@@ -1167,6 +1167,6 @@ mod tests {
             line,
             "Chosen for this server: end-to-end encryption off · connecting with Tailscale"
         );
-        assert!(summary(Choices::recommended(true)).contains("encryption off"));
+        assert!(summary(Choices::recommended(true)).contains("encryption on"));
     }
 }

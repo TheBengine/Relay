@@ -103,6 +103,7 @@ pub(super) struct ServerUi {
     inbox_remaining: Vec<(Target, Option<u64>)>,
     inbox_errors: Vec<String>,
     inbox_loaded: bool,
+    inbox_read_queue: InboxReadQueue,
     poll_draft: Option<PollContent>,
     image_picker: Option<ImagePicker>,
     asset_cache: HashMap<String, (egui::TextureHandle, Instant)>,

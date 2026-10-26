@@ -630,7 +630,7 @@ pub fn shared_address(expected_server_id: &str) -> Option<String> {
     let stack = read("stack-instance.json")?;
     let address = shared_address_records(expected_server_id, &managed, &stack)?;
     if stack["hosting_mode"] == "embedded" {
-        crate::embedded_network::shared_address(expected_server_id).filter(|u| u == &address)
+        crate::embedded_network::hosted_status(expected_server_id).filter(|u| u == &address)
     } else {
         Some(address)
     }

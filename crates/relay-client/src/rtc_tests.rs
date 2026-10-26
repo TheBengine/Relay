@@ -114,6 +114,8 @@ pub(super) fn recovery_fixture_publication(
         stats_task: None,
         next_stats: Instant::now(),
         previous_sample: None,
+        previous_sample_at: None,
+        outbound_mbps: None,
         next_frame: None,
         rate_bitrate: None,
         adaptive_samples: 0,
@@ -676,6 +678,8 @@ async fn software_publication_delivers_native_frames_while_hidden_and_rejects_st
         stats_task: None,
         next_stats: Instant::now(),
         previous_sample: None,
+        previous_sample_at: None,
+        outbound_mbps: None,
         next_frame: None,
         rate_bitrate: None,
         adaptive_samples: 0,
@@ -1568,6 +1572,112 @@ async fn actual_controller_terminal_disconnect_releases_session_without_source_r
         "normal cancel must not report disconnect"
     );
     close_controller(&mut viewer).await;
+}
+
+#[tokio::test]
+async fn video_upload_is_measured_without_enabling_adaptive_quality() {
+    let state = recovery_fixture_state(recovery_fixture_keys(), 1);
+    let source = NativeVideoSource::new(VideoResolution { width: 16, height: 16 }, true);
+    let options = CaptureOptions { adaptive_video: false, ..Default::default() };
+    let mut publication = recovery_fixture_publication(
+        source, "TR_owned_upload".to_owned().try_into().unwrap(),
+        "owned-upload".into(), options, 1,
+    );
+    publication.next_stats = Instant::now() + Duration::from_secs(10);
+    publication.previous_sample = Some(VideoSample {
+        id: "owned-upload".into(), timestamp: 100, encoded: 50,
+        bytes_sent: 500_000, pressure: VideoPressure::Bandwidth,
+    });
+    publication.previous_sample_at = Some(Instant::now() - Duration::from_secs(2));
+    publication.stats_task = Some(tokio::spawn(async {
+        Some((VideoSample {
+            id: "owned-upload".into(), timestamp: 200, encoded: 100,
+            bytes_sent: 1_500_000, pressure: VideoPressure::Bandwidth,
+        }, Instant::now()))
+    }));
+    while !publication.stats_task.as_ref().unwrap().is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let profile = publication.adaptation.profile();
+    update_video_adaptation(&mut publication, &state, false).await;
+    assert!(publication.outbound_mbps.is_some_and(|(rate, _)| (3.5..4.5).contains(&rate)));
+    assert_eq!(publication.adaptive_samples, 0);
+    assert_eq!(publication.adaptation.profile(), profile);
+    // An unavailable next poll clears the displayed rate instead of reporting zero.
+    publication.stats_task = Some(tokio::spawn(async { None }));
+    while !publication.stats_task.as_ref().unwrap().is_finished() {
+        tokio::task::yield_now().await;
+    }
+    update_video_adaptation(&mut publication, &state, false).await;
+    assert!(publication.outbound_mbps.is_none());
+    assert!(publication.previous_sample_at.is_none());
+}
+
+#[tokio::test]
+async fn video_upload_uses_collection_time_and_rejects_delayed_stale_results() {
+    async fn consume(publication: &mut Publication, state: &WorkerState, sample: VideoSample, at: Instant) {
+        publication.stats_task = Some(tokio::spawn(async move { Some((sample, at)) }));
+        while !publication.stats_task.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        update_video_adaptation(publication, state, false).await;
+    }
+    let state = recovery_fixture_state(recovery_fixture_keys(), 1);
+    let source = NativeVideoSource::new(VideoResolution { width: 16, height: 16 }, true);
+    let options = CaptureOptions { adaptive_video: true, ..Default::default() };
+    let mut publication = recovery_fixture_publication(
+        source, "TR_owned_delayed_upload".to_owned().try_into().unwrap(),
+        "owned-delayed-upload".into(), options, 1,
+    );
+    publication.next_stats = Instant::now() + Duration::from_secs(30);
+    let now = Instant::now();
+    let sample = VideoSample {
+        id: "owned-delayed-upload".into(), timestamp: 100, encoded: 50,
+        bytes_sent: 500_000, pressure: VideoPressure::Bandwidth,
+    };
+    // Old completed work must not look freshly collected or affect adaptation.
+    consume(&mut publication, &state, sample.clone(), now - Duration::from_secs(6)).await;
+    assert!(publication.outbound_mbps.is_none());
+    assert!(publication.previous_sample.is_none());
+    assert!(publication.previous_sample_at.is_none());
+    assert_eq!(publication.adaptive_samples, 0);
+
+    consume(&mut publication, &state, sample.clone(), now - Duration::from_secs(4)).await;
+    assert!(publication.outbound_mbps.is_none());
+    let second_at = now - Duration::from_secs(2);
+    consume(&mut publication, &state, VideoSample {
+        timestamp: 200, encoded: 100, bytes_sent: 1_500_000, ..sample
+    }, second_at).await;
+    // Two-second collections consumed almost together still measure exactly 4 Mbps.
+    assert_eq!(publication.outbound_mbps, Some((4.0, second_at)));
+    assert_eq!(publication.previous_sample_at, Some(second_at));
+}
+
+#[test]
+fn measured_video_upload_rejects_reset_stale_and_nonprogressing_samples() {
+    let previous = VideoSample {
+        id: "screen-sender".into(), timestamp: 100, encoded: 50,
+        bytes_sent: 500_000, pressure: VideoPressure::Unknown,
+    };
+    let current = VideoSample {
+        timestamp: 200, encoded: 100, bytes_sent: 1_500_000,
+        ..previous.clone()
+    };
+    assert_eq!(video_upload_mbps(&previous, &current, Duration::from_secs(2)), Some(4.0));
+    // A confirmed, unchanged byte counter really is zero upload; missing data is not.
+    assert_eq!(video_upload_mbps(&previous, &VideoSample { bytes_sent: previous.bytes_sent, ..current.clone() }, Duration::from_secs(2)), Some(0.0));
+    for invalid in [
+        VideoSample { id: "new-sender".into(), ..current.clone() },
+        VideoSample { timestamp: previous.timestamp, ..current.clone() },
+        VideoSample { timestamp: previous.timestamp - 1, ..current.clone() },
+        VideoSample { encoded: previous.encoded - 1, ..current.clone() },
+        VideoSample { bytes_sent: previous.bytes_sent - 1, ..current.clone() },
+    ] {
+        assert_eq!(video_upload_mbps(&previous, &invalid, Duration::from_secs(2)), None);
+    }
+    for elapsed in [Duration::ZERO, Duration::from_millis(499), Duration::from_millis(5001)] {
+        assert_eq!(video_upload_mbps(&previous, &current, elapsed), None);
+    }
 }
 
 #[test]

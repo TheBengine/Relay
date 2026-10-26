@@ -80,6 +80,20 @@ impl RelayApp {
         invitation: Invitation,
     ) {
         let prefs = self.prefs.connection.clone();
+        self.start_joining_with_prefs(ctx, kind, invitation, prefs, self.central_account.account.is_some());
+    }
+
+    /// The one-invitation plaintext consent uses the same background decision
+    /// and cancellation flow, without changing the saved connection settings.
+    fn start_joining_with_prefs(
+        &mut self,
+        ctx: &egui::Context,
+        kind: FlowKind,
+        invitation: Invitation,
+        prefs: route_choice::ConnectionPrefs,
+        shared_account: bool,
+    ) {
+        let shared_account = shared_account || self.central_account.account.is_some();
         let caps = Capabilities::current();
         {
             let state = &mut self.join_flow_mut(kind).setup;
@@ -91,18 +105,19 @@ impl RelayApp {
         let all = route_choice::candidates(&invitation);
         if matches!(route_choice::plan(&all, prefs.mode, caps), Plan::Probe(_)) {
             let wake = ctx.clone();
-            self.join_flow_mut(kind).setup.routing = Some(route_choice::Job::start(
+            self.join_flow_mut(kind).setup.routing = Some(route_choice::Job::start_for_login(
                 invitation,
                 prefs,
                 caps,
+                shared_account,
                 move || wake.request_repaint(),
             ));
             return;
         }
         // One route needs no measuring, so deciding does not touch the network.
         let prober = route_choice::HealthProber::for_invitation(&invitation);
-        let outcome = route_choice::decide(&invitation, &prefs, caps, &prober);
-        self.finish_joining(ctx, kind, invitation, outcome);
+        let outcome = route_choice::decide_for_login(&invitation, &prefs, caps, &prober, shared_account);
+        self.finish_joining(ctx, kind, invitation, outcome, shared_account);
     }
 
     fn finish_joining(
@@ -111,9 +126,18 @@ impl RelayApp {
         kind: FlowKind,
         original: Invitation,
         outcome: Outcome,
+        shared_account: bool,
     ) {
         match outcome.invitation {
             Ok(invitation) => {
+                // Account sign-in may have completed while the probes ran.
+                // Do not adopt a legacy-only route into the shared-account form.
+                if !shared_account && self.central_account.account.is_some()
+                    && crate::community::account_destination(&invitation.server).is_err()
+                {
+                    self.start_joining_with_prefs(ctx, kind, original, self.prefs.connection.clone(), true);
+                    return;
+                }
                 self.adopt_invitation(ctx, kind, invitation, Some(outcome.summary));
             }
             Err(message) => {
@@ -121,6 +145,7 @@ impl RelayApp {
                     invitation: original,
                     message,
                     overridable: outcome.needs_consent,
+                    shared_account,
                 });
             }
         }
@@ -183,6 +208,7 @@ impl RelayApp {
                     invitation,
                     message: route_choice::PLAIN_PUBLIC_MESSAGE.into(),
                     overridable: true,
+                    shared_account: false,
                 });
             }
             _ => {}
@@ -197,7 +223,7 @@ impl RelayApp {
             match job.poll() {
                 Some(outcome) => {
                     let original = job.original.clone();
-                    self.finish_joining(&ctx, kind, original, outcome);
+                    self.finish_joining(&ctx, kind, original, outcome, job.shared_account);
                 }
                 None => {
                     ui.add_space(8.0);
@@ -255,21 +281,14 @@ impl RelayApp {
                 Some(RefusedAction::Retry) => {
                     // Reuse the original invitation and current safety settings.
                     // Only this click starts another bounded route check.
-                    self.start_joining(&ctx, kind, refused.invitation);
+                    self.start_joining_with_prefs(&ctx, kind, refused.invitation, self.prefs.connection.clone(), refused.shared_account);
                 }
                 Some(RefusedAction::AnotherInvitation) => {}
                 Some(RefusedAction::AllowOnce) => {
                     // For this one invitation only; the setting itself is untouched.
                     let mut once = self.prefs.connection.clone();
                     once.allow_plain_public_login = true;
-                    let prober = route_choice::HealthProber::for_invitation(&refused.invitation);
-                    let outcome = route_choice::decide(
-                        &refused.invitation,
-                        &once,
-                        Capabilities::current(),
-                        &prober,
-                    );
-                    self.finish_joining(&ctx, kind, refused.invitation.clone(), outcome);
+                    self.start_joining_with_prefs(&ctx, kind, refused.invitation, once, refused.shared_account);
                 }
                 None => self.join_flow_mut(kind).setup.refused = Some(refused),
             }

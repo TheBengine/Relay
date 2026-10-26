@@ -195,6 +195,7 @@ pub(super) fn run() {
     assert!(actors[welcomed]
         .worker
         .handle(Command::SendRich {
+            binding: None,
             origin,
             target: target.clone(),
             content: "must not escape partial admission".into(),

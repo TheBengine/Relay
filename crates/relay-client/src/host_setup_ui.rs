@@ -557,7 +557,7 @@ impl HostSetup {
             Some(address) => address,
             None => {
                 // Shared only through the account-free route: no access link is needed.
-                let route = crate::iroh_route::hosted(&origin.server_id)?;
+                let route = crate::iroh_route::hosted_status(&origin.server_id)?;
                 return Some(SharingDraft {
                     origin: origin.clone(),
                     address: route.address(),
@@ -675,7 +675,7 @@ impl HostSetup {
             invitation = invitation.with_alternatives(&self.extra_addresses)?;
         }
         // Your own community may also be reachable without any account.
-        if let Some(route) = crate::iroh_route::hosted(&pending.draft.origin.server_id) {
+        if let Some(route) = crate::iroh_route::hosted_status(&pending.draft.origin.server_id) {
             invitation = invitation.with_iroh(route.to_invitation()?);
         }
         if let Some(proof) = proof {
@@ -1004,7 +1004,7 @@ impl RelayApp {
                 .unwrap_or_default();
             if self
                 .hosting_setup
-                .ready_to_auto_copy(crate::iroh_route::hosted(&own_id).is_some(), self.busy)
+                .ready_to_auto_copy(crate::iroh_route::hosted_status(&own_id).is_some(), self.busy)
             {
                 self.hosting_setup.copy_when_shared = false;
                 self.request_invitation_copy();
@@ -1025,7 +1025,7 @@ impl RelayApp {
                 .unwrap_or_default();
             let sharing = self
                 .hosting_setup
-                .sharing(crate::iroh_route::hosted(&own_id).is_some());
+                .sharing(crate::iroh_route::hosted_status(&own_id).is_some());
             let account_free = sharing == Some(Sharing::Iroh);
             let step = if !local {
                 1
@@ -1353,13 +1353,13 @@ impl RelayApp {
             return None;
         }
         let tailscale = self.hosting_setup.hosted_address.is_some()
-            || crate::embedded_network::shared_address(&b.server_id).is_some();
+            || crate::embedded_network::hosted_status(&b.server_id).is_some();
         if let Some(shown) = self.hosting_setup.capture_sharing {
             return Some(Some(shown));
         }
         Some(Sharing::current(
             tailscale,
-            crate::iroh_route::hosted(&b.server_id).is_some(),
+            crate::iroh_route::hosted_status(&b.server_id).is_some(),
         ))
     }
 
@@ -1711,7 +1711,7 @@ impl RelayApp {
                         .extra_addresses
                         .iter()
                         .all(|address| crate::invitation::local_network_address(address))
-                    && crate::iroh_route::hosted(&self.bootstrap.as_ref().unwrap().server_id)
+                    && crate::iroh_route::hosted_status(&self.bootstrap.as_ref().unwrap().server_id)
                         .is_none()
             });
         if local_only {
@@ -2301,7 +2301,7 @@ mod tests {
         };
         assert!(!nothing.begin_invitation_copy(&other, 4));
         crate::iroh_route::rotate(OWN).unwrap();
-        let fresh = crate::iroh_route::hosted(OWN).unwrap();
+        let fresh = crate::iroh_route::hosted_status(OWN).unwrap();
         assert_eq!(fresh.endpoint_id, route.endpoint_id);
         assert_ne!(fresh.token, route.token);
         only.invitations_stopped();

@@ -140,11 +140,18 @@ impl RelayApp {
     }
 
     fn join_private_call(&mut self, call: &PrivateCall, origin: CommandOrigin) {
-        if self
-            .call_alerts
-            .clock(&origin)
-            .is_none_or(|clock| call.expires_at <= clock.unix_seconds)
-        {
+        let Some(clock) = self.call_alerts.clock(&origin) else {
+            self.notice = Some((
+                "Wait for the call status to reconnect before joining.".into(),
+                Instant::now(),
+            ));
+            return;
+        };
+        if call.state != "accepted" || call.expires_at <= clock.unix_seconds {
+            self.notice = Some((
+                "This call invitation has expired. Start a new call to try again.".into(),
+                Instant::now(),
+            ));
             return;
         }
         self.private_calls.intent = None;
@@ -462,16 +469,27 @@ impl RelayApp {
                         && self.voice_channel.is_none()
                         && self.joining_voice.is_none()
                     {
+                        let fresh = call.expires_at > timestamp;
                         if ui
                             .add_enabled(
-                                channel_available(&call, &bootstrap),
+                                fresh && channel_available(&call, &bootstrap),
                                 secondary("Join call"),
                             )
+                            .on_disabled_hover_text(if fresh {
+                                "The call room is not available yet."
+                            } else {
+                                "This invitation has expired. Start a new call to try again."
+                            })
                             .clicked()
                         {
                             if let Some(origin) = origin.clone() {
                                 self.join_private_call(&call, origin);
                             }
+                        }
+                        if !fresh {
+                            ui.label(RichText::new(
+                                "Invitation expired. Start a new call to try again."
+                            ).color(c_muted()));
                         }
                         if icon_button(ui, Icon::Close, false, "Dismiss call notice").clicked() {
                             self.private_calls.dismissed.insert(call.id.clone());

@@ -75,6 +75,14 @@ impl ScopedDrafts {
 }
 
 impl DraftStore {
+    pub fn has_draft(&self, target: &Target) -> bool {
+        self.drafts.get(target).is_some_and(|draft| {
+            !draft.content.trim().is_empty()
+                || !draft.attachments.is_empty()
+                || draft.reply.is_some()
+        })
+    }
+
     pub fn snapshot(&self) -> Vec<(Target, Draft)> {
         self.drafts
             .iter()
@@ -178,6 +186,45 @@ mod tests {
             .iter()
             .map(|attachment| attachment.id.as_str())
             .collect()
+    }
+
+    #[test]
+    fn draft_indicators_include_files_and_replies_without_counting_empty_text() {
+        let target = Target::Channel("general".into());
+        let mut store = DraftStore::default();
+        store.store(target.clone(), draft("  \n", &[]));
+        assert!(!store.has_draft(&target));
+        store.store(target.clone(), draft("", &["photo"]));
+        assert!(store.has_draft(&target));
+        store.store(
+            target.clone(),
+            Draft {
+                reply: Some(ReplyDraft {
+                    message_id: "reply".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(store.has_draft(&target));
+        let restored = store.take(&target);
+        assert!(!store.has_draft(&target));
+        assert_eq!(restored.reply.unwrap().message_id, "reply");
+    }
+
+    #[test]
+    fn draft_indicators_stay_separate_for_directs_channels_and_restored_accounts() {
+        let channel = Target::Channel("same-id".into());
+        let direct = Target::Direct("same-id".into());
+        let mut store = DraftStore::default();
+        store.store(channel.clone(), draft("Channel text", &[]));
+        assert!(store.has_draft(&channel));
+        assert!(!store.has_draft(&direct));
+        store.restore([(direct.clone(), draft("Private text", &[]))]);
+        assert!(!store.has_draft(&channel));
+        assert!(store.has_draft(&direct));
+        store.restore([]);
+        assert!(!store.has_draft(&direct));
     }
 
     #[test]

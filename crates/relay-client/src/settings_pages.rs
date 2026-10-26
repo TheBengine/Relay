@@ -99,6 +99,7 @@ impl SettingsTab {
             Self::Appearance => "Appearance",
             Self::Accessibility => "Accessibility",
             Self::Notifications => "Notifications",
+            Self::Sounds => "Sounds",
             Self::Keybinds => "Keybinds",
             Self::Advanced => "Advanced",
             Self::Server => "Server Settings",
@@ -118,7 +119,8 @@ impl SettingsTab {
             Self::VoiceVideo => "voice video microphone input output volume camera screen noise echo buffer bitrate debugging delay latency",
             Self::Appearance => "appearance theme dark light onyx ash font zoom compact cozy messages spacing emoji suggestions convert send chat box composer",
             Self::Accessibility => "accessibility motion animation gifs text readability",
-            Self::Notifications => "notifications mentions sounds mute deafen join leave",
+            Self::Notifications => "notifications mentions alerts desktop previews",
+            Self::Sounds => "sounds audio notifications ring ringtone ringback call message mute unmute deafen undeafen join leave volume custom wav",
             Self::Keybinds => "keybinds keyboard shortcuts push talk hotkey",
             Self::Advanced => "advanced storage preferences reset version connection close quit window tray background hidden icons",
             Self::Server => "server community roles channels permissions members invitations backups hosting",
@@ -265,6 +267,7 @@ impl RelayApp {
                                                         SettingsTab::Accessibility,
                                                         SettingsTab::VoiceVideo,
                                                         SettingsTab::Notifications,
+                                                        SettingsTab::Sounds,
                                                         SettingsTab::Keybinds,
                                                         SettingsTab::Advanced,
                                                         SettingsTab::Help,
@@ -370,9 +373,10 @@ impl RelayApp {
                                 )
                                 .show_inside(ui, |ui| {
                                     ui.horizontal_wrapped(|ui| {
-                                        ui.label("Your voice settings have changed.");
+                                        ui.label("Your audio settings have changed.");
                                         if ui.add(secondary("Reset")).clicked() {
                                             self.stop_settings_mic_test();
+                                            self.sound_settings.discard_import(None);
                                             self.prefs.audio = self.audio_applied.clone();
                                             self.save_preferences();
                                         }
@@ -450,6 +454,7 @@ impl RelayApp {
                                 SettingsTab::Appearance => self.appearance_page(ui),
                                 SettingsTab::Accessibility => self.accessibility_page(ui),
                                 SettingsTab::Notifications => self.notifications_page(ui),
+                                SettingsTab::Sounds => self.sounds_page(ui),
                                 SettingsTab::Keybinds => self.keybinds_page(ui),
                                 SettingsTab::Advanced => self.advanced_page(ui),
                                 SettingsTab::Help => self.help_page(ui),
@@ -501,8 +506,16 @@ impl RelayApp {
             self.defer_preferences();
         }
         if audio_before != self.prefs.audio {
+            if self.mic_test {
+                self.stop_settings_mic_test();
+                self.notice = Some(("Microphone preview stopped. Start listening again to hear your changes.".into(), Instant::now()));
+            }
             // The pinned counter is drawn before controls; refresh it immediately.
             ctx.request_repaint();
+        }
+        if before.8 != after.8 && self.mic_test {
+            self.stop_settings_mic_test();
+            self.notice = Some(("Microphone preview stopped. Start listening again to use your new push-to-talk key.".into(), Instant::now()));
         }
     }
 
@@ -600,7 +613,7 @@ impl RelayApp {
             ui,
             "remember-drafts",
             "Remember message drafts",
-            "Restore unfinished messages after restarting Relay. Preferences and drafts are protected by Windows for this PC's user account.",
+            "Restore drafts and unconfirmed outgoing messages after restarting Relay. They are protected by Windows for this PC's user account. Turning this off keeps them only until Relay closes.",
             &mut self.prefs.remember_drafts,
         );
         if ui.add(secondary("Clear Saved Drafts")).clicked() {
@@ -612,6 +625,18 @@ impl RelayApp {
             self.reply = None;
             self.save_preferences();
             self.notice = Some(("Saved drafts cleared".into(), Instant::now()));
+        }
+        if !self.outbox.is_empty() {
+            controls::description(ui, &format!("{} unconfirmed outgoing messages are kept on this PC. Retry them in their original conversations. Removing saved attempts does not delete messages already delivered.", self.outbox.iter().count()));
+            if ui.add_enabled(self.pending_sends.is_empty() && self.outbox_pending.is_empty(), secondary("Clear saved outgoing messages"))
+                .on_hover_text("Remove saved outgoing attempts for every community on this PC.")
+                .clicked() {
+                self.outbox.clear();
+                self.outgoing_messages.retain(|(_, _, _, confirmed)| *confirmed);
+                self.send_ids.clear();
+                self.save_preferences();
+                self.notice = Some(("Saved outgoing messages cleared from this PC".into(), Instant::now()));
+            }
         }
         controls::divider(ui);
         controls::section_heading(ui,"Community privacy","The server's owner controls access and retention. Private channels and direct messages follow server permissions.");
@@ -626,8 +651,7 @@ impl RelayApp {
         self.game_activity_settings(ui);
     }
 
-    /// How Relay reaches a community. Automatic is right for almost everyone;
-    /// the other choices are for a friend who needs a particular route.
+    /// New invitations prefer iroh; joined communities retain their saved route.
     fn connection_route_settings(&mut self, ui: &mut egui::Ui) {
         let capabilities = crate::route_choice::Capabilities::current();
         controls::nav_group(ui, "HOW TO CONNECT");
@@ -645,7 +669,9 @@ impl RelayApp {
                     .changed();
             });
             let explanation = if unavailable {
-                "Not part of this version of Relay yet."
+                "iroh is not included in this copy of Relay. Your saved choice is kept."
+            } else if mode == crate::route_choice::ConnectionMode::PreferIroh && !capabilities.iroh {
+                "iroh is not included in this copy. Use a direct address offered by the invitation, or choose Tailscale below."
             } else {
                 mode.explanation()
             };
@@ -655,8 +681,7 @@ impl RelayApp {
             });
         }
         if unavailable_choice_saved(&self.prefs.connection, capabilities) {
-            self.prefs.connection.mode = crate::route_choice::ConnectionMode::Automatic;
-            changed = true;
+            controls::description(ui, "Your saved iroh-only choice needs a copy of Relay with iroh. Choose another option here if you want a different connection.");
         }
         ui.collapsing("Advanced", |ui| {
             changed |= ui
@@ -757,6 +782,46 @@ impl RelayApp {
         }
     }
 
+    fn microphone_preview_ui(&mut self, ui: &mut egui::Ui) {
+        controls::section_heading(ui, "Microphone Preview", "Hear your microphone with your current input and output settings.");
+        let can_start = self.media.is_some() && self.voice_channel.is_none() && self.joining_voice.is_none();
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(self.mic_test || can_start,
+                primary(if self.mic_test { "Stop Listening" } else { "Listen to Myself" })).clicked() {
+                if self.mic_test {
+                    self.stop_settings_mic_test();
+                } else if let Some(media) = &mut self.media {
+                    if self.error.as_deref().is_some_and(|error| error.starts_with("Microphone preview:")) {
+                        self.error = None;
+                    }
+                    media.set_push_to_talk_key(self.prefs.ptt_key);
+                    match media.preview_microphone(self.prefs.audio.clone()) {
+                        Ok(()) => self.mic_test = true,
+                        Err(error) => self.error = Some(format!("Microphone preview: {error}")),
+                    }
+                }
+            }
+            let starting = self.media.as_ref().is_some_and(MediaEngine::is_microphone_test_starting);
+            let level = self.media.as_ref().map(MediaEngine::input_level).unwrap_or_default();
+            let meter_width = ui.available_width().max(120.0);
+            ui.add_sized([meter_width, 24.0],
+                egui::ProgressBar::new((level * 4.0).clamp(0.0, 1.0)).fill(c_good())
+                    .text(if starting { "Opening microphone and output…" }
+                        else if self.mic_test { "Listening locally…" } else { "Microphone level" }));
+        });
+        controls::description(ui, "Use headphones to avoid feedback. Your voice is played only on this PC, without saving or sending it. This previews local processing, not codec quality or network delay.");
+        if self.prefs.audio.transmission == TransmissionMode::PushToTalk {
+            controls::description(ui, &format!("Hold {} to hear yourself. Release it to stop playback.", ptt_key_name(self.prefs.ptt_key)));
+        } else if self.prefs.audio.transmission == TransmissionMode::VoiceActivation {
+            controls::description(ui, "Your voice-activation sensitivity also applies to this preview.");
+        }
+        controls::description(ui, if self.voice_channel.is_some() || self.joining_voice.is_some() {
+            "Leave the current call before starting a microphone preview."
+        } else {
+            "Changing an audio setting stops the preview. Start listening again to hear the new choices; Save Changes applies them to calls."
+        });
+    }
+
     fn voice_page(&mut self, ui: &mut egui::Ui) {
         let width = ui.available_width();
         if width >= 480.0 {
@@ -827,6 +892,8 @@ impl RelayApp {
             self.refresh_devices();
         }
         bluetooth_hint(ui, &self.inventory.audio, &self.prefs.audio);
+        self.microphone_preview_ui(ui);
+        controls::divider(ui);
         controls::section_heading(
             ui,
             "Receive Latency",
@@ -911,62 +978,6 @@ impl RelayApp {
         if self.prefs.audio.recover_packet_loss && self.prefs.audio.packet_samples() < 480 {
             controls::description(ui, "Recovery is inactive with 2.5 or 5 ms packets. Choose 10 or 20 ms packets to use it.");
         }
-        controls::section_heading(
-            ui,
-            "Mic Test",
-            "Check your microphone level before joining a call.",
-        );
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(
-                    self.voice_channel.is_none(),
-                    primary(if self.mic_test {
-                        "Stop Testing"
-                    } else {
-                        "Let's Check"
-                    }),
-                )
-                .clicked()
-            {
-                if self.mic_test {
-                    if let Some(media) = &mut self.media {
-                        media.stop_microphone_test();
-                    }
-                    self.mic_test = false;
-                } else {
-                    if let Some(media) = &mut self.media {
-                        match media.preview_microphone(self.prefs.audio.clone()) {
-                            Ok(()) => self.mic_test = true,
-                            Err(error) => self.error = Some(error),
-                        }
-                    }
-                }
-            }
-            let level = self
-                .media
-                .as_ref()
-                .map(MediaEngine::input_level)
-                .unwrap_or_default();
-            let meter_width = ui.available_width().max(120.0);
-            ui.add_sized(
-                [meter_width, 24.0],
-                egui::ProgressBar::new((level * 4.0).clamp(0.0, 1.0))
-                    .fill(c_good())
-                    .text(if self.mic_test {
-                        "Listening locally…"
-                    } else {
-                        "Microphone level"
-                    }),
-            );
-        });
-        controls::description(
-            ui,
-            if self.voice_channel.is_some() {
-                "Your microphone is already being used by the current call."
-            } else {
-                "Tests your current selections locally without saving or sending your voice. Stop and test again after making changes."
-            },
-        );
         controls::divider(ui);
         controls::section_heading(
             ui,
@@ -1400,13 +1411,17 @@ impl RelayApp {
             for (label, camera) in [("Screen", false), ("Camera", true)] {
                 if let Some(d) = rtc.source_diagnostics(camera) {
                     ui.label(format!(
-                        "{label}: {} × {} · {:.1} / {} fps · {}",
+                        "{label}: {} × {} · capture {:.1} / {} fps · {}",
                         d.actual_width,
                         d.actual_height,
                         d.delivered_fps,
                         d.target_fps,
                         d.video_codec
                     ));
+                    ui.label(match d.outbound_mbps {
+                        Some(rate) => format!("Measured video upload: {rate:.2} Mbps"),
+                        None => "Measured video upload: waiting for recent RTC samples".into(),
+                    }).on_hover_text("Approximate video RTP payload sent over the recent sampling interval, including retransmissions. Excludes headers, voice and application audio. This is measured traffic, separate from the selected bandwidth limit; it does not measure what viewers receive.");
                     controls::description(ui, &d.source);
                     if let Some(adaptation) = &d.adaptive_output {
                         controls::description(ui, adaptation);
@@ -1713,37 +1728,11 @@ impl RelayApp {
         controls::section_heading(
             ui,
             "Sounds",
-            "Audio feedback for microphone and call controls.",
+            "Customize message, call and voice channel sounds together.",
         );
-        controls::switch_row(
-            ui,
-            "notification-sounds",
-            "Enable Sounds",
-            "Play short sounds for mute, unmute, deafen, joining and leaving.",
-            &mut self.prefs.audio.sounds_enabled,
-        );
-        ui.add_enabled_ui(self.prefs.audio.sounds_enabled, |ui| {
-            percent_slider(
-                ui,
-                "SOUND VOLUME",
-                &mut self.prefs.audio.sound_volume,
-                0.0..=1.0,
-            );
-        });
-        if ui
-            .add_enabled(self.prefs.audio.sounds_enabled, secondary("Test Sound"))
-            .clicked()
-        {
-            if let Some(media) = &mut self.media {
-                if let Err(error) = media.preview_sound(self.prefs.audio.clone()) {
-                    self.error = Some(error);
-                }
-            }
+        if ui.add(secondary("Customize Sounds")).clicked() {
+            self.settings_tab = SettingsTab::Sounds;
         }
-        controls::description(
-            ui,
-            "Test Sound previews your choices without saving. Save Changes applies them.",
-        );
     }
 
     fn keybinds_page(&mut self, ui: &mut egui::Ui) {
@@ -1762,6 +1751,9 @@ impl RelayApp {
         for (action, key) in [
             ("Find a conversation", "Ctrl + K"),
             ("Search message history", "Ctrl + F"),
+            ("Open pinned messages", "Ctrl + P"),
+            ("Open settings", "Ctrl + ,"),
+            ("Show keyboard shortcuts", "Ctrl + /"),
             ("Send a message", "Enter"),
             ("Add a new line", "Shift + Enter"),
             ("Close settings or a dialog", "Esc"),
@@ -1892,7 +1884,7 @@ impl RelayApp {
     }
 }
 
-fn percent_slider(
+pub(super) fn percent_slider(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut f32,
@@ -1910,7 +1902,7 @@ fn percent_slider(
     ui.add_space(8.0);
 }
 
-/// A saved choice this build cannot honour falls back to Automatic.
+/// An unavailable explicit choice is explained without overwriting it.
 fn unavailable_choice_saved(
     prefs: &crate::route_choice::ConnectionPrefs,
     capabilities: crate::route_choice::Capabilities,

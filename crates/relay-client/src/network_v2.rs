@@ -311,6 +311,33 @@ pub(super) fn path_id(id: &str) -> Result<(), String> {
 }
 
 impl Worker {
+    fn validate_send_binding(&self, binding: &SendBinding) -> Result<(), String> {
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or("Connect before sending this message.")?;
+        if binding.protection.level != connection.chat.protection.level
+            || binding.protection.revision != connection.chat.protection.revision
+            || binding.plain != connection.chat.plain_allowed()
+        {
+            return Err("The protection settings changed since this message was prepared. Copy it to a new message before sending.".into());
+        }
+        // An accepted open-mode send has no cryptographic sender identity.
+        // A background device refresh must not block its exact plaintext retry.
+        if binding.plain {
+            return Ok(());
+        }
+        match connection.crypto.as_ref() {
+            Some(crypto)
+                if binding.device_id == crypto.device.identity().device_id
+                    && binding.fingerprint == crypto.device.fingerprint()? =>
+            {
+                Ok(())
+            }
+            _ => Err("The encryption device changed since this message was prepared. Copy it to a new message before sending.".into()),
+        }
+    }
+
     pub(super) fn edit_message(
         &mut self,
         message_id: &str,
@@ -1175,23 +1202,18 @@ impl Worker {
                 self.mark_community_read(&origin)?;
             }
             Command::MarkRead {
+                origin,
                 target,
                 last_read_sequence,
             } => {
-                let (channel_id, peer_id) = target_ids(&target);
-                let _: ReadState = self.patch(
-                    "/api/read-state",
-                    &MarkRead {
-                        channel_id,
-                        peer_id,
-                        last_read_sequence,
-                    },
-                )?;
-                let bootstrap: Bootstrap = self.get("/api/bootstrap")?;
-                self.emit(Update::Bootstrap(bootstrap));
+                let result = self.mark_read(&origin, &target, last_read_sequence);
+                self.emit(Update::ReadMarked {
+                    origin, target, requested_sequence: last_read_sequence, result,
+                });
             }
             Command::SendRich {
                 origin,
+                binding,
                 target,
                 content,
                 attachment_ids,
@@ -1200,6 +1222,9 @@ impl Worker {
                 mentions,
             } => {
                 self.command_connection(&origin)?;
+                if let Some(binding) = &binding {
+                    self.validate_send_binding(binding)?;
+                }
                 if client_id.is_empty() || client_id.len() > 100 {
                     return Err("This message needs a valid retry identifier.".into());
                 }
@@ -1332,7 +1357,11 @@ impl Worker {
                         }
                     }
                 }
-                self.emit(Update::SentRich { target, client_id });
+                self.emit(Update::SentRich {
+                    origin,
+                    target,
+                    client_id,
+                });
                 if let Err(error) = self.load_messages() {
                     self.emit(Update::Error(error));
                 }
@@ -2520,6 +2549,31 @@ impl Worker {
             return Err(format!("Cannot start the upload: {error}"));
         }
         Ok(())
+    }
+
+    pub(super) fn mark_read(
+        &mut self,
+        origin: &CommandOrigin,
+        target: &Target,
+        last_read_sequence: u64,
+    ) -> Result<ReadState, String> {
+        self.command_connection(origin)?;
+        let (channel_id, peer_id) = target_ids(target);
+        let mut state: ReadState = self.patch(
+            "/api/read-state",
+            &MarkRead {
+                channel_id: channel_id.clone(),
+                peer_id: peer_id.clone(),
+                last_read_sequence,
+            },
+        )?;
+        if state.channel_id != channel_id || state.peer_id != peer_id {
+            return Err("The server returned a read marker for another conversation.".into());
+        }
+        if let Some(connection) = &self.connection {
+            encrypted::reconcile_read_states(connection, std::slice::from_mut(&mut state));
+        }
+        Ok(state)
     }
 
     fn mark_community_read(&mut self, origin: &CommandOrigin) -> Result<(), String> {

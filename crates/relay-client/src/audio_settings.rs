@@ -137,6 +137,7 @@ pub struct AudioSettings {
     pub echo_delay_ms: u32,
     pub sounds_enabled: bool,
     pub sound_volume: f32,
+    pub event_sounds: crate::sound_customization::EventSounds,
 }
 
 impl Default for AudioSettings {
@@ -176,6 +177,7 @@ impl Default for AudioSettings {
             echo_delay_ms: 40,
             sounds_enabled: true,
             sound_volume: 0.25,
+            event_sounds: Default::default(),
         }
     }
 }
@@ -378,6 +380,7 @@ impl AudioSettings {
         self.ducking_volume = bounded(self.ducking_volume, defaults.ducking_volume, 0.0, 1.0);
         self.priority_volume = bounded(self.priority_volume, defaults.priority_volume, 0.0, 1.0);
         self.sound_volume = bounded(self.sound_volume, defaults.sound_volume, 0.0, 1.0);
+        self.event_sounds.normalize();
         self.activation_hold_ms = self.activation_hold_ms.min(1000);
         self.bitrate_kbps = self.bitrate_kbps.clamp(16, 128);
         if !matches!(self.packet_ms, 5 | 10 | 20) {
@@ -405,7 +408,8 @@ pub(crate) fn bluetooth_enumerator(name: &str) -> bool {
     )
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AudioCue {
     Ring,
     Ringback,
@@ -417,6 +421,28 @@ pub enum AudioCue {
     Leave,
     CallEnd,
     Message,
+}
+
+impl AudioCue {
+    pub const ALL: [Self; 10] = [
+        Self::Message, Self::Ring, Self::Ringback, Self::Join, Self::Leave,
+        Self::CallEnd, Self::Mute, Self::Unmute, Self::Deafen, Self::Undeafen,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Message => "Message notification",
+            Self::Ring => "Incoming call",
+            Self::Ringback => "Outgoing call",
+            Self::Join => "Joining voice",
+            Self::Leave => "Leaving voice",
+            Self::CallEnd => "Call ended",
+            Self::Mute => "Microphone muted",
+            Self::Unmute => "Microphone unmuted",
+            Self::Deafen => "Deafen on",
+            Self::Undeafen => "Deafen off",
+        }
+    }
 }
 
 #[cfg(test)]

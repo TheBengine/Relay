@@ -441,6 +441,7 @@ impl CryptoWorker {
         }
         self.select(target);
         let updates = self.handle(Command::SendRich {
+            binding: None,
             origin: CommandOrigin::from(self.worker.connection.as_ref().unwrap()),
             target: target.clone(),
             content: content.into(),
@@ -1736,6 +1737,7 @@ fn actual_server_mls_worker_groups_voice_text_threads_polls_inbox_and_revocation
     let poll = "relay-poll:v1:{\"question\":\"Owned encrypted poll 37fb30?\",\"options\":[\"Friday\",\"Saturday\"],\"multiple\":false}";
     let poll_id = uuid::Uuid::new_v4().to_string();
     let updates = bob.handle(Command::SendRich {
+        binding: None,
         origin: bob.origin(),
         target: target.clone(),
         content: poll.into(),
@@ -2438,6 +2440,7 @@ fn actual_server_mls_worker_chat_files_and_restart() {
     assert!(alice
         .worker
         .handle(Command::SendRich {
+            binding: None,
             origin: CommandOrigin::from(alice.worker.connection.as_ref().unwrap()),
             target: dm_a.clone(),
             content: "forbidden unverified DM".into(),
@@ -2458,6 +2461,7 @@ fn actual_server_mls_worker_chat_files_and_restart() {
     let first_text = "protected channel text 5e7db9bd";
     alice.select(&target);
     let mention_send = alice.handle(Command::SendRich {
+        binding: None,
         origin: CommandOrigin::from(alice.worker.connection.as_ref().unwrap()),
         target: target.clone(),
         content: first_text.into(),
@@ -2481,6 +2485,7 @@ fn actual_server_mls_worker_chat_files_and_restart() {
     assert_eq!(raw[0].attachments[0].mime, "application/octet-stream");
     alice.reopen_keys();
     let retried_send = alice.handle(Command::SendRich {
+        binding: None,
         origin: CommandOrigin::from(alice.worker.connection.as_ref().unwrap()),
         target: target.clone(),
         content: first_text.into(),

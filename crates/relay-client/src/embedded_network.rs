@@ -39,8 +39,10 @@ struct Helper {
     token: String,
     routes: HashMap<String, Route>,
     _group: crate::handover_runtime::ProcessGroup,
+    _liveness: crate::helper_liveness::Registration<(String, String)>,
 }
 static HELPER: OnceLock<Mutex<Option<Helper>>> = OnceLock::new();
+static LIVENESS: crate::helper_liveness::Registry<(String, String)> = crate::helper_liveness::Registry::new();
 // Keep closed local routes after a helper failure: existing requests must fail
 // at localhost rather than silently trying an unprotected OS network route.
 static ROUTES: OnceLock<Mutex<HashMap<String, Route>>> = OnceLock::new();
@@ -195,13 +197,19 @@ fn launch() -> Result<Helper, String> {
         .and_then(|v| v["control_url"].as_str().map(str::to_owned))
         .filter(|s| loopback_url(s));
     match result {
-        Some(control) => Ok(Helper {
+        Some(control) => {
+            let observation = match LIVENESS.observe(&child, token_generation(&token)) {
+                Ok(observation) => observation,
+                Err(error) => { let _ = child.kill(); let _ = child.wait(); return Err(error); }
+            };
+            Ok(Helper {
             child,
             control,
             token,
             routes: HashMap::new(),
             _group: group,
-        }),
+            _liveness: observation,
+        })},
         None => {
             let _ = child.kill();
             let _ = child.wait();
@@ -464,11 +472,7 @@ pub fn endpoint(address: &str) -> String {
     let Some(route) = route else {
         return address.to_owned();
     };
-    let live = slot().lock().ok().is_some_and(|mut s| {
-        s.as_mut().is_some_and(|h| {
-            h.token == route.generation && h.child.try_wait().is_ok_and(|e| e.is_none())
-        })
-    });
+    let live = LIVENESS.alive(token_generation(&route.generation));
     if !live {
         return blocked_endpoint(address);
     }
@@ -510,10 +514,7 @@ pub(crate) fn same_form(address: &str, mapped: &url::Url) -> String {
 }
 pub fn rtc_turn(address: &str) -> Option<Turn> {
     if let Some((generation, turn)) = iroh_turns().lock().ok()?.get(address).cloned() {
-        let mut guard = slot().lock().ok()?;
-        let helper = guard.as_mut()?;
-        return (helper.token == generation
-            && helper.child.try_wait().is_ok_and(|exit| exit.is_none()))
+        return LIVENESS.alive(token_generation(&generation))
         .then_some(turn);
     }
     let host = private_host(address)?;
@@ -647,8 +648,11 @@ pub(crate) struct HttpsMediaLease {
     generation: [u8; 32],
 }
 fn media_helper_generation(helper: &Helper) -> [u8; 32] {
+    token_generation(&helper.token)
+}
+fn token_generation(token: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    Sha256::digest(helper.token.as_bytes()).into()
+    Sha256::digest(token.as_bytes()).into()
 }
 impl HttpsMediaLease {
     pub fn open(bridge: &relay_protocol::RtcMediaBridge, signaling: &str) -> Result<Self, String> {
@@ -715,11 +719,7 @@ impl HttpsMediaLease {
         })
     }
     pub fn alive(&self) -> Option<bool> {
-        let mut guard = slot().try_lock().ok()?;
-        Some(guard.as_mut().is_some_and(|h| {
-            media_helper_generation(h) == self.generation
-                && h.child.try_wait().is_ok_and(|s| s.is_none())
-        }))
+        Some(LIVENESS.alive(self.generation))
     }
 }
 impl Drop for HttpsMediaLease {
@@ -819,7 +819,8 @@ pub fn host(peer_port: u16, ingress_token: &str, server_id: &str) -> Result<Stat
         *HOSTED
             .get_or_init(|| Mutex::new(None))
             .lock()
-            .map_err(|_| "The private host is busy.")? = Some((server_id.into(), url));
+            .map_err(|_| "The private host is busy.")? = Some((server_id.into(), url.clone()));
+        LIVENESS.set_hosted(token_generation(&h.token), Some((server_id.into(), url)));
         Ok(status)
     })
 }
@@ -834,6 +835,10 @@ pub fn shared_address(server_id: &str) -> Option<String> {
     }
     Some(value.1)
 }
+/// Read-only UI observation, independent of ongoing helper network requests.
+pub fn hosted_status(server_id: &str) -> Option<String> {
+    LIVENESS.hosted().filter(|host| host.0 == server_id).map(|host| host.1)
+}
 pub fn unhost(server_id: &str) -> Result<(), String> {
     let hosted = HOSTED
         .get()
@@ -847,6 +852,7 @@ pub fn unhost(server_id: &str) -> Result<(), String> {
             "/unhost",
             Some(serde_json::json!({"server_id":server_id})),
         )?;
+        LIVENESS.set_hosted(token_generation(&h.token), None);
         Ok(())
     })?;
     if let Some(h) = HOSTED.get() {
@@ -880,6 +886,7 @@ pub fn require_rtc_route(ticket_url: &str, origin: &str, server_id: &str) -> Res
     Ok(())
 }
 pub fn shutdown() {
+    LIVENESS.retire();
     if let Ok(mut turns) = iroh_turns().lock() {
         turns.clear();
     }
@@ -891,6 +898,7 @@ pub fn shutdown() {
     }
     if let Ok(mut guard) = slot().lock() {
         if let Some(mut h) = guard.take() {
+            LIVENESS.retire();
             let _ = api::<serde_json::Value>(&h, "/shutdown", Some(serde_json::json!({})));
             let until = Instant::now() + Duration::from_secs(3);
             while Instant::now() < until {

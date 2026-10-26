@@ -424,9 +424,9 @@ impl State {
                             background_only: false,
                         });
                     }
+                    let cue = if ring.incoming { AudioCue::Ring } else { AudioCue::Ringback };
                     if !self.policy.deafened
-                        && self.policy.audio.sounds_enabled
-                        && self.policy.audio.sound_volume > 0.0
+                        && crate::sound_customization::audible(&self.policy.audio, cue)
                         && (ring.incoming || self.policy.active.as_ref() == Some(&ring.key.origin))
                         && (sound
                             .as_ref()
@@ -445,12 +445,15 @@ impl State {
         }
         if let Some((_, incoming)) = sound {
             if self.next_sound.is_none_or(|at| now >= at) {
-                effects.sound = Some(if incoming {
+                let cue = if incoming {
                     AudioCue::Ring
                 } else {
                     AudioCue::Ringback
-                });
-                self.next_sound = Some(now + CADENCE);
+                };
+                effects.sound = Some(cue);
+                self.next_sound = Some(now + crate::sound_customization::repeat_interval(
+                    cue, &self.policy.audio, CADENCE,
+                ));
             }
         }
         effects

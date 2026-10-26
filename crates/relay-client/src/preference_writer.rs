@@ -1,7 +1,9 @@
-//! Preferences are protected before any disk write. Rapid edits replace pending snapshots.
+//! Preferences are protected before any disk write. Rapid edits replace pending
+//! snapshots, but a confirmed snapshot is an ordered, non-coalescing barrier.
 use eframe::egui;
 use serde::de::DeserializeOwned;
 use std::{
+    collections::VecDeque,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Condvar, Mutex},
@@ -11,6 +13,8 @@ use zeroize::Zeroizing;
 
 const MAGIC: &[u8] = b"RLYPREF1";
 const MAX_WIRE_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_PLAIN_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONFIRMED_SNAPSHOTS: usize = 8;
 
 /// Migrate valid legacy JSON directly to protected storage. An unreadable
 /// protected file is returned as an error and remains untouched.
@@ -44,8 +48,56 @@ pub(super) fn load<T: DeserializeOwned + Default>(path: &Path) -> Result<T, Stri
 
 #[derive(Default)]
 struct Pending {
-    bytes: Option<Zeroizing<Vec<u8>>>,
+    snapshots: VecDeque<Snapshot>,
+    confirmed: usize,
     stopped: bool,
+}
+
+struct Snapshot {
+    bytes: Zeroizing<Vec<u8>>,
+    receipt: Option<mpsc::Sender<Result<(), String>>>,
+}
+
+impl Pending {
+    fn save(&mut self, bytes: Vec<u8>) {
+        // Never replace or move a snapshot across a persistence barrier.
+        if let Some(snapshot) = self
+            .snapshots
+            .back_mut()
+            .filter(|last| last.receipt.is_none())
+        {
+            snapshot.bytes = Zeroizing::new(bytes);
+        } else {
+            self.snapshots.push_back(Snapshot {
+                bytes: Zeroizing::new(bytes),
+                receipt: None,
+            });
+        }
+    }
+
+    fn save_confirmed(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<mpsc::Receiver<Result<(), String>>, String> {
+        if self.stopped {
+            return Err(
+                "Local preferences storage is shutting down. Your message was not sent.".into(),
+            );
+        }
+        if bytes.len() > MAX_PLAIN_BYTES {
+            return Err("Local preferences storage is full. Your message was not sent.".into());
+        }
+        if self.confirmed >= MAX_CONFIRMED_SNAPSHOTS {
+            return Err("Local preferences storage is busy. Try sending again in a moment.".into());
+        }
+        let (sender, receipt) = mpsc::channel();
+        self.snapshots.push_back(Snapshot {
+            bytes: Zeroizing::new(bytes),
+            receipt: Some(sender),
+        });
+        self.confirmed += 1;
+        Ok(receipt)
+    }
 }
 
 pub(super) struct PreferenceWriter {
@@ -57,6 +109,14 @@ pub(super) struct PreferenceWriter {
 
 impl PreferenceWriter {
     pub fn new(path: PathBuf, ctx: egui::Context, writable: bool) -> Self {
+        Self::with_commit(ctx, writable, move |bytes| commit(&path, bytes))
+    }
+
+    fn with_commit(
+        ctx: egui::Context,
+        writable: bool,
+        commit: impl Fn(&[u8]) -> Result<(), String> + Send + 'static,
+    ) -> Self {
         let shared = Arc::new((Mutex::new(Pending::default()), Condvar::new()));
         let (error_tx, errors) = mpsc::sync_channel(1);
         let worker = if writable {
@@ -64,19 +124,28 @@ impl PreferenceWriter {
             Some(thread::spawn(move || {
                 let (lock, wake) = &*worker_shared;
                 loop {
-                    let bytes = {
+                    let snapshot = {
                         let mut pending = lock.lock().unwrap_or_else(|error| error.into_inner());
-                        while pending.bytes.is_none() && !pending.stopped {
+                        while pending.snapshots.is_empty() && !pending.stopped {
                             pending = wake
                                 .wait(pending)
                                 .unwrap_or_else(|error| error.into_inner());
                         }
-                        match pending.bytes.take() {
-                            Some(bytes) => bytes,
+                        match pending.snapshots.pop_front() {
+                            Some(snapshot) => snapshot,
                             None => break,
                         }
                     };
-                    if let Err(error) = commit(&path, &bytes) {
+                    let result = commit(&snapshot.bytes);
+                    if let Some(receipt) = snapshot.receipt {
+                        lock.lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .confirmed -= 1;
+                        let _ = receipt.send(result);
+                        // The UI must wake on success too, before dispatching
+                        // any action gated on this exact durable snapshot.
+                        ctx.request_repaint();
+                    } else if let Err(error) = result {
                         let _ = error_tx.try_send(error);
                         ctx.request_repaint();
                     }
@@ -101,8 +170,32 @@ impl PreferenceWriter {
             .0
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        pending.bytes = Some(Zeroizing::new(bytes));
+        if pending.stopped {
+            return;
+        }
+        pending.save(bytes);
         self.shared.1.notify_one();
+    }
+
+    /// A receipt acknowledges only these bytes after the protected atomic
+    /// commit. Later settings edits cannot acknowledge an earlier failed send.
+    /// Callers must retain every staged outgoing message in subsequent snapshots
+    /// until it is acknowledged by the server or explicitly discarded.
+    pub fn save_confirmed(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<mpsc::Receiver<Result<(), String>>, String> {
+        if !self.writable {
+            return Err("Cannot save local preferences. The existing file was preserved and your message was not sent.".into());
+        }
+        let receipt = self
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .save_confirmed(bytes)?;
+        self.shared.1.notify_one();
+        Ok(receipt)
     }
     pub fn take_error(&self) -> Option<String> {
         self.errors.try_recv().ok()
@@ -190,6 +283,99 @@ fn replace(source: &Path, destination: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn ordinary_edits_coalesce_only_between_exact_confirmation_barriers() {
+        let mut pending = Pending::default();
+        pending.save(b"settings-old".to_vec());
+        pending.save(b"settings-latest".to_vec());
+        let _first = pending.save_confirmed(b"first-send".to_vec()).unwrap();
+        pending.save(b"draft-old".to_vec());
+        pending.save(b"draft-latest".to_vec());
+        let _second = pending.save_confirmed(b"second-send".to_vec()).unwrap();
+        pending.save(b"later-settings".to_vec());
+        let bytes: Vec<&[u8]> = pending
+            .snapshots
+            .iter()
+            .map(|item| item.bytes.as_slice())
+            .collect();
+        assert_eq!(
+            bytes,
+            vec![
+                b"settings-latest".as_slice(),
+                b"first-send",
+                b"draft-latest",
+                b"second-send",
+                b"later-settings"
+            ]
+        );
+        assert_eq!(pending.confirmed, 2);
+    }
+
+    #[test]
+    fn later_success_cannot_acknowledge_a_failed_snapshot() {
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let observed = committed.clone();
+        let writer = PreferenceWriter::with_commit(egui::Context::default(), true, move |bytes| {
+            observed.lock().unwrap().push(bytes.to_vec());
+            if bytes == b"failed-send" {
+                Err("synthetic failure".into())
+            } else {
+                Ok(())
+            }
+        });
+        let failed = writer.save_confirmed(b"failed-send".to_vec()).unwrap();
+        let success = writer.save_confirmed(b"later-send".to_vec()).unwrap();
+        drop(writer); // Flush both exact snapshots and close the worker.
+        assert_eq!(failed.recv().unwrap(), Err("synthetic failure".into()));
+        assert_eq!(success.recv().unwrap(), Ok(()));
+        assert_eq!(
+            *committed.lock().unwrap(),
+            vec![b"failed-send".to_vec(), b"later-send".to_vec()]
+        );
+    }
+
+    #[test]
+    fn confirmed_snapshot_is_not_acknowledged_until_commit_finishes() {
+        let (started_tx, started) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let writer = PreferenceWriter::with_commit(egui::Context::default(), true, move |_| {
+            started_tx.send(()).unwrap();
+            blocked
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            Ok(())
+        });
+        let receipt = writer.save_confirmed(b"send".to_vec()).unwrap();
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(receipt.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release.send(()).unwrap();
+        assert_eq!(
+            receipt
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn confirmed_queue_is_bounded_and_refuses_oversize_or_read_only_storage() {
+        let mut pending = Pending::default();
+        for _ in 0..MAX_CONFIRMED_SNAPSHOTS {
+            let _receipt = pending.save_confirmed(b"send".to_vec()).unwrap();
+        }
+        assert!(pending.save_confirmed(b"one-too-many".to_vec()).is_err());
+        assert_eq!(pending.snapshots.len(), MAX_CONFIRMED_SNAPSHOTS);
+        assert!(Pending::default()
+            .save_confirmed(vec![0; MAX_PLAIN_BYTES + 1])
+            .is_err());
+        let writer = PreferenceWriter::with_commit(egui::Context::default(), false, |_| {
+            panic!("must not write")
+        });
+        assert!(writer.save_confirmed(b"send".to_vec()).is_err());
+    }
 
     fn folder() -> PathBuf {
         let folder = std::env::var_os("RELAY_TEST_WORK_ROOT")

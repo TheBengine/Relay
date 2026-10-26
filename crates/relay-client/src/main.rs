@@ -54,6 +54,7 @@ mod gif_library;
 mod graphics_capture;
 mod handover_client;
 mod handover_runtime;
+mod helper_liveness;
 #[cfg(all(windows, feature = "native-rtc"))]
 mod hardware_encoder;
 mod host_route;
@@ -98,6 +99,7 @@ mod settings_ui;
 #[cfg(windows)]
 mod single_instance;
 mod sound_cues;
+mod sound_customization;
 mod tailscale_connect;
 mod timeline;
 mod tls_crypto;

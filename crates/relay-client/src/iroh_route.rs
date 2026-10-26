@@ -74,6 +74,7 @@ struct Helper {
     // Do not leave this helper (with the same persistent endpoint key) behind
     // after a hard app exit, where a second copy could race the new owner.
     _group: crate::handover_runtime::ProcessGroup,
+    _liveness: crate::helper_liveness::Registration<Hosted>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +113,7 @@ static ROUTES: OnceLock<Mutex<HashMap<String, RouteState>>> = OnceLock::new();
 static KNOWN: OnceLock<Mutex<HashMap<String, SavedIroh>>> = OnceLock::new();
 /// The community this PC hosts through iroh: its server identity and its route.
 static HOSTED: OnceLock<Mutex<Option<Hosted>>> = OnceLock::new();
+static LIVENESS: crate::helper_liveness::Registry<Hosted> = crate::helper_liveness::Registry::new();
 
 fn slot() -> &'static Mutex<Option<Helper>> {
     HELPER.get_or_init(|| Mutex::new(None))
@@ -378,12 +380,18 @@ fn launch() -> Result<Helper, String> {
         .and_then(|v| v["control_url"].as_str().map(str::to_owned))
         .filter(|s| loopback_url(s));
     match control {
-        Some(control) => Ok(Helper {
+        Some(control) => {
+            let observation = match LIVENESS.observe(&child, digest(token.as_bytes())) {
+                Ok(observation) => observation,
+                Err(error) => { let _ = child.kill(); let _ = child.wait(); return Err(error); }
+            };
+            Ok(Helper {
             child,
             control,
             token,
             _group:group,
-        }),
+            _liveness: observation,
+        })},
         None => {
             let _ = child.kill();
             let _ = child.wait();
@@ -646,11 +654,7 @@ pub(crate) fn bound_media_gateway(address:&str) -> Result<String,String> {
 }
 
 fn live(generation: &str) -> bool {
-    slot().lock().ok().is_some_and(|mut s| {
-        s.as_mut().is_some_and(|h| {
-            h.token == generation && h.child.try_wait().is_ok_and(|status| status.is_none())
-        })
-    })
+    LIVENESS.alive(digest(generation.as_bytes()))
 }
 
 pub fn routed(address: &str) -> bool {
@@ -920,6 +924,7 @@ fn host_bound(peer_port:u16,ingress_token:&str,server_id:&str,transport:Option<H
         };
         saved.to_invitation()?;
         pending.saved = Some(saved.clone());
+        LIVENESS.set_hosted(pending.generation, Some(pending.clone()));
         Ok((saved,pending.binding.clone(),pending.generation))
     })?;
     register(&saved.0);
@@ -986,6 +991,7 @@ fn release_host(helper: &Helper, binding: &HostBinding) -> Result<(), String> {
     {
         return Err("The host stop could not be confirmed. Try again; its lease was kept.".into());
     }
+    LIVENESS.set_hosted(digest(helper.token.as_bytes()), None);
     Ok(())
 }
 
@@ -1024,6 +1030,7 @@ pub fn rotate(server_id: &str) -> Result<(), String> {
         };
         fresh.to_invitation()?;
         current.saved = Some(fresh.clone());
+        LIVENESS.set_hosted(current.generation, Some(current.clone()));
         Ok(fresh)
     })?;
     register(&fresh);
@@ -1047,6 +1054,13 @@ pub fn hosted(server_id: &str) -> Option<SavedIroh> {
     .ok()
 }
 
+/// UI-only observation: no helper control request or control-plane mutex.
+/// Commands still use hosted() to serialize decisions with host/stop/rotation.
+pub fn hosted_status(server_id: &str) -> Option<SavedIroh> {
+    LIVENESS.hosted().filter(|host| host.binding.server_id == server_id)
+        .and_then(|host| host.saved)
+}
+
 pub fn unhost(server_id: &str) -> Result<(), String> {
     // Do not start a helper for a stop, and never forget a lease when its stop
     // reply is lost. The next attempt can safely repeat the same scoped stop.
@@ -1057,6 +1071,7 @@ pub fn unhost(server_id: &str) -> Result<(), String> {
         };
         if current.generation != digest(helper.token.as_bytes()) {
             *slot = None;
+            LIVENESS.set_hosted(digest(helper.token.as_bytes()), None);
             return Ok(());
         }
         if current.binding.server_id != server_id {
@@ -1083,11 +1098,13 @@ pub fn unhost(server_id: &str) -> Result<(), String> {
 }
 
 pub fn shutdown() {
+    LIVENESS.retire();
     if let Ok(mut h) = hosted_slot().lock() {
         *h = None;
     }
     if let Ok(mut guard) = slot().lock() {
         if let Some(mut h) = guard.take() {
+            LIVENESS.retire();
             let _ = api::<serde_json::Value>(
                 &h,
                 "/shutdown",
@@ -1104,6 +1121,61 @@ pub fn shutdown() {
             let _ = h.child.kill();
             let _ = h.child.wait();
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod liveness_tests {
+    use super::*;
+
+    #[test]
+    fn exact_process_observation_survives_control_contention_and_retires_generations() {
+        use std::{io::Write, os::windows::process::CommandExt, sync::mpsc};
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        // A hidden, owned input-waiting process. No Relay profile, network,
+        // helper setup, media device or system setting is involved.
+        let mut child = OwnedChild(Command::new("C:/Windows/System32/cmd.exe")
+            .args(["/d", "/q"]).stdin(Stdio::piped()).stdout(Stdio::null())
+            .stderr(Stdio::null()).creation_flags(0x08000000).spawn().unwrap());
+        let first_token = "owned-liveness-one";
+        let first_generation = digest(first_token.as_bytes());
+        let first = LIVENESS.observe(&child.0, first_generation).unwrap();
+        LIVENESS.set_hosted(first_generation, Some(Hosted {
+            binding: HostBinding { server_id: "owned-monitor".into(), lease_id: "owned".into() },
+            generation: first_generation,
+            spec: HostSpec { peer_port: 4580, ingress: [1; 32], transport: None },
+            saved: Some(SavedIroh { endpoint_id: "ab".repeat(32), relay: None, token: "owned-admission".into() }),
+        }));
+        let control = slot().lock().unwrap();
+        let host_control = hosted_slot().lock().unwrap();
+        let (reply, result) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = reply.send((live(first_token), hosted_status("owned-monitor").is_some()));
+        });
+        let observed = result.recv_timeout(Duration::from_secs(1));
+        drop(host_control);
+        drop(control);
+        reader.join().unwrap();
+        assert_eq!(observed.unwrap(), (true, true), "read-only status must not wait for helper HTTP/control locks");
+
+        let replacement_generation = digest(b"owned-liveness-two");
+        let replacement = LIVENESS.observe(&child.0, replacement_generation).unwrap();
+        drop(first); // A retired owner's later drop must not retire a replacement.
+        assert!(!LIVENESS.alive(first_generation));
+        assert!(LIVENESS.alive(replacement_generation));
+        drop(replacement);
+        assert!(!LIVENESS.alive(replacement_generation));
+        assert!(child.0.try_wait().unwrap().is_none(), "retirement is independent of process exit");
+
+        let final_observation = LIVENESS.observe(&child.0, replacement_generation).unwrap();
+        child.0.stdin.take().unwrap().write_all(b"exit\r\n").unwrap();
+        child.0.wait().unwrap();
+        assert!(!LIVENESS.alive(replacement_generation), "the exact captured process exit must invalidate status");
+        assert!(hosted_status("owned-monitor").is_none());
+        drop(final_observation);
     }
 }
 

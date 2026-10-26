@@ -114,7 +114,7 @@ impl OwnedApp {
         let pending = app.prefs.pending_creation.as_ref();
         let iroh_hosted = server_id
             .as_deref()
-            .is_some_and(|id| crate::iroh_route::hosted(id).is_some());
+            .is_some_and(|id| crate::iroh_route::hosted_status(id).is_some());
         json!({
             "run": self.run,
             "frame": self.frames,

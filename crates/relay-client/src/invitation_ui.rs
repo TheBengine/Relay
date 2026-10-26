@@ -108,14 +108,66 @@ fn lan_find_controls(
     picked
 }
 
+enum SetupAction {
+    Check(String),
+    Invitation(Invitation),
+}
+
+#[cfg(test)]
+mod setup_action_tests {
+    use super::*;
+
+    #[test]
+    fn advanced_invitation_click_keeps_full_capability_for_the_shared_join_flow() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        ctx.enable_accesskit();
+        let endpoint = "b".repeat(64);
+        let invitation = Invitation::new(
+            &crate::route_choice::iroh_address(&endpoint),
+            "4be44aef-8c98-4db6-a9d5-81c2eb311330",
+            "synthetic-invitation",
+        ).unwrap().with_iroh(crate::invitation_routes::IrohRoute::new(
+            &endpoint, None, "abcdefghijklmnopqrstuvwxyzABCDEF0123456789_-",
+        ).unwrap());
+        let mut address = invitation.browser_link();
+        let mut code = String::new();
+        let mut state = SetupState::default();
+        let mut action = None;
+        let mut frame = |events| ctx.run(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 800.0))),
+            focused: true,
+            events,
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = setup_controls(ui, &mut address, &mut code, &mut state, true);
+            });
+        });
+        let first = frame(Vec::new());
+        let button = first.platform_output.accesskit_update.unwrap().nodes.into_iter()
+            .find(|(_, node)| node.name() == Some("Use invitation")).unwrap().0;
+        frame(vec![egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            target: button,
+            action: egui::accesskit::Action::Default,
+            data: None,
+        })]);
+        let Some(SetupAction::Invitation(chosen)) = action else {
+            panic!("The advanced control must request the ordinary join flow");
+        };
+        assert!(chosen == invitation);
+        assert_eq!(address, invitation.browser_link());
+        assert!(code.is_empty() && state.invitation.is_none() && state.pending.is_none());
+    }
+}
+
 fn setup_controls(
     ui: &mut egui::Ui,
     address: &mut String,
     invite_code: &mut String,
-    registering: &mut bool,
     state: &mut SetupState,
     enabled: bool,
-) -> Option<String> {
+) -> Option<SetupAction> {
     if field(ui, "SERVER ADDRESS OR INVITATION", address, false).changed() {
         state.edited(invite_code);
     }
@@ -130,14 +182,7 @@ fn setup_controls(
             .clicked()
         {
             match Invitation::parse(address) {
-                Ok(invitation) => {
-                    *address = invitation.server.clone();
-                    *invite_code = invitation.code.clone();
-                    *registering = true;
-                    state.invitation = Some(invitation);
-                    state.pending = None;
-                    state.result = None;
-                }
+                Ok(invitation) => return Some(SetupAction::Invitation(invitation)),
                 Err(error) => state.result = Some(Err(error)),
             }
         }
@@ -168,7 +213,7 @@ fn setup_controls(
             .clicked()
         {
             state.result = None;
-            return crate::community::normalize_url(address).ok();
+            return crate::community::normalize_url(address).ok().map(SetupAction::Check);
         }
     }
     if let Some(result) = &state.result {
@@ -200,6 +245,11 @@ fn setup_controls(
 
 impl RelayApp {
     pub(super) fn setup_controls(&mut self, ui: &mut egui::Ui, kind: FlowKind) {
+        // Pasting into the advanced address form must use the same bounded
+        // route selection, consent and iroh admission as the normal Join form.
+        if self.routing_state(ui, kind) {
+            return;
+        }
         let previous = if kind == FlowKind::AddCommunity {
             self.add_community.setup.invitation.clone()
         } else {
@@ -211,7 +261,6 @@ impl RelayApp {
                 ui,
                 &mut self.add_community.url,
                 &mut self.add_community.invite,
-                &mut self.add_community.registering,
                 &mut self.add_community.setup,
                 !self.busy,
             )
@@ -220,11 +269,15 @@ impl RelayApp {
                 ui,
                 &mut self.login.url,
                 &mut self.login.invite,
-                &mut self.login.registering,
                 &mut self.login.setup,
                 !self.busy,
             )
         };
+        if let Some(SetupAction::Invitation(invitation)) = target {
+            self.start_joining(ui.ctx(), kind, invitation);
+            ui.ctx().request_repaint();
+            return;
+        }
         let relay_account = self.central_account.account.is_some();
         let found = {
             let state = if kind == FlowKind::AddCommunity {
@@ -269,7 +322,7 @@ impl RelayApp {
                 Err(message) => self.error = Some(message),
             }
         }
-        if let Some(url) = target {
+        if let Some(SetupAction::Check(url)) = target {
             let request_id = self.next_request();
             let state = if kind == FlowKind::AddCommunity {
                 &mut self.add_community.setup
@@ -442,7 +495,7 @@ impl RelayApp {
             // Every route this PC offers travels with it, as in the host's own dialog.
             .and_then(|invite| invite.with_alternatives(&offer))
             .and_then(|invite| {
-                match crate::iroh_route::hosted(&invitation.server_id) {
+                match crate::iroh_route::hosted_status(&invitation.server_id) {
                     Some(route) => Ok(invite.with_iroh(route.to_invitation()?)),
                     None => Ok(invite),
                 }
