@@ -368,6 +368,114 @@ pub fn forget_replica_token(key: &ReplicaKey<'_>) -> Result<(), String> {
     }
 }
 
+/// A purpose-separated central account refresh credential. Never stored in preferences.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CentralSession {
+    pub issuer: String,
+    pub client_id: String,
+    pub subject: String,
+    pub nonce: String,
+    pub refresh_token: String,
+}
+impl Drop for CentralSession {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.refresh_token.zeroize();
+        self.nonce.zeroize();
+    }
+}
+
+fn central_target(issuer: &str, client_id: &str, profile: Option<&std::ffi::OsStr>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut identity = Sha256::new();
+    identity.update(issuer.as_bytes());
+    identity.update([0]);
+    identity.update(client_id.as_bytes());
+    let binding = format!("{:x}", identity.finalize());
+    match profile {
+        Some(profile) => format!(
+            "Relay/profile/{:x}/central-account-v1/{binding}",
+            Sha256::digest(profile.to_string_lossy().as_bytes())
+        ),
+        None => format!("Relay/central-account-v1/{binding}"),
+    }
+}
+fn decode_central(issuer: &str, client_id: &str, raw: &[u8]) -> Result<CentralSession, String> {
+    if raw.len() > 4096 {
+        return Err("The saved Relay account is invalid.".into());
+    }
+    let saved: CentralSession =
+        serde_json::from_slice(raw).map_err(|_| "The saved Relay account is invalid.")?;
+    if saved.issuer != issuer
+        || saved.client_id != client_id
+        || saved.subject.is_empty()
+        || saved.subject.len() > 255
+        || saved.subject.chars().any(char::is_control)
+        || saved.nonce.is_empty()
+        || saved.nonce.len() > 512
+        || saved.refresh_token.is_empty()
+        || saved.refresh_token.len() > 3500
+    {
+        return Err("The saved Relay account does not match this sign-in service.".into());
+    }
+    Ok(saved)
+}
+
+pub(crate) fn load_central_session(
+    issuer: &str,
+    client_id: &str,
+) -> Result<Option<CentralSession>, String> {
+    #[cfg(windows)]
+    {
+        let raw = native::load(&central_target(issuer, client_id, profile().as_deref()))?;
+        raw.map(|raw| {
+            let raw = zeroize::Zeroizing::new(raw);
+            decode_central(issuer, client_id, &raw)
+        })
+        .transpose()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (issuer, client_id);
+        Ok(None)
+    }
+}
+pub(crate) fn save_central_session(saved: &CentralSession) -> Result<(), String> {
+    let mut raw = zeroize::Zeroizing::new(
+        serde_json::to_vec(saved).map_err(|_| "Windows could not save your Relay account.")?,
+    );
+    // Apply exactly the same bounds before writing as when reading the vault.
+    decode_central(&saved.issuer, &saved.client_id, &raw)?;
+    if raw.len() > 4096 {
+        let _wipe = zeroize::Zeroizing::new(raw);
+        return Err("The account session is too large to remember safely.".into());
+    }
+    #[cfg(windows)]
+    {
+        native::save(
+            &central_target(&saved.issuer, &saved.client_id, profile().as_deref()),
+            &saved.subject,
+            std::mem::take(&mut *raw),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _wipe = zeroize::Zeroizing::new(raw);
+        Err("Remembering Relay accounts requires the Windows credential vault.".into())
+    }
+}
+pub(crate) fn forget_central_session(issuer: &str, client_id: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        native::forget(&central_target(issuer, client_id, profile().as_deref()))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (issuer, client_id);
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn profile() -> Option<std::ffi::OsString> {
     std::env::var_os("RELAY_PROFILE_DIR")
@@ -662,5 +770,41 @@ mod tests {
         assert_eq!(found.confirmed_server_id(None).unwrap(), pin);
         forget(&url).unwrap();
         assert!(load(&url).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod central_session_tests {
+    use super::*;
+    #[test]
+    fn central_credentials_are_bound_to_issuer_client_and_profile_and_not_community_sessions() {
+        use std::ffi::OsStr;
+        let issuer = "https://accounts.example/realms/relay";
+        let target = central_target(issuer, "relay-desktop", None);
+        assert!(target.starts_with("Relay/central-account-v1/"));
+        assert_ne!(
+            target,
+            session_target("http://127.0.0.1:4580", None).unwrap()
+        );
+        assert_ne!(target, central_target(issuer, "another-client", None));
+        assert_ne!(
+            target,
+            central_target("https://other.example/realm", "relay-desktop", None)
+        );
+        assert_ne!(
+            central_target(issuer, "relay-desktop", Some(OsStr::new("C:/owned/a"))),
+            central_target(issuer, "relay-desktop", Some(OsStr::new("C:/owned/b")))
+        );
+        let saved = CentralSession {
+            issuer: issuer.into(),
+            client_id: "relay-desktop".into(),
+            subject: "owned-subject".into(),
+            nonce: "owned-nonce".into(),
+            refresh_token: "owned-refresh".into(),
+        };
+        let raw = serde_json::to_vec(&saved).unwrap();
+        assert!(decode_central(issuer, "relay-desktop", &raw).is_ok());
+        assert!(decode_central(issuer, "another-client", &raw).is_err());
+        assert!(decode_central("https://other.example/realm", "relay-desktop", &raw).is_err());
     }
 }

@@ -91,6 +91,8 @@ pub(super) struct State {
     pub(super) creation_request: Option<String>,
     pub(super) opening_local: Option<String>,
     pub(super) local_choices: Option<Result<Vec<SavedCommunity>, String>>,
+    pub(super) clearing_previous_account: Option<u64>,
+    pub(super) account_cleanup_error: Option<String>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -104,17 +106,41 @@ impl Default for State {
             creation_request: None,
             opening_local: None,
             local_choices: None,
+            clearing_previous_account: None,
+            account_cleanup_error: None,
         }
     }
 }
 
 impl State {
+    pub(super) fn finish_account_cleanup(&mut self, request_id: u64, result: Result<(), String>,
+        verified_identity: Option<(String, String)>, last_identity: &mut Option<(String, String)>) -> bool {
+        if self.clearing_previous_account != Some(request_id) { return false; }
+        match result {
+            Ok(()) => {
+                *last_identity = verified_identity;
+                self.clearing_previous_account = None;
+                self.account_cleanup_error = None;
+                true
+            }
+            Err(_) => {
+                self.account_cleanup_error = Some("Windows could not remove the previous account's saved logins. Try again before opening this account.".into());
+                false
+            }
+        }
+    }
+
     pub(super) fn waiting(&self) -> bool {
         self.pending
             .as_ref()
             .and_then(|attempt| attempt.browser.as_ref())
             .is_some_and(|browser| browser.waiting())
     }
+}
+
+/// The saved identity is a cleanup marker, never proof of authentication.
+pub(super) fn identity_needs_cleanup(previous: &Option<(String, String)>, verified: &crate::central_account::Account) -> bool {
+    previous.as_ref().is_none_or(|(issuer, subject)| issuer != &verified.issuer || subject != &verified.subject)
 }
 
 fn challenge_matches(nonce: &str, url: &str, server: &str) -> bool {
@@ -133,6 +159,22 @@ impl RelayApp {
     pub(super) fn account_front(&mut self, ctx: &egui::Context) -> bool {
         if self.capture_path.is_some() {
             return false;
+        }
+        if self.account_start.clearing_previous_account.is_some() {
+            entry_surface::page(ctx, "relay-account-switch", |ui| {
+                if let Some(error) = &self.account_start.account_cleanup_error {
+                    ui.add(egui::Label::new(RichText::new(error).color(c_bad())).wrap(true));
+                    if ui.add(primary("Try again")).clicked() {
+                        self.begin_account_cleanup();
+                    }
+                } else {
+                    ui.spinner();
+                    ui.label("Updating saved logins…");
+                }
+                if ui.add(secondary("Sign out of Relay")).clicked() { self.sign_out_relay(); }
+            });
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return true;
         }
         let gate = self.central_account.account.is_none()
             && !self.account_start.bypass
@@ -178,21 +220,8 @@ impl RelayApp {
             self.account_start.home = false;
             return false;
         }
-        #[cfg(windows)]
-        if gate
-            && self.central_account.provider.is_some()
-            && self.central_account.error.is_none()
-            && !self.central_account.waiting()
-        {
-            if let Some(surface) = self
-                .account_webview
-                .as_mut()
-                .filter(|surface| !surface.started)
-            {
-                surface.started = true;
-                self.central_account.start(ctx.clone());
-            }
-        }
+        // Silent restoration starts at launch. Interactive sign-in is an
+        // explicit action, after the user can see the saved-login choice.
         self.people_call_notice(ctx);
         entry_surface::page(ctx, "relay-account-entry", |ui| {
             let width = ui.available_width();
@@ -209,11 +238,15 @@ impl RelayApp {
                 );
                 ui.add_space(28.0);
                 if self.central_account.provider.is_some() {
+                    self.stay_signed_in_control(ui);
+                    ui.add_space(12.0);
                     if self.central_account.waiting() {
                         ui.horizontal(|ui| {
                             ui.spinner();
                             ui.label(if self.central_account.browser_ready() {
                                 "Continue in your browser, then come back to Relay."
+                            } else if self.central_account.resuming() {
+                                "Restoring your saved login…"
                             } else {
                                 "Getting sign-in ready…"
                             });
@@ -233,7 +266,7 @@ impl RelayApp {
                             if let Some(surface) = &mut self.account_webview {
                                 surface.browser_only = false;
                             }
-                            self.central_account.start(ctx.clone());
+                            self.central_account.start_remembered(ctx.clone(), self.prefs.stay_signed_in);
                         }
                         ui.add_space(24.0);
                         ui.vertical(|ui| {
@@ -252,7 +285,7 @@ impl RelayApp {
                                 if let Some(surface) = &mut self.account_webview {
                                     surface.browser_only = false;
                                 }
-                                self.central_account.start_registration(ctx.clone());
+                                self.central_account.start_registration_remembered(ctx.clone(), self.prefs.stay_signed_in);
                             }
                         });
                     }
@@ -263,7 +296,7 @@ impl RelayApp {
                         if let Some(surface) = &mut self.account_webview {
                             surface.browser_only = true;
                         }
-                        self.central_account.start(ctx.clone());
+                        self.central_account.start_remembered(ctx.clone(), self.prefs.stay_signed_in);
                     }
                 } else {
                     ui.label(RichText::new("Relay account sign-in is not configured in this copy. Install the latest version of Relay.").color(c_muted()));
@@ -281,6 +314,9 @@ impl RelayApp {
                                 egui::Label::new(RichText::new(error).color(c_bad())).wrap(true),
                             );
                         });
+                }
+                if let Some(warning) = self.central_account.warning {
+                    ui.add(egui::Label::new(RichText::new(warning).color(c_muted())).wrap(true));
                 }
             } else if self.hosting_setup.choosing_creation {
                 self.creation_choices(ui);
@@ -578,8 +614,8 @@ impl RelayApp {
             return;
         }
         if let Some((url, since)) = &auto.resuming {
-            let live = self.communities.iter().any(|c| c.url == *url)
-                || (self.session.is_some() && self.login.url == *url);
+            // A parked connection is not proof that switching to it completed.
+            let live = self.session.is_some() && self.login.url == *url;
             if !live && since.elapsed() < RESUME_WAIT {
                 ctx.request_repaint_after(Duration::from_millis(250));
                 return;
@@ -602,7 +638,7 @@ impl RelayApp {
             auto.queue.pop_front();
             // A login kept for a move (or by the user's choice) resumes without
             // a new session, which also works while that host is paused.
-            if crate::credential_vault::load(&url).ok().flatten().is_some() {
+            if self.prefs.stay_signed_in && crate::credential_vault::load(&url).ok().flatten().is_some() {
                 let expected_server_id = self
                     .prefs
                     .communities
@@ -624,7 +660,8 @@ impl RelayApp {
             auto.friends = true;
             if self.people_url().is_some() {
                 self.open_people();
-                if self.account_start.pending.is_some() {
+                if self.account_start.pending.is_some()
+                    || self.account_start.auto.as_ref().is_some_and(|auto| auto.resuming.is_some()) {
                     return;
                 }
             }
@@ -670,29 +707,17 @@ impl RelayApp {
     }
 
     pub(super) fn sign_out_relay(&mut self) {
-        self.community_friends.clear();
-        self.people_ui = Default::default();
         #[cfg(windows)]
         if let Some(surface) = &mut self.account_webview {
             surface.reset();
         }
-        self.account_start.pending = None;
-        self.save_preferences();
-        self.stop_media();
-        let mut urls: Vec<_> = self.communities.iter().map(|c| c.url.clone()).collect();
-        if self.session.is_some() {
-            urls.push(self.login.url.clone());
+        self.begin_account_cleanup();
+        if let Err(error) = self.central_account.forget() {
+            self.central_account.error = Some(error);
         }
-        urls.sort();
-        urls.dedup();
-        for url in urls {
-            self.send(Command::ForgetCommunity { url });
-        }
-        self.central_account.disconnect();
-        self.account_start = Default::default();
-        self.account_link_ui = Default::default();
         self.settings_open = false;
         self.add_community_open = false;
+        self.save_preferences();
     }
 
     pub(super) fn relay_server_account_form(&mut self, ui: &mut egui::Ui, other: bool) -> bool {
@@ -767,7 +792,9 @@ impl RelayApp {
             self.error = Some("The Friends service address has not been configured.".into());
             return;
         };
-        if self.in_people() && self.login.url == url {
+        let sign_in_required = self.community_statuses.get(&url) == Some(&ConnectionStatus::SignInRequired)
+            || (self.login.url == url && self.connection_status == ConnectionStatus::SignInRequired);
+        if self.in_people() && self.login.url == url && !sign_in_required {
             self.account_start.home = false;
             self.selected_nav = false;
             self.home_page = Some(SettingsTab::Friends);
@@ -775,6 +802,23 @@ impl RelayApp {
             return;
         }
         self.account_start.home = true;
+        if !sign_in_required && self.communities.iter().any(|community| community.url == url) {
+            self.switch_community(url.clone());
+            if let Some(auto) = &mut self.account_start.auto {
+                auto.resuming = Some((url, Instant::now()));
+            }
+            return;
+        }
+        if !sign_in_required && self.prefs.stay_signed_in && crate::credential_vault::load(&url).ok().flatten().is_some() {
+            let expected_server_id = self.prefs.communities.iter()
+                .find(|saved| saved.url == url).map(|saved| saved.server_id.clone())
+                .filter(|id| !id.is_empty());
+            if let Some(auto) = &mut self.account_start.auto {
+                auto.resuming = Some((url.clone(), Instant::now()));
+            }
+            self.send(Command::Resume { url, expected_server_id });
+            return;
+        }
         let previous_login = std::mem::take(&mut self.login);
         self.login.url = url;
         self.login.registering = true;
@@ -851,7 +895,7 @@ impl RelayApp {
             detached: false,
         });
         self.send(Command::RememberNextLogins {
-            enabled: self.prefs.remember_session,
+            enabled: self.prefs.stay_signed_in,
         });
         self.send(Command::AccountLoginBegin {
             authority,
@@ -1031,6 +1075,35 @@ impl RelayApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn account_cleanup_survives_restart_and_only_matching_success_ack_advances_identity() {
+        let account = crate::central_account::Account {
+            issuer: "https://owned.invalid/realm".into(), subject: "account-b".into(),
+            handle: "same_handle".into(), expires_at: u64::MAX,
+        };
+        let a = Some((account.issuer.clone(), "account-a".into()));
+        let b = Some((account.issuer.clone(), account.subject.clone()));
+        assert!(identity_needs_cleanup(&None, &account));
+        assert!(identity_needs_cleanup(&a, &account));
+        assert!(!identity_needs_cleanup(&b, &account));
+        let mut prefs = Preferences { last_relay_identity: a.clone(), ..Default::default() };
+        let mut state = State { clearing_previous_account: Some(17), ..Default::default() };
+        assert!(!state.finish_account_cleanup(16, Ok(()), b.clone(), &mut prefs.last_relay_identity));
+        assert_eq!(prefs.last_relay_identity, a);
+        assert!(!state.finish_account_cleanup(17, Err("owned vault failure".into()), b.clone(), &mut prefs.last_relay_identity));
+        assert_eq!(state.clearing_previous_account, Some(17));
+        assert!(state.account_cleanup_error.is_some());
+        // A crash before successful cleanup retains the old marker, including
+        // when a new refresh credential was already saved by the worker.
+        let restarted: Preferences = serde_json::from_slice(&serde_json::to_vec(&prefs).unwrap()).unwrap();
+        assert!(identity_needs_cleanup(&restarted.last_relay_identity, &account));
+        assert!(state.finish_account_cleanup(17, Ok(()), b.clone(), &mut prefs.last_relay_identity));
+        assert_eq!(prefs.last_relay_identity, b);
+        assert!(state.clearing_previous_account.is_none() && state.account_cleanup_error.is_none());
+        assert!(!state.finish_account_cleanup(17, Ok(()), a, &mut prefs.last_relay_identity));
+        assert_eq!(prefs.last_relay_identity, b);
+    }
+
     #[test]
     fn account_attempt_rejects_replaced_same_address_forms_and_closed_join_dialogs() {
         let mut login = crate::connection_setup::JoinFlow {

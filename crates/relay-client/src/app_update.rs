@@ -1977,6 +1977,9 @@ impl RelayApp {
                         Err(_) => {}
                     }
                 }
+                Update::AccountSessionsForgotten { request_id, result } => {
+                    self.account_sessions_forgotten(request_id, result);
+                }
                 Update::Notice(text) => self.notice = Some((text, Instant::now())),
                 Update::LocalHostFailed(error) => {
                     self.hosting_setup.local_ready = false;

@@ -97,7 +97,7 @@ fn owned_native_account_entry_signup_and_otp() {
         Box::new(move |cc| {
             let mut app = RelayApp::new(cc, crate::invitation_launch::Launch::default());
             app.prefs.close_to_tray = false;
-            app.central_account.provider = Some(
+            app.central_account = crate::central_account::Controller::owned(
                 crate::central_account::Provider::owned_loopback_fixture(&issuer),
             );
             app.central_account.error = None;

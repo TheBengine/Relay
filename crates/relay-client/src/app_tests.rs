@@ -228,6 +228,20 @@ fn pre_theme_preferences_keep_real_devices_communities_and_privacy_choices() {
 }
 
 #[test]
+fn sign_in_preferences_default_to_staying_signed_in_and_preserve_explicit_opt_out() {
+    let new = Preferences::default();
+    assert!(new.stay_signed_in && new.remember_session);
+    let old: Preferences = serde_json::from_str(r#"{"server":"","username":"","remember_session":false}"#).unwrap();
+    // The old password-only choice is preserved; the new combined account
+    // choice is shown before the next interactive account sign-in.
+    assert!(old.stay_signed_in);
+    assert!(!old.remember_session);
+    let chosen = Preferences { stay_signed_in: false, remember_session: false, ..new };
+    let restarted: Preferences = serde_json::from_slice(&serde_json::to_vec(&chosen).unwrap()).unwrap();
+    assert!(!restarted.stay_signed_in && !restarted.remember_session);
+}
+
+#[test]
 fn older_preferences_prefer_iroh_and_keep_a_chosen_mode() {
     let mut legacy = serde_json::to_value(Preferences::default()).unwrap();
     legacy.as_object_mut().unwrap().remove("connection");

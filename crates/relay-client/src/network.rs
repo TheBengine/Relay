@@ -381,6 +381,16 @@ pub enum Command {
     RememberNextLogins {
         enabled: bool,
     },
+    /// Apply the shared-account choice to these known server/Friends sessions,
+    /// including parked connections, without signing them out while in use.
+    RememberAccountSessions {
+        enabled: bool,
+        urls: Vec<String>,
+    },
+    ForgetAccountSessions {
+        urls: Vec<String>,
+        request_id: u64,
+    },
     /// Keep this server's current login on this PC: a host paused for a move
     /// issues no new sessions, so the people moving it must be able to resume.
     KeepSignedInForMove {
@@ -703,6 +713,10 @@ pub enum Update {
         frames: Vec<(MediaFrame, Arc<eframe::egui::ColorImage>)>,
     },
     Notice(String),
+    AccountSessionsForgotten {
+        request_id: u64,
+        result: Result<(), String>,
+    },
     Error(String),
     LocalHostFailed(String),
     LocalOpened(crate::community::SavedCommunity),

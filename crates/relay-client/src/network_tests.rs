@@ -615,6 +615,227 @@ fn remembered_normal_close_keeps_session_and_protected_actor_continuity() {
         .any(|path| path == "/api/logout"));
 }
 
+#[cfg(windows)]
+struct OwnedSignInVault(Vec<String>);
+
+#[cfg(windows)]
+impl OwnedSignInVault {
+    fn new(urls: Vec<String>) -> Self {
+        use std::os::windows::fs::MetadataExt;
+        let profile = PathBuf::from(std::env::var_os("RELAY_PROFILE_DIR")
+            .expect("the sign-in vault test requires its isolated profile"));
+        let root = PathBuf::from(r"C:\Important\Projects\2026-10-03\can\work\relay-signin-persistence-20261026");
+        assert_eq!(profile.parent(), Some(root.as_path()));
+        assert_eq!(test_work_root().parent(), Some(root.as_path()));
+        for path in profile.ancestors() {
+            assert_eq!(fs::symlink_metadata(path).unwrap().file_attributes() & 0x400, 0);
+        }
+        for url in &urls {
+            assert!(crate::credential_vault::load(url).unwrap().is_none(),
+                "fresh synthetic URL must not overwrite any existing credential");
+        }
+        Self(urls)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedSignInVault {
+    fn drop(&mut self) {
+        for url in &self.0 {
+            let _ = crate::credential_vault::forget(url);
+        }
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn remember_account_sessions_updates_active_parked_and_disconnected_without_touching_other_urls() {
+    const SERVER: &str = "46ec6ef9-9abc-47f0-8076-3b6149c37843";
+    let nonce = uuid::Uuid::new_v4();
+    let urls: Vec<_> = ["active", "parked", "disconnected", "unrelated"].into_iter()
+        .map(|name| format!("https://{name}-{nonce}.owned-signin.invalid")).collect();
+    let _vault = OwnedSignInVault::new(urls.clone());
+    let mut client = TestWorker::new();
+    client.connection(urls[1].clone());
+    client.worker.connection.as_mut().unwrap().server_id = SERVER.into();
+    let parked = client.worker.connection.take().unwrap();
+    client.worker.saved_connections.insert(urls[1].clone(), SavedConnection {
+        connection: parked,
+        stop: Arc::new(AtomicBool::new(false)),
+        dirty: Arc::new(AtomicBool::new(false)),
+    });
+    client.connection(urls[0].clone());
+    client.worker.connection.as_mut().unwrap().server_id = SERVER.into();
+    let session = client.worker.connection.as_ref().unwrap().session.clone();
+    let mut unrelated = session.clone();
+    unrelated.token = "owned-unrelated-token".into();
+    crate::credential_vault::save(&urls[2], SERVER, &session).unwrap();
+    crate::credential_vault::save(&urls[3], SERVER, &unrelated).unwrap();
+    client.handle(Command::RememberAccountSessions { enabled: true, urls: urls[..3].to_vec() });
+    assert!(client.worker.remember_session);
+    assert!(client.worker.connection.as_ref().unwrap().remembered);
+    assert!(client.worker.saved_connections[&urls[1]].connection.remembered);
+    for url in &urls[..3] {
+        let saved = crate::credential_vault::load(url).unwrap().unwrap();
+        assert_eq!(saved.server_id.as_deref(), Some(SERVER));
+        assert_eq!(saved.session.token, session.token);
+        assert_eq!(saved.session.user.id, session.user.id);
+    }
+    client.handle(Command::RememberAccountSessions { enabled: false, urls: urls[..3].to_vec() });
+    assert!(!client.worker.remember_session);
+    assert!(!client.worker.connection.as_ref().unwrap().remembered);
+    assert!(!client.worker.saved_connections[&urls[1]].connection.remembered);
+    assert_eq!(client.worker.connection.as_ref().unwrap().session.token, session.token,
+        "opting out must keep the current in-memory account connected");
+    for url in &urls[..3] {
+        assert!(crate::credential_vault::load(url).unwrap().is_none());
+    }
+    assert_eq!(crate::credential_vault::load(&urls[3]).unwrap().unwrap().session.token,
+        unrelated.token, "another saved account must not be removed");
+}
+
+#[test]
+#[cfg(windows)]
+fn remembered_account_resumes_in_a_fresh_worker_and_opt_out_revokes_on_normal_close() {
+    const SERVER: &str = "e967e2ae-3716-4e69-b8c2-c58edcffda50";
+    let server = MockHttp::with_request(|request| match request.path.as_str() {
+        "/api/health" => {
+            assert!(request.authorization.is_none());
+            Reply::json(200, invitation_health(SERVER))
+        }
+        "/api/bootstrap" => {
+            assert_eq!(request.authorization.as_deref(), Some("Bearer fixture-token"));
+            Reply::json(200, serde_json::to_value(Bootstrap {
+                server_id: SERVER.into(),
+                user: User { id: "fixture-user".into(), username: "owned-restarted".into(), ..Default::default() },
+                protocol_version: API_PROTOCOL_VERSION,
+                ..Default::default()
+            }).unwrap())
+        }
+        "/api/voice/leave" | "/api/logout" => Reply::json(200, json!({})),
+        _ => Reply::json(404, json!({})),
+    });
+    let _vault = OwnedSignInVault::new(vec![server.url.clone()]);
+    let mut first = TestWorker::new();
+    first.connection(server.url.clone());
+    first.worker.connection.as_mut().unwrap().server_id = SERVER.into();
+    first.handle(Command::RememberAccountSessions { enabled: true, urls: vec![server.url.clone()] });
+    let report = first.worker.finish_normal(Instant::now() + Duration::from_secs(2));
+    assert_eq!(report.failed_requests, 0);
+    assert_eq!(report.revoked_confirmed, 0);
+    assert!(crate::credential_vault::load(&server.url).unwrap().is_some());
+    drop(first);
+    let mut resumed = TestWorker::new();
+    let updates = resumed.handle(Command::Resume {
+        url: server.url.clone(), expected_server_id: Some(SERVER.into()),
+    });
+    assert!(updates.iter().any(|update| matches!(update,
+        Update::Connected { session, .. } if session.user.username == "owned-restarted")));
+    let connection = resumed.worker.connection.as_ref().unwrap();
+    assert!(connection.remembered);
+    assert_eq!(connection.session.token, "fixture-token");
+    assert_eq!(connection.server_id, SERVER);
+    assert!(!server.paths.lock().unwrap().iter().any(|path| path == "/api/logout"));
+    resumed.handle(Command::RememberAccountSessions { enabled: false, urls: vec![server.url.clone()] });
+    assert!(crate::credential_vault::load(&server.url).unwrap().is_none());
+    assert!(!resumed.worker.connection.as_ref().unwrap().remembered);
+    let report = resumed.worker.finish_normal(Instant::now() + Duration::from_secs(2));
+    assert_eq!(report.failed_requests, 0);
+    assert_eq!(report.revoked_confirmed, 1);
+    assert_eq!(server.paths.lock().unwrap().iter().filter(|path| path.as_str() == "/api/logout").count(), 1);
+    assert!(crate::credential_vault::load(&server.url).unwrap().is_none());
+}
+
+#[test]
+#[cfg(windows)]
+fn bulk_forget_accounts_acknowledges_completed_cleanup_and_reports_invalid_urls() {
+    const SERVER: &str = "624070bc-0d9d-40f5-b5b1-3b3bd7b6fbf2";
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let release = Arc::new(AtomicBool::new(false));
+    let handler = || {
+        let entered_tx = entered_tx.clone();
+        let release = release.clone();
+        move |path: &str| {
+            if path == "/api/logout" {
+                let _ = entered_tx.send(());
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !release.load(Ordering::Acquire) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+            Reply::json(200, json!({}))
+        }
+    };
+    let active = MockHttp::new(handler());
+    let parked = MockHttp::new(handler());
+    let saved_only = MockHttp::new(|_| panic!("saved-only cleanup must not make an HTTP request"));
+    let unrelated = MockHttp::new(|_| panic!("an unrelated account must not be contacted"));
+    let urls = vec![active.url.clone(), parked.url.clone(), saved_only.url.clone(), unrelated.url.clone()];
+    let _vault = OwnedSignInVault::new(urls.clone());
+    let mut setup = TestWorker::new();
+    setup.connection(active.url.clone());
+    let session = setup.worker.connection.as_ref().unwrap().session.clone();
+    drop(setup);
+    for url in &urls {
+        crate::credential_vault::save(url, SERVER, &session).unwrap();
+    }
+    let selected = urls[..3].to_vec();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut test = TestWorker::new();
+        test.connection(selected[1].clone());
+        let mut parked = test.worker.connection.take().unwrap();
+        parked.server_id = SERVER.into();
+        parked.remembered = true;
+        test.worker.saved_connections.insert(selected[1].clone(), SavedConnection {
+            connection: parked,
+            stop: Arc::new(AtomicBool::new(false)),
+            dirty: Arc::new(AtomicBool::new(false)),
+        });
+        test.connection(selected[0].clone());
+        test.worker.connection.as_mut().unwrap().server_id = SERVER.into();
+        test.worker.connection.as_mut().unwrap().remembered = true;
+        let updates = std::mem::replace(&mut test.updates, mpsc::sync_channel(1).1);
+        ready_tx.send(updates).unwrap();
+        test.worker.handle(Command::ForgetAccountSessions { urls: selected, request_id: 81 }).unwrap();
+        assert!(test.worker.connection.is_none());
+        assert!(test.worker.saved_connections.is_empty());
+    });
+    let updates = ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let early_ack = updates.try_iter().any(|update|
+        matches!(update, Update::AccountSessionsForgotten { request_id: 81, .. }));
+    // Release before asserting so a failed ordering check cannot strand the worker.
+    release.store(true, Ordering::Release);
+    worker.join().unwrap();
+    assert!(!early_ack, "success must not precede the completed known-account cleanup");
+    let completed: Vec<_> = updates.try_iter().filter_map(|update| match update {
+        Update::AccountSessionsForgotten { request_id: 81, result } => Some(result),
+        _ => None,
+    }).collect();
+    assert_eq!(completed.len(), 1);
+    assert!(completed[0].is_ok());
+    for url in &urls[..3] {
+        assert!(crate::credential_vault::load(url).unwrap().is_none(),
+            "a success acknowledgement must leave no selected stored session");
+    }
+    assert!(crate::credential_vault::load(&urls[3]).unwrap().is_some());
+    let mut invalid = TestWorker::new();
+    invalid.connection(unrelated.url.clone());
+    let updates = invalid.handle(Command::ForgetAccountSessions {
+        urls: vec![unrelated.url.clone(), "not a server URL".into()], request_id: 82,
+    });
+    let acknowledgements: Vec<_> = updates.iter().filter_map(|update| match update {
+        Update::AccountSessionsForgotten { request_id: 82, result } => Some(result),
+        _ => None,
+    }).collect();
+    assert_eq!(acknowledgements.len(), 1);
+    assert!(acknowledgements[0].is_err());
+    assert!(invalid.worker.connection.is_some());
+    assert_eq!(crate::credential_vault::load(&unrelated.url).unwrap().unwrap().session.token, session.token);
+    assert!(unrelated.requests.lock().unwrap().is_empty());
+}
+
 #[test]
 fn actual_encrypted_history_open_blocks_update_until_its_archive_lease_finishes() {
     let folder = test_work_root().join(format!("native-shutdown-history-{}", uuid::Uuid::new_v4()));

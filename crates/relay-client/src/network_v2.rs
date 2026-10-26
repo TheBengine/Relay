@@ -1037,6 +1037,62 @@ impl Worker {
             Command::RememberNextLogins { enabled } => {
                 self.remember_session = enabled;
             }
+            Command::RememberAccountSessions { enabled, urls } => {
+                let urls = urls.iter()
+                    .map(|url| crate::community::normalize_url(url))
+                    .collect::<Result<HashSet<_>, _>>()?;
+                self.remember_session = enabled;
+                let mut failure = None;
+                for url in urls {
+                    let connection = self.connection.as_mut().filter(|c| c.url == url)
+                        .or_else(|| self.saved_connections.get_mut(&url).map(|s| &mut s.connection));
+                    let result = if let Some(connection) = connection {
+                        // A session which could not be kept, or was opted out,
+                        // is revoked on normal close even if storage failed.
+                        connection.remembered = false;
+                        if enabled {
+                            let authority = connection.chat.authority.as_ref().map(|pin|
+                                crate::host_route::RememberedAuthority {
+                                    pin: pin.clone(),
+                                    account_provider: connection.chat.account_provider.clone(),
+                                    previous_urls: connection.chat.authority_aliases.clone(),
+                                });
+                            crate::credential_vault::save_bound(&url, &connection.server_id,
+                                &connection.session, authority.as_ref())
+                                .map(|()| connection.remembered = true)
+                        } else {
+                            crate::credential_vault::forget(&url)
+                        }
+                    } else if !enabled {
+                        crate::credential_vault::forget(&url)
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(error) = result { failure.get_or_insert(error); }
+                }
+                if let Some(error) = failure {
+                    return Err(format!("The saved-login choice could not be applied to every server: {error}"));
+                }
+            }
+            Command::ForgetAccountSessions { urls, request_id } => {
+                let result = (|| {
+                    let urls = urls.iter().map(|url| crate::community::normalize_url(url))
+                        .collect::<Result<HashSet<_>, _>>()?;
+                    let mut failure = None;
+                    for url in urls {
+                        // Acknowledgement means the protected credential was
+                        // deleted, including saved-only URLs with no live UI.
+                        if let Err(error) = crate::credential_vault::forget(&url) {
+                            failure.get_or_insert(error);
+                        }
+                        if let Err(error) = self.handle(Command::ForgetCommunity { url }) {
+                            failure.get_or_insert(error);
+                        }
+                    }
+                    failure.map_or(Ok(()), Err)
+                })();
+                self.emit(Update::AccountSessionsForgotten { request_id, result });
+            }
             Command::KeepSignedInForMove { origin } => {
                 self.command_connection(&origin)?;
                 let c = self

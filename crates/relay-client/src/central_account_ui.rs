@@ -1,7 +1,79 @@
-//! Shared account controls never alter a community login or encryption state.
+//! Shared-account sign-in and the explicit choice to keep or forget sessions.
 use super::*;
 
 impl RelayApp {
+    pub(super) fn begin_account_cleanup(&mut self) {
+        self.account_start.pending = None;
+        self.account_link_ui = Default::default();
+        self.community_friends.clear();
+        self.people_ui = Default::default();
+        self.stop_media();
+        let request_id = self.next_request();
+        self.account_start = account_start_ui::State {
+            clearing_previous_account: Some(request_id),
+            ..Default::default()
+        };
+        self.send(Command::ForgetAccountSessions {
+            urls: self.account_session_urls(),
+            request_id,
+        });
+    }
+
+    pub(super) fn account_sessions_forgotten(
+        &mut self,
+        request_id: u64,
+        result: Result<(), String>,
+    ) {
+        let identity = self
+            .central_account
+            .account
+            .as_ref()
+            .map(|account| (account.issuer.clone(), account.subject.clone()));
+        if self.account_start.finish_account_cleanup(
+            request_id,
+            result,
+            identity,
+            &mut self.prefs.last_relay_identity,
+        ) {
+            self.save_preferences();
+        }
+    }
+
+    pub(super) fn account_session_urls(&self) -> Vec<String> {
+        let mut urls: Vec<_> = self
+            .prefs
+            .communities
+            .iter()
+            .map(|saved| saved.url.clone())
+            .chain(self.communities.iter().map(|live| live.url.clone()))
+            .chain(self.people_url())
+            .collect();
+        if self.session.is_some() {
+            urls.push(self.login.url.clone());
+        }
+        urls.sort();
+        urls.dedup();
+        urls
+    }
+
+    pub(super) fn stay_signed_in_control(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .checkbox(&mut self.prefs.stay_signed_in, "Stay signed in on this PC")
+            .changed()
+        {
+            if let Err(error) = self.central_account.set_remember(self.prefs.stay_signed_in) {
+                self.central_account.warning = Some(error);
+            }
+            self.send(Command::RememberAccountSessions {
+                enabled: self.prefs.stay_signed_in,
+                urls: self.account_session_urls(),
+            });
+            self.save_preferences();
+        }
+        crate::settings_ui::description(ui,
+            "Remember your Relay account and connected servers in Windows' protected credential storage. Sign out to remove saved logins.");
+    }
+
     pub(super) fn central_account_tick(&mut self, ctx: &egui::Context) {
         let was_signed_in = self.central_account.account.is_some();
         if let Some(url) = self.central_account.poll() {
@@ -28,6 +100,22 @@ impl RelayApp {
                 url: url.into(),
                 new_tab: true,
             });
+        }
+        let changed = self.central_account.take_account_change();
+        if self
+            .central_account
+            .account
+            .as_ref()
+            .is_some_and(|account| {
+                changed
+                    || (!was_signed_in
+                        && account_start_ui::identity_needs_cleanup(
+                            &self.prefs.last_relay_identity,
+                            account,
+                        ))
+            })
+        {
+            self.begin_account_cleanup();
         }
         if !was_signed_in {
             if let Some(account) = &self.central_account.account {
@@ -116,6 +204,7 @@ impl RelayApp {
                             .clicked();
                     });
                 });
+                self.stay_signed_in_control(ui);
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(c_rail()))
@@ -157,6 +246,7 @@ impl RelayApp {
         ui.label(
             RichText::new(format!("Account service: {}", provider.service())).color(c_muted()),
         );
+        self.stay_signed_in_control(ui);
         if let Some(account) = &self.central_account.account {
             let handle = format!("@{}", account.handle);
             ui.label(RichText::new(&handle).size(font_size(22.0)).strong());
@@ -175,6 +265,8 @@ impl RelayApp {
         } else if self.central_account.waiting() {
             ui.label(if self.central_account.browser_ready() {
                 "Continue in your browser. Relay will show your account here when sign-in finishes."
+            } else if self.central_account.resuming() {
+                "Restoring your saved login…"
             } else {
                 "Contacting the Relay account service…"
             });
@@ -182,10 +274,14 @@ impl RelayApp {
                 self.central_account.disconnect();
             }
         } else if ui.add(primary("Sign in to Relay account")).clicked() {
-            self.central_account.start(ui.ctx().clone());
+            self.central_account
+                .start_remembered(ui.ctx().clone(), self.prefs.stay_signed_in);
         }
         if let Some(error) = self.central_account.error {
             ui.label(RichText::new(error).color(c_bad()));
+        }
+        if let Some(warning) = self.central_account.warning {
+            ui.add(egui::Label::new(RichText::new(warning).color(c_muted())).wrap(true));
         }
         crate::settings_ui::description(ui, "Use this account to join participating servers. Existing server accounts can be linked explicitly; their messages and private chat keys stay with them.");
         ui.add_space(22.0);

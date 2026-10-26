@@ -320,8 +320,12 @@ impl RelayApp {
                                             .clicked()
                                         {
                                             self.close_settings();
-                                            self.stop_media();
-                                            self.send(Command::Logout);
+                                            if self.central_account.provider.is_some() {
+                                                self.sign_out_relay();
+                                            } else {
+                                                self.stop_media();
+                                                self.send(Command::Logout);
+                                            }
                                         }
                                         ui.add_space(16.0);
                                         controls::description(
@@ -601,13 +605,17 @@ impl RelayApp {
             controls::description(ui, "Your existing preferences file was preserved. If it cannot be unlocked, settings stay in memory for this session; restore the original file and restart Relay.");
             controls::divider(ui);
         }
-        controls::switch_row(
-            ui,
-            "remember-login",
-            "Remember my login",
-            "Keep this community's session in the Windows credential vault.",
-            &mut self.prefs.remember_session,
-        );
+        if self.central_account.provider.is_some() {
+            self.stay_signed_in_control(ui);
+        } else {
+            controls::switch_row(
+                ui,
+                "remember-login",
+                "Remember my login",
+                "Keep this community's session in the Windows credential vault.",
+                &mut self.prefs.remember_session,
+            );
+        }
         controls::divider(ui);
         controls::switch_row(
             ui,

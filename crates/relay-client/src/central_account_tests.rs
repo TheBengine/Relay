@@ -7,17 +7,27 @@ fn account_transport_retains_only_typed_policy_denial_through_discovery_and_toke
     let sanitized = account_transport_error(&io::Error::from_raw_os_error(10013));
     assert_eq!(sanitized.raw_os_error(), Some(10013));
     let discovery = openidconnect::DiscoveryError::Request(sanitized);
-    assert_eq!(hint_or(&discovery, "discovery fallback"), WINDOWS_CONNECTION_BLOCKED);
-    let token: openidconnect::RequestTokenError<io::Error,
-        openidconnect::StandardErrorResponse<openidconnect::core::CoreErrorResponseType>> =
-        openidconnect::RequestTokenError::Request(account_transport_error(&discovery));
-    assert_eq!(hint_or(&token, "token fallback"), WINDOWS_CONNECTION_BLOCKED);
+    assert_eq!(
+        hint_or(&discovery, "discovery fallback"),
+        WINDOWS_CONNECTION_BLOCKED
+    );
+    let token: openidconnect::RequestTokenError<
+        io::Error,
+        openidconnect::StandardErrorResponse<openidconnect::core::CoreErrorResponseType>,
+    > = openidconnect::RequestTokenError::Request(account_transport_error(&discovery));
+    assert_eq!(
+        hint_or(&token, "token fallback"),
+        WINDOWS_CONNECTION_BLOCKED
+    );
 }
 
 #[test]
 fn account_transport_redacts_unrelated_errors_and_does_not_infer_a_policy_denial() {
     for error in [
-        io::Error::new(io::ErrorKind::PermissionDenied, "https://private.invalid/?token=secret"),
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "https://private.invalid/?token=secret",
+        ),
         io::Error::other("socket 10013 in untrusted response text"),
         io::Error::from_raw_os_error(10061),
     ] {
@@ -25,7 +35,10 @@ fn account_transport_redacts_unrelated_errors_and_does_not_infer_a_policy_denial
         assert_eq!(sanitized.to_string(), "Relay account request failed");
         assert_eq!(sanitized.raw_os_error(), None);
         let discovery = openidconnect::DiscoveryError::Request(sanitized);
-        assert_eq!(crate::connection_errors::hint_or(&discovery, "fallback"), "fallback");
+        assert_eq!(
+            crate::connection_errors::hint_or(&discovery, "fallback"),
+            "fallback"
+        );
     }
 }
 
@@ -352,6 +365,11 @@ struct Authorization {
     challenge: String,
     exchanges: usize,
     refreshes: usize,
+    rotate: bool,
+    expected_refresh: Option<String>,
+    fail_refreshes: usize,
+    reject_refresh: bool,
+    offline_supported: bool,
 }
 
 struct Fixture {
@@ -417,8 +435,16 @@ impl Fixture {
                 }
                 let head = String::from_utf8_lossy(&data[..header_end]);
                 let path = head.split_whitespace().nth(1).unwrap();
+                let mut status = "200 OK";
                 let result = if path.ends_with("/.well-known/openid-configuration") {
-                    json!({"issuer":url,"authorization_endpoint":format!("{url}/authorize"),"token_endpoint":format!("{url}/token"),"jwks_uri":format!("{url}/keys"),"response_types_supported":["code"],"subject_types_supported":["public"],"id_token_signing_alg_values_supported":["EdDSA"],"code_challenge_methods_supported":["S256"]})
+                    {
+                        let mut metadata = json!({"issuer":url,"authorization_endpoint":format!("{url}/authorize"),"token_endpoint":format!("{url}/token"),"jwks_uri":format!("{url}/keys"),"response_types_supported":["code"],"subject_types_supported":["public"],"id_token_signing_alg_values_supported":["EdDSA"],"code_challenge_methods_supported":["S256"]});
+                        if shared.lock().unwrap().offline_supported {
+                            metadata["scopes_supported"] =
+                                json!(["openid", "profile", "offline_access"]);
+                        }
+                        metadata
+                    }
                 } else if path.ends_with("/keys") {
                     json!({"keys":[public]})
                 } else if path.ends_with("/token") {
@@ -440,24 +466,45 @@ impl Fixture {
                         state.exchanges += 1;
                     } else {
                         assert_eq!(params["grant_type"], "refresh_token");
-                        assert_eq!(params["refresh_token"], "own-fixture-refresh-token");
+                        assert_eq!(
+                            params["refresh_token"],
+                            state
+                                .expected_refresh
+                                .as_deref()
+                                .unwrap_or("own-fixture-refresh-token")
+                        );
                         state.refreshes += 1;
                     }
-                    token_json(
-                        claims(
-                            &service,
-                            &state.nonce,
-                            "stable-subject-a",
-                            "alice_shared",
-                            if state.refreshes == 0 { 31 } else { 300 },
-                        ),
-                        &signing,
-                    )
+                    if params["grant_type"] == "refresh_token" && state.reject_refresh {
+                        status = "400 Bad Request";
+                        json!({"error":"invalid_grant"})
+                    } else if params["grant_type"] == "refresh_token" && state.fail_refreshes > 0 {
+                        state.fail_refreshes -= 1;
+                        status = "503 Service Unavailable";
+                        json!({"error":"temporarily_unavailable"})
+                    } else {
+                        let mut tokens = token_json(
+                            claims(
+                                &service,
+                                &state.nonce,
+                                "stable-subject-a",
+                                "alice_shared",
+                                if state.refreshes == 0 { 31 } else { 300 },
+                            ),
+                            &signing,
+                        );
+                        if params["grant_type"] == "refresh_token" && state.rotate {
+                            let rotated = format!("owned-rotated-refresh-{}", state.refreshes);
+                            tokens["refresh_token"] = json!(rotated);
+                            state.expected_refresh = Some(rotated);
+                        }
+                        tokens
+                    }
                 } else {
                     panic!("unexpected fixture request")
                 };
                 let body = serde_json::to_vec(&result).unwrap();
-                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
+                write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
                 stream.write_all(&body).unwrap();
             }
         });
@@ -606,6 +653,11 @@ fn cancellation_drops_old_results_and_expired_accounts_require_sign_in_again() {
         provider: Some(provider("https://accounts.example.test/realm")),
         account: None,
         error: None,
+        warning: None,
+        last_identity: None,
+        account_changed: false,
+        resuming: false,
+        persistence: Arc::new(Persistence::new(None)),
         job: Some(Job {
             cancel: cancel.clone(),
             events: rx,
@@ -767,4 +819,384 @@ fn owned_live_global_account_links_to_existing_community_account() {
     assert_eq!(status, 200, "{value}");
     assert!(value["linked"].is_null());
     println!("OWN_LINK_JOURNEY_OK: app sign-in, destination-bound link, bootstrap, replay rejection, duplicate identity rejection, unlink; local user preserved");
+}
+
+static PERSISTENCE_TEST_LOCK: Mutex<()> = Mutex::new(());
+fn wait_account_workers() {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while WORKERS.load(Ordering::Acquire) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "Owned account worker did not stop"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+#[derive(Default)]
+struct MemorySessionStore {
+    saved: Mutex<Option<SavedSession>>,
+    fail_save: AtomicBool,
+}
+impl SessionStore for MemorySessionStore {
+    fn load(&self) -> Result<Option<SavedSession>> {
+        Ok(self.saved.lock().unwrap().clone())
+    }
+    fn save(&self, saved: &SavedSession) -> Result<()> {
+        if self.fail_save.load(Ordering::Acquire) {
+            return Err(SAVE_WARNING);
+        }
+        *self.saved.lock().unwrap() = Some(saved.clone());
+        Ok(())
+    }
+    fn forget(&self) -> Result<()> {
+        *self.saved.lock().unwrap() = None;
+        Ok(())
+    }
+}
+fn saved_fixture(fixture: &Fixture) -> SavedSession {
+    fixture.state.lock().unwrap().nonce = "owned-remembered-nonce".into();
+    SavedSession {
+        issuer: fixture.provider.issuer.to_string(),
+        client_id: fixture.provider.client_id.clone(),
+        subject: "stable-subject-a".into(),
+        nonce: "owned-remembered-nonce".into(),
+        refresh_token: "own-fixture-refresh-token".into(),
+    }
+}
+fn remembered_controller(provider: Provider, store: Arc<MemorySessionStore>) -> Controller {
+    Controller {
+        provider: Some(provider),
+        account: None,
+        error: None,
+        warning: None,
+        persistence: Arc::new(Persistence {
+            state: Mutex::new(PersistenceState {
+                enabled: false,
+                current: None,
+            }),
+            store,
+        }),
+        last_identity: None,
+        account_changed: false,
+        resuming: false,
+        job: None,
+        waiting: false,
+        browser_ready: false,
+        link_proof: None,
+    }
+}
+fn restored_account(controller: &mut Controller) {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while controller.account.is_none() {
+        assert!(
+            controller.poll().is_none(),
+            "Silent restoration must not open a browser"
+        );
+        assert!(controller.error.is_none(), "Owned restoration failed");
+        assert!(Instant::now() < deadline, "Owned restoration timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        controller.account.as_ref().unwrap().subject,
+        "stable-subject-a"
+    );
+    assert!(!controller.resuming());
+}
+
+#[test]
+fn remembered_account_restores_without_browser_and_keeps_rotated_token_across_restart() {
+    let _guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
+    wait_account_workers();
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().rotate = true;
+    let store = Arc::new(MemorySessionStore::default());
+    *store.saved.lock().unwrap() = Some(saved_fixture(&fixture));
+    let mut first = remembered_controller(fixture.provider.clone(), store.clone());
+    assert!(first.resume(egui::Context::default(), true));
+    assert!(first.resuming() && first.waiting());
+    restored_account(&mut first);
+    assert_eq!(
+        store.saved.lock().unwrap().as_ref().unwrap().refresh_token,
+        "owned-rotated-refresh-1"
+    );
+    first.disconnect();
+    assert!(
+        store.saved.lock().unwrap().is_some(),
+        "Cancel must keep remembered sign-in"
+    );
+    drop(first);
+    wait_account_workers();
+    let mut second = remembered_controller(fixture.provider.clone(), store.clone());
+    assert!(second.resume(egui::Context::default(), true));
+    restored_account(&mut second);
+    assert_eq!(
+        store.saved.lock().unwrap().as_ref().unwrap().refresh_token,
+        "owned-rotated-refresh-2"
+    );
+    assert_eq!(fixture.state.lock().unwrap().exchanges, 0);
+    second.forget().unwrap();
+    assert!(store.saved.lock().unwrap().is_none());
+}
+
+#[test]
+fn temporary_refresh_failure_keeps_saved_signin_and_retries_without_browser() {
+    let _guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
+    wait_account_workers();
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().fail_refreshes = 1;
+    let store = Arc::new(MemorySessionStore::default());
+    *store.saved.lock().unwrap() = Some(saved_fixture(&fixture));
+    let mut controller = remembered_controller(fixture.provider.clone(), store.clone());
+    assert!(controller.resume(egui::Context::default(), true));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while controller.warning.is_none() {
+        assert!(controller.poll().is_none());
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(controller.resuming() && controller.waiting());
+    assert!(store.saved.lock().unwrap().is_some());
+    restored_account(&mut controller);
+    assert!(controller.warning.is_none());
+    assert_eq!(fixture.state.lock().unwrap().refreshes, 2);
+}
+
+#[test]
+fn revoked_refresh_requires_signin_and_forgets_only_that_central_session() {
+    let _guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
+    wait_account_workers();
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().reject_refresh = true;
+    let store = Arc::new(MemorySessionStore::default());
+    *store.saved.lock().unwrap() = Some(saved_fixture(&fixture));
+    let mut controller = remembered_controller(fixture.provider.clone(), store.clone());
+    assert!(controller.resume(egui::Context::default(), true));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while controller.error.is_none() {
+        assert!(controller.poll().is_none());
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!controller.resuming() && !controller.waiting());
+    assert!(controller.account.is_none());
+    assert!(store.saved.lock().unwrap().is_none());
+}
+
+#[test]
+fn remember_choice_changes_during_signin_and_cancelled_workers_cannot_restore_it() {
+    let fixture = Fixture::new();
+    let saved = saved_fixture(&fixture);
+    let store = Arc::new(MemorySessionStore::default());
+    let mut controller = remembered_controller(fixture.provider.clone(), store.clone());
+    let cancel = AtomicBool::new(false);
+    controller
+        .persistence
+        .update(saved.clone(), &cancel)
+        .unwrap();
+    assert!(store.saved.lock().unwrap().is_none());
+    controller.set_remember(true).unwrap();
+    assert!(store.saved.lock().unwrap().is_some());
+    controller.set_remember(false).unwrap();
+    controller
+        .persistence
+        .update(saved.clone(), &cancel)
+        .unwrap();
+    assert!(store.saved.lock().unwrap().is_none());
+    controller.set_remember(true).unwrap();
+    controller.forget().unwrap();
+    cancel.store(true, Ordering::Release);
+    controller.persistence.update(saved, &cancel).unwrap();
+    assert!(store.saved.lock().unwrap().is_none());
+    assert!(controller
+        .persistence
+        .state
+        .lock()
+        .unwrap()
+        .current
+        .is_none());
+}
+
+#[test]
+fn vault_save_failure_keeps_ram_session_and_is_a_warning() {
+    let fixture = Fixture::new();
+    let store = Arc::new(MemorySessionStore::default());
+    store.fail_save.store(true, Ordering::Release);
+    let mut controller = remembered_controller(fixture.provider.clone(), store.clone());
+    controller.set_remember(true).unwrap();
+    assert!(controller
+        .persistence
+        .update(saved_fixture(&fixture), &AtomicBool::new(false))
+        .is_err());
+    assert!(controller
+        .persistence
+        .state
+        .lock()
+        .unwrap()
+        .current
+        .is_some());
+    assert!(controller.set_remember(true).is_err());
+    assert_eq!(controller.warning, Some(SAVE_WARNING));
+    assert!(controller.error.is_none());
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_vault_owned_refresh_survives_two_silent_controller_restarts() {
+    let _guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
+    wait_account_workers();
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().rotate = true;
+    // Unique owned loopback issuer/purpose target: never reads a real account.
+    struct Cleanup(VaultStore);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.0.forget();
+        }
+    }
+    let _cleanup = Cleanup(VaultStore(Some(fixture.provider.clone())));
+    let mut initial = Controller::owned(fixture.provider.clone());
+    initial.set_remember(true).unwrap();
+    initial
+        .persistence
+        .update(saved_fixture(&fixture), &AtomicBool::new(false))
+        .unwrap();
+    drop(initial);
+    let mut first = Controller::owned(fixture.provider.clone());
+    assert!(first.resume(egui::Context::default(), true));
+    restored_account(&mut first);
+    drop(first);
+    wait_account_workers();
+    let mut second = Controller::owned(fixture.provider.clone());
+    assert!(second.resume(egui::Context::default(), true));
+    restored_account(&mut second);
+    assert_eq!(fixture.state.lock().unwrap().refreshes, 2);
+    assert_eq!(fixture.state.lock().unwrap().exchanges, 0);
+    second.forget().unwrap();
+    assert!(VaultStore(Some(fixture.provider.clone()))
+        .load()
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn replacement_signed_subject_signals_old_community_sessions_must_be_removed() {
+    let fixture = Fixture::new();
+    let mut controller = remembered_controller(
+        fixture.provider.clone(),
+        Arc::new(MemorySessionStore::default()),
+    );
+    controller.last_identity = Some((fixture.provider.issuer.to_string(), "old-subject".into()));
+    let (tx, rx) = mpsc::sync_channel(4);
+    controller.job = Some(Job {
+        cancel: Arc::new(AtomicBool::new(false)),
+        events: rx,
+    });
+    tx.send(Event::Account(Account {
+        issuer: fixture.provider.issuer.to_string(),
+        subject: "new-subject".into(),
+        handle: "same_handle".into(),
+        expires_at: u64::MAX,
+    }))
+    .unwrap();
+    assert!(controller.poll().is_none());
+    assert!(controller.take_account_change());
+    assert!(!controller.take_account_change());
+}
+
+#[test]
+fn persistent_signin_keeps_normal_scopes_even_when_offline_access_is_advertised() {
+    for advertised in [false, true] {
+        let fixture = Fixture::new();
+        fixture.state.lock().unwrap().offline_supported = advertised;
+        let store = Arc::new(MemorySessionStore::default());
+        let persistence = Arc::new(Persistence {
+            state: Mutex::new(PersistenceState {
+                enabled: true,
+                current: None,
+            }),
+            store,
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let provider = fixture.provider.clone();
+        let (tx, rx) = mpsc::sync_channel(4);
+        let worker = thread::spawn(move || {
+            run_flow_persistent(
+                provider,
+                worker_cancel,
+                &tx,
+                0,
+                None,
+                false,
+                Some(persistence),
+            )
+        });
+        let Event::Browser(url) = rx.recv_timeout(Duration::from_secs(3)).unwrap() else {
+            panic!("Expected owned authorization URL")
+        };
+        let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        let scopes: std::collections::BTreeSet<_> =
+            parameters["scope"].split_whitespace().collect();
+        assert_eq!(
+            scopes,
+            std::collections::BTreeSet::from(["openid", "profile"])
+        );
+        cancel.store(true, Ordering::Release);
+        let _ = worker.join().unwrap();
+    }
+}
+
+#[test]
+fn signed_identity_delivery_survives_a_temporarily_full_ui_queue() {
+    let (tx, rx) = mpsc::sync_channel(1);
+    tx.send(Event::Warning(Some(RETRY_WARNING))).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let worker = thread::spawn(move || {
+        deliver_account(
+            &tx,
+            &worker_cancel,
+            Account {
+                issuer: "https://accounts.example/realm".into(),
+                subject: "owned-subject".into(),
+                handle: "owned_user".into(),
+                expires_at: u64::MAX,
+            },
+        )
+    });
+    thread::sleep(Duration::from_millis(120));
+    assert!(!worker.is_finished());
+    assert!(matches!(rx.recv().unwrap(), Event::Warning(_)));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        Event::Account(_)
+    ));
+    assert!(worker.join().unwrap().is_ok());
+}
+
+#[test]
+fn saved_subject_and_original_nonce_remain_checked_during_silent_restoration() {
+    let _guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
+    for change_subject in [false, true] {
+        wait_account_workers();
+        let fixture = Fixture::new();
+        let store = Arc::new(MemorySessionStore::default());
+        let mut saved = saved_fixture(&fixture);
+        if change_subject {
+            saved.subject = "other-subject".into();
+        } else {
+            saved.nonce = "other-original-nonce".into();
+        }
+        *store.saved.lock().unwrap() = Some(saved);
+        let mut controller = remembered_controller(fixture.provider.clone(), store.clone());
+        assert!(controller.resume(egui::Context::default(), true));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while controller.error.is_none() {
+            assert!(controller.poll().is_none());
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(controller.account.is_none());
+        assert!(store.saved.lock().unwrap().is_none());
+    }
 }

@@ -1,14 +1,14 @@
 //! Optional app-wide OIDC account. Community logins and chat keys are independent.
-//! Credentials remain in the identity page; tokens stay inside one RAM worker.
+//! Credentials remain in the identity page; remembered refresh tokens use the OS vault.
 use eframe::egui;
 use openidconnect::{
     core::{
         CoreAuthenticationFlow, CoreClient, CoreIdTokenVerifier, CoreJwsSigningAlgorithm,
         CoreProviderMetadata, CoreTokenResponse,
     },
-    AccessTokenHash, AuthorizationCode, ClientId, CsrfToken, HttpRequest, HttpResponse, IssuerUrl,
-    Nonce, OAuth2TokenResponse, PkceCodeChallenge, RedirectUrl, Scope, SyncHttpClient,
-    TokenResponse,
+    AccessTokenHash, AuthorizationCode, ClientId, CsrfToken, EndpointMaybeSet, EndpointNotSet,
+    EndpointSet, HttpRequest, HttpResponse, IssuerUrl, Nonce, OAuth2TokenResponse,
+    PkceCodeChallenge, RedirectUrl, Scope, SyncHttpClient, TokenResponse,
 };
 use std::{
     collections::HashMap,
@@ -16,7 +16,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -471,11 +471,100 @@ fn checked_account(
     })
 }
 
+type SavedSession = crate::credential_vault::CentralSession;
+const SAVE_WARNING: &str =
+    "Relay could not remember your account on this PC. You can stay signed in for this session.";
+const RETRY_WARNING: &str = "Reconnecting to your Relay account. Your saved sign-in is kept; you do not need to enter your password again.";
+trait SessionStore: Send + Sync {
+    fn load(&self) -> Result<Option<SavedSession>>;
+    fn save(&self, saved: &SavedSession) -> Result<()>;
+    fn forget(&self) -> Result<()>;
+}
+struct VaultStore(Option<Provider>);
+impl SessionStore for VaultStore {
+    fn load(&self) -> Result<Option<SavedSession>> {
+        let Some(provider) = &self.0 else {
+            return Ok(None);
+        };
+        crate::credential_vault::load_central_session(provider.issuer.as_str(), &provider.client_id)
+            .map_err(|_| "Windows could not read your saved Relay account. Try again.")
+    }
+    fn save(&self, saved: &SavedSession) -> Result<()> {
+        crate::credential_vault::save_central_session(saved).map_err(|_| SAVE_WARNING)
+    }
+    fn forget(&self) -> Result<()> {
+        let Some(provider) = &self.0 else {
+            return Ok(());
+        };
+        crate::credential_vault::forget_central_session(
+            provider.issuer.as_str(),
+            &provider.client_id,
+        )
+        .map_err(|_| "Windows could not remove your saved Relay account. Try signing out again.")
+    }
+}
+struct PersistenceState {
+    enabled: bool,
+    current: Option<SavedSession>,
+}
+struct Persistence {
+    state: Mutex<PersistenceState>,
+    store: Arc<dyn SessionStore>,
+}
+impl Persistence {
+    fn new(provider: Option<&Provider>) -> Self {
+        Self {
+            state: Mutex::new(PersistenceState {
+                enabled: false,
+                current: None,
+            }),
+            store: Arc::new(VaultStore(provider.cloned())),
+        }
+    }
+    fn set_enabled(&self, enabled: bool) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| SAVE_WARNING)?;
+        state.enabled = enabled;
+        if !enabled {
+            self.store.forget()
+        } else if let Some(saved) = &state.current {
+            self.store.save(saved)
+        } else {
+            Ok(())
+        }
+    }
+    fn update(&self, saved: SavedSession, cancel: &AtomicBool) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| SAVE_WARNING)?;
+        if cancel.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        state.current = Some(saved);
+        if state.enabled {
+            self.store.save(state.current.as_ref().unwrap())
+        } else {
+            Ok(())
+        }
+    }
+    fn reject(&self, cancel: &AtomicBool) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| SAVE_WARNING)?;
+        if cancel.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        state.current = None;
+        self.store.forget()
+    }
+    fn clear_ram(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.current = None;
+        }
+    }
+}
+
 enum Event {
     Browser(Url),
     Account(Account),
     Proof(LinkProof),
     Failed(&'static str),
+    Warning(Option<&'static str>),
 }
 
 struct LinkRequest {
@@ -497,6 +586,7 @@ impl Drop for WorkerPermit {
     }
 }
 
+#[cfg(test)]
 fn run(
     provider: Provider,
     cancel: Arc<AtomicBool>,
@@ -506,6 +596,7 @@ fn run(
     run_flow(provider, cancel, events, port, None)
 }
 
+#[cfg(test)]
 fn run_flow(
     provider: Provider,
     cancel: Arc<AtomicBool>,
@@ -516,6 +607,7 @@ fn run_flow(
     run_flow_with_registration(provider, cancel, events, port, link, false)
 }
 
+#[cfg(test)]
 fn run_flow_with_registration(
     provider: Provider,
     cancel: Arc<AtomicBool>,
@@ -524,35 +616,18 @@ fn run_flow_with_registration(
     link: Option<LinkRequest>,
     registration: bool,
 ) -> Result<()> {
-    let http = Transport {
-        client: reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|_| "The Relay account connection could not start.")?,
-        provider: provider.clone(),
-        cancelled: cancel.clone(),
-    };
-    let metadata = CoreProviderMetadata::discover(
-        &IssuerUrl::new(provider.issuer.to_string()).map_err(|_| "Invalid account service.")?,
-        &http,
-    )
-    .map_err(|error| {
-        crate::connection_errors::hint_or(
-            &error,
-            "Cannot reach the Relay account service. Check your connection, then try again.",
-        )
-    })?;
-    // Discovery cannot select an unrelated browser destination or token endpoint.
-    if !provider.allows(metadata.authorization_endpoint().url())
-        || metadata
-            .token_endpoint()
-            .is_none_or(|url| !provider.allows(url.url()))
-    {
-        return Err("The account service returned an unsupported sign-in address.");
-    }
+    run_flow_persistent(provider, cancel, events, port, link, registration, None)
+}
+fn run_flow_persistent(
+    provider: Provider,
+    cancel: Arc<AtomicBool>,
+    events: &mpsc::SyncSender<Event>,
+    port: u16,
+    link: Option<LinkRequest>,
+    registration: bool,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    let (client, http) = account_client(&provider, &cancel)?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).map_err(|_| {
         "Another browser sign-in is already using the local callback. Finish it and try again."
     })?;
@@ -562,12 +637,9 @@ fn run_flow_with_registration(
             .local_addr()
             .map_err(|_| "Cannot create sign-in callback.")?
     );
-    let client = CoreClient::from_provider_metadata(
-        metadata,
-        ClientId::new(provider.client_id.clone()),
-        None,
-    )
-    .set_redirect_uri(RedirectUrl::new(callback).map_err(|_| "Cannot create sign-in callback.")?);
+    let client = client.set_redirect_uri(
+        RedirectUrl::new(callback).map_err(|_| "Cannot create sign-in callback.")?,
+    );
     let (challenge, pkce) = PkceCodeChallenge::new_random_sha256();
     let requested_nonce = link
         .as_ref()
@@ -614,6 +686,7 @@ fn run_flow_with_registration(
     drop(state);
     let verifier = client.id_token_verifier();
     let original = checked_account(&tokens, &verifier, &nonce, &provider, false)?;
+    drop(verifier);
     if let Some(link) = link {
         if original.issuer != link.expected.issuer || original.subject != link.expected.subject {
             return Err(
@@ -634,61 +707,257 @@ fn run_flow_with_registration(
             .map_err(|_| "Account page closed.")?;
         return Ok(());
     }
-    let mut account = original.clone();
     if cancel.load(Ordering::Acquire) {
         return Err("Sign-in cancelled.");
     }
-    events
-        .try_send(Event::Account(account.clone()))
-        .map_err(|_| "Sign-in window closed.")?;
-    // Refresh tokens are optional, private RAM state. They never enter the UI,
-    // community server, preferences, drafts or the normal community vault.
-    let mut refresh = tokens
-        .refresh_token()
-        .map(|value| Zeroizing::new(value.secret().clone()));
+    let saved = tokens.refresh_token().map(|token| SavedSession {
+        issuer: provider.issuer.to_string(),
+        client_id: provider.client_id.clone(),
+        subject: original.subject.clone(),
+        nonce: nonce.secret().clone(),
+        refresh_token: token.secret().clone(),
+    });
+    if let (Some(persistence), Some(saved)) = (&persistence, &saved) {
+        if let Err(warning) = persistence.update(saved.clone(), &cancel) {
+            let _ = events.try_send(Event::Warning(Some(warning)));
+        }
+    }
+    if saved.is_none() {
+        if let Some(persistence) = &persistence {
+            if let Err(warning) = persistence.reject(&cancel) {
+                let _ = events.try_send(Event::Warning(Some(warning)));
+            }
+        }
+    }
+    if saved.is_none()
+        && persistence
+            .as_ref()
+            .is_some_and(|p| p.state.lock().is_ok_and(|s| s.enabled))
+    {
+        let _ = events.try_send(Event::Warning(Some("This account service did not provide a reusable sign-in. You may need to sign in after restarting Relay.")));
+    }
+    deliver_account(events, &cancel, original.clone())?;
     drop(tokens);
+    let Some(saved) = saved else { return Ok(()) };
+    refresh_session(
+        client,
+        http,
+        cancel,
+        events,
+        saved,
+        Some(original),
+        persistence,
+    )
+}
+
+type AccountClient = CoreClient<
+    EndpointSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointMaybeSet,
+    EndpointMaybeSet,
+>;
+fn account_client(
+    provider: &Provider,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(AccountClient, Transport)> {
+    let http = Transport {
+        client: reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| "The Relay account connection could not start.")?,
+        provider: provider.clone(),
+        cancelled: cancel.clone(),
+    };
+    let metadata = CoreProviderMetadata::discover(
+        &IssuerUrl::new(provider.issuer.to_string()).map_err(|_| "Invalid account service.")?,
+        &http,
+    )
+    .map_err(|error| {
+        crate::connection_errors::hint_or(
+            &error,
+            "Cannot reach the Relay account service. Check your connection, then try again.",
+        )
+    })?;
+    // Discovery cannot select an unrelated browser destination or token endpoint.
+    if !provider.allows(metadata.authorization_endpoint().url())
+        || metadata
+            .token_endpoint()
+            .is_none_or(|url| !provider.allows(url.url()))
+    {
+        return Err("The account service returned an unsupported sign-in address.");
+    }
+    Ok((
+        CoreClient::from_provider_metadata(
+            metadata,
+            ClientId::new(provider.client_id.clone()),
+            None,
+        ),
+        http,
+    ))
+}
+
+// A paused UI must not turn a valid refresh into a signed-out worker. Warnings
+// are best effort/coalesced; signed identity delivery waits with cancellation.
+fn deliver_account(
+    events: &mpsc::SyncSender<Event>,
+    cancel: &AtomicBool,
+    account: Account,
+) -> Result<()> {
+    let mut event = Event::Account(account);
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match events.try_send(event) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => return Err("Sign-in window closed."),
+            Err(mpsc::TrySendError::Full(pending)) => {
+                event = pending;
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn retry_pause(cancel: &AtomicBool, attempt: u32) -> bool {
+    let seconds = match attempt {
+        0 => 1,
+        1 => 2,
+        2 => 5,
+        3 => 10,
+        _ => 30,
+    };
+    let until = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < until {
+        if cancel.load(Ordering::Acquire) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    !cancel.load(Ordering::Acquire)
+}
+
+fn resume_flow(
+    provider: Provider,
+    cancel: Arc<AtomicBool>,
+    events: &mpsc::SyncSender<Event>,
+    saved: SavedSession,
+    persistence: Arc<Persistence>,
+) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match account_client(&provider, &cancel) {
+            Ok((client, http)) => {
+                return refresh_session(
+                    client,
+                    http,
+                    cancel,
+                    events,
+                    saved,
+                    None,
+                    Some(persistence),
+                )
+            }
+            Err(_) => {
+                if attempt == 0 {
+                    let _ = events.try_send(Event::Warning(Some(RETRY_WARNING)));
+                }
+                if !retry_pause(&cancel, attempt) {
+                    return Ok(());
+                }
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn refresh_session(
+    client: AccountClient,
+    http: Transport,
+    cancel: Arc<AtomicBool>,
+    events: &mpsc::SyncSender<Event>,
+    mut saved: SavedSession,
+    mut account: Option<Account>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    let nonce = Nonce::new(saved.nonce.clone());
+    let verifier = client.id_token_verifier();
+    let mut attempt = 0;
     loop {
         if cancel.load(Ordering::Acquire) {
             return Ok(());
         }
         let now = chrono::Utc::now().timestamp().max(0) as u64;
-        let refresh_at = account.expires_at.saturating_sub(30);
-        if now < refresh_at {
+        if account
+            .as_ref()
+            .is_some_and(|a| now < a.expires_at.saturating_sub(30))
+        {
             thread::sleep(Duration::from_millis(100));
             continue;
         }
-        let Some(secret) = refresh.take() else {
-            return Ok(());
-        };
-        let token = openidconnect::RefreshToken::new(secret.to_string());
-        let refreshed = client
+        let token = openidconnect::RefreshToken::new(saved.refresh_token.clone());
+        let result = client
             .exchange_refresh_token(&token)
-            .map_err(|_| "This account needs a new browser sign-in.")?
-            .request(&http)
-            .map_err(|error| {
-                crate::connection_errors::hint_or(
-                    &error,
-                    "The account session could not be renewed. Sign in again.",
-                )
-            })?;
-        let next = checked_account(&refreshed, &verifier, &nonce, &provider, true)?;
-        if next.issuer != original.issuer
-            || next.subject != original.subject
-            || next.expires_at <= now + 30
-        {
-            return Err("The account session changed. Sign in again.");
-        }
-        refresh = refreshed
-            .refresh_token()
-            .map(|value| Zeroizing::new(value.secret().clone()))
-            .or(Some(secret));
-        account = next;
+            .map_err(|_| "This account needs a new sign-in.")?
+            .request(&http);
+        let refreshed = match result {
+            Ok(tokens) => tokens,
+            Err(openidconnect::RequestTokenError::ServerResponse(error))
+                if *error.error() == openidconnect::core::CoreErrorResponseType::InvalidGrant =>
+            {
+                if let Some(persistence) = &persistence {
+                    persistence.reject(&cancel)?;
+                }
+                return Err("Your Relay account session ended. Sign in again.");
+            }
+            Err(_) => {
+                if attempt == 0 {
+                    let _ = events.try_send(Event::Warning(Some(RETRY_WARNING)));
+                }
+                if !retry_pause(&cancel, attempt) {
+                    return Ok(());
+                }
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        };
+        let next = match checked_account(&refreshed, &verifier, &nonce, &http.provider, true) {
+            Ok(next) if next.subject == saved.subject && next.expires_at > now + 30 => next,
+            _ => {
+                if let Some(persistence) = &persistence {
+                    persistence.reject(&cancel)?;
+                }
+                return Err("The account session changed. Sign in again.");
+            }
+        };
         if cancel.load(Ordering::Acquire) {
             return Ok(());
         }
-        events
-            .try_send(Event::Account(account.clone()))
-            .map_err(|_| "Sign-in window closed.")?;
+        if let Some(rotated) = refreshed.refresh_token() {
+            use zeroize::Zeroize;
+            saved.refresh_token.zeroize();
+            saved.refresh_token = rotated.secret().clone();
+        }
+        let warning = persistence
+            .as_ref()
+            .and_then(|p| p.update(saved.clone(), &cancel).err());
+        if warning.is_some() || attempt > 0 || persistence.is_some() {
+            let _ = events.try_send(Event::Warning(warning));
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        deliver_account(events, &cancel, next.clone())?;
+        account = Some(next);
+        attempt = 0;
     }
 }
 
@@ -696,6 +965,11 @@ pub struct Controller {
     pub provider: Option<Provider>,
     pub account: Option<Account>,
     pub error: Option<&'static str>,
+    pub warning: Option<&'static str>,
+    persistence: Arc<Persistence>,
+    last_identity: Option<(String, String)>,
+    account_changed: bool,
+    resuming: bool,
     job: Option<Job>,
     waiting: bool,
     browser_ready: bool,
@@ -706,18 +980,28 @@ impl Default for Controller {
     fn default() -> Self {
         match Provider::configured() {
             Ok(provider) => Self {
+                persistence: Arc::new(Persistence::new(provider.as_ref())),
                 provider,
                 account: None,
                 error: None,
+                warning: None,
+                last_identity: None,
+                account_changed: false,
+                resuming: false,
                 job: None,
                 waiting: false,
                 browser_ready: false,
                 link_proof: None,
             },
             Err(error) => Self {
+                persistence: Arc::new(Persistence::new(None)),
                 provider: None,
                 account: None,
                 error: Some(error),
+                warning: None,
+                last_identity: None,
+                account_changed: false,
+                resuming: false,
                 job: None,
                 waiting: false,
                 browser_ready: false,
@@ -734,6 +1018,82 @@ impl Controller {
 
     pub fn browser_ready(&self) -> bool {
         self.browser_ready
+    }
+
+    pub fn set_remember(&mut self, remember: bool) -> Result<()> {
+        let result = self.persistence.set_enabled(remember);
+        self.warning = result.as_ref().err().copied();
+        result
+    }
+    pub fn resuming(&self) -> bool {
+        self.resuming
+    }
+    /// A different signed global identity must not inherit old community sessions.
+    pub fn take_account_change(&mut self) -> bool {
+        std::mem::take(&mut self.account_changed)
+    }
+    #[cfg(test)]
+    pub(crate) fn owned(provider: Provider) -> Self {
+        Self {
+            persistence: Arc::new(Persistence::new(Some(&provider))),
+            provider: Some(provider),
+            account: None,
+            error: None,
+            warning: None,
+            last_identity: None,
+            account_changed: false,
+            resuming: false,
+            job: None,
+            waiting: false,
+            browser_ready: false,
+            link_proof: None,
+        }
+    }
+    pub fn start_remembered(&mut self, ctx: egui::Context, remember: bool) {
+        let _ = self.set_remember(remember);
+        self.start(ctx);
+    }
+    pub fn start_registration_remembered(&mut self, ctx: egui::Context, remember: bool) {
+        let _ = self.set_remember(remember);
+        self.start_registration(ctx);
+    }
+    /// Restore via a fresh signed token response; never opens a browser.
+    /// True means a worker started, not that a cached identity was trusted.
+    pub fn resume(&mut self, ctx: egui::Context, remember: bool) -> bool {
+        if let Err(warning) = self.set_remember(remember) {
+            self.warning = Some(warning);
+        }
+        if !remember {
+            return false;
+        }
+        let Some(provider) = self.provider.clone() else {
+            return false;
+        };
+        self.disconnect();
+        let saved = match self.persistence.store.load() {
+            Ok(Some(saved)) => saved,
+            Ok(None) => return false,
+            Err(error) => {
+                self.error = Some(error);
+                return false;
+            }
+        };
+        if saved.issuer != provider.issuer.as_str() || saved.client_id != provider.client_id {
+            self.error = Some("The saved Relay account does not match this sign-in service.");
+            return false;
+        }
+        self.last_identity = Some((saved.issuer.clone(), saved.subject.clone()));
+        let persistence = self.persistence.clone();
+        self.launch_job(ctx, true, move |cancel, tx| {
+            resume_flow(provider, cancel, tx, saved, persistence)
+        })
+    }
+    /// Explicit sign-out only. Cancellation and application shutdown keep the vault.
+    pub fn forget(&mut self) -> Result<()> {
+        self.disconnect();
+        self.last_identity = None;
+        self.account_changed = false;
+        self.set_remember(false)
     }
 
     pub fn start(&mut self, ctx: egui::Context) {
@@ -786,18 +1146,37 @@ impl Controller {
         link: Option<LinkRequest>,
         registration: bool,
     ) {
-        self.disconnect();
         let Some(provider) = self.provider.clone() else {
             return;
         };
+        let persistence = link.is_none().then(|| self.persistence.clone());
+        self.launch_job(ctx, false, move |cancel, tx| {
+            run_flow_persistent(
+                provider,
+                cancel,
+                tx,
+                CALLBACK_PORT,
+                link,
+                registration,
+                persistence,
+            )
+        });
+    }
+    fn launch_job(
+        &mut self,
+        ctx: egui::Context,
+        resuming: bool,
+        task: impl FnOnce(Arc<AtomicBool>, &mpsc::SyncSender<Event>) -> Result<()> + Send + 'static,
+    ) -> bool {
+        self.disconnect();
         if WORKERS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < 2).then_some(n + 1)
             })
             .is_err()
         {
-            self.error = Some("The previous browser sign-in is finishing. Try again shortly.");
-            return;
+            self.error = Some("The previous sign-in is finishing. Try again shortly.");
+            return false;
         }
         let (tx, rx) = mpsc::sync_channel(4);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -806,23 +1185,18 @@ impl Controller {
             events: rx,
         });
         self.waiting = true;
+        self.resuming = resuming;
         ctx.request_repaint();
         thread::spawn(move || {
             let _permit = WorkerPermit;
-            let result = if registration {
-                run_flow_with_registration(provider, cancel.clone(), &tx, CALLBACK_PORT, None, true)
-            } else if let Some(link) = link {
-                run_flow(provider, cancel.clone(), &tx, CALLBACK_PORT, Some(link))
-            } else {
-                run(provider, cancel.clone(), &tx, CALLBACK_PORT)
-            };
-            if let Err(error) = result {
+            if let Err(error) = task(cancel.clone(), &tx) {
                 if !cancel.load(Ordering::Acquire) {
                     let _ = tx.try_send(Event::Failed(error));
                 }
             }
             ctx.request_repaint();
         });
+        true
     }
 
     /// The caller opens this URL only for its explicit Sign in action. Polling
@@ -838,6 +1212,13 @@ impl Controller {
                         browser = Some(url);
                     }
                     Ok(Event::Account(account)) => {
+                        let identity = (account.issuer.clone(), account.subject.clone());
+                        self.account_changed |= self
+                            .last_identity
+                            .as_ref()
+                            .is_some_and(|last| last != &identity);
+                        self.last_identity = Some(identity);
+                        self.resuming = false;
                         self.account = Some(account);
                         self.error = None;
                         self.waiting = false;
@@ -848,7 +1229,9 @@ impl Controller {
                         terminal = true;
                         break;
                     }
+                    Ok(Event::Warning(warning)) => self.warning = warning,
                     Ok(Event::Failed(error)) => {
+                        self.resuming = false;
                         self.error = Some(error);
                         self.waiting = false;
                         terminal = true;
@@ -870,8 +1253,14 @@ impl Controller {
             account.expires_at <= chrono::Utc::now().timestamp().max(0) as u64
         }) {
             self.account = None;
-            self.error
-                .get_or_insert("Your Relay account session ended. Sign in again.");
+            if self.job.is_some() {
+                self.resuming = true;
+                self.waiting = true;
+                self.warning = Some(RETRY_WARNING);
+            } else {
+                self.error
+                    .get_or_insert("Your Relay account session ended. Sign in again.");
+            }
         }
         browser
     }
@@ -880,6 +1269,8 @@ impl Controller {
         if let Some(job) = self.job.take() {
             job.cancel.store(true, Ordering::Release);
         }
+        self.persistence.clear_ram();
+        self.resuming = false;
         self.account = None;
         self.error = None;
         self.waiting = false;

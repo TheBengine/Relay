@@ -204,8 +204,16 @@ struct Preferences {
     outbox: durable_outbox::Outbox,
     #[serde(default = "default_remember_drafts")]
     remember_drafts: bool,
-    #[serde(default)]
+    #[serde(default = "default_remember_drafts")]
     remember_session: bool,
+    /// Shared-account sign-in also keeps subsequent server/Friends sessions.
+    /// Separate from the older password-only community preference.
+    #[serde(default = "default_remember_drafts")]
+    stay_signed_in: bool,
+    /// Cleanup marker only, never evidence of authentication. Retained across
+    /// rejected grants/crashes so another account cannot inherit saved logins.
+    #[serde(default)]
+    last_relay_identity: Option<(String, String)>,
     #[serde(default)]
     communities: Vec<SavedCommunity>,
     #[serde(default)]
@@ -462,7 +470,9 @@ impl Default for Preferences {
             conversations: ConversationMemory::default(),
             outbox: Default::default(),
             remember_drafts: true,
-            remember_session: false,
+            remember_session: true,
+            stay_signed_in: true,
+            last_relay_identity: None,
             communities: Vec::new(),
             peer_volumes: HashMap::new(),
             priority_speakers: HashSet::new(),
@@ -1444,6 +1454,9 @@ impl RelayApp {
                 }
             }
         }
+        if capture_path.is_none() {
+            app.central_account.resume(cc.egui_ctx.clone(), app.prefs.stay_signed_in);
+        }
         // Smoke runs can supply credentials through the environment; passwords are never saved.
         if let Ok(password) = std::env::var("RELAY_TEST_PASSWORD") {
             if !app.login.username.is_empty() {
@@ -2108,7 +2121,11 @@ impl RelayApp {
             .iter()
             .any(|community| community.url == url)
         {
-            if self.prefs.remember_session {
+            if if self.central_account.provider.is_some() {
+                self.prefs.stay_signed_in
+            } else {
+                self.prefs.remember_session
+            } {
                 let expected_server_id = self
                     .prefs
                     .communities
