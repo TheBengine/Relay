@@ -1088,6 +1088,7 @@ impl RelayApp {
         pending: bool,
         cooling_down: bool,
     ) -> bool {
+        self.staged_files_ui(ui);
         let editor_id = egui::Id::new(("composer-editor", self.current.clone()));
         self.composer_format_keys(ui, editor_id);
         self.composer_emoji_keys(ui, editor_id);
@@ -1106,9 +1107,9 @@ impl RelayApp {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     ui.menu_button("+", |ui| {
-                        if ui.button("Upload a file (up to 10 MB)").clicked() {
+                        if ui.button("Select a file to review").clicked() {
                             if let Some(target) = self.current.clone() {
-                                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                if let Some(path) = crate::file_pick::pick(rfd::FileDialog::new()) {
                                     self.start_upload(target, path);
                                 }
                             }
@@ -1234,6 +1235,7 @@ impl RelayApp {
                         self.open_expression_picker();
                     }
                     let ready = !pending
+                        && !self.has_staged_uploads()
                         && !cooling_down
                         && (!self.draft.trim().is_empty() || !self.attachments.is_empty());
                     if pending {
@@ -1258,7 +1260,7 @@ impl RelayApp {
         self.emoji_completion_popup(ui, editor_id, editor_rect);
         self.mention_completion_popup(ui, editor_id, editor_rect);
         self.manual_mention_popup(ui, editor_id, editor_rect);
-        submit
+        submit && !self.has_staged_uploads()
     }
 }
 

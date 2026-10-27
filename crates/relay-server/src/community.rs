@@ -3,7 +3,7 @@ use super::*;
 use axum::extract::OriginalUri;
 use std::path::PathBuf;
 
-pub const SCHEMA_VERSION: u32 = 27;
+pub const SCHEMA_VERSION: u32 = 28;
 pub const READ: u32 = 1;
 pub const SEND: u32 = 2;
 pub const JOIN: u32 = 4;
@@ -202,6 +202,8 @@ pub fn migrate_database(db: &mut Connection) -> rusqlite::Result<()> {
                 CREATE INDEX IF NOT EXISTS host_locator_anchor ON host_locator_records(anchor,expires_ms);
                 CREATE INDEX IF NOT EXISTS host_locator_expiry ON host_locator_records(expires_ms);",
             )?,
+            // File policy is durable community metadata, including replica deltas.
+            28 => crate::replica::refresh_upload_metadata_triggers(&tx)?,
             _ => unreachable!(),
         }
         tx.execute(

@@ -56,6 +56,9 @@ fn crop_controls(ui: &mut egui::Ui, picker: &mut ImagePicker, pending: bool) -> 
             ui.add(egui::Slider::new(&mut picker.zoom, 1.0..=8.0).text("Zoom"));
             ui.add(egui::Slider::new(&mut picker.x, 0.0..=1.0).text("Horizontal Position"));
             ui.add(egui::Slider::new(&mut picker.y, 0.0..=1.0).text("Vertical Position"));
+            if let Some((width, height)) = normalized_asset_dimensions(&picker.kind) {
+                ui.label(format!("Saved as PNG, resized to fit {width} × {height}. The preview stays on this PC until you save."));
+            }
             ui.horizontal(|ui| {
                 if ui.button("Reset Crop").clicked() {
                     picker.zoom = 1.0;
@@ -95,36 +98,229 @@ fn crop_rectangle(width: u32, height: u32, aspect: f32, zoom: f32, x: f32, y: f3
         height: h,
     }
 }
+static CROP_DECODE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct CropDecodeAdmission<'a>(&'a std::sync::atomic::AtomicBool);
+impl<'a> CropDecodeAdmission<'a> {
+    fn acquire(busy: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
+        busy.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .ok()
+        .map(|_| Self(busy))
+    }
+}
+impl Drop for CropDecodeAdmission<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+const CROP_INPUT_BYTES: usize = 25 * 1024 * 1024;
+const CROP_INPUT_AXIS: u32 = 8192;
+const CROP_INPUT_PIXELS: u64 = 16_000_000;
+const CROP_WORKING_AXIS: u32 = 2048;
+
 fn read_crop_image(path: &std::path::Path) -> LoadedImage {
     use std::io::Read;
     let mut bytes = vec![];
     std::fs::File::open(path)
         .map_err(|_| "Cannot open image")?
-        .take(2 * 1024 * 1024 + 1)
+        .take(CROP_INPUT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "Cannot read image")?;
-    if bytes.is_empty() || bytes.len() > 2 * 1024 * 1024 {
-        return Err("Choose an image up to 2 MiB.".into());
+    decode_crop_image(bytes)
+}
+
+// ICO's embedded PNG decoder is constructed without PNG metadata limits in image 0.24.
+// Inspect every bounded directory entry before allowing that constructor to run.
+fn validate_crop_ico(bytes: &[u8]) -> Result<(), String> {
+    let invalid = || "The ICO image is damaged or exceeds safe image limits.".to_owned();
+    if bytes.len() < 6 || bytes[..4] != [0, 0, 1, 0] {
+        return Err(invalid());
     }
-    let format = image::guess_format(&bytes).map_err(|_| "Choose PNG, JPEG or WebP")?;
+    let count = usize::from(u16::from_le_bytes([bytes[4], bytes[5]]));
+    let directory_end = 6 + count * 16;
+    if count == 0 || count > 256 || directory_end > bytes.len() {
+        return Err(invalid());
+    }
+    for entry in bytes[6..directory_end].chunks_exact(16) {
+        let length = u32::from_le_bytes(entry[8..12].try_into().map_err(|_| invalid())?) as usize;
+        let offset = u32::from_le_bytes(entry[12..16].try_into().map_err(|_| invalid())?) as usize;
+        let end = offset.checked_add(length).ok_or_else(invalid)?;
+        if offset < directory_end || length < 8 || end > bytes.len() {
+            return Err(invalid());
+        }
+        let payload = &bytes[offset..end];
+        if !payload.starts_with(b"\x89PNG\r\n\x1a\n") {
+            continue; // BMP metadata construction does not decompress image pixels/profiles.
+        }
+        let (width, height) = crate::chat_media::png_header_dimensions(payload)?;
+        if width > CROP_INPUT_AXIS
+            || height > CROP_INPUT_AXIS
+            || u64::from(width) * u64::from(height) > CROP_INPUT_PIXELS
+        {
+            return Err(invalid());
+        }
+        let mut position = 8usize;
+        let mut ended = false;
+        for _ in 0..1024 {
+            let header_end = position.checked_add(8).ok_or_else(invalid)?;
+            if header_end > payload.len() {
+                return Err(invalid());
+            }
+            let length = u32::from_be_bytes(
+                payload[position..position + 4]
+                    .try_into()
+                    .map_err(|_| invalid())?,
+            ) as usize;
+            let kind = &payload[position + 4..header_end];
+            let chunk_end = header_end
+                .checked_add(length)
+                .and_then(|n| n.checked_add(4))
+                .ok_or_else(invalid)?;
+            if chunk_end > payload.len() {
+                return Err(invalid());
+            }
+            if matches!(kind, b"iCCP" | b"zTXt" | b"iTXt") {
+                return Err(
+                    "Choose an ICO without compressed PNG metadata, or select the PNG directly."
+                        .into(),
+                );
+            }
+            position = chunk_end;
+            if kind == b"IEND" {
+                ended = length == 0 && position == payload.len();
+                break;
+            }
+        }
+        if !ended {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn decode_crop_image(bytes: Vec<u8>) -> LoadedImage {
+    if bytes.is_empty() || bytes.len() > CROP_INPUT_BYTES {
+        return Err("Choose an image up to 25 MiB.".into());
+    }
+    let format = image::guess_format(&bytes).map_err(|_| "Choose PNG, JPEG, WebP, BMP or ICO")?;
     if !matches!(
         format,
-        image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP
+        image::ImageFormat::Png
+            | image::ImageFormat::Jpeg
+            | image::ImageFormat::WebP
+            | image::ImageFormat::Bmp
+            | image::ImageFormat::Ico
     ) {
-        return Err("Choose a static PNG, JPEG or WebP image.".into());
+        return Err("Choose a static PNG, JPEG, WebP, BMP or ICO image.".into());
     }
-    let mut reader = image::io::Reader::with_format(std::io::Cursor::new(&bytes), format);
-    let mut limits = image::io::Limits::default();
-    limits.max_image_width = Some(2048);
-    limits.max_image_height = Some(2048);
-    limits.max_alloc = Some(32 * 1024 * 1024);
-    reader.limits(limits);
-    let image = reader
-        .decode()
-        .map_err(|_| "The image is damaged or exceeds 2048 × 2048 pixels.")?
-        .to_rgba8();
-    Ok((bytes, image))
+    // image 0.24's WebP constructor decodes eagerly, so use the bounded decoder.
+    let decoded = if format == image::ImageFormat::WebP {
+        crate::chat_media::decode_bounded_webp(&bytes)?
+    } else {
+        if format == image::ImageFormat::Ico {
+            validate_crop_ico(&bytes)?;
+        }
+        let (width, height) = if format == image::ImageFormat::Png {
+            crate::chat_media::png_header_dimensions(&bytes)?
+        } else {
+            image::io::Reader::with_format(std::io::Cursor::new(&bytes), format)
+                .into_dimensions()
+                .map_err(|_| "The image is damaged or its dimensions cannot be read.")?
+        };
+        if width == 0
+            || height == 0
+            || width > CROP_INPUT_AXIS
+            || height > CROP_INPUT_AXIS
+            || u64::from(width) * u64::from(height) > CROP_INPUT_PIXELS
+        {
+            return Err("Choose an image up to 16 megapixels and 8192 pixels per side.".into());
+        }
+        let mut reader = image::io::Reader::with_format(std::io::Cursor::new(&bytes), format);
+        let mut limits = image::io::Limits::default();
+        limits.max_image_width = Some(CROP_INPUT_AXIS);
+        limits.max_image_height = Some(CROP_INPUT_AXIS);
+        limits.max_alloc = Some(64 * 1024 * 1024);
+        reader.limits(limits);
+        reader
+            .decode()
+            .map_err(|_| "The image is damaged or exceeds the image memory limit.")?
+    };
+    // Reduce the working image before converting to RGBA; never upscale small inputs.
+    let working = if decoded.width() > CROP_WORKING_AXIS || decoded.height() > CROP_WORKING_AXIS {
+        decoded.thumbnail(CROP_WORKING_AXIS, CROP_WORKING_AXIS)
+    } else {
+        decoded
+    };
+    Ok((bytes, working.to_rgba8()))
 }
+
+fn normalized_asset_dimensions(kind: &str) -> Option<(u32, u32)> {
+    match kind {
+        "avatar" | "server_icon" => Some((256, 256)),
+        "profile_banner" | "server_banner" => Some((1200, 480)),
+        _ => None,
+    }
+}
+
+/// Presentation images only: message attachments never use this conversion.
+fn normalized_crop_png(
+    image: &image::RgbaImage,
+    crop: &ImageCrop,
+    kind: &str,
+) -> Result<(Vec<u8>, egui::ColorImage), String> {
+    let (max_width, max_height) = normalized_asset_dimensions(kind)
+        .ok_or("This image is not a profile or server presentation image.")?;
+    if !crop.valid() || image.width() == 0 || image.height() == 0 {
+        return Err("Choose a valid image crop.".into());
+    }
+    let x = ((crop.x * image.width() as f32).floor() as u32).min(image.width() - 1);
+    let y = ((crop.y * image.height() as f32).floor() as u32).min(image.height() - 1);
+    let width = ((crop.width * image.width() as f32).round() as u32)
+        .max(1)
+        .min(image.width() - x);
+    let height = ((crop.height * image.height() as f32).round() as u32)
+        .max(1)
+        .min(image.height() - y);
+    let cropped = image::imageops::crop_imm(image, x, y, width, height).to_image();
+    // image::thumbnail may enlarge a small source. These are ceilings, so keep
+    // the original cropped pixels when both dimensions already fit.
+    let mut normalized = if cropped.width() > max_width || cropped.height() > max_height {
+        image::DynamicImage::ImageRgba8(cropped)
+            .thumbnail(max_width, max_height)
+            .to_rgba8()
+    } else {
+        cropped
+    };
+    // A very noisy banner can exceed the asset wire budget even after resize.
+    // Keep the same crop/aspect and PNG format while reducing its dimensions.
+    for _ in 0..8 {
+        let mut output = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(normalized.clone())
+            .write_to(&mut output, image::ImageOutputFormat::Png)
+            .map_err(|_| "Could not prepare this image as PNG.")?;
+        let bytes = output.into_inner();
+        if bytes.len() <= 2 * 1024 * 1024 {
+            let preview = egui::ColorImage::from_rgba_unmultiplied(
+                [normalized.width() as usize, normalized.height() as usize],
+                normalized.as_raw(),
+            );
+            return Ok((bytes, preview));
+        }
+        let smaller_width = (normalized.width() * 3 / 4).max(1);
+        let smaller_height = (normalized.height() * 3 / 4).max(1);
+        normalized = image::DynamicImage::ImageRgba8(normalized)
+            .thumbnail(smaller_width, smaller_height)
+            .to_rgba8();
+    }
+    Err("The prepared image is still too large. Choose a smaller image.".into())
+}
+
 impl RelayApp {
     pub(super) fn community_assets_pending(&self) -> bool {
         !self.admin_ui.asset_pending.is_empty()
@@ -156,15 +352,24 @@ impl RelayApp {
         let Some(scope) = self.conversation_scope() else {
             return;
         };
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Static image", &["png", "jpg", "jpeg", "webp"])
-            .pick_file()
+        let formats: &[&str] = if normalized_asset_dimensions(kind).is_some() {
+            &["png", "jpg", "jpeg", "webp", "bmp", "ico"]
+        } else {
+            &["png", "jpg", "jpeg", "webp"]
+        };
+        if let Some(path) =
+            crate::file_pick::pick(rfd::FileDialog::new().add_filter("Static image", formats))
         {
+            let Some(admission) = CropDecodeAdmission::acquire(&CROP_DECODE_BUSY) else {
+                self.error = Some("Another image is still being prepared. Please try again shortly.".into());
+                return;
+            };
             let (tx, loaded) = mpsc::sync_channel(1);
             let ctx = self.capture_ctx.clone();
             if let Err(error) = std::thread::Builder::new()
                 .name("relay-crop-image".into())
                 .spawn(move || {
+                    let _admission = admission;
                     let _ = tx.send(read_crop_image(&path));
                     ctx.request_repaint();
                 })
@@ -244,31 +449,20 @@ impl RelayApp {
                 picker.x,
                 picker.y,
             );
-            if picker.kind == "avatar" {
-                let x = (crop.x * image.width() as f32).floor() as u32;
-                let y = (crop.y * image.height() as f32).floor() as u32;
-                let w = ((crop.width * image.width() as f32).round() as u32)
-                    .max(1)
-                    .min(image.width() - x);
-                let h = ((crop.height * image.height() as f32).round() as u32)
-                    .max(1)
-                    .min(image.height() - y);
-                let cropped = image::imageops::crop_imm(image, x, y, w, h).to_image();
-                let normalized = image::DynamicImage::ImageRgba8(cropped)
-                    .thumbnail(256, 256)
-                    .to_rgba8();
-                let color = egui::ColorImage::from_rgba_unmultiplied(
-                    [normalized.width() as usize, normalized.height() as usize],
-                    normalized.as_raw(),
-                );
-                let mut bytes = std::io::Cursor::new(vec![]);
-                if let Err(error) = image::DynamicImage::ImageRgba8(normalized)
-                    .write_to(&mut bytes, image::ImageOutputFormat::Png)
-                {
-                    self.error = Some(error.to_string());
-                } else {
-                    self.apply_cropped_avatar(bytes.into_inner(), color);
-                    open = false;
+            if normalized_asset_dimensions(&picker.kind).is_some() {
+                match normalized_crop_png(image, &crop, &picker.kind) {
+                    Ok((bytes, color)) if picker.kind == "avatar" => {
+                        self.apply_cropped_avatar(bytes, color);
+                        open = false;
+                    }
+                    Ok((bytes, _)) => {
+                        use base64::Engine;
+                        self.admin_request(AdminMethod::Put,
+                            format!("/api/assets/{}/{}", picker.kind, picker.name),
+                            json!({"image_base64":base64::engine::general_purpose::STANDARD.encode(bytes),"crop":null}),
+                            "action:assets".into());
+                    }
+                    Err(error) => self.error = Some(error),
                 }
             } else {
                 use base64::Engine;
@@ -807,6 +1001,144 @@ mod crop_tests {
                 }
             }
         }
+    }
+    #[test]
+    fn ico_input_is_bounded_and_presentation_output_is_png_with_a_local_preview() {
+        let image = image::RgbaImage::from_pixel(32, 32, image::Rgba([20, 90, 180, 255]));
+        let mut ico = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image).write_to(&mut ico, image::ImageOutputFormat::Ico).unwrap();
+        let (original, decoded) = decode_crop_image(ico.into_inner()).unwrap();
+        assert_eq!(image::guess_format(&original).unwrap(), image::ImageFormat::Ico);
+        let crop = crop_rectangle(32, 32, 1.0, 1.0, 0.5, 0.5);
+        let (png, preview) = normalized_crop_png(&decoded, &crop, "server_icon").unwrap();
+        assert_eq!(image::guess_format(&png).unwrap(), image::ImageFormat::Png);
+        assert_eq!(preview.size, [32, 32]);
+        assert_eq!(preview.pixels[0], egui::Color32::from_rgb(20, 90, 180));
+        assert!(decode_crop_image(vec![0; CROP_INPUT_BYTES + 1]).is_err());
+        assert!(decode_crop_image(b"GIF89a".to_vec()).is_err());
+        assert!(decode_crop_image(vec![0, 0, 1, 0, 1, 0]).is_err());
+    }
+    #[test]
+    fn profile_and_server_crops_resize_without_touching_message_attachment_formats() {
+        let source = image::RgbaImage::from_fn(1200, 600, |x, _| {
+            if x < 600 { image::Rgba([220, 30, 20, 255]) } else { image::Rgba([10, 20, 220, 255]) }
+        });
+        let original = source.clone();
+        let crop = crop_rectangle(1200, 600, 1.0, 1.0, 0.0, 0.5);
+        for kind in ["avatar", "server_icon"] {
+            let (png, preview) = normalized_crop_png(&source, &crop, kind).unwrap();
+            assert_eq!(preview.size, [256, 256]);
+            assert_eq!(preview.pixels[0], egui::Color32::from_rgb(220, 30, 20));
+            assert!(png.len() <= 2 * 1024 * 1024);
+        }
+        let banner_crop = crop_rectangle(1200, 600, 2.5, 1.0, 0.5, 0.5);
+        let (_, preview) = normalized_crop_png(&source, &banner_crop, "profile_banner").unwrap();
+        assert_eq!(preview.size, [1200, 480]);
+        assert!(normalized_crop_png(&source, &crop, "chat_photo").is_err());
+        assert_eq!(source, original);
+    }
+    #[test]
+    fn advertised_webp_has_a_decoder_and_invalid_images_do_not_get_a_format_fallback() {
+        let result = image::io::Reader::with_format(std::io::Cursor::new(vec![0u8; 32]),
+            image::ImageFormat::WebP).decode();
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(image::ImageError::Unsupported(_))),
+            "WebP decoding must be enabled when the picker advertises it");
+        assert!(decode_crop_image(b"not an image".to_vec()).is_err());
+    }
+    #[test]
+    fn ico_compressed_metadata_and_invalid_entry_bounds_are_rejected_before_decode() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(32, 32))
+            .write_to(&mut png, image::ImageOutputFormat::Png)
+            .unwrap();
+        let mut payload = png.into_inner();
+        // Deliberately invalid compressed profile: preflight must reject it, never inflate it.
+        payload.splice(33..33, [0, 0, 0, 0, b'i', b'C', b'C', b'P', 0, 0, 0, 0]);
+        let mut ico = vec![0, 0, 1, 0, 1, 0, 32, 32, 0, 0, 1, 0, 32, 0];
+        ico.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        ico.extend_from_slice(&22u32.to_le_bytes());
+        ico.extend_from_slice(&payload);
+        let error = decode_crop_image(ico.clone()).unwrap_err();
+        assert!(error.contains("compressed PNG metadata"), "{error}");
+        // The library sniffs eight bytes regardless of the entry's declared length.
+        ico[14..18].copy_from_slice(&1u32.to_le_bytes());
+        assert!(validate_crop_ico(&ico).is_err());
+        ico[14..18].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        ico[18..22].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(validate_crop_ico(&ico).is_err());
+    }
+    #[test]
+    fn crop_decode_admission_serializes_work_and_releases_after_worker_failure() {
+        let busy = std::sync::atomic::AtomicBool::new(false);
+        let held = CropDecodeAdmission::acquire(&busy).unwrap();
+        assert!(CropDecodeAdmission::acquire(&busy).is_none());
+        drop(held);
+        let result = std::panic::catch_unwind(|| {
+            let _held = CropDecodeAdmission::acquire(&busy).unwrap();
+            panic!("synthetic decoder failure");
+        });
+        assert!(result.is_err());
+        assert!(CropDecodeAdmission::acquire(&busy).is_some());
+    }
+    #[test]
+    fn phone_photo_is_reduced_before_crop_and_bmp_input_is_supported() {
+        let photo = image::RgbImage::from_pixel(4000, 3000, image::Rgb([20, 90, 180]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(photo)
+            .write_to(&mut png, image::ImageOutputFormat::Png)
+            .unwrap();
+        let (_, working) = decode_crop_image(png.into_inner()).unwrap();
+        assert_eq!(working.dimensions(), (2048, 1536));
+        assert_eq!(working.get_pixel(0, 0).0, [20, 90, 180, 255]);
+
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(32, 16))
+            .write_to(&mut bmp, image::ImageOutputFormat::Bmp)
+            .unwrap();
+        let (original, working) = decode_crop_image(bmp.into_inner()).unwrap();
+        assert_eq!(
+            image::guess_format(&original).unwrap(),
+            image::ImageFormat::Bmp
+        );
+        assert_eq!(working.dimensions(), (32, 16));
+    }
+    #[test]
+    fn compressed_pixel_bomb_is_rejected_before_pixel_decode() {
+        // A BMP header exposes dimensions without needing any pixel payload.
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(1, 1))
+            .write_to(&mut bmp, image::ImageOutputFormat::Bmp)
+            .unwrap();
+        let mut header = bmp.into_inner();
+        header.truncate(54);
+        header[18..22].copy_from_slice(&4096u32.to_le_bytes());
+        header[22..26].copy_from_slice(&4096u32.to_le_bytes());
+        let error = decode_crop_image(header).unwrap_err();
+        assert!(error.contains("16 megapixels"), "{error}");
+    }
+    #[test]
+    fn noisy_banners_keep_the_png_wire_budget_and_oversized_input_is_rejected() {
+        let mut state = 1u32;
+        let noisy = image::RgbaImage::from_fn(1200, 480, |_, _| {
+            let mut pixel = [0; 4];
+            for byte in &mut pixel {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *byte = state as u8;
+            }
+            image::Rgba(pixel)
+        });
+        let crop = crop_rectangle(1200, 480, 2.5, 1.0, 0.5, 0.5);
+        let (png, preview) = normalized_crop_png(&noisy, &crop, "server_banner").unwrap();
+        assert!(png.len() <= 2 * 1024 * 1024);
+        assert!(preview.size[0] <= 1200 && preview.size[1] <= 480);
+        assert_eq!(image::guess_format(&png).unwrap(), image::ImageFormat::Png);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(CROP_INPUT_AXIS + 1, 1))
+            .write_to(&mut bytes, image::ImageOutputFormat::Png).unwrap();
+        assert!(decode_crop_image(bytes.into_inner()).is_err());
     }
 }
 #[cfg(test)]

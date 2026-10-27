@@ -696,7 +696,8 @@ impl RelayApp {
                                 );
                             }
                             if failed {
-                                ui.label(RichText::new("Delivery not confirmed").color(c_bad()));
+                                let reason = self.current_wait().map_or("Delivery not confirmed", conversation_readiness_ui::failed_label);
+                                ui.label(RichText::new(reason).color(c_bad()));
                                 let available = self
                                     .current
                                     .as_ref()
@@ -1090,6 +1091,11 @@ impl RelayApp {
                                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                                     .on_hover_text(url);
                             }
+                        }
+                        if !gif_only {
+                            let cards = ui.scope(|ui| super::link_embeds::render(ui, &message.content,
+                                self.revealed_spoiler_message.as_deref() == Some(message.id.as_str())));
+                            if cards.response.rect.is_positive() { media_click_regions.push(cards.response.rect); }
                         }
                         for attachment in &message.attachments {
                             ui.add_space(6.0);

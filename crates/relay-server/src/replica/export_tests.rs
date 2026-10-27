@@ -153,6 +153,30 @@ fn cell<'a>(export: &'a Export, table: &str, key: &str, column: &str) -> Option<
 // ---------------------------------------------------------------------------
 
 #[test]
+fn upload_policy_survives_filtered_snapshot_and_delta_replay() {
+    let w = world();
+    let first_policy = serde_json::to_string(&UploadPolicy::default()).unwrap();
+    w.db.execute("INSERT INTO metadata VALUES('upload_policy',?1)", [&first_policy]).unwrap();
+    assert_eq!(cell(&full(&w), "metadata", "upload_policy", "value"), Some(&json!(first_policy)));
+    let mut live = store_for(&w, "r1");
+    catch_up(&w, &mut live).unwrap();
+    let before = live.cursor().unwrap().unwrap();
+    let changed = serde_json::to_string(&UploadPolicy { revision: 1, default_file_bytes: 0, ..Default::default() }).unwrap();
+    w.db.execute("UPDATE metadata SET value=?1 WHERE key='upload_policy'", [&changed]).unwrap();
+    let delta = pull(&w, "r1", Some(before.head), &before.eligible).unwrap();
+    assert_eq!(cell(&delta, "metadata", "upload_policy", "value"), Some(&json!(changed)));
+    catch_up(&w, &mut live).unwrap();
+    let mut fresh = store_for(&w, "r1");
+    catch_up(&w, &mut fresh).unwrap();
+    assert_eq!(live.dump(), fresh.dump());
+    exec(&w.db, "DELETE FROM metadata WHERE key='upload_policy'");
+    catch_up(&w, &mut live).unwrap();
+    let mut fresh = store_for(&w, "r1");
+    catch_up(&w, &mut fresh).unwrap();
+    assert_eq!(live.dump(), fresh.dump());
+}
+
+#[test]
 fn a_full_snapshot_follows_the_recipients_real_permissions_not_visibility() {
     let w = world();
     let export = full(&w);

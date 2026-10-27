@@ -37,6 +37,9 @@ mod account_feedback_ui;
 mod account_link_ui;
 #[path = "account_start_ui.rs"]
 mod account_start_ui;
+#[cfg(all(test, windows))]
+#[path = "dm_navigation_native_fixture.rs"]
+mod dm_navigation_native_fixture;
 #[path = "admin_ui.rs"]
 mod admin_ui;
 #[path = "app_dialogs.rs"]
@@ -57,6 +60,15 @@ mod channel_sidebar;
 mod chat_ui;
 #[path = "composer_ui.rs"]
 mod composer_ui;
+#[path = "attachment_staging.rs"]
+mod attachment_staging;
+#[cfg(feature = "qa-automation")]
+#[path = "qa_commands.rs"]
+mod qa_commands;
+#[cfg(feature = "qa-automation")]
+pub(crate) use qa_commands::picked_file as qa_picked_file;
+#[path = "link_embeds.rs"]
+mod link_embeds;
 #[path = "connection_path_ui.rs"]
 mod connection_path_ui;
 #[path = "conversation_readiness_ui.rs"]
@@ -753,6 +765,7 @@ pub struct RelayApp {
     request_id: u64,
     marked_read: HashMap<Target, read_receipts::Attempt>,
     uploads: HashMap<String, UploadView>,
+    staged_uploads: attachment_staging::State,
     transfers_open: bool,
     send_ids: HashMap<Target, SendAttempt>,
     communities: Vec<CommunityInfo>,
@@ -1206,6 +1219,7 @@ impl RelayApp {
             request_id: 0,
             marked_read: HashMap::new(),
             uploads: HashMap::new(),
+            staged_uploads: Default::default(),
             transfers_open: false,
             send_ids: HashMap::new(),
             communities: Vec::new(),
@@ -1875,10 +1889,16 @@ impl RelayApp {
     }
 
     fn start_upload(&mut self, target: Target, path: PathBuf) {
-        let _ = self.queue_upload(target, path);
+        self.stage_file(target, path);
     }
 
     fn queue_upload(&mut self, target: Target, path: PathBuf) -> Option<String> {
+        self.queue_upload_request(target, path, None)
+    }
+    fn queue_reviewed_upload(&mut self, target: Target, path: PathBuf, review: crate::network::UploadReview) -> Option<String> {
+        self.queue_upload_request(target, path, Some(review))
+    }
+    fn queue_upload_request(&mut self, target: Target, path: PathBuf, review: Option<crate::network::UploadReview>) -> Option<String> {
         let origin = self.command_origin()?;
         let operation_id = crate::network::operation_id();
         self.uploads.insert(
@@ -1893,12 +1913,11 @@ impl RelayApp {
                 cancelled: false,
             },
         );
-        if let Err(error) = self.network.send(Command::StartUpload {
-            origin,
-            target,
-            path,
-            operation_id: operation_id.clone(),
-        }) {
+        let command = match review {
+            Some(review) => Command::StartReviewedUpload { origin, target, path, operation_id: operation_id.clone(), review },
+            None => Command::StartUpload { origin, target, path, operation_id: operation_id.clone() },
+        };
+        if let Err(error) = self.network.send(command) {
             if let Some(transfer) = self.uploads.get_mut(&operation_id) {
                 transfer.error = Some(error);
             }
@@ -1971,6 +1990,10 @@ impl RelayApp {
     }
 
     fn retry_transfer(&mut self, id: &str) {
+        if self.staged_uploads.owns_operation(id) {
+            self.notice = Some(("Retry this file with Upload selected files in its conversation. Your reviewed file and text are kept.".into(), Instant::now()));
+            return;
+        }
         if let Some(transfer) = self.uploads.remove(id) {
             match transfer.kind {
                 TransferKind::Upload => {
@@ -2097,6 +2120,7 @@ impl RelayApp {
     }
 
     fn switch_community(&mut self, url: String) {
+        self.cancel_friends_navigation(Some(&url));
         self.cancel_background_people_answer();
         self.server_actions.cancel_if_other(&url);
         if self.community_statuses.get(&url) == Some(&ConnectionStatus::SignInRequired)
@@ -3137,7 +3161,7 @@ impl RelayApp {
         message: &Message,
     ) {
         let name = attachment.name.to_ascii_lowercase();
-        if ![".gif", ".png", ".jpg", ".jpeg"]
+        if !matches!(attachment.mime.as_str(), "image/png" | "image/jpeg" | "image/gif") && ![".gif", ".png", ".jpg", ".jpeg"]
             .iter()
             .any(|ext| name.ends_with(ext))
         {

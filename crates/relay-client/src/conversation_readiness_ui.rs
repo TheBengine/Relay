@@ -72,32 +72,65 @@ impl ConversationReadiness {
     }
 }
 
-/// One short explanation and the next step. No names: the worker does not
-/// report who the key manager is, so the text stays honest and general.
-pub(super) fn wait_text(wait: SendWait) -> (&'static str, &'static str) {
-    match wait {
-        SendWait::DeviceApproval => (
+/// One short explanation and the next step. Only a direct message names a
+/// person: there the other person is the only one who can confirm this device.
+/// In channels the worker does not report who the key manager is.
+pub(super) fn wait_text(wait: SendWait, peer: Option<&str>) -> (String, String) {
+    let (headline, next): (&str, &str) = match (wait, peer) {
+        (SendWait::PeerVerification, Some(name)) => {
+            return (
+                format!("Verify {name} to send private messages."),
+                format!("Compare your security codes with {name} in person, on a call or in another chat you trust. {name} also needs to verify you. Your message is kept; send it again afterwards."),
+            )
+        }
+        (SendWait::DeviceApproval, Some(name)) => {
+            return (
+                format!("{name} needs to verify your device first."),
+                format!("Ask {name} to open Encryption and verify you, and verify {name} too. Your message is kept; send it again afterwards."),
+            )
+        }
+        (SendWait::PeerVerification, None) => (
+            "Verify the other person to send private messages.",
+            "Compare your security codes in person, on a call or in another chat you trust. They also need to verify you. Your message is kept; send it again afterwards.",
+        ),
+        (SendWait::DeviceApproval, None) => (
             "Your device is waiting to be confirmed for this conversation.",
             "Ask the person who manages its keys to confirm your device in Encryption. Your message is kept; send it again afterwards.",
         ),
-        SendWait::AddingDevices => (
+        (SendWait::AddingDevices, _) => (
             "This conversation is still adding your confirmed devices.",
             "The person who manages its keys may need to be online. Your message is kept; send it again in a moment.",
         ),
-        SendWait::KeyRotation => (
+        (SendWait::KeyRotation, _) => (
             "A device left this conversation, so its keys are being replaced.",
             "The person who manages its keys needs to be online to finish. Your message is kept; send it again afterwards.",
         ),
-        SendWait::KeyUpdates => (
+        (SendWait::KeyUpdates, _) => (
             "This conversation has key updates waiting.",
             "Open the conversation again to load them, then send. Your message is kept.",
         ),
+    };
+    (headline.into(), next.into())
+}
+
+/// The failed row's short reason while its conversation is waiting.
+pub(super) fn failed_label(wait: SendWait) -> &'static str {
+    match wait {
+        SendWait::DeviceApproval | SendWait::PeerVerification => "Not sent · device verification needed",
+        SendWait::AddingDevices | SendWait::KeyRotation | SendWait::KeyUpdates => {
+            "Not sent yet · encryption keys are updating"
+        }
     }
 }
 
-/// Draws the banner and returns true when Open Encryption was clicked.
-pub(super) fn readiness_banner(ui: &mut egui::Ui, wait: SendWait) -> bool {
-    let (headline, next) = wait_text(wait);
+/// Draws the banner and returns true when its button was clicked. In a direct
+/// message the button opens that person's devices on the Encryption page.
+pub(super) fn readiness_banner(ui: &mut egui::Ui, wait: SendWait, peer: Option<&str>) -> bool {
+    let (headline, next) = wait_text(wait, peer);
+    let action = match (wait, peer) {
+        (SendWait::PeerVerification | SendWait::DeviceApproval, Some(name)) => format!("Verify {name}"),
+        _ => "Open Encryption".to_owned(),
+    };
     let mut open = false;
     egui::Frame::none()
         .fill(c_panel())
@@ -109,7 +142,7 @@ pub(super) fn readiness_banner(ui: &mut egui::Ui, wait: SendWait) -> bool {
             ui.add(egui::Label::new(RichText::new(headline).strong()).wrap(true));
             ui.add(egui::Label::new(RichText::new(next).color(c_muted())).wrap(true));
             ui.add_space(6.0);
-            open = ui.add(secondary("Open Encryption")).clicked();
+            open = ui.add(secondary(action.as_str())).clicked();
         });
     ui.add_space(8.0);
     open
@@ -123,17 +156,52 @@ impl RelayApp {
         })
     }
 
-    /// Hook, above the composer of the open conversation.
-    pub(super) fn composer_readiness(&mut self, ui: &mut egui::Ui) {
-        let Some(wait) = self
-            .current
+    /// The wait reported for the open conversation on the active connection.
+    pub(super) fn current_wait(&self) -> Option<SendWait> {
+        self.current
             .as_ref()
             .and_then(|target| self.readiness_key(target))
             .and_then(|key| self.readiness.current(&key))
-        else {
+    }
+
+    /// The other person of an open direct message: id and shown name.
+    fn direct_peer(&self) -> Option<(String, String)> {
+        let Some(Target::Direct(id)) = &self.current else {
+            return None;
+        };
+        let name = self
+            .bootstrap
+            .as_ref()
+            .and_then(|b| b.members.iter().find(|user| &user.id == id))
+            .map(|user| profile_ui::display_name(user).to_owned())
+            .or_else(|| {
+                self.encryption_ui
+                    .status
+                    .peers
+                    .iter()
+                    .find(|peer| &peer.user_id == id)
+                    .map(|peer| peer.name.clone())
+            })?;
+        Some((id.clone(), name))
+    }
+
+    /// Hook, above the composer of the open conversation. A direct message to
+    /// someone with no device verified here explains that before the first
+    /// send fails; nothing is verified or approved by showing it.
+    pub(super) fn composer_readiness(&mut self, ui: &mut egui::Ui) {
+        let peer = self.direct_peer();
+        let wait = self.current_wait().or_else(|| {
+            peer.as_ref()
+                .filter(|(id, _)| self.encryption_ui.person_unverified(id))
+                .map(|_| SendWait::PeerVerification)
+        });
+        let Some(wait) = wait else {
             return;
         };
-        if readiness_banner(ui, wait) {
+        if readiness_banner(ui, wait, peer.as_ref().map(|(_, name)| name.as_str())) {
+            if let Some((id, _)) = &peer {
+                self.encryption_ui.review_person(id);
+            }
             self.settings_tab = SettingsTab::Encryption;
             self.settings_open = true;
             self.send(Command::CryptoRefresh);
@@ -257,6 +325,21 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_message_names_the_one_person_who_can_confirm() {
+        let (headline, next) = wait_text(SendWait::PeerVerification, Some("sebron"));
+        assert_eq!(headline, "Verify sebron to send private messages.");
+        assert!(next.contains("sebron also needs to verify you") && next.contains("Your message is kept"));
+        let (headline, next) = wait_text(SendWait::DeviceApproval, Some("spect1e"));
+        assert_eq!(headline, "spect1e needs to verify your device first.");
+        assert!(next.contains("Ask spect1e to open Encryption"));
+        // Channels never guess at a key manager's name.
+        let (headline, _) = wait_text(SendWait::DeviceApproval, None);
+        assert!(!headline.contains("spect1e"));
+        assert_eq!(failed_label(SendWait::PeerVerification), "Not sent · device verification needed");
+        assert_eq!(failed_label(SendWait::KeyUpdates), "Not sent yet · encryption keys are updating");
+    }
+
+    #[test]
     fn remembered_waits_are_bounded() {
         let mut readiness = ConversationReadiness::default();
         for n in 0..(REMEMBERED_WAITS + 5) {
@@ -288,7 +371,7 @@ mod tests {
             |ctx| {
                 egui::TopBottomPanel::bottom("composer-test").show(ctx, |ui| {
                     let top = ui.cursor().top();
-                    let clicked = wait.is_some_and(|wait| readiness_banner(ui, wait));
+                    let clicked = wait.is_some_and(|wait| readiness_banner(ui, wait, Some("Sebastian Rønne-Hansen")));
                     let banner = wait.map(|_| {
                         Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top())
                     });
@@ -312,6 +395,7 @@ mod tests {
                 SendWait::AddingDevices,
                 SendWait::KeyRotation,
                 SendWait::KeyUpdates,
+                SendWait::PeerVerification,
             ] {
                 let ctx = egui::Context::default();
                 configure(&ctx);

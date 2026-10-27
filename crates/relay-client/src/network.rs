@@ -364,11 +364,23 @@ pub enum Command {
         path: PathBuf,
         operation_id: String,
     },
+    StartReviewedUpload {
+        origin: CommandOrigin,
+        target: Target,
+        path: PathBuf,
+        operation_id: String,
+        review: UploadReview,
+    },
     CancelUpload {
         operation_id: String,
     },
     SwitchCommunity {
         url: String,
+    },
+    /// Park only the exact abandoned connection; never revoke remembered access.
+    CancelNavigation {
+        cancelled: CommandOrigin,
+        restore: Option<String>,
     },
     ForgetCommunity {
         url: String,
@@ -500,6 +512,8 @@ pub enum SendWait {
     KeyRotation,
     /// Key updates are queued for this conversation.
     KeyUpdates,
+    /// A direct message whose other person has no device verified here yet.
+    PeerVerification,
 }
 
 pub enum Update {
@@ -1514,6 +1528,15 @@ impl LiveTransport {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct UploadReview {
+    pub bytes: u64,
+    pub sha256: [u8; 32],
+}
+pub(crate) fn upload_plain_limit(limits: &UploadLimits, plain: bool) -> u64 {
+    limits.effective().saturating_sub(if plain { 0 } else { relay_crypto::files::FILE_OVERHEAD as u64 })
+}
+
 struct ChatMediaJob {
     _activity: Option<shutdown::Lease>,
     original: bool,
@@ -1601,8 +1624,8 @@ fn validate_chat_attachment(attachment: &Attachment) -> Result<(), String> {
     {
         return Err("The image attachment address is invalid.".into());
     }
-    if attachment.size > chat_media::MAX_COMPRESSED_BYTES as u64 {
-        return Err("The image exceeds the 10 MB attachment limit.".into());
+    if attachment.size > MAX_SUPPORTED_UPLOAD_BYTES as u64 {
+        return Err("The attachment exceeds this client's supported file-size limit.".into());
     }
     Ok(())
 }
@@ -1675,6 +1698,11 @@ fn fetch_chat_media(http: &Client, job: &ChatMediaJob) -> Result<chat_media::Dec
         validate_avatar_attachment(&job.attachment)?;
     } else {
         validate_chat_attachment(&job.attachment)?;
+        let wire_size = job.attachment.size.checked_add(if job.encrypted.is_some() { relay_crypto::files::FILE_OVERHEAD as u64 } else { 0 })
+            .ok_or("The image size is invalid.")?;
+        if wire_size > chat_media::MAX_COMPRESSED_BYTES as u64 {
+            return Err("This file exceeds the 10 MiB inline-preview allowance. Download the original to view it.".into());
+        }
         if job.encrypted.is_none() && !job.plain {
             return Err(
                 "This attachment has no verified encryption key. Plaintext fallback is disabled."
@@ -2841,17 +2869,18 @@ impl Worker {
                 let size = std::fs::metadata(&path)
                     .map_err(|_| "The selected file cannot be read.")?
                     .len();
-                if size > MAX_UPLOAD_BYTES as u64 {
-                    return Err("Files can be up to 10 MB in this version.".into());
+                let limit = self.connection.as_ref().map(|c| c.chat.upload_limits.effective()).unwrap_or(0);
+                if size == 0 || size > limit {
+                    return Err("The file exceeds this server's current upload limit.".into());
                 }
                 let file =
                     std::fs::File::open(&path).map_err(|_| "The selected file cannot be read.")?;
-                let mut reader = std::io::Read::take(file, (MAX_UPLOAD_BYTES + 1) as u64);
+                let mut reader = std::io::Read::take(file, limit + 1);
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(&mut reader, &mut bytes)
                     .map_err(|_| "The selected file cannot be read.")?;
-                if bytes.len() > MAX_UPLOAD_BYTES {
-                    return Err("Files can be up to 10 MB in this version.".into());
+                if bytes.len() as u64 != size || bytes.len() as u64 > limit {
+                    return Err("The selected file changed or exceeds the current upload limit.".into());
                 }
                 let name = path
                     .file_name()

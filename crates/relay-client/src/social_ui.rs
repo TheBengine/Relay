@@ -848,6 +848,10 @@ impl RelayApp {
         }
     }
     pub(super) fn friends_page(&mut self, ui: &mut egui::Ui) {
+        if self.friends_shell_pending() {
+            self.friends_connection_ui(ui);
+            return;
+        }
         let people = self.in_people();
         ui.horizontal_wrapped(|ui| {
             if crate::settings_ui::top_tab(

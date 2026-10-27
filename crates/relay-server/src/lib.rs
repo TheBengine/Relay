@@ -38,6 +38,7 @@ mod roles;
 mod rtc;
 mod rtc_media;
 mod server_settings;
+mod upload_policy;
 mod social;
 mod takeover_voter;
 mod takeover_store;
@@ -823,6 +824,7 @@ pub fn router(state: AppState) -> Router {
             get(server_settings::get_settings).patch(server_settings::save_settings),
         )
         .route("/api/system-events", get(server_settings::system_events))
+        .route("/api/settings/uploads", get(upload_policy::get_policy).put(upload_policy::put_policy).layer(DefaultBodyLimit::max(32 * 1024)))
         .route("/api/hosting/voice-gateways", get(gateway_admission::list))
         .route(
             "/api/hosting/voice-gateways/registration",
@@ -999,7 +1001,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/messages/{message_id}/reactions", post(reaction))
         .route(
             "/api/uploads",
-            post(upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+            post(upload).layer(DefaultBodyLimit::max(MAX_SUPPORTED_UPLOAD_BYTES)),
         )
         .route("/api/uploads/{upload_id}", get(download))
         .route("/api/events", get(events))
@@ -1654,6 +1656,7 @@ async fn bootstrap(
         .filter(|v| visible.contains(&v.channel_id.as_str()))
         .collect();
     let mut result = Bootstrap {
+        upload_limits: upload_policy::for_user(&db, &auth.user.id)?,
         host_paused,
         host_authority: (!state.0.config.people).then(|| state.0.handover.route_pin()),
         account_login_only: db.query_row(
@@ -1717,6 +1720,7 @@ async fn bootstrap(
                 "profiles-v1".into(),
                 "profiles-v2".into(),
                 "server-settings-v1".into(),
+                "upload-policy-v1".into(),
                 "hosting-v1".into(),
                 "handover-preparation-v1".into(),
                 "handover-private-setup-v1".into(),
@@ -2187,70 +2191,22 @@ async fn upload(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(input): Query<UploadQuery>,
-    bytes: Bytes,
+    request: axum::extract::Request,
 ) -> ApiResult<Json<Attachment>> {
     let auth = state.auth(&headers)?;
-    let name = input.name.trim();
-    if name.is_empty()
-        || name.len() > 255
-        || name.chars().any(char::is_control)
-        || input.mime.len() > 128
-        || input.mime.chars().any(char::is_control)
-        || bytes.is_empty()
-    {
-        return Err(bad("Invalid filename, MIME type or empty file"));
+    if !upload_policy::input_valid(&input.name, &input.mime) {
+        return Err(bad("Invalid filename or MIME type"));
     }
-    if bytes.len() > MAX_UPLOAD_BYTES {
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Files may be at most 10 MiB",
-        ));
+    // Authenticate and calculate the account's allowance before buffering a
+    // body. A role change during the read is checked again by commit().
+    let limit = upload_policy::for_user(&lock(&state.0.db), &auth.user.id)?.effective();
+    if limit == 0 {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "File uploads are disabled for your roles"));
     }
-    let attachment = Attachment {
-        id: id(),
-        name: name.to_string(),
-        mime: input.mime,
-        size: bytes.len() as u64,
-        url: String::new(),
-    };
-    let mut attachment = attachment;
-    attachment.url = format!("/api/uploads/{}", attachment.id);
-    let db = lock(&state.0.db);
-    let pending: u64 = db.query_row(
-        "SELECT COALESCE(SUM(size),0) FROM uploads WHERE owner_id=?1 AND message_id IS NULL",
-        [&auth.user.id],
-        |r| r.get(0),
-    )?;
-    let (total, user_total) = profiles::storage_usage(&db, &auth.user.id)?;
-    if total.saturating_add(attachment.size) > state.0.config.storage_limit_bytes
-        || user_total.saturating_add(attachment.size) > state.0.config.user_storage_limit_bytes
-    {
-        return Err(ApiError::new(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "Attachment storage quota reached; remove files or ask the host to raise the limit",
-        ));
-    }
-    if pending + attachment.size > 50 * 1024 * 1024 {
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Send existing pending files before uploading more",
-        ));
-    }
-    db.execute(
-        "INSERT INTO uploads VALUES(?1,?2,NULL,?3,?4,?5,?6,?7)",
-        params![
-            attachment.id,
-            auth.user.id,
-            attachment.name,
-            attachment.mime,
-            attachment.size,
-            bytes.as_ref(),
-            now()
-        ],
-    )?;
-    Ok(Json(attachment))
+    let bytes = axum::body::to_bytes(request.into_body(), limit as usize)
+        .await.map_err(|_| upload_policy::too_large(limit))?;
+    Ok(Json(upload_policy::commit(&state, &auth.user.id, &input.name, &input.mime, &bytes)?))
 }
-
 async fn download(
     State(state): State<AppState>,
     headers: HeaderMap,

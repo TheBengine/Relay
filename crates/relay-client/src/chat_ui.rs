@@ -512,6 +512,10 @@ impl RelayApp {
     }
 
     pub(super) fn submit_composer(&mut self) {
+        if self.has_staged_uploads() {
+            self.notice = Some(("Upload or remove the selected files before sending this message. Your text is kept.".into(), Instant::now()));
+            return;
+        }
         self.submit_message_content(self.draft.clone(), self.attachments.clone(), true);
     }
 

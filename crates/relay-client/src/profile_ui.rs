@@ -727,10 +727,12 @@ impl RelayApp {
                                 )
                                 .clicked()
                             {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("Avatar image", &["png", "jpg", "jpeg", "webp"])
-                                    .pick_file()
-                                {
+                                if assets {
+                                    crop_avatar = true;
+                                } else if let Some(path) = crate::file_pick::pick(
+                                    rfd::FileDialog::new()
+                                        .add_filter("Avatar image", &["png", "jpg", "jpeg", "webp"]),
+                                ) {
                                     let (tx, rx) = mpsc::sync_channel(1);
                                     let preview_path = path.clone();
                                     if std::thread::Builder::new()
@@ -754,10 +756,11 @@ impl RelayApp {
                                 editor.preview_rx = None;
                             }
                         });
-                        controls::description(ui, "PNG, JPEG or WebP · up to 2 MiB");
-                        if assets && ui.add(secondary("Crop Avatar")).clicked() {
-                            crop_avatar = true;
-                        }
+                        controls::description(ui, if assets {
+                            "PNG, JPEG, WebP or ICO. Preview and crop locally; saved as PNG up to 256 × 256. Apply to the draft, then Save Profile."
+                        } else {
+                            "PNG, JPEG or WebP · up to 2 MiB (legacy server)"
+                        });
                     }
                     if section == ProfileSection::Banner {
                         if extended {
@@ -1116,16 +1119,22 @@ fn local_avatar_preview(path: &std::path::Path) -> Result<egui::ColorImage, Stri
     ) {
         return Err("Choose a static PNG, JPEG or WebP avatar.".into());
     }
+    let webp = if format == image::ImageFormat::WebP {
+        Some(crate::chat_media::decode_legacy_avatar_webp(&bytes)?)
+    } else { None };
     let mut reader = image::io::Reader::with_format(std::io::Cursor::new(bytes), format);
     let mut limits = image::io::Limits::default();
     limits.max_image_width = Some(2048);
     limits.max_image_height = Some(2048);
     limits.max_alloc = Some(32 * 1024 * 1024);
     reader.limits(limits);
-    let image = reader
+    let decoded = if let Some(decoded) = webp { decoded } else { reader
         .decode()
-        .map_err(|_| "This avatar is damaged or exceeds 2048×2048 pixels.")?
-        .thumbnail(256, 256)
+        .map_err(|_| "This avatar is damaged or exceeds 2048×2048 pixels.")? };
+    if decoded.width() > 2048 || decoded.height() > 2048 {
+        return Err("This avatar exceeds 2048×2048 pixels.".into());
+    }
+    let image = decoded.thumbnail(256, 256)
         .to_rgba8();
     Ok(egui::ColorImage::from_rgba_unmultiplied(
         [image.width() as usize, image.height() as usize],
@@ -1852,19 +1861,23 @@ mod tests {
 
     #[test]
     fn profile_ack_preserves_later_edits_and_partial_failure_keeps_avatar_retry() {
-        let mut editor = Editor::new("server|me".into(), user());
-        editor.draft.display_name = "Submitted".into();
-        editor.draft.avatar = ProfileAvatarChange::Remove;
-        let submitted = editor.draft.clone();
-        editor.draft.bio = "Later edit".into();
-        editor.draft.appearance.pronouns = "Later pronouns".into();
-        let mut ack = user();
-        ack.profile.display_name = "Submitted".into();
-        editor.apply(ack, Some(submitted), false);
-        assert_eq!(editor.draft.bio, "Later edit");
-        assert_eq!(editor.draft.appearance.pronouns, "Later pronouns");
-        assert_eq!(editor.draft.avatar, ProfileAvatarChange::Remove);
-        assert!(editor.dirty());
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 2).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        for avatar in [ProfileAvatarChange::Remove, ProfileAvatarChange::Prepared(encoded.into_inner())] {
+            let mut editor = Editor::new("server|me".into(), user());
+            editor.draft.display_name = "Submitted".into();
+            editor.draft.avatar = avatar.clone();
+            let submitted = editor.draft.clone();
+            editor.draft.bio = "Later edit".into();
+            editor.draft.appearance.pronouns = "Later pronouns".into();
+            let mut ack = user();
+            ack.profile.display_name = "Submitted".into();
+            editor.apply(ack, Some(submitted), false);
+            assert_eq!(editor.draft.bio, "Later edit");
+            assert_eq!(editor.draft.appearance.pronouns, "Later pronouns");
+            assert_eq!(editor.draft.avatar, avatar);
+            assert!(editor.dirty());
+        }
     }
     #[test]
     fn profile_limits_count_unicode_characters_and_ignore_stale_other_account_acks() {

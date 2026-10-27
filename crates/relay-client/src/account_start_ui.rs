@@ -93,6 +93,11 @@ pub(super) struct State {
     pub(super) local_choices: Option<Result<Vec<SavedCommunity>, String>>,
     pub(super) clearing_previous_account: Option<u64>,
     pub(super) account_cleanup_error: Option<String>,
+    pub(super) friends_requested: bool,
+    pub(super) friends_error: Option<String>,
+    friends_resume: Option<(String, Instant)>,
+    cancelled_navigation: std::collections::HashSet<String>,
+    navigation_restore: Option<String>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -108,11 +113,27 @@ impl Default for State {
             local_choices: None,
             clearing_previous_account: None,
             account_cleanup_error: None,
+            friends_requested: false,
+            friends_error: None,
+            friends_resume: None,
+            cancelled_navigation: Default::default(),
+            navigation_restore: None,
         }
     }
 }
 
 impl State {
+    fn cancel_navigation(&mut self, destination: Option<&str>) {
+        self.navigation_restore = destination.map(str::to_owned);
+        if let Some(auto) = self.auto.take() {
+            if let Some((url, _)) = auto.resuming { self.cancelled_navigation.insert(url); }
+        }
+        if let Some((url, _)) = self.friends_resume.take() { self.cancelled_navigation.insert(url); }
+        if self.pending.as_ref().is_some_and(|a| a.people || a.background) { self.pending = None; }
+        if let Some(url) = destination { self.cancelled_navigation.remove(url); }
+        self.friends_requested = false;
+        self.home = false;
+    }
     pub(super) fn finish_account_cleanup(&mut self, request_id: u64, result: Result<(), String>,
         verified_identity: Option<(String, String)>, last_identity: &mut Option<(String, String)>) -> bool {
         if self.clearing_previous_account != Some(request_id) { return false; }
@@ -155,7 +176,86 @@ fn challenge_matches(nonce: &str, url: &str, server: &str) -> bool {
     })
 }
 
+fn signed_shell_allowed(verified: bool, cleaning: bool, creating: bool, explicit_join: bool) -> bool {
+    verified && !cleaning && !creating && !explicit_join
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FriendsConnectionAction { Cancel, Retry }
+fn friends_connection_contents(ui: &mut egui::Ui, error: Option<&str>, connecting: bool) -> Option<FriendsConnectionAction> {
+    ui.heading("Friends");
+    ui.label(RichText::new("Messages and calls with your Relay friends.").color(c_muted()));
+    ui.add_space(16.0);
+    if let Some(error) = error {
+        ui.add(egui::Label::new(RichText::new(error).color(c_bad())).wrap(true));
+    } else if connecting {
+        ui.horizontal(|ui| { ui.spinner(); ui.label("Connecting to Friends…"); });
+    } else {
+        ui.label("Friends is not connected. Your servers and settings are still available.");
+    }
+    ui.add_space(12.0);
+    if connecting {
+        ui.add(secondary("Cancel connection")).clicked().then_some(FriendsConnectionAction::Cancel)
+    } else {
+        ui.add(primary("Retry Friends")).clicked().then_some(FriendsConnectionAction::Retry)
+    }
+}
+
 impl RelayApp {
+    /// The verified global account can show the shell before Friends connects.
+    pub(super) fn signed_in_shell(&self) -> bool {
+        signed_shell_allowed(self.central_account.account.is_some(),
+            self.account_start.clearing_previous_account.is_some(), self.hosting_setup.choosing_creation,
+            self.session.is_none() && (self.hosting_setup.entry == host_setup_ui::LoginEntry::Join
+                || self.login.has_invitation_input()))
+    }
+    pub(super) fn friends_shell_selected(&self) -> bool {
+        self.central_account.account.is_some() && self.account_start.friends_requested
+            && !self.selected_nav && self.home_page == Some(SettingsTab::Friends)
+    }
+    pub(super) fn friends_shell_pending(&self) -> bool {
+        self.friends_shell_selected() && !(self.session.is_some() && self.in_people()
+            && self.people_url().as_deref() == Some(self.login.url.as_str())
+            && self.connection_status == ConnectionStatus::Connected)
+    }
+    pub(super) fn cancel_friends_navigation(&mut self, destination: Option<&str>) {
+        self.account_start.cancel_navigation(destination);
+    }
+    pub(super) fn friends_connection_failed(&mut self, error: &str) {
+        if self.account_start.friends_resume.is_some()
+            || self.account_start.pending.as_ref().is_some_and(|a| a.people) {
+            self.account_start.friends_error = Some(error.into());
+            self.account_start.friends_resume = None;
+            self.account_start.pending = None;
+        }
+    }
+    pub(super) fn friends_connection_adopted(&mut self, url: &str, people: bool) {
+        if self.people_url().as_deref() == Some(url) {
+            self.account_start.friends_resume = None;
+            self.account_start.friends_error = (!people).then(|| "This address is not the Relay Friends service.".into());
+        }
+    }
+    pub(super) fn friends_connection_ui(&mut self, ui: &mut egui::Ui) {
+        let connecting = self.account_start.friends_resume.is_some()
+            || self.account_start.pending.as_ref().is_some_and(|a| a.people)
+            || self.account_start.auto.is_some();
+        match friends_connection_contents(ui, self.account_start.friends_error.as_deref(), connecting) {
+            Some(FriendsConnectionAction::Cancel) => {
+                self.cancel_friends_navigation(None);
+                self.account_start.friends_requested = true;
+                self.account_start.friends_error = Some("Connection cancelled.".into());
+            }
+            Some(FriendsConnectionAction::Retry) => self.open_people(),
+            None => {}
+        }
+    }
+
+    pub(super) fn cancelled_navigation_restore(&self) -> Option<String> {
+        self.account_start.navigation_restore.clone().or_else(|| self.session.as_ref().map(|_| self.login.url.clone()))
+    }
+    pub(super) fn reject_cancelled_navigation(&self, url: &str) -> bool {
+        self.account_start.cancelled_navigation.contains(url)
+    }
+
     pub(super) fn account_front(&mut self, ctx: &egui::Context) -> bool {
         if self.capture_path.is_some() {
             return false;
@@ -191,35 +291,28 @@ impl RelayApp {
             self.account_start.home = false;
             return false;
         }
-        let home = self.central_account.account.is_some() && self.account_start.home;
-        if !gate && !home {
-            return false;
-        }
-        if home && !self.account_start.entered && !self.hosting_setup.choosing_creation {
-            self.account_start.entered = true;
-            if self.error.is_none() {
+        if !gate && self.signed_in_shell() {
+            if !self.account_start.entered {
+                self.account_start.entered = true;
+                self.account_start.home = false;
+                self.account_start.friends_requested = true;
+                self.selected_nav = false;
+                self.home_page = Some(SettingsTab::Friends);
                 self.account_start.auto = Some(AutoEntry {
-                    queue: self.saved_servers_to_reconnect().into(),
-                    friends: false,
-                    started: Instant::now(),
-                    resuming: None,
+                    queue: self.saved_servers_to_reconnect().into(), friends: false,
+                    started: Instant::now(), resuming: None,
                 });
             }
-        }
-        self.auto_entry_tick(ctx);
-        let entering = home && self.error.is_none() && self.account_start.auto.is_some();
-        if home
-            && self.account_start.entered
-            && !entering
-            && self.account_start.auto.is_none()
-            && self.account_start.pending.is_none()
-            && !self.hosting_setup.choosing_creation
-            && self.error.is_none()
-            && self.session.is_some()
-        {
-            self.account_start.home = false;
+            if self.account_start.friends_resume.as_ref().is_some_and(|(_, since)| since.elapsed() >= RESUME_WAIT) {
+                self.account_start.friends_resume = None;
+                self.account_start.friends_error = Some("Friends could not connect. Try again when your connection is available.".into());
+            }
+            self.auto_entry_tick(ctx);
             return false;
         }
+        let home = self.central_account.account.is_some()
+            && (self.account_start.home || self.hosting_setup.choosing_creation);
+        if !gate && !home { return false; }
         // Silent restoration starts at launch. Interactive sign-in is an
         // explicit action, after the user can see the saved-login choice.
         self.people_call_notice(ctx);
@@ -321,11 +414,6 @@ impl RelayApp {
             } else if self.hosting_setup.choosing_creation {
                 self.creation_choices(ui);
                 self.local_host_problem(ui);
-            } else if entering {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Opening Relay…");
-                });
             } else {
                 let handle = self
                     .central_account
@@ -460,7 +548,7 @@ impl RelayApp {
         };
         ui.add_space(12.0);
         egui::Frame::none().fill(c_bg()).rounding(6.0)
-            .stroke(Stroke::new(1.0, c_line())).inner_margin(Margin::same(12.0))
+            .stroke(Stroke::new(1.0_f32, c_line())).inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
                 ui.label(RichText::new("Your local server couldn't start").strong());
                 ui.add_space(4.0);
@@ -707,6 +795,7 @@ impl RelayApp {
     }
 
     pub(super) fn sign_out_relay(&mut self) {
+        self.staged_uploads.clear();
         #[cfg(windows)]
         if let Some(surface) = &mut self.account_webview {
             surface.reset();
@@ -774,24 +863,24 @@ impl RelayApp {
     }
 
     pub(super) fn open_people(&mut self) {
-        if self.central_account.account.is_none() {
-            self.account_start.home = true;
-            return;
-        }
+        if self.central_account.account.is_none() { self.account_start.home = true; return; }
         if self.voice_channel.is_some() || self.joining_voice.is_some() {
-            self.notice = Some((
-                "Finish your current call before opening Friends.".into(),
-                Instant::now(),
-            ));
+            self.notice = Some(("Finish your current call before opening Friends.".into(), Instant::now()));
             return;
         }
-        if self.account_start.pending.is_some() {
-            return;
-        }
+        self.cancel_friends_navigation(None);
+        self.account_start.entered = true;
+        self.account_start.friends_requested = true;
+        self.account_start.friends_error = None;
+        self.selected_nav = false;
+        self.home_page = Some(SettingsTab::Friends);
+        self.admin_ui.friend_all_servers = false;
+        self.error = None;
         let Some(url) = self.people_url() else {
-            self.error = Some("The Friends service address has not been configured.".into());
+            self.account_start.friends_error = Some("The Friends service address has not been configured.".into());
             return;
         };
+        self.account_start.cancelled_navigation.remove(&url);
         let sign_in_required = self.community_statuses.get(&url) == Some(&ConnectionStatus::SignInRequired)
             || (self.login.url == url && self.connection_status == ConnectionStatus::SignInRequired);
         if self.in_people() && self.login.url == url && !sign_in_required {
@@ -801,21 +890,17 @@ impl RelayApp {
             self.admin_ui.friend_all_servers = false;
             return;
         }
-        self.account_start.home = true;
+        self.account_start.home = false;
         if !sign_in_required && self.communities.iter().any(|community| community.url == url) {
-            self.switch_community(url.clone());
-            if let Some(auto) = &mut self.account_start.auto {
-                auto.resuming = Some((url, Instant::now()));
-            }
+            self.account_start.friends_resume = Some((url.clone(), Instant::now()));
+            self.send(Command::SwitchCommunity { url });
             return;
         }
         if !sign_in_required && self.prefs.stay_signed_in && crate::credential_vault::load(&url).ok().flatten().is_some() {
             let expected_server_id = self.prefs.communities.iter()
                 .find(|saved| saved.url == url).map(|saved| saved.server_id.clone())
                 .filter(|id| !id.is_empty());
-            if let Some(auto) = &mut self.account_start.auto {
-                auto.resuming = Some((url.clone(), Instant::now()));
-            }
+            self.account_start.friends_resume = Some((url.clone(), Instant::now()));
             self.send(Command::Resume { url, expected_server_id });
             return;
         }
@@ -920,11 +1005,10 @@ impl RelayApp {
                 .pending
                 .as_ref()
                 .is_some_and(|attempt| self.account_login_current(request, &attempt.url));
-            let background = self
-                .account_start
-                .pending
-                .take()
-                .is_some_and(|attempt| attempt.background);
+            let attempt = self.account_start.pending.take();
+            let people = attempt.as_ref().is_some_and(|a| a.people);
+            let background = attempt.as_ref().is_some_and(|a| a.background);
+            if people && current { self.account_start.friends_error = Some(error.into()); }
             // A saved server that cannot be reopened automatically stays in the
             // side rail with its sign-in state; it does not stop opening Relay.
             if !background && current {
@@ -1002,6 +1086,9 @@ impl RelayApp {
                 return;
             }
         }
+        if attempt.people {
+            self.account_start.friends_error = Some("The Friends service identity changed. Check your connection and try again.".into());
+        }
         self.account_start.pending = None;
         self.error = Some(
             "The account service or server identity changed. Check the invitation and try again."
@@ -1050,6 +1137,7 @@ impl RelayApp {
             });
         }
         if let Some(error) = browser.error {
+            if a.people { self.account_start.friends_error = Some(error.into()); }
             self.error = Some(error.into());
             self.account_start.pending = None;
             return;
@@ -1176,7 +1264,7 @@ fn home_section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)
     egui::Frame::none()
         .fill(c_rail())
         .rounding(8.0)
-        .stroke(Stroke::new(1.0, c_line()))
+        .stroke(Stroke::new(1.0_f32, c_line()))
         .inner_margin(Margin::same(16.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1185,3 +1273,7 @@ fn home_section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)
             body(ui);
         });
 }
+
+#[cfg(test)]
+#[path = "friends_shell_tests.rs"]
+mod friends_shell_tests;

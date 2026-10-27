@@ -37,9 +37,10 @@ impl RelayApp {
                     if response.on_hover_text("Direct messages").clicked() {
                         if self.central_account.account.is_some() {
                             self.open_people();
+                        } else {
+                            self.selected_nav = false;
+                            self.home_page = Some(SettingsTab::Friends);
                         }
-                        self.selected_nav = false;
-                        self.home_page = Some(SettingsTab::Friends);
                     }
                     ui.add_space(10.0);
                     ui.separator();

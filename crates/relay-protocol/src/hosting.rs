@@ -1286,8 +1286,14 @@ mod tests {
     fn nothing_claims_that_copying_or_routing_is_already_running() {
         for role in HostRole::ALL {
             let words = role.explanation();
-            assert!(words.contains("not active in this version"), "{words}");
-            assert!(words.contains("records your consent only"), "{words}");
+            // The work exists now, but it never starts by itself and never
+            // makes the member a host: the words must keep saying so.
+            assert!(words.contains("only when"), "{words}");
+            assert!(
+                words.contains("does not make this PC a host")
+                    || words.contains("does not store messages"),
+                "{words}"
+            );
             assert!(!words.starts_with("Keeps") && !words.starts_with("Can relay"));
         }
     }

@@ -110,9 +110,11 @@ impl Invitation {
         if input.len() > 4096 {
             return Err("This invitation is too long.".into());
         }
+        // Windows' URL protocol launch rewrites `relay://join?…` to
+        // `relay://join/?…` before Relay sees it; both are the same invitation.
         if link.scheme() != "relay"
             || link.host_str() != Some("join")
-            || !link.path().is_empty()
+            || !matches!(link.path(), "" | "/")
             || link.port().is_some()
             || !link.username().is_empty()
             || link.password().is_some()
@@ -633,7 +635,7 @@ mod tests {
             link.replace("#invite=code", "&invite=code"),
             link.replace("#invite=code", "#invite="),
             link.replace("relay://join?", "relay://user@join?"),
-            link.replace("relay://join?", "relay://join/?"),
+            link.replace("relay://join?", "relay://join/x?"),
             link.replace(ID, "not-a-community"),
             format!("{link}{}", "x".repeat(4096)),
         ] {
@@ -934,6 +936,10 @@ mod authority_tests {
             assert!(!value.split('#').next().unwrap().contains("hp="));
         }
         assert!(invite.link().contains("v=5&"));
+        // The form Windows hands a URL protocol handler: a `/` before the query.
+        let windows = invite.link().replacen("relay://join?", "relay://join/?", 1);
+        assert!(Invitation::parse(&windows).unwrap() == invite);
+        assert!(Invitation::parse(&invite.link().replacen("relay://join?", "relay://join/x?", 1)).is_err());
         let changed = invite
             .clone()
             .with_alternatives(&["https://other.example".into()])

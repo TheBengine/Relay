@@ -430,7 +430,7 @@ pub(crate) const TABLES: &[Table] = &[
 /// `metadata` keys that are exported and logged. Everything else is host-bound
 /// configuration or a secret (`open_call_secret`).
 pub(crate) const METADATA_KEYS: &[&str] =
-    &["server_id", "presentation", "protection", "hosting.v1"];
+    &["server_id", "presentation", "protection", "hosting.v1", "upload_policy"];
 
 /// FTS5 creates shadow tables named after the virtual table.
 pub(crate) fn table_for(name: &str) -> Option<&'static Table> {
@@ -458,6 +458,13 @@ fn key_expr(table: &Table, row: &str) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("json_array({columns})")
+}
+
+pub(crate) fn refresh_upload_metadata_triggers(tx: &Connection) -> rusqlite::Result<()> {
+    for (name, sql) in trigger_definitions().into_iter().filter(|(name, _)| name.starts_with("replica_metadata_")) {
+        tx.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};{sql}"))?;
+    }
+    Ok(())
 }
 
 fn metadata_filter(row: &str) -> String {

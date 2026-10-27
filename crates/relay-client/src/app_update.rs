@@ -170,6 +170,7 @@ impl RelayApp {
                         && !bootstrap.capabilities.iter().any(|c| c == "people-v1")
                     {
                         self.account_start.pending = None;
+                        self.account_start.friends_error = Some("This address is not the Relay Friends service.".into());
                         self.send(Command::ForgetCommunity { url });
                         self.error = Some("This address is not the Relay Friends service.".into());
                         continue;
@@ -222,6 +223,16 @@ impl RelayApp {
                         self.send(Command::ForgetCommunity { url });
                         continue;
                     }
+                    if self.reject_cancelled_navigation(&url) {
+                        self.send(Command::CancelNavigation {
+                            cancelled: CommandOrigin { url, server_id: bootstrap.server_id.clone(), user_id: session.user.id.clone() },
+                            restore: self.cancelled_navigation_restore(),
+                        });
+                        continue;
+                    }
+                    let preserve_friends_shell = self.friends_shell_selected()
+                        && (self.account_start.auto.is_some() || self.people_url().as_deref() == Some(url.as_str()));
+                    self.friends_connection_adopted(&url, bootstrap.capabilities.iter().any(|c| c == "people-v1"));
                     // Consume the explicit answer before normal connection
                     // adoption tears down the previous idle media context.
                     let background_answer = self.take_background_people_answer(&url, &bootstrap);
@@ -233,7 +244,7 @@ impl RelayApp {
                         .is_some_and(|attempt| attempt.is_people());
                     // During automatic entry a reconnected saved server stays in the
                     // background while the start page waits for Friends.
-                    self.account_start.home = self.account_start.auto.is_some() && !people;
+                    self.account_start.home = false;
                     if people {
                         self.account_start.auto = None;
                     }
@@ -479,11 +490,11 @@ impl RelayApp {
                     if let Err(error) = self.remember_current_local() {
                         self.notice = Some((error, Instant::now()));
                     }
-                    if let Some(target) = target {
+                    if let Some(target) = target.filter(|_| !preserve_friends_shell) {
                         self.selected_nav = !matches!(target, Target::Direct(_));
                         self.select(target);
                     }
-                    if self.in_people() && self.current.is_none() {
+                    if preserve_friends_shell || (self.in_people() && self.current.is_none()) {
                         self.selected_nav = false;
                         self.home_page = Some(SettingsTab::Friends);
                         self.admin_ui.friend_all_servers = false;
@@ -1081,6 +1092,8 @@ impl RelayApp {
                     attachment,
                 } => {
                     self.uploads.remove(&operation_id);
+                    let active = self.command_origin();
+                    if !self.staged_uploads.uploaded(&operation_id, active.as_ref(), &target) { continue; }
                     let send_gif = self.gif_upload_sends.remove(&operation_id).is_some_and(
                         |(origin, original_target)| {
                             self.command_origin().as_ref() == Some(&origin)
@@ -1103,6 +1116,7 @@ impl RelayApp {
                     cancelled,
                 } => {
                     self.gif_upload_sends.remove(&operation_id);
+                    self.staged_uploads.failed(&operation_id, &error);
                     if let Some(upload) = self.uploads.get_mut(&operation_id) {
                         upload.target = Some(target);
                         upload.error = Some(error);
@@ -1988,6 +2002,7 @@ impl RelayApp {
                 }
                 Update::LocalOpened(saved) => self.local_server_opened(saved),
                 Update::Error(e) => {
+                    self.friends_connection_failed(&e);
                     self.cancel_background_people_answer();
                     self.error = Some(e);
                 }
@@ -2339,6 +2354,8 @@ impl eframe::App for RelayApp {
         desktop_ui::preserve_minimized_layout(raw_input);
         #[cfg(feature = "qa-automation")]
         crate::qa_automation::hook(&mut self.qa_input, _ctx, raw_input);
+        #[cfg(feature = "qa-automation")]
+        self.qa_commands(_ctx);
         if self
             .focused_stream
             .as_ref()
@@ -2563,7 +2580,7 @@ impl eframe::App for RelayApp {
         let account_surface = false;
         let account_gateway = account_surface || self.account_front(ctx);
         if !account_gateway {
-            if self.session.is_none() {
+            if self.session.is_none() && !self.signed_in_shell() {
                 self.login_view(ctx);
             } else {
                 self.rail(ctx);

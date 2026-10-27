@@ -1375,9 +1375,10 @@ impl Worker {
                 .iter()
                 .any(|m| &m.user_id == peer)
             {
-                return Err(
-                    "Verify the other person's device before sending a private message.".into(),
-                );
+                return Err(self.send_waiting(
+                    SendWait::PeerVerification,
+                    "Verify the other person's device before sending a private message.",
+                ));
             }
         }
         if self.service_call_challenges(target, &scope, &context)? {

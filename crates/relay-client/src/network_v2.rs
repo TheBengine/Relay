@@ -12,6 +12,7 @@ pub(super) struct ChatSession {
     pub(super) handover_checked_at: Option<Instant>,
     pub(super) handover_probe: Option<crate::host_route::Job>,
     pub(super) account_provider: Option<AccountProvider>,
+    pub(super) upload_limits: UploadLimits,
     pub(super) events: ChatEventInbox,
     capabilities: HashSet<String>,
     protection: CommunityProtection,
@@ -84,6 +85,7 @@ impl ChatSession {
     pub(super) fn update_bootstrap(&mut self, bootstrap: &Bootstrap) {
         self.host_paused = bootstrap.host_paused;
         self.account_provider = bootstrap.account_provider.clone();
+        self.upload_limits = bootstrap.upload_limits.clone();
         self.capabilities = bootstrap.capabilities.iter().cloned().collect();
         self.protection = bootstrap.protection.clone();
         let channels: HashMap<_, _> = bootstrap
@@ -1429,7 +1431,7 @@ impl Worker {
                 operation_id,
             } => {
                 if let Err(error) =
-                    self.start_upload(&origin, target.clone(), path, operation_id.clone())
+                    self.start_upload(&origin, target.clone(), path, operation_id.clone(), None)
                 {
                     self.emit(Update::UploadFailed {
                         target,
@@ -1437,6 +1439,11 @@ impl Worker {
                         error,
                         cancelled: false,
                     });
+                }
+            }
+            Command::StartReviewedUpload { origin, target, path, operation_id, review } => {
+                if let Err(error) = self.start_upload(&origin, target.clone(), path, operation_id.clone(), Some(review)) {
+                    self.emit(Update::UploadFailed { target, operation_id, error, cancelled: false });
                 }
             }
             Command::CancelUpload { operation_id } => {
@@ -1472,6 +1479,36 @@ impl Worker {
                         cancelled: false,
                     });
                 }
+            }
+            Command::CancelNavigation { cancelled, restore } => {
+                // A URL can be reused by another account. Only the exact late
+                // connection may be parked, and active calls are never abandoned.
+                if !self.connection.as_ref().is_some_and(|c|
+                    CommandOrigin::from(c) == cancelled && c.voice_channel.is_none() && c.voice_attempt.is_none()) {
+                    return Ok(());
+                }
+                let gate = self.live.gate.clone();
+                {
+                    let _gate = gate.lock().map_err(|_| "The media worker stopped.".to_string())?;
+                    self.cancel_transfers();
+                    self.live.epoch.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(mut context) = self.live.context.lock() { *context = None; }
+                    if let Some(connection) = self.connection.take() {
+                        self.saved_connections.insert(connection.url.clone(), SavedConnection {
+                            connection, stop: self.socket_stop.clone(), dirty: self.refresh_pending.clone(),
+                        });
+                    }
+                    self.chat_media_epoch.fetch_add(1, Ordering::SeqCst);
+                    self.chat_media_workers = None;
+                    self.status = None;
+                    self.live.activity.notify_all();
+                }
+                if let Some(url) = restore.filter(|url| self.saved_connections.contains_key(url)) {
+                    if let Err(error) = self.handle_extended(Command::SwitchCommunity { url: url.clone() }) {
+                        self.emit(Update::ConnectionState { url, status: if error == "Sign in again" { ConnectionStatus::SignInRequired } else { ConnectionStatus::Reconnecting } });
+                        return Err(error);
+                    }
+                } else { self.publish_communities(); }
             }
             Command::SwitchCommunity { url } => {
                 let url = crate::community::normalize_url(&url)?;
@@ -2410,6 +2447,7 @@ impl Worker {
         target: Target,
         path: PathBuf,
         operation_id: String,
+        review: Option<UploadReview>,
     ) -> Result<(), String> {
         self.command_connection(origin)?;
         if self.transfers.len() >= 2 {
@@ -2429,13 +2467,14 @@ impl Worker {
         let size = std::fs::metadata(&path)
             .map_err(|_| "The selected file cannot be read.")?
             .len();
-        if plain_upload {
-            if size == 0 || size > MAX_UPLOAD_BYTES as u64 {
-                return Err("Files must be nonempty and fit within 10 MB.".into());
-            }
-        } else if size == 0 || size > (MAX_UPLOAD_BYTES - relay_crypto::files::FILE_OVERHEAD) as u64
-        {
-            return Err("Encrypted files must be nonempty and fit within 10 MB including encryption overhead.".into());
+        let wire_limit = self.connection.as_ref().map(|c| c.chat.upload_limits.effective()).unwrap_or(0);
+        let plain_limit = wire_limit.saturating_sub(if plain_upload { 0 } else { relay_crypto::files::FILE_OVERHEAD as u64 });
+        if size == 0 || size > plain_limit {
+            return Err(if wire_limit == 0 { "File uploads are disabled for your roles on this server.".into() }
+                else { format!("The file exceeds this server's current {:.1} MiB upload limit, including encryption overhead.", wire_limit as f64 / 1_048_576.0) });
+        }
+        if review.as_ref().is_some_and(|review| review.bytes != size) {
+            return Err("The selected file changed after review. Review it again before uploading.".into());
         }
         let file = std::fs::File::open(&path).map_err(|_| "The selected file cannot be read.")?;
         let binding = if plain_upload {
@@ -2524,6 +2563,13 @@ impl Worker {
                         {
                             return Err("The selected file changed or upload was cancelled.".into());
                         }
+                        if let Some(review) = &review {
+                            use sha2::{Digest, Sha256};
+                            let digest: [u8; 32] = Sha256::digest(&*plain).into();
+                            if review.bytes != plain.len() as u64 || digest != review.sha256 {
+                                return Err("The selected file changed after review. Review it again before uploading.".into());
+                            }
+                        }
                         let mime = match image::guess_format(&plain) {
                             Ok(image::ImageFormat::Png) => "image/png",
                             Ok(image::ImageFormat::Jpeg) => "image/jpeg",
@@ -2546,7 +2592,7 @@ impl Worker {
                         };
                         drop(plain);
                         let wire_size = wire.len() as u64;
-                        if wire_size > MAX_UPLOAD_BYTES as u64 {
+                        if wire_size > wire_limit {
                             return Err("The encrypted file exceeds the upload limit.".into());
                         }
                         let reader = ProgressReader {
@@ -2883,7 +2929,7 @@ impl Worker {
         {
             return Err("This download identifier is invalid or already running.".into());
         }
-        if attachment.size > MAX_UPLOAD_BYTES as u64
+        if attachment.size > MAX_SUPPORTED_UPLOAD_BYTES as u64
             || attachment.id.is_empty()
             || attachment.id.len() > 128
             || !attachment
@@ -2910,7 +2956,7 @@ impl Worker {
                     .file
                     .size
                     .checked_add(relay_crypto::files::FILE_OVERHEAD as u64)
-                    .filter(|size| *size <= MAX_UPLOAD_BYTES as u64)
+                    .filter(|size| *size <= MAX_SUPPORTED_UPLOAD_BYTES as u64)
                     .ok_or("The encrypted attachment exceeds its limit.")?;
                 (Some(encrypted), wire_size)
             }
@@ -2982,7 +3028,7 @@ impl Worker {
                                 break;
                             }
                             transferred += count as u64;
-                            if transferred > wire_size || transferred > MAX_UPLOAD_BYTES as u64 {
+                            if transferred > wire_size || transferred > MAX_SUPPORTED_UPLOAD_BYTES as u64 {
                                 return Err(
                                     "The download exceeds the attachment size limit.".into()
                                 );
@@ -3444,7 +3490,7 @@ impl Read for ProgressReader {
         }
         let n = self.reader.read(buffer)?;
         self.read += n as u64;
-        if self.read > self.size || self.read > MAX_UPLOAD_BYTES as u64 {
+        if self.read > self.size || self.read > MAX_SUPPORTED_UPLOAD_BYTES as u64 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "File changed during upload",
@@ -3770,5 +3816,14 @@ mod tests {
             target_ids(&Target::Direct("a".into())),
             (None, Some("a".into()))
         );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn upload_policy_admin_path_is_allowed_without_relaxing_canonical_paths() {
+    assert!(valid_admin_path("/api/settings/uploads"));
+    for path in ["/api/local/uploads", "/api/settings/uploads?token=x", "/api/settings/../uploads"] {
+        assert!(!valid_admin_path(path));
     }
 }

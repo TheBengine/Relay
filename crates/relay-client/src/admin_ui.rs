@@ -12,6 +12,7 @@ include!("assets_ui.rs");
 include!("interactions_ui.rs");
 include!("welcome_ui.rs");
 include!("discord_ui.rs");
+include!("upload_settings_ui.rs");
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Section {
@@ -28,6 +29,7 @@ enum Section {
     Hosts,
     Backups,
     Discord,
+    Uploads,
 }
 
 #[derive(Default)]
@@ -47,6 +49,7 @@ pub(super) struct ServerUi {
     pub(super) search: String,
     section: Section,
     pub(super) hosting: super::host_ui::State,
+    uploads: UploadSettings,
     channel: Option<Channel>,
     permissions: Vec<ChannelPermission>,
     permission_user: String,
@@ -164,6 +167,7 @@ impl ServerUi {
                 bootstrap.capabilities.iter().any(|c| c == "hosting-v1"),
             ),
             (Section::Backups, "Backups & Restore", admin),
+            (Section::Uploads, "Uploads", upload_policy_owner(bootstrap)),
             (
                 Section::Discord,
                 "Discord",
@@ -206,6 +210,7 @@ impl ServerUi {
             "hosts" => Section::Hosts,
             "backups" => Section::Backups,
             "discord" => Section::Discord,
+            "uploads" => Section::Uploads,
             _ => Section::Overview,
         };
     }
@@ -566,6 +571,9 @@ impl RelayApp {
         self.ensure_admin_data(key, path);
     }
     pub(super) fn handle_admin_result(&mut self, key: String, data: Value) {
+        if self.upload_settings_received(&key, &data) {
+            return;
+        }
         if key == "action:people-request" {
             match serde_json::from_value::<SocialState>(data) {
                 Ok(social) => {
@@ -875,6 +883,7 @@ impl RelayApp {
             Section::Account => self.account_settings_ui(ui),
             Section::Backups if admin => self.backup_settings_ui(ui, &bootstrap),
             Section::Discord if admin => self.discord_settings_ui(ui, &bootstrap),
+            Section::Uploads if upload_policy_owner(&bootstrap) => self.upload_settings_ui(ui, &bootstrap),
             _ => {
                 self.admin_ui.section = Section::Overview;
             }

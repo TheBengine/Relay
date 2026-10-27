@@ -19,7 +19,7 @@ mod privacy;
 const APP_ID: i64 = 0x524c5943;
 const MANIFEST_LIMIT: usize = 16 * 1024 * 1024;
 const PART_LIMIT: usize = 16 * 1024 * 1024;
-const FILE_LIMIT: usize = 10 * 1024 * 1024;
+const FILE_LIMIT: usize = relay_protocol::MAX_SUPPORTED_UPLOAD_BYTES;
 const JOB_BYTES: u64 = 512 * 1024 * 1024;
 const DISK_BYTES: i64 = 8 * 1024 * 1024 * 1024;
 

@@ -231,6 +231,18 @@ impl EncryptionUi {
         *self = Self::default();
     }
 
+    /// Opens one person's devices on the Encryption page; nothing is approved.
+    pub(super) fn review_person(&mut self, user_id: &str) {
+        self.expanded_people.insert(user_id.to_owned());
+    }
+
+    /// True when the server lists devices for this person and none of them is
+    /// verified here and unchanged: a private message to them cannot be sent.
+    pub(super) fn person_unverified(&self, user_id: &str) -> bool {
+        let mut devices = self.status.peers.iter().filter(|p| p.user_id == user_id).peekable();
+        devices.peek().is_some() && devices.all(|p| !p.verified || p.changed)
+    }
+
     pub(super) fn apply_status(&mut self, status: CryptoUiStatus) {
         self.expanded_people
             .retain(|user_id| status.peers.iter().any(|peer| &peer.user_id == user_id));
@@ -1184,6 +1196,19 @@ mod tests {
             verified: false,
             changed: false,
         }
+    }
+
+    #[test]
+    fn a_person_is_unverified_only_when_no_listed_device_is_verified_and_unchanged() {
+        let mut ui = EncryptionUi::default();
+        assert!(!ui.person_unverified("person"), "an unknown person is not reported");
+        ui.status.peers = vec![peer("a"), CryptoPeerStatus { device_id: "second".into(), ..peer("b") }];
+        assert!(ui.person_unverified("person"));
+        ui.status.peers[1].verified = true;
+        assert!(!ui.person_unverified("person"), "one verified device is enough to send");
+        ui.status.peers[1].changed = true;
+        assert!(ui.person_unverified("person"), "a changed device needs a new check");
+        assert!(!ui.person_unverified("someone-else"));
     }
 
     fn ready_status(peers: Vec<CryptoPeerStatus>) -> CryptoUiStatus {

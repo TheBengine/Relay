@@ -3,16 +3,15 @@ use super::*;
 
 impl RelayApp {
     pub(super) fn begin_account_cleanup(&mut self) {
+        self.staged_uploads.clear();
         self.account_start.pending = None;
         self.account_link_ui = Default::default();
         self.community_friends.clear();
         self.people_ui = Default::default();
         self.stop_media();
         let request_id = self.next_request();
-        self.account_start = account_start_ui::State {
-            clearing_previous_account: Some(request_id),
-            ..Default::default()
-        };
+        self.account_start = Default::default();
+        self.account_start.clearing_previous_account = Some(request_id);
         self.send(Command::ForgetAccountSessions {
             urls: self.account_session_urls(),
             request_id,

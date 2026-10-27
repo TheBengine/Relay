@@ -9,6 +9,8 @@ pub mod installation;
 pub mod lan_discovery;
 pub mod lan_pairing;
 pub mod takeover;
+pub mod uploads;
+pub use uploads::{UploadLimits, UploadPolicy, MAX_PENDING_UPLOAD_BYTES, MAX_SUPPORTED_UPLOAD_BYTES};
 
 pub const CRYPTO_MAX_OPERATION_JSON_BYTES: usize = 1536 * 1024;
 pub const CRYPTO_MAX_OPERATION_DECODED_BYTES: usize = 1024 * 1024;
@@ -440,6 +442,8 @@ pub struct SetProtection {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Bootstrap {
+    #[serde(default)]
+    pub upload_limits: UploadLimits,
     /// A frozen source offers a read-only view for resuming/cancelling the move.
     /// It never renews a voice lease or permits a mutation.
     #[serde(default)]

@@ -59,7 +59,7 @@ fn decoder_limits(limits: PreviewLimits) -> image::io::Limits {
     let mut result = image::io::Limits::default();
     result.max_image_width = Some(limits.dimension);
     result.max_image_height = Some(limits.dimension);
-    result.max_alloc = Some(MAX_DECODED_BYTES as u64);
+    result.max_alloc = Some(limits.decoded_bytes as u64);
     result
 }
 
@@ -71,8 +71,116 @@ pub fn picker_preview(bytes: &[u8]) -> Result<DecodedMedia, String> {
     decode_variant(bytes, LIMITS, Some((144, 100, 8 * 1024 * 1024)))
 }
 /// Two-times-density inline preview; large previews request the original separately.
+const STATIC_THUMBNAIL_LIMITS: PreviewLimits = PreviewLimits {
+    dimension: 8192, pixels: 16 * 1024 * 1024, frames: 1,
+    decoded_bytes: 64 * 1024 * 1024,
+};
+/// Read only the fixed IHDR: the old PNG dimensions constructor decompresses metadata.
+pub(crate) fn png_header_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
+    if bytes.len() < 33 || &bytes[..8] != b"\x89PNG\r\n\x1a\n"
+        || &bytes[8..16] != b"\0\0\0\rIHDR" {
+        return Err("The PNG header is damaged.".into());
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().map_err(|_| "The PNG header is damaged.")?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().map_err(|_| "The PNG header is damaged.")?);
+    check_dimensions(width, height, STATIC_THUMBNAIL_LIMITS)?;
+    Ok((width, height))
+}
+pub(crate) fn decode_legacy_avatar_webp(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    if bytes.len() > 2 * 1024 * 1024 { return Err("Avatars can be up to 2 MiB.".into()); }
+    decode_webp_with_limits(bytes, PreviewLimits {
+        dimension: 2048, pixels: 2048 * 2048, frames: 1, decoded_bytes: 32 * 1024 * 1024,
+    })
+}
+/// Header inspection precedes every WebP pixel allocation, including VP8X's nested frame.
+pub(crate) fn decode_bounded_webp(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    decode_webp_with_limits(bytes, STATIC_THUMBNAIL_LIMITS)
+}
+fn decode_webp_with_limits(bytes: &[u8], limits: PreviewLimits) -> Result<image::DynamicImage, String> {
+    let invalid = || "This WebP is damaged or exceeds preview limits.".to_string();
+    if bytes.len() > 25 * 1024 * 1024 || bytes.len() < 20
+        || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP"
+        || u32::from_le_bytes(bytes[4..8].try_into().map_err(|_| invalid())?) as usize != bytes.len() - 8 {
+        return Err(invalid());
+    }
+    let mut decoder = image_webp::WebPDecoder::new(Cursor::new(bytes)).map_err(|_| invalid())?;
+    let dimensions = decoder.dimensions();
+    check_dimensions(dimensions.0, dimensions.1, limits)?;
+    if decoder.is_animated() {
+        return Err("Animated WebP previews are not supported. Download the original file to view it.".into());
+    }
+    // The library checks VP8X canvas/frame equality only AFTER decoding. Inspect
+    // each top-level chunk first; delegate codec header parsing to the library.
+    let mut offset = 12usize;
+    let mut frames = 0;
+    let mut chunks = 0;
+    while offset < bytes.len() {
+        chunks += 1;
+        if chunks > 1024 || bytes.len() - offset < 8 { return Err(invalid()); }
+        let kind = &bytes[offset..offset + 4];
+        let length = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().map_err(|_| invalid())?) as usize;
+        let start = offset + 8;
+        let end = start.checked_add(length).ok_or_else(invalid)?;
+        let next = end.checked_add(length & 1).ok_or_else(invalid)?;
+        if next > bytes.len() { return Err(invalid()); }
+        if kind == b"ANIM" || kind == b"ANMF" { return Err("Animated WebP previews are not supported.".into()); }
+        if kind == b"VP8X" && (length != 10 || bytes[start] & 2 != 0) { return Err(invalid()); }
+        if kind == b"VP8 " || kind == b"VP8L" {
+            frames += 1;
+            if frames != 1 { return Err(invalid()); }
+            let header_len = if kind == b"VP8 " { 10 } else { 5 };
+            if length < header_len { return Err(invalid()); }
+            // Simple VP8/VP8L new() reads only its fixed header, never pixels.
+            let mut header = Vec::with_capacity(30);
+            header.extend_from_slice(b"RIFF");
+            header.extend_from_slice(&(12u32 + header_len as u32 + (header_len as u32 & 1)).to_le_bytes());
+            header.extend_from_slice(b"WEBP");
+            header.extend_from_slice(kind);
+            header.extend_from_slice(&(header_len as u32).to_le_bytes());
+            header.extend_from_slice(&bytes[start..start + header_len]);
+            if header_len & 1 != 0 { header.push(0); }
+            let frame = image_webp::WebPDecoder::new(Cursor::new(header)).map_err(|_| invalid())?;
+            let size = frame.dimensions();
+            check_dimensions(size.0, size.1, limits)?;
+            if size != dimensions { return Err(invalid()); }
+        }
+        offset = next;
+    }
+    if frames != 1 { return Err(invalid()); }
+    let size = decoder.output_buffer_size().filter(|size| *size <= limits.decoded_bytes).ok_or_else(invalid)?;
+    decoder.set_memory_limit(limits.decoded_bytes);
+    let alpha = decoder.has_alpha();
+    let mut pixels = vec![0; size];
+    decoder.read_image(&mut pixels).map_err(|_| invalid())?;
+    if alpha {
+        image::RgbaImage::from_raw(dimensions.0, dimensions.1, pixels)
+            .map(image::DynamicImage::ImageRgba8).ok_or_else(invalid)
+    } else {
+        image::RgbImage::from_raw(dimensions.0, dimensions.1, pixels)
+            .map(image::DynamicImage::ImageRgb8).ok_or_else(invalid)
+    }
+}
+fn thumbnail_limits(bytes: &[u8]) -> PreviewLimits {
+    if matches!(image::guess_format(bytes), Ok(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP)) {
+        STATIC_THUMBNAIL_LIMITS
+    } else { LIMITS }
+}
+/// File names never decide whether bytes are decoded. Keep animation limits unchanged.
+static STATIC_THUMBNAIL_DECODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn thumbnail_variant(bytes: &[u8], size: (u32, u32, usize)) -> Result<DecodedMedia, String> {
+    let limits = thumbnail_limits(bytes);
+    // Stage and incoming-media workers share one large-still decoder budget.
+    // This gate is never taken by the UI thread.
+    let _gate = if limits.pixels > MAX_PIXELS {
+        Some(STATIC_THUMBNAIL_DECODE.lock().map_err(|_| "The image preview worker stopped.".to_string())?)
+    } else { None };
+    decode_variant(bytes, limits, Some(size))
+}
+pub fn staging_preview(bytes: &[u8]) -> Result<DecodedMedia, String> {
+    thumbnail_variant(bytes, (144, 100, 8 * 1024 * 1024))
+}
 pub fn inline_preview(bytes: &[u8]) -> Result<DecodedMedia, String> {
-    decode_variant(bytes, LIMITS, Some((800, 520, MAX_DECODED_BYTES)))
+    thumbnail_variant(bytes, (800, 520, MAX_DECODED_BYTES))
 }
 fn preview_rgba(rgba: image::RgbaImage, preview: Option<(u32, u32, usize)>) -> image::RgbaImage {
     if let Some((width, height, _)) = preview {
@@ -150,10 +258,11 @@ fn decode_variant(
             });
             result.decoded_bytes += frame_bytes;
         }
-    } else if matches!(format, ImageFormat::Png | ImageFormat::Jpeg) {
-        let dimensions = image::io::Reader::with_format(Cursor::new(bytes), format)
+    } else if matches!(format, ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP) {
+        let webp = if format == ImageFormat::WebP { Some(decode_webp_with_limits(bytes, limits)?) } else { None };
+        let dimensions = if let Some(decoded) = &webp { (decoded.width(), decoded.height()) } else if format == ImageFormat::Png { png_header_dimensions(bytes)? } else { image::io::Reader::with_format(Cursor::new(bytes), format)
             .into_dimensions()
-            .map_err(|_| "The image dimensions could not be read.".to_string())?;
+            .map_err(|_| "The image dimensions could not be read.".to_string())? };
         let frame_bytes = check_dimensions(dimensions.0, dimensions.1, limits)?;
         result.source_size = [dimensions.0 as usize, dimensions.1 as usize];
         if frame_bytes > limits.decoded_bytes {
@@ -161,11 +270,25 @@ fn decode_variant(
         }
         let mut reader = image::io::Reader::with_format(Cursor::new(bytes), format);
         reader.limits(decoder_limits(limits));
-        let rgba = reader
-            .decode()
-            .map_err(|_| "The image could not be decoded.".to_string())?
-            .to_rgba8();
-        let rgba = preview_rgba(rgba, preview);
+        let mut decoded = if let Some(decoded) = webp { decoded } else { reader.decode()
+            .map_err(|_| "The image could not be decoded.".to_string())? };
+        let rgba = if let Some((max_width, max_height, _)) = preview {
+            // Shrink the original color buffer before RGBA conversion. A phone
+            // photo must not retain full-size RGB and RGBA buffers together.
+            let (width, height) = dimensions;
+            if width > max_width || height > max_height {
+                let (w, h) = (u64::from(width), u64::from(height));
+                let (width, height) = if u64::from(max_width) * h <= u64::from(max_height) * w {
+                    (max_width, (h * u64::from(max_width) / w).max(1) as u32)
+                } else {
+                    ((w * u64::from(max_height) / h).max(1) as u32, max_height)
+                };
+                decoded = decoded.thumbnail_exact(width, height);
+            }
+            decoded.into_rgba8()
+        } else {
+            decoded.to_rgba8()
+        };
         if rgba.as_raw().len() > byte_limit {
             return Err("The image exceeds preview memory limits.".into());
         }
@@ -178,7 +301,7 @@ fn decode_variant(
         });
         result.decoded_bytes = rgba.as_raw().len();
     } else {
-        return Err("Inline previews support PNG, JPEG, and GIF files.".into());
+        return Err("Inline previews support PNG, JPEG, static WebP, and GIF files.".into());
     }
     if result.frames.is_empty() {
         return Err("The image has no displayable frames.".into());
@@ -633,3 +756,139 @@ mod tests {
 #[cfg(test)]
 #[path = "chat_media_resource_tests.rs"]
 mod resource_tests;
+
+#[cfg(test)]
+mod static_thumbnail_tests {
+    use super::*;
+    #[test]
+    fn ordinary_twelve_megapixel_photo_gets_bounded_thumbnail_without_changing_original_policy() {
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(4000, 3000).write_to(&mut bytes, ImageFormat::Png).unwrap();
+        let original = bytes.into_inner();
+        let digest = { use sha2::{Digest, Sha256}; Sha256::digest(&original) };
+        let preview = inline_preview(&original).unwrap();
+        assert_eq!(preview.source_size, [4000, 3000]);
+        assert_eq!(preview.frames[0].image.size, [693, 520]);
+        assert!(preview.decoded_bytes <= 800 * 520 * 4);
+        let selected = staging_preview(&original).unwrap();
+        assert!(selected.frames[0].image.size[0] <= 144 && selected.frames[0].image.size[1] <= 100);
+        assert!(decode(&original).is_err(), "Full-original decoder retains its existing bound");
+        use sha2::{Digest, Sha256};
+        assert_eq!(digest, Sha256::digest(&original));
+    }
+    #[test]
+    fn static_thumbnail_limits_do_not_expand_animated_or_encoded_memory_allowances() {
+        assert!(check_dimensions(8193, 1, STATIC_THUMBNAIL_LIMITS).is_err());
+        assert!(check_dimensions(8192, 8192, STATIC_THUMBNAIL_LIMITS).is_err());
+        assert!(staging_preview(&vec![0; MAX_COMPRESSED_BYTES + 1]).is_err());
+        let gif = super::tests::disposal_gif();
+        let staged = staging_preview(&gif).unwrap();
+        let original = decode(&gif).unwrap();
+        assert_eq!(staged.frames.len(), original.frames.len());
+        for (a, b) in staged.frames.iter().zip(&original.frames) {
+            assert_eq!(a.delay, b.delay);
+            assert_eq!(a.image.pixels, b.image.pixels);
+        }
+        assert_eq!(thumbnail_limits(&gif).pixels, MAX_PIXELS);
+    }
+}
+
+#[cfg(test)]
+mod bounded_webp_tests {
+    use super::*;
+    fn riff(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut bytes = b"RIFF\0\0\0\0WEBP".to_vec();
+        for (kind, payload) in chunks {
+            bytes.extend_from_slice(*kind);
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(payload);
+            if payload.len() & 1 != 0 { bytes.push(0); }
+        }
+        let size = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&size.to_le_bytes());
+        bytes
+    }
+    fn encoded(width: u32, height: u32, alpha: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let (pixels, color) = if alpha {
+            ([20, 40, 60, 80].repeat((width * height) as usize), image::ColorType::Rgba8)
+        } else {
+            ([20, 40, 60].repeat((width * height) as usize), image::ColorType::Rgb8)
+        };
+        image::codecs::webp::WebPEncoder::new_lossless(&mut bytes).encode(&pixels, width, height, color).unwrap();
+        bytes
+    }
+    #[test]
+    fn bounded_webp_preserves_rgb_rgba_and_static_extended_alpha() {
+        for alpha in [false, true] {
+            let bytes = encoded(12, 8, alpha);
+            let decoded = decode_bounded_webp(&bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (12, 8));
+            let expected = if alpha { [20, 40, 60, 80] } else { [20, 40, 60, 255] };
+            assert_eq!(decoded.to_rgba8().get_pixel(0, 0).0, expected);
+            if alpha {
+                let extended = riff(&[(b"VP8X", &[16, 0, 0, 0, 11, 0, 0, 7, 0, 0]), (b"VP8L", &bytes[20..20 + u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize])]);
+                assert_eq!(decode_bounded_webp(&extended).unwrap().to_rgba8(), decoded.to_rgba8());
+            }
+        }
+    }
+    #[test]
+    fn bounded_webp_rejects_oversized_and_mismatched_nested_headers_before_pixels() {
+        for width in [2u32, 8193] {
+            // Header only: there is no pixel stream available to decode.
+            let header = ((width - 1) | (1 << 28)).to_le_bytes();
+            let payload = [0x2f, header[0], header[1], header[2], header[3]];
+            let bytes = riff(&[(b"VP8X", &[16, 0, 0, 0, 0, 0, 0, 0, 0, 0]), (b"VP8L", &payload)]);
+            let error = decode_bounded_webp(&bytes).err().unwrap();
+            assert!(error.contains(if width > 8192 { "too large" } else { "damaged" }));
+        }
+    }
+    #[test]
+    fn bounded_webp_rejects_animation_duplicate_frames_and_truncated_chunks() {
+        let bytes = encoded(2, 1, true);
+        let length = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let payload = &bytes[20..20 + length];
+        for kind in [b"ANIM", b"ANMF"] {
+            let bytes = riff(&[(b"VP8L", payload), (kind, &[0; 24])]);
+            assert!(decode_bounded_webp(&bytes).err().unwrap().contains("Animated"));
+        }
+        assert!(decode_bounded_webp(&riff(&[(b"VP8L", payload), (b"VP8L", payload)])).is_err());
+        let mut malformed = bytes.clone();
+        malformed[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_bounded_webp(&malformed).is_err());
+        assert!(decode_bounded_webp(&bytes[..bytes.len()-1]).is_err());
+        let flagged = riff(&[(b"VP8X", &[2, 0, 0, 0, 1, 0, 0, 0, 0, 0]), (b"VP8L", payload)]);
+        assert!(decode_bounded_webp(&flagged).is_err());
+    }
+    #[test]
+    fn static_webp_thumbnail_keeps_old_original_bound_and_original_bytes() {
+        let bytes = encoded(2049, 1, true);
+        let before = bytes.clone();
+        let media = inline_preview(&bytes).unwrap();
+        assert_eq!(media.source_size, [2049, 1]);
+        assert_eq!(media.frames[0].image.size, [800, 1]);
+        assert!(staging_preview(&bytes).unwrap().decoded_bytes <= 144 * 100 * 4);
+        assert!(decode(&bytes).is_err());
+        assert_eq!(before, bytes);
+    }
+}
+
+#[cfg(test)]
+mod png_header_tests {
+    use super::*;
+    #[test]
+    fn png_header_admission_ignores_metadata_and_rejects_huge_or_truncated_header() {
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 3).write_to(&mut bytes, ImageFormat::Png).unwrap();
+        let mut bytes = bytes.into_inner();
+        assert_eq!(png_header_dimensions(&bytes).unwrap(), (2, 3));
+        // No decoder or metadata parsing is needed to admit the fixed IHDR.
+        assert_eq!(png_header_dimensions(&bytes[..33]).unwrap(), (2, 3));
+        assert!(png_header_dimensions(&bytes[..32]).is_err());
+        bytes[16..20].copy_from_slice(&8193u32.to_be_bytes());
+        assert!(png_header_dimensions(&bytes).is_err());
+        assert!(inline_preview(&bytes).is_err());
+        bytes[16..20].copy_from_slice(&0u32.to_be_bytes());
+        assert!(png_header_dimensions(&bytes).is_err());
+    }
+}

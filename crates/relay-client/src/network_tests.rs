@@ -11,6 +11,11 @@ mod send_binding_tests;
 #[path = "network_status_problem_tests.rs"]
 mod status_problem_tests;
 
+#[path = "network_upload_policy_tests.rs"]
+mod upload_policy_tests;
+#[path = "network_navigation_cancel_tests.rs"]
+mod navigation_cancel_tests;
+
 use super::*;
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -1446,7 +1451,8 @@ fn read_request(socket: &mut TcpStream) -> Option<RecordedRequest> {
         name.eq_ignore_ascii_case("authorization")
             .then(|| value.trim().to_owned())
     });
-    if length > 64 * 1024 {
+    // Bound fixture bodies by the supported wire ceiling; headers stay 64 KiB.
+    if length > MAX_SUPPORTED_UPLOAD_BYTES {
         return None;
     }
     while request.len() < header_end + length {

@@ -6,6 +6,7 @@
 mod accessible_input;
 #[cfg(feature = "qa-automation")]
 mod qa_automation;
+mod file_pick;
 mod audio_wake;
 mod build_metadata;
 #[cfg(windows)]

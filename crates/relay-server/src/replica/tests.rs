@@ -541,6 +541,25 @@ fn log_row_exists_exactly_when_an_allow_listed_write_commits() {
 }
 
 #[test]
+fn upload_policy_metadata_is_logged_after_upgrading_existing_schema_27_triggers() {
+    let (_dir, mut db) = enabled();
+    for (name, sql) in trigger_definitions().into_iter().filter(|(name, _)| name.starts_with("replica_metadata_")) {
+        db.execute_batch(&format!("DROP TRIGGER {name};{}", sql.replace(",'upload_policy'", ""))).unwrap();
+    }
+    db.pragma_update(None, "user_version", 27).unwrap();
+    db.execute("DELETE FROM schema_migrations WHERE version=28", []).unwrap();
+    clear_log(&db);
+    exec(&db, "INSERT INTO metadata VALUES('upload_policy','{}')");
+    assert!(log(&db).is_empty());
+    crate::community::migrate_database(&mut db).unwrap();
+    exec(&db, "UPDATE metadata SET value='{\"revision\":1}' WHERE key='upload_policy'");
+    assert_eq!(log(&db), [entry("metadata", "i", "[\"upload_policy\"]")]);
+    clear_log(&db);
+    exec(&db, "DELETE FROM metadata WHERE key='upload_policy'");
+    assert_eq!(log(&db), [entry("metadata", "d", "[\"upload_policy\"]")]);
+}
+
+#[test]
 fn metadata_logs_only_allow_listed_keys() {
     let (_d, db) = enabled();
     clear_log(&db);

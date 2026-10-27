@@ -43,6 +43,24 @@ impl RelayApp {
         }
     }
 
+    fn pending_friends_sidebar(&mut self, ui: &mut egui::Ui) {
+        egui::TopBottomPanel::bottom("pending-profile-footer")
+            .frame(egui::Frame::none().fill(c_card()).rounding(6.0).inner_margin(Margin::same(8.0)))
+            .show_inside(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(account) = &self.central_account.account { ui.label(format!("@{}", account.handle)); }
+                    if icon_button_sized(ui, 24.0, Icon::Settings, false, "User settings").clicked() { self.settings_open = true; }
+                });
+            });
+        ui.label(RichText::new("Direct messages").strong().size(font_size(16.0)));
+        ui.add_space(16.0);
+        if icon_nav_row(ui, "pending-friends-nav", Icon::Users, "Friends", true).clicked() {
+            self.home_page = Some(SettingsTab::Friends);
+        }
+        ui.add_space(16.0);
+        ui.label(RichText::new("Your conversations appear here when Friends connects.").color(c_muted()));
+    }
+
     pub(super) fn sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("channels")
             .default_width(240.0)
@@ -54,6 +72,10 @@ impl RelayApp {
             .frame(egui::Frame::none().fill(c_panel()))
             .show(ctx, |ui| {
                 ui.set_enabled(!self.modal_open());
+                if self.friends_shell_pending() || (self.bootstrap.is_none() && self.central_account.account.is_some()) {
+                    self.pending_friends_sidebar(ui);
+                    return;
+                }
                 let Some(b) = self.bootstrap.clone() else {
                     return;
                 };

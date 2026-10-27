@@ -5,8 +5,12 @@
 //! on the next frame. Never compiled into a normal build.
 use eframe::egui::{self, accesskit};
 
+/// The text waiting for focus, and the file the next screenshot goes to.
 #[derive(Default)]
-pub(crate) struct Pending(Option<(accesskit::NodeId, String, u8)>);
+pub(crate) struct Pending(
+    Option<(accesskit::NodeId, String, u8)>,
+    pub(crate) Option<std::path::PathBuf>,
+);
 
 pub(crate) fn hook(pending: &mut Pending, ctx: &egui::Context, raw: &mut egui::RawInput) {
     if let Some((target, text, frames)) = pending.0.take() {
@@ -26,6 +30,22 @@ pub(crate) fn hook(pending: &mut Pending, ctx: &egui::Context, raw: &mut egui::R
             pending.0 = Some((target, text, frames + 1));
         }
         ctx.request_repaint();
+    }
+    // egui reads the frame back from the GL surface: window captures of a GL window are black.
+    for event in &raw.events {
+        if let egui::Event::Screenshot { image, .. } = event {
+            if let Some(path) = pending.1.take() {
+                let bytes: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+                let saved = image::save_buffer(
+                    &path,
+                    &bytes,
+                    image.size[0] as u32,
+                    image.size[1] as u32,
+                    image::ColorType::Rgba8,
+                );
+                eprintln!("QA screenshot {}: {:?}", path.display(), saved.is_ok());
+            }
+        }
     }
     for event in &mut raw.events {
         let egui::Event::AccessKitActionRequest(request) = event else {

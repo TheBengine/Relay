@@ -86,6 +86,15 @@ impl Provider {
     /// One independently hosted Friends service beside the account provider.
     /// The address is explicit; never adopt a service supplied by a community.
     pub fn people_url(&self) -> Result<String> {
+        #[cfg(test)]
+        if self.fixture_http {
+            // Explicit owned-loopback fixtures never contact a configured
+            // production Friends service, including inherited environment.
+            assert_eq!(self.issuer.scheme(), "http");
+            assert_eq!(self.issuer.host_str(), Some("127.0.0.1"));
+            assert!(self.issuer.port().is_some());
+            return Ok(format!("{}/people", self.issuer.origin().ascii_serialization()));
+        }
         let configured = std::env::var("RELAY_PEOPLE_URL")
             .ok()
             .or_else(|| option_env!("RELAY_PEOPLE_URL").map(str::to_owned));
