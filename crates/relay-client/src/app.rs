@@ -3,7 +3,7 @@ use crate::{
     audio_settings::{AudioCue, AudioDevices, AudioSettings, TransmissionMode},
     capture::{
         CaptureOptions, CaptureQuality, CaptureSession, CaptureSource, SourceKind, VideoBitrate,
-        VideoCodecPreference,
+        VideoCodecPreference, VideoPriority,
     },
     chat_media::AnimatedImage,
     chat_state::{Draft, DraftStore, ReplyDraft, ScopedDrafts},
@@ -50,6 +50,8 @@ mod app_update;
 mod audio_device_menu;
 #[path = "authenticator_ui.rs"]
 mod authenticator_ui;
+#[path = "password_reset_ui.rs"]
+mod password_reset_ui;
 #[path = "call_switch_ui.rs"]
 mod call_switch_ui;
 #[path = "central_account_ui.rs"]
@@ -140,6 +142,10 @@ mod server_creation;
 mod server_menu;
 #[path = "settings_pages.rs"]
 mod settings_pages;
+#[path = "audio_setup_ui.rs"]
+mod audio_setup_ui;
+#[path = "data_location_ui.rs"]
+mod data_location_ui;
 #[path = "sound_settings_ui.rs"]
 mod sound_settings_ui;
 #[path = "sidebar_tooltip.rs"]
@@ -149,6 +155,12 @@ mod sidebar_tooltip;
 pub(crate) mod source_preview;
 #[path = "support_report.rs"]
 mod support_report;
+#[path = "lan_profile.rs"]
+mod lan_profile;
+#[path = "shortcuts.rs"]
+mod shortcuts;
+#[path = "squads.rs"]
+mod squads;
 #[path = "voice_room_ui.rs"]
 mod voice_room_ui;
 #[path = "voice_view.rs"]
@@ -230,8 +242,16 @@ struct Preferences {
     communities: Vec<SavedCommunity>,
     #[serde(default)]
     peer_volumes: HashMap<String, f32>,
+    /// The first-time sound setup was offered (shown once, then from Settings).
+    #[serde(default)]
+    audio_setup_offered: bool,
     #[serde(default)]
     priority_speakers: HashSet<String>,
+    /// Voice values saved when the LAN profile was turned on.
+    #[serde(default)]
+    lan_profile: Option<lan_profile::Saved>,
+    #[serde(default)]
+    squads: squads::Squads,
     #[serde(default)]
     notifications: bool,
     #[serde(default)]
@@ -418,6 +438,27 @@ fn capture_options_ui(
     if high_fps {
         ui.horizontal_wrapped(|ui| {
             ui.label(
+                RichText::new("When the connection is tight")
+                    .size(font_size(12.0))
+                    .color(c_muted()),
+            );
+            let label = |priority| match priority {
+                VideoPriority::Auto => "Automatic · Sharp screens, smooth cameras",
+                VideoPriority::Detail => "Keep detail · Lower frame rate first",
+                VideoPriority::Motion => "Keep motion smooth · Lower resolution first",
+            };
+            egui::ComboBox::from_id_source((id, "priority"))
+                .selected_text(label(options.priority))
+                .show_ui(ui, |ui| {
+                    for priority in [VideoPriority::Auto, VideoPriority::Detail, VideoPriority::Motion] {
+                        changed |= ui
+                            .selectable_value(&mut options.priority, priority, label(priority))
+                            .changed();
+                    }
+                });
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
                 RichText::new("Video bandwidth limit")
                     .size(font_size(12.0))
                     .color(c_muted()),
@@ -487,7 +528,10 @@ impl Default for Preferences {
             last_relay_identity: None,
             communities: Vec::new(),
             peer_volumes: HashMap::new(),
+            audio_setup_offered: false,
             priority_speakers: HashSet::new(),
+            lan_profile: None,
+            squads: squads::Squads::default(),
             notifications: false,
             notification_previews: false,
             notification_policies: HashMap::new(),
@@ -688,6 +732,7 @@ pub struct RelayApp {
     tray: Option<crate::tray::Tray>,
     exiting: bool,
     update_ui: crate::update_ui::Controller,
+    data_location_ui: data_location_ui::Panel,
     network: Network,
     notifications: Notifications,
     call_alerts: crate::call_alerts::Alerts,
@@ -828,6 +873,9 @@ pub struct RelayApp {
     authenticator_ui: authenticator_ui::State,
     account_link_ui: account_link_ui::State,
     central_account: crate::central_account::Controller,
+    service_health: crate::service_health::HealthLog,
+    video_delivery: crate::video_quality::DeliveryMeter,
+    squads: squads::State,
     people_ui: people_ui::State,
     #[cfg(windows)]
     account_webview: Option<crate::account_webview::Surface>,
@@ -860,6 +908,23 @@ pub struct RelayApp {
     audio_applied: AudioSettings,
     sound_settings: sound_settings_ui::State,
     mic_test: bool,
+    /// Level advice for the running "Listen to Myself" preview.
+    mic_meter: Option<crate::self_listen::LevelAnalyzer>,
+    /// Windows audio endpoint notifications; None when registration failed.
+    device_watch: Option<crate::device_watch::DeviceWatch>,
+    /// Changes waiting for a fresh audio device list.
+    device_change: crate::device_follow::Change,
+    audio_devices_rx: Option<Receiver<Result<AudioDevices, String>>>,
+    pending_device_change: crate::device_follow::Change,
+    /// Kept from a failed device enumeration until the next notification.
+    pending_after_error: crate::device_follow::Change,
+    /// The first-time "Set up your sound" dialog, while open.
+    audio_setup: Option<crate::audio_setup::AudioSetup>,
+    /// When the first-time offer's conditions started to hold.
+    audio_setup_offer_at: Option<Instant>,
+    /// In-call microphone silence while sending is allowed.
+    mic_silence: crate::voice_problem::SilenceTimer,
+
     joining_voice: Option<String>,
     voice_request: u64,
     share_picker: Option<bool>,
@@ -1050,6 +1115,8 @@ impl RelayApp {
                 Err(error) => (Preferences::default(), Some(error)),
             };
         crate::replica_copy::sanitize(&mut prefs.replica_copies);
+        // People who already use Relay are not interrupted by the first-time setup.
+        prefs.audio_setup_offered |= !prefs.communities.is_empty();
         // Communities joined through the account-free route can be opened again.
         for community in &prefs.communities {
             if let Some(route) = &community.iroh {
@@ -1135,6 +1202,7 @@ impl RelayApp {
             },
             exiting: false,
             update_ui: crate::update_ui::Controller::new(&cc.egui_ctx),
+            data_location_ui: data_location_ui::Panel::default(),
             network: Network::with_call_alerts(cc.egui_ctx.clone(), Some(call_alerts.clone())),
             notifications,
             call_alerts,
@@ -1185,6 +1253,8 @@ impl RelayApp {
                 factor_binding: None,
                 invite: String::new(),
                 registering: false,
+                reset_code: String::new(),
+                new_password: String::new(),
             },
             account_feedback: Default::default(),
             account_start: Default::default(),
@@ -1281,6 +1351,9 @@ impl RelayApp {
             authenticator_ui: authenticator_ui::State::default(),
             account_link_ui: account_link_ui::State::default(),
             central_account: crate::central_account::Controller::default(),
+            service_health: crate::service_health::HealthLog::default(),
+            video_delivery: crate::video_quality::DeliveryMeter::default(),
+            squads: squads::State::default(),
             people_ui: people_ui::State::default(),
             #[cfg(windows)]
             account_webview,
@@ -1332,6 +1405,20 @@ impl RelayApp {
             audio_applied,
             sound_settings,
             mic_test: false,
+            mic_meter: None,
+            device_watch: {
+                let ctx = cc.egui_ctx.clone();
+                crate::device_watch::DeviceWatch::start(std::sync::Arc::new(move || ctx.request_repaint())).ok()
+            },
+            // Check the saved devices once at startup: one may be missing already.
+            device_change: crate::device_follow::Change { devices: true, ..Default::default() },
+            audio_devices_rx: None,
+            pending_device_change: Default::default(),
+            pending_after_error: Default::default(),
+            audio_setup: None,
+            audio_setup_offer_at: None,
+            mic_silence: Default::default(),
+
             joining_voice: None,
             voice_request: 0,
             share_picker: args
@@ -1504,6 +1591,7 @@ impl RelayApp {
         let resume_intent = match &command {
             Command::Resume { url, .. } => Some(Some(url.clone())),
             Command::Auth { .. }
+            | Command::ResetPassword { .. }
             | Command::AccountLoginBegin { .. }
             | Command::AccountLoginFinish { .. }
             | Command::Logout
@@ -1584,6 +1672,23 @@ impl RelayApp {
             },
             register: self.login.registering,
             request_id,
+        });
+    }
+
+    /// Sends a reset or recovery code with a new password; the fields are cleared at once.
+    fn send_password_reset(&mut self, add_community: bool) {
+        let flow = if add_community { &mut self.add_community } else { &mut self.login };
+        let url = flow.url.trim().to_owned();
+        let username = flow.username.trim().to_owned();
+        let code = std::mem::take(&mut flow.reset_code);
+        let new_password = std::mem::take(&mut flow.new_password);
+        self.error = None;
+        self.busy = true;
+        self.send(Command::ResetPassword {
+            url,
+            username,
+            code,
+            new_password,
         });
     }
 
@@ -2252,11 +2357,16 @@ impl RelayApp {
             media.set_deafened(self.deafened);
         }
         if self.voice_channel.is_some() {
+            let (sharing, camera) = (self.source_active(false), self.source_active(true));
             self.send(Command::VoiceState(VoiceState {
                 muted: self.muted,
                 deafened: self.deafened,
-                sharing: self.source_active(false),
-                camera: self.source_active(true),
+                sharing,
+                camera,
+                chosen_camera: camera
+                    .then(|| crate::video_quality::chosen(&self.prefs.camera_options)),
+                chosen_screen: sharing
+                    .then(|| crate::video_quality::chosen(&self.prefs.screen_options)),
             }));
         }
     }
@@ -2322,6 +2432,7 @@ impl RelayApp {
                 audio.ducking_volume,
             );
             if audio.overlay_enabled && self.voice_channel.is_some() {
+                let status = self.overlay_status();
                 let names: Vec<_> = members
                     .iter()
                     .filter(|m| {
@@ -2334,7 +2445,10 @@ impl RelayApp {
                     egui::ViewportId::from_hash_of("voice-speaking-overlay"),
                     egui::ViewportBuilder::default()
                         .with_title("Relay Voice")
-                        .with_inner_size([220.0, 36.0 + names.len() as f32 * 22.0])
+                        .with_inner_size([
+                            260.0,
+                            36.0 + (names.len() + status.len()) as f32 * 22.0,
+                        ])
                         .with_position([audio.overlay_x, audio.overlay_y])
                         .with_decorations(false)
                         .with_transparent(true)
@@ -2352,6 +2466,9 @@ impl RelayApp {
                                 ui.label(
                                     RichText::new("Relay Voice").color(Color32::WHITE).strong(),
                                 );
+                                for line in &status {
+                                    ui.label(RichText::new(line).color(Color32::from_rgb(255, 214, 102)));
+                                }
                                 for name in &names {
                                     ui.label(RichText::new(name).color(Color32::LIGHT_GREEN));
                                 }
@@ -2361,6 +2478,23 @@ impl RelayApp {
                 ctx.request_repaint_after(Duration::from_millis(50));
             }
         }
+    }
+
+    /// Your own state for the overlay: only what this app currently holds.
+    fn overlay_status(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.deafened {
+            lines.push("You: deafened".to_owned());
+        } else if self.muted {
+            lines.push("You: muted".to_owned());
+        }
+        if let Some(line) = self.active_squad_line() {
+            lines.push(line);
+        }
+        if self.lan_profile_on() {
+            lines.push("LAN profile on".to_owned());
+        }
+        lines
     }
 
     fn member_speaking(&self, member: &VoiceMember) -> bool {
@@ -2549,6 +2683,13 @@ impl RelayApp {
 
     fn voice_failure(&mut self, channel: Option<String>, error: String) {
         self.finish_private_call();
+        // Name the cause so it is not mistaken for a device or network problem.
+        let error = if crate::e2ee::device_not_approved(&error) {
+            let problem = crate::voice_problem::VoiceProblem::DeviceNotApproved;
+            format!("{}. {}", problem.title(), problem.next_step())
+        } else {
+            error
+        };
         self.voice_retry = channel
             .zip(self.command_origin())
             .map(|(channel_id, origin)| crate::voice_ui_state::Retry {
@@ -2688,14 +2829,10 @@ impl RelayApp {
     }
 
     fn apply_audio_settings(&mut self) {
-        if self.mic_test {
-            if let Some(media) = &mut self.media {
-                media.stop_microphone_test();
-            }
-            self.mic_test = false;
-        }
         self.prefs.audio = self.prefs.audio.clone().normalized();
         self.configure_audio(self.prefs.audio.clone());
+        // A running preview already plays the draft; keep it running.
+        self.sync_microphone_preview();
     }
 
     fn apply_quick_audio_change(&mut self, change: impl Fn(&mut AudioSettings)) {
@@ -2707,11 +2844,107 @@ impl RelayApp {
         self.configure_audio(next);
     }
 
+    /// The saved choice, or the Windows default while a chosen device is unplugged.
+    fn effective_audio(&self, settings: &AudioSettings) -> AudioSettings {
+        // Without live device notifications the list may be stale: keep the saved choice.
+        if self.inventory_loaded && self.device_watch.is_some() {
+            crate::device_follow::effective(settings, &self.inventory.audio.inputs, &self.inventory.audio.outputs)
+        } else {
+            settings.clone()
+        }
+    }
+
+    /// Follow USB plug/unplug and Windows default changes without saving anything.
+    pub(super) fn device_follow_tick(&mut self) {
+        let Some(watch) = self.device_watch.as_ref() else { return };
+        self.device_change.merge(watch.take());
+        if let Some(media) = self.media.as_mut() {
+            media.set_device_following(true);
+            if media.take_device_lost() {
+                self.device_change.devices = true;
+            }
+        }
+        if let Some(result) = self.audio_devices_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.audio_devices_rx = None;
+            let change = std::mem::take(&mut self.pending_device_change);
+            match result {
+                Ok(devices) => {
+                    let change = crate::device_follow::real_default_changes(
+                        change,
+                        (&self.inventory.audio.default_input, &self.inventory.audio.default_output),
+                        (&devices.default_input, &devices.default_output),
+                    );
+                    self.inventory.audio = devices;
+                    self.inventory_loaded = true;
+                    self.follow_devices(change);
+                }
+                // Try again with the next notification.
+                Err(_) => self.pending_after_error.merge(change),
+            }
+        }
+        if self.device_change.any() && self.audio_devices_rx.is_none() {
+            let mut change = std::mem::take(&mut self.device_change);
+            change.merge(std::mem::take(&mut self.pending_after_error));
+            self.pending_device_change = change;
+            let (tx, rx) = mpsc::sync_channel(1);
+            self.audio_devices_rx = Some(rx);
+            let ctx = self.capture_ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(enumerate_audio_devices());
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn follow_devices(&mut self, change: crate::device_follow::Change) {
+        let Some(media) = self.media.as_mut() else { return };
+        let running = media.device_selection();
+        let follow = crate::device_follow::decide(
+            change,
+            &self.audio_applied,
+            (&running.0, &running.1),
+            &self.inventory.audio.inputs,
+            &self.inventory.audio.outputs,
+        );
+        // The preview plays the unsaved draft, so it is decided separately.
+        let preview = media.preview_device_selection().map(|running| {
+            crate::device_follow::decide(
+                change,
+                &self.prefs.audio,
+                (&running.0, &running.1),
+                &self.inventory.audio.inputs,
+                &self.inventory.audio.outputs,
+            )
+        });
+        let mut notice = None;
+        let mut result = Ok(());
+        if let crate::device_follow::Follow::Reopen { notice: text } = follow {
+            let effective = crate::device_follow::effective(&self.audio_applied, &self.inventory.audio.inputs, &self.inventory.audio.outputs);
+            notice = text;
+            result = media.follow_device_change(effective);
+        }
+        if let Some(crate::device_follow::Follow::Reopen { notice: text }) = preview {
+            let draft = crate::device_follow::effective(&self.prefs.audio, &self.inventory.audio.inputs, &self.inventory.audio.outputs);
+            notice = notice.or(text);
+            result = result.and_then(|()| media.reopen_microphone_preview(&draft));
+            self.mic_meter = Some(crate::self_listen::LevelAnalyzer::new(Instant::now()));
+        }
+        match result {
+            Ok(()) => {
+                if let Some(notice) = notice {
+                    self.notice = Some((notice, Instant::now()));
+                }
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
     fn configure_audio(&mut self, settings: AudioSettings) {
+        let effective = self.effective_audio(&settings);
         let reopen = self
             .media
             .as_mut()
-            .is_some_and(|media| media.configure(settings.clone()));
+            .is_some_and(|media| media.configure(effective));
         self.audio_applied = settings;
         self.save_preferences();
         if reopen {
@@ -2722,13 +2955,8 @@ impl RelayApp {
                     }
                 }
             } else if self.mic_test {
-                if let Some(media) = &mut self.media {
-                    media.stop_microphone_test();
-                    if let Err(error) = media.start_microphone_test() {
-                        self.mic_test = false;
-                        self.error = Some(error);
-                    }
-                }
+                // Reopens only when the preview is not already on these devices.
+                self.sync_microphone_preview();
             }
         }
     }

@@ -543,6 +543,9 @@ impl RelayApp {
         );
         let factor_enter =
             authenticator_ui::sign_in_field(ui, &mut self.login, self.error.as_deref());
+        if password_reset_ui::reset_section(ui, &mut self.login, self.busy) {
+            self.send_password_reset(false);
+        }
         if self.login.registering {
             ui.label(
                 RichText::new("Use at least 10 characters.")
@@ -756,6 +759,9 @@ impl RelayApp {
         );
         let factor_enter =
             authenticator_ui::sign_in_field(ui, &mut self.add_community, self.error.as_deref());
+        if password_reset_ui::reset_section(ui, &mut self.add_community, self.busy) {
+            self.send_password_reset(true);
+        }
         if self.add_community.registering {
             ui.label(
                 RichText::new("Use at least 10 characters.")

@@ -26,7 +26,8 @@ fn seat(state: &AppState, who: &Session, id: u64, channel: &str) {
             user: who.user.clone(),
             channel_id: channel.into(),
             device_id: None,
-            token_hash: token_hash(&who.token),
+            token_hash: crate::session_hash(&who.token),
+            token_digest: token_hash(&who.token),
             private_call_id: None,
             recovery_deadline: None,
             key: [7; 32],
@@ -499,7 +500,7 @@ async fn role_session_channel_and_permission_changes_revoke_at_once() {
     lock(&w.state.0.db)
         .execute(
             "DELETE FROM sessions WHERE token_hash=?1",
-            [token_hash(&w.client.token)],
+            [crate::session_hash(&w.client.token)],
         )
         .unwrap();
     assert_eq!(grants(&w, &w.gateway).await.1["grants"], json!([]));
@@ -1023,7 +1024,7 @@ fn friends_account(state: &AppState, handle: &str) -> Session {
         ],
     )
     .unwrap();
-    new_session(&db, user).unwrap()
+    new_session(&db, &crate::credential_seal::Seal::fixed(crate::credential_seal::TEST_KEY), user).unwrap()
 }
 
 async fn befriend(app: &Router, x: &Session, y: &Session) {
@@ -1304,7 +1305,7 @@ async fn friends_leases_bind_the_exact_login_instance_session_and_renew_only_the
     let second = {
         let db = lock(&w.state.0.db);
         let user = w.client.user.clone();
-        new_session(&db, user).unwrap()
+        new_session(&db, &crate::credential_seal::Seal::fixed(crate::credential_seal::TEST_KEY), user).unwrap()
     };
     assert_eq!(list(w, &second).await.0, StatusCode::FORBIDDEN);
     assert_eq!(
@@ -1428,4 +1429,281 @@ async fn community_roles_are_unchanged_and_the_friends_routes_and_capability_sta
             assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The voice mesh between homes
+
+const ENDPOINT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const ENDPOINT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+async fn mesh_report(
+    w: &World,
+    who: &Session,
+    endpoint: &str,
+    upload: Option<u32>,
+    applied: Option<u64>,
+    peer: Option<&Session>,
+) -> (StatusCode, Value) {
+    let links = match peer {
+        Some(peer) => json!([{"gateway_id":peer.user.id,
+            "quality":{"rtt_ms":30,"loss_permille":0,"jitter_ms":2},"up":true}]),
+        None => json!([]),
+    };
+    request(
+        &w.app,
+        "POST",
+        &format!("{PATH}/mesh"),
+        Some(&who.token),
+        json!({"instance":INSTANCE,"session_id":session_of(w, who),"port":48000,
+            "endpoint_id":endpoint,"upload_kbps":upload,"host_rtt_ms":40,
+            "applied_epoch":applied,"links":links}),
+    )
+    .await
+}
+
+async fn mesh_member(w: &World, who: &Session, healthy: bool) -> (StatusCode, Value) {
+    request(
+        &w.app,
+        "POST",
+        &format!("{PATH}/mesh/member"),
+        Some(&who.token),
+        json!({"session_id":session_of(w, who),"healthy":healthy}),
+    )
+    .await
+}
+
+/// Two homes in room one: Gus's (with Cleo on his LAN lease) and Otto's (with
+/// Anna on his), both with measured upload and a working link to each other.
+async fn two_homes() -> World {
+    let w = ready().await;
+    grant_role(&w, &w.other).await;
+    seat(&w.state, &w.other, 33, "vc1");
+    seat(&w.state, &w.admin, 44, "vc1");
+    let (status, body) = register(&w, &w.other, "192.168.2.20", 47000).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = lease(&w, &w.client, &w.gateway.user.id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = lease(&w, &w.admin, &w.other.user.id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    w
+}
+
+/// Both gateways report with the plan applied and everyone reports a working hop.
+async fn carried(w: &World) -> u64 {
+    mesh_report(w, &w.gateway, ENDPOINT_A, Some(4000), None, Some(&w.other)).await;
+    let (_, b) = mesh_report(w, &w.other, ENDPOINT_B, Some(4000), None, Some(&w.gateway)).await;
+    let epoch = b["plan"]["epoch"].as_u64().unwrap();
+    for who in [&w.gateway, &w.client, &w.other, &w.admin] {
+        let (status, body) = mesh_member(w, who, true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    mesh_report(
+        w,
+        &w.gateway,
+        ENDPOINT_A,
+        Some(4000),
+        Some(epoch),
+        Some(&w.other),
+    )
+    .await;
+    let (_, b) = mesh_report(
+        w,
+        &w.other,
+        ENDPOINT_B,
+        Some(4000),
+        Some(epoch),
+        Some(&w.gateway),
+    )
+    .await;
+    assert_eq!(b["plan"]["epoch"].as_u64(), Some(epoch), "the plan settled");
+    epoch
+}
+
+#[tokio::test]
+async fn two_homes_get_one_bound_plan_a_shared_link_key_and_their_own_members() {
+    let w = two_homes().await;
+    // Gus alone first: a plan of his home only.
+    let (status, alone) = mesh_report(&w, &w.gateway, ENDPOINT_A, Some(4000), None, None).await;
+    assert_eq!(status, StatusCode::OK, "{alone}");
+    assert_eq!(alone["plan"]["nodes"].as_array().unwrap().len(), 1);
+    let (_, b) = mesh_report(&w, &w.other, ENDPOINT_B, Some(4000), None, Some(&w.gateway)).await;
+    let (_, a) = mesh_report(&w, &w.gateway, ENDPOINT_A, Some(4000), None, Some(&w.other)).await;
+    let (_, b2) = mesh_report(&w, &w.other, ENDPOINT_B, Some(4000), None, Some(&w.gateway)).await;
+    assert_eq!(a["plan"]["nodes"].as_array().unwrap().len(), 2, "{a}");
+    assert_eq!(a["plan"], b2["plan"], "one plan per channel");
+    let _ = b;
+    let b = b2;
+    let community = server_id(&lock(&w.state.0.db)).unwrap();
+    for x in [&a, &b] {
+        let binding = &x["approval"]["binding"];
+        assert_eq!(binding["community_id"], community.as_str());
+        assert_eq!(binding["channel_id"], "vc1");
+        assert_ne!(binding["media_session"], 0);
+        assert_eq!(x["links"].as_array().unwrap().len(), 1);
+    }
+    // Both ends of the link get the same id and key and each other's iroh endpoint.
+    assert_eq!(a["links"][0]["id"], b["links"][0]["id"]);
+    assert_eq!(a["links"][0]["key"], b["links"][0]["key"]);
+    assert_eq!(a["links"][0]["endpoint_id"], ENDPOINT_B);
+    assert_eq!(b["links"][0]["endpoint_id"], ENDPOINT_A);
+    assert_ne!(a["approval"]["node"], b["approval"]["node"]);
+    // Cleo, on Gus's LAN lease, gets her place at Gus's gateway and her own key,
+    // and Gus then serves exactly that lease.
+    let (status, cleo) = mesh_member(&w, &w.client, true).await;
+    assert_eq!(status, StatusCode::OK, "{cleo}");
+    assert_eq!(cleo["gateway_id"], w.gateway.user.id.as_str());
+    assert_eq!(cleo["ip"], "192.168.1.20");
+    assert_eq!(cleo["port"], 48000);
+    assert_eq!(cleo["node"], a["approval"]["node"]);
+    let (_, a) = mesh_report(&w, &w.gateway, ENDPOINT_A, Some(4000), None, Some(&w.other)).await;
+    assert!(a["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["id"] == cleo["lease_id"]
+            && m["key"] == cleo["key"]
+            && m["stream"] == cleo["stream"]));
+    let (_, b) = mesh_report(&w, &w.other, ENDPOINT_B, Some(4000), None, Some(&w.gateway)).await;
+    assert!(
+        b["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["id"] != cleo["lease_id"]),
+        "a gateway never receives another home's member keys"
+    );
+}
+
+fn sealed_voice(session: u64, sequence: u64, payload: &[u8]) -> Vec<u8> {
+    use chacha20poly1305::{
+        aead::{Aead, Payload},
+        ChaCha20Poly1305, KeyInit, Nonce,
+    };
+    let mut header = session.to_le_bytes().to_vec();
+    header.extend(sequence.to_le_bytes());
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&sequence.to_le_bytes());
+    let mut out = header.clone();
+    out.extend(
+        ChaCha20Poly1305::new_from_slice(&[7; 32])
+            .unwrap()
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: payload,
+                    aad: &header,
+                },
+            )
+            .unwrap(),
+    );
+    out
+}
+
+#[tokio::test]
+async fn the_host_skips_a_pair_only_while_the_whole_mesh_carries_it() {
+    let w = two_homes().await;
+    assert!(!w.state.0.gateways.mesh_carries(22, 44));
+    // Plans and keys alone are not enough: the epoch must be applied and the hops healthy.
+    mesh_report(&w, &w.gateway, ENDPOINT_A, Some(4000), None, Some(&w.other)).await;
+    mesh_report(&w, &w.other, ENDPOINT_B, Some(4000), None, Some(&w.gateway)).await;
+    mesh_member(&w, &w.client, true).await;
+    mesh_member(&w, &w.admin, true).await;
+    assert!(!w.state.0.gateways.mesh_carries(22, 44));
+    carried(&w).await;
+    assert!(w.state.0.gateways.mesh_carries(22, 44));
+    assert!(w.state.0.gateways.mesh_carries(11, 33));
+    // The voice relay sends Cleo's frame only to people outside the mesh.
+    let lena = signup(&w.app, "Lena", &new_invite(&w.app, &w.admin).await).await;
+    seat(&w.state, &lena, 55, "vc1");
+    let address = |port: u16| std::net::SocketAddr::from(([10, 0, 0, 1], 40000 + port));
+    {
+        let mut seats = lock(&w.state.0.voice);
+        for (id, port) in [(11u64, 1u16), (22, 2), (33, 3), (44, 4), (55, 5)] {
+            seats.get_mut(&id).unwrap().remote = Some(address(port));
+        }
+    }
+    let mut frame = vec![relay_protocol::AUDIO_PACKET_V2];
+    frame.extend([0; relay_protocol::AUDIO_V2_HEADER_LEN + 20]);
+    let out = voice::relay_packet(&w.state, address(2), &sealed_voice(22, 900, &frame));
+    let to: Vec<u16> = out.iter().map(|(a, _)| a.port() - 40000).collect();
+    assert_eq!(
+        to,
+        vec![5],
+        "only Lena, who is not in the mesh, gets it from the host"
+    );
+    // Cleo's hop stops working: the host delivers to everyone again at once.
+    mesh_member(&w, &w.client, false).await;
+    assert!(!w.state.0.gateways.mesh_carries(22, 44));
+    let out = voice::relay_packet(&w.state, address(2), &sealed_voice(22, 901, &frame));
+    assert_eq!(out.len(), 4);
+}
+
+#[tokio::test]
+async fn revoking_a_role_or_a_silent_gateway_ends_the_mesh_at_once() {
+    let w = two_homes().await;
+    carried(&w).await;
+    assert!(w.state.0.gateways.mesh_carries(22, 44));
+    w.state.0.gateways.cancel_user(&w.other.user.id);
+    assert!(
+        !w.state.0.gateways.mesh_carries(22, 44),
+        "revocation is immediate"
+    );
+    assert!(
+        !w.state.0.gateways.mesh_carries(11, 22),
+        "an incomplete tree carries nothing"
+    );
+    let (status, _) =
+        mesh_report(&w, &w.other, ENDPOINT_B, Some(4000), None, Some(&w.gateway)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, a) = mesh_report(&w, &w.gateway, ENDPOINT_A, Some(4000), None, Some(&w.other)).await;
+    assert_eq!(a["plan"]["nodes"].as_array().unwrap().len(), 1);
+    assert!(a["links"].as_array().unwrap().is_empty());
+    let (_, anna) = mesh_member(&w, &w.admin, true).await;
+    assert!(anna.is_null(), "Anna's home is gone; the host carries her");
+    // A gateway that stops reporting lapses too.
+    let w = two_homes().await;
+    carried(&w).await;
+    w.state.0.gateways.age_mesh_reports();
+    mesh_member(&w, &w.client, true).await;
+    assert!(!w.state.0.gateways.mesh_carries(22, 44));
+}
+
+#[tokio::test]
+async fn other_rooms_unmeasured_upload_and_stale_instances_get_no_mesh() {
+    let w = two_homes().await;
+    // Without measured upload no link between homes is used.
+    mesh_report(&w, &w.gateway, ENDPOINT_A, None, None, Some(&w.other)).await;
+    let (_, b) = mesh_report(&w, &w.other, ENDPOINT_B, None, None, Some(&w.gateway)).await;
+    assert!(b["links"].as_array().unwrap().is_empty(), "{b}");
+    assert!(b["plan"]["edges"].as_array().is_none_or(|e| e.is_empty()));
+    // A report for another instance or a privileged port is refused.
+    let (status, _) = request(
+        &w.app,
+        "POST",
+        &format!("{PATH}/mesh"),
+        Some(&w.gateway.token),
+        json!({"instance":RESTARTED,"session_id":11,"port":48000}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = request(
+        &w.app,
+        "POST",
+        &format!("{PATH}/mesh"),
+        Some(&w.gateway.token),
+        json!({"instance":INSTANCE,"session_id":11,"port":80}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Someone in another room never gets a place in room one's mesh.
+    let lena = signup(&w.app, "Lena", &new_invite(&w.app, &w.admin).await).await;
+    seat(&w.state, &lena, 66, "vc2");
+    let (status, other_room) = mesh_member(&w, &lena, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(other_room.is_null());
+    assert!(!w.state.0.gateways.mesh_carries(66, 22));
+    // A member who is not a registered gateway cannot report as one.
+    let (status, _) = mesh_report(&w, &w.client, ENDPOINT_A, Some(4000), None, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

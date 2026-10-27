@@ -207,6 +207,9 @@ impl RelayApp {
             || self.profile_ui.card.is_some()
             || self.pins.open
             || self.admin_ui.modal_open()
+            // The first-time sound setup is a dialog too: nothing opens over it.
+            || self.audio_setup.is_some()
+            || self.squads.window_open
     }
     pub(super) fn desktop_titlebar(&mut self, ctx: &egui::Context) {
         if self.stream_fullscreen {

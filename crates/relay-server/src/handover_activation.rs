@@ -85,6 +85,17 @@ pub(crate) fn valid_history(history:&[ActivationGrant], pin:&model::RoutePin)->b
     }
     host == pin.host && term == pin.term
 }
+/// A takeover term stands on its own mandate, never mixed with a planned move.
+fn takeover_matches(j: &Journal) -> bool {
+    j.accepted_from.is_none()
+        && j.history.is_empty()
+        && j.takeover.as_ref().and_then(crate::takeover_failover::mandate_route)
+            == j.source_identity.as_ref().map(|host| model::RoutePin {
+                server_id: j.server_id.clone(),
+                host: host.clone(),
+                term: j.term,
+            })
+}
 fn receipt_scope(j: &Journal, r: &Receipt) -> bool {
     let b = &r.body;
     valid_receipt(r)
@@ -113,7 +124,7 @@ fn epoch_prefix(value: &str) -> bool {
         && &rest[73..] == "-"
 }
 pub(super) fn valid_journal(j: &Journal) -> bool {
-    (j.term == 1 || j.accepted_from.is_some())
+    (j.term == 1 || j.accepted_from.is_some() || takeover_matches(j))
         && j.source_identity.as_ref().is_none_or(|host|valid_history(&j.route_history(),
             &model::RoutePin{server_id:j.server_id.clone(),host:host.clone(),term:j.term}))
         && (j.history.is_empty() || j.history.last() == j.accepted_from.as_ref())
@@ -759,6 +770,7 @@ pub(crate) fn activate(
             rtc_cleanup_prefix: None,
             rtc_cleanup_binding: None,
             rtc_legacy_cleanup: false,
+            takeover: None,
         };
         if !valid_journal(&j) {
             return Err("Invalid destination authority".into());

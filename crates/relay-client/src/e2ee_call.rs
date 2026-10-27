@@ -62,6 +62,14 @@ fn scope_for(server: &str, user: &str, target: &CryptoTarget) -> Result<String, 
     }
 }
 
+/// The join error when this device has no verified group for the call yet.
+pub(crate) const VERIFY_BEFORE_CALL: &str = "Verify the other device before joining this encrypted call.";
+
+/// True for the join error that means "this device is not approved yet".
+pub(crate) fn device_not_approved(error: &str) -> bool {
+    error.starts_with(VERIFY_BEFORE_CALL)
+}
+
 impl CryptoSession {
     /// A transport replacement must prove freshness again, even when this
     /// actor stays alive. Keep exact durable operations and old replay caches:
@@ -74,7 +82,7 @@ impl CryptoSession {
     }
     pub fn call_waiting_message(&self, scope: &str) -> String {
         let Some(group) = self.device.group_state(scope) else {
-            return "Verify the other device before joining this encrypted call.".into();
+            return VERIFY_BEFORE_CALL.into();
         };
         if group.controller == *self.device.identity() {
             return "Preparing fresh call keys on this device. Relay retries automatically.".into();

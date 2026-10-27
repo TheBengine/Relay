@@ -233,6 +233,14 @@ pub(super) fn steadier_audio_help(ui: &mut egui::Ui) -> bool {
     }).inner
 }
 
+/// One named cause and its next step, with text (never colour alone).
+pub(super) fn voice_problem_help(ui: &mut egui::Ui, problem: crate::voice_problem::VoiceProblem) {
+    egui::Frame::none().fill(c_rail()).rounding(8.0).inner_margin(Margin::same(12.0)).show(ui, |ui| {
+        ui.add(egui::Label::new(RichText::new(format!("⚠ {}", problem.title())).strong().color(c_bad())).wrap(true));
+        ui.add(egui::Label::new(RichText::new(problem.next_step()).size(font_size(13.0)).color(c_text())).wrap(true));
+    });
+}
+
 /// Per-person receive activity. This is not a physical speaker test and must
 /// not blame the sender solely because speech has not arrived here.
 pub(super) fn sound_check(ui: &mut egui::Ui, rows: &[SoundRow], hint: Option<&str>) {

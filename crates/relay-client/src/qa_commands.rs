@@ -28,6 +28,16 @@ impl RelayApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             }
         }
+        // `qa-scroll.txt` holds "X Y DELTA": one mouse-wheel step at that point (negative scrolls down).
+        let scroll = std::path::Path::new(&dir).join("qa-scroll.txt");
+        if let Ok(text) = std::fs::read_to_string(&scroll) {
+            let _ = std::fs::remove_file(&scroll);
+            let numbers: Vec<f32> = text.split_whitespace().filter_map(|n| n.parse().ok()).collect();
+            if let [x, y, delta] = numbers[..] {
+                self.qa_input.2 = Some((egui::pos2(x, y), delta));
+                ctx.request_repaint();
+            }
+        }
         let file = std::path::Path::new(&dir).join("qa-stage.txt");
         let text = match std::fs::read_to_string(&file) {
             Ok(text) => text,

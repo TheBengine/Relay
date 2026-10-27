@@ -547,7 +547,7 @@ fn upload_policy_metadata_is_logged_after_upgrading_existing_schema_27_triggers(
         db.execute_batch(&format!("DROP TRIGGER {name};{}", sql.replace(",'upload_policy'", ""))).unwrap();
     }
     db.pragma_update(None, "user_version", 27).unwrap();
-    db.execute("DELETE FROM schema_migrations WHERE version=28", []).unwrap();
+    db.execute("DELETE FROM schema_migrations WHERE version>=28", []).unwrap();
     clear_log(&db);
     exec(&db, "INSERT INTO metadata VALUES('upload_policy','{}')");
     assert!(log(&db).is_empty());

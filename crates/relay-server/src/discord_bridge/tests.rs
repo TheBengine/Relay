@@ -186,7 +186,8 @@ pub(crate) fn ticket(session: &Session, channel: &str) -> voice::VoiceSession {
         user: session.user.clone(),
         channel_id: channel.into(),
         device_id: None,
-        token_hash: token_hash(&session.token),
+        token_hash: crate::session_hash(&session.token),
+        token_digest: token_hash(&session.token),
         key: [0; 32],
         state: VoiceState::default(),
         remote: None,
@@ -238,7 +239,7 @@ async fn public_count_deduplicates_and_excludes_stale_revoked_removed_and_other_
     lock(&state.0.db)
         .execute(
             "DELETE FROM sessions WHERE token_hash=?1",
-            [token_hash(&member.token)],
+            [crate::session_hash(&member.token)],
         )
         .unwrap();
     assert!(command_content(&state, &p, 12345, Some(67890)).contains("1 person"));

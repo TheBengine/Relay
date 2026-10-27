@@ -69,6 +69,7 @@ async fn a_full_open_room_refuses_a_new_seat_without_breaking_existing_calls() {
                     channel_id: channel.into(),
                     device_id: None,
                     token_hash: format!("{index:064x}"),
+                    token_digest: format!("{index:064x}"),
                     key: [0; 32],
                     state: VoiceState::default(),
                     remote: None,

@@ -361,7 +361,7 @@ fn account(state: &AppState, handle: &str) -> Session {
         ],
     )
     .unwrap();
-    new_session(&db, user).unwrap()
+    new_session(&db, &crate::credential_seal::Seal::fixed(crate::credential_seal::TEST_KEY), user).unwrap()
 }
 
 #[test]

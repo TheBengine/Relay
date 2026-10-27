@@ -542,6 +542,8 @@ impl RelayApp {
     }
 
     pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
+        self.audio_setup_dialog(ctx);
+        self.squads_window(ctx);
         self.compact_members_dialog(ctx);
         self.profile_card(ctx);
         self.social_dialogs(ctx);

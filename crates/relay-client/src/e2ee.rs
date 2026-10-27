@@ -54,6 +54,9 @@ mod tests;
 const MAX_PRIVATE_BYTES: usize = 64 * 1024 * 1024;
 #[path = "e2ee_call.rs"]
 mod call;
+pub(crate) use call::device_not_approved;
+#[cfg(test)]
+pub(crate) use call::VERIFY_BEFORE_CALL;
 #[path = "e2ee_history.rs"]
 mod history;
 #[path = "e2ee_history_cache.rs"]

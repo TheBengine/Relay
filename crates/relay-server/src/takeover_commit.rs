@@ -33,6 +33,11 @@ pub(crate) trait Replicate {
     /// delivery cannot turn a committed quorum into a rollback. Catch-up uses
     /// the retained log and the same certificate again after reconnect.
     fn committed(&mut self, notice: &CommitNotice, deadline: Instant);
+    /// Whether a co-host can confirm a change right now. A write is refused
+    /// before it starts when none can, so no half-confirmed change is left.
+    fn ready(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]

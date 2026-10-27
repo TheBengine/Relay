@@ -29,6 +29,14 @@ mod audio_duck;
 mod audio_echo;
 mod audio_resample;
 mod audio_settings;
+mod self_listen;
+mod voice_priority;
+mod delay_estimate;
+mod device_follow;
+mod device_watch;
+mod audio_setup;
+mod voice_problem;
+mod voice_quality;
 mod call_alerts;
 mod capture;
 mod central_account;
@@ -58,7 +66,9 @@ mod handover_runtime;
 mod helper_liveness;
 #[cfg(all(windows, feature = "native-rtc"))]
 mod hardware_encoder;
+mod host_measurements;
 mod host_route;
+mod takeover_copy;
 mod host_locator;
 mod host_locator_ack;
 mod host_locator_outbox;
@@ -88,6 +98,7 @@ mod online_gifs;
 #[cfg(all(windows, feature = "native-rtc"))]
 mod process_audio;
 mod profile_paths;
+mod data_location;
 mod protection;
 mod recovery;
 mod replica_copy;
@@ -97,6 +108,10 @@ mod rtc;
 mod safety_number;
 mod search_filters;
 mod settings_ui;
+mod service_health;
+mod video_quality;
+#[cfg(test)]
+mod honest_claims;
 #[cfg(windows)]
 mod single_instance;
 mod sound_cues;
@@ -121,6 +136,8 @@ mod voice_ui_state;
 
 fn main() -> eframe::Result<()> {
     tls_crypto::initialize();
+    // A Relay restarted by this process re-reads its data location itself.
+    data_location::forget_inherited();
     let original_args: Vec<_> = std::env::args_os().collect();
     let args: Vec<String> = original_args
         .iter()
@@ -153,12 +170,10 @@ fn main() -> eframe::Result<()> {
             invitation_launch::failed(error);
         }
     };
-    let personal = match invitation_launch::personal(
-        &args,
-        invitation_launch::STORAGE_OVERRIDES
-            .iter()
-            .any(|name| std::env::var_os(name).is_some()),
-    ) {
+    let storage_override = invitation_launch::STORAGE_OVERRIDES
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+    let personal = match invitation_launch::personal(&args, storage_override) {
         Ok(personal) => personal,
         Err(error) => {
             eprintln!("Cannot open Relay profile: {error}");
@@ -235,6 +250,14 @@ fn main() -> eframe::Result<()> {
     if let Err(error) = profile_paths::configure(&args) {
         eprintln!("Cannot open Relay profile: {error}");
         std::process::exit(2);
+    }
+    // The normal profile may live in a folder the user chose in Settings.
+    // Explicit profiles and storage overrides keep their own isolation.
+    if !storage_override && matches!(profile_paths::requested_root(&args), Ok(None)) {
+        if let Err(error) = data_location::startup(personal) {
+            eprintln!("Cannot open Relay data: {error}");
+            std::process::exit(2);
+        }
     }
     relay_updater::initialize_tls_provider();
     let icon = image::load_from_memory(include_bytes!("../assets/relay.png"))

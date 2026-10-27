@@ -299,8 +299,15 @@ async fn complete_image_is_encrypted_resumable_after_source_restart_and_received
             |r| r.get::<_, String>(0)
         )
         .unwrap(),
-        original_hash
+        crate::host_copy_secrets::NOT_COPIED
     );
+    assert_ne!(original_hash, crate::host_copy_secrets::NOT_COPIED);
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(crate::host_copy_secrets::is_stripped(&db).unwrap());
     drop(db);
     assert!(AppState::open(&dir, "must not activate", 0).is_err());
     assert_eq!(
@@ -1469,6 +1476,7 @@ async fn signed_receipt_and_irreversible_retirement_allow_exactly_the_chosen_hos
             .unwrap(),
         "new writer"
     );
+    assert!(crate::host_copy_secrets::is_stripped(&lock(&target.0.db)).unwrap());
     let target_app = router(target);
     let challenge=URL_SAFE_NO_PAD.encode([82;32]);
     let (code,route)=request(&target_app,"POST","/api/hosting/handover/route",None,
@@ -1480,6 +1488,8 @@ async fn signed_receipt_and_irreversible_retirement_allow_exactly_the_chosen_hos
     assert_eq!(route.state.challenge,challenge);
     assert!(crate::handover_target::verify(&model::HostProof{identity:route.state.pin.host.clone(),signature:route.signature},
         &model::route_message(&route.state)));
+    // Sessions and password hashes stay with the old host: the copy carries the
+    // same members, but each signs in again on the new host.
     assert_eq!(
         request(
             &target_app,
@@ -1490,7 +1500,7 @@ async fn signed_receipt_and_irreversible_retirement_allow_exactly_the_chosen_hos
         )
         .await
         .0,
-        StatusCode::OK
+        StatusCode::UNAUTHORIZED
     );
     drop(target_app);
     let restarted=AppState::open(&active.data,"new host restarted",0).unwrap();

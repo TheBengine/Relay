@@ -76,6 +76,23 @@ impl RelayApp {
         ui.ctx().request_repaint_after(Duration::from_secs(1));
     }
 
+    /// App-to-app delay in both directions: set, observed and unknown parts.
+    fn delay_estimate_lines(&self, ui: &mut egui::Ui, stats: &crate::media::NetworkStats, voice: &crate::voice_connection::Status) {
+        let estimate = crate::delay_estimate::estimate(
+            &self.audio_applied,
+            crate::delay_estimate::Inputs {
+                input_period_ms: stats.input_timing.map(|timing| timing.period_ms),
+                output_period_ms: stats.output_timing.map(|timing| timing.period_ms),
+                rtt_ms: voice.rtt_ms,
+                rtt_to_peer: voice.route == crate::voice_connection::Route::DirectPeer,
+                receive_ms: stats.receive_target_ms,
+            },
+        );
+        ui.label(estimate.to_them.summary("You → them"));
+        ui.label(estimate.to_you.summary("Them → you"));
+        controls::description(ui, crate::delay_estimate::ASSUMPTION);
+    }
+
     pub(super) fn connection_path_details(&self, ui: &mut egui::Ui) {
         connection_path::observe(&self.login.url, ui.ctx());
         if let Some(media) = self.media.as_ref().filter(|m| m.is_active()) {
@@ -86,6 +103,10 @@ impl RelayApp {
                     .color(quality_color(voice.quality())),
             );
             controls::description(ui, &voice.explanation(&stats));
+            if crate::voice_priority::pressured() {
+                ui.label(RichText::new("Voice first: incoming voice is struggling, so Relay lowers your video one step, paces uploads to 1 MiB/s and holds the replica copy for up to a minute until it is steady again. If the trouble is on the other person's connection, this cannot fix it.").color(c_text()));
+            }
+            self.delay_estimate_lines(ui, &stats, &voice);
         }
         let (line, quality, detail) = chat_status(&self.login.url);
         ui.label(RichText::new(line).color(quality_color(quality)));

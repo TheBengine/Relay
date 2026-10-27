@@ -22,6 +22,11 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+/// Fanout between linked gateways: the "two households" model. The server's
+/// plan drives it through `gateway_control`; some accessors serve tests only.
+#[allow(dead_code)]
+pub(crate) mod mesh;
+
 const MAGIC: &[u8; 4] = b"RGW1";
 const HEADER: usize = 36;
 const DATA: u8 = 0;
@@ -249,9 +254,17 @@ impl Client {
     /// Outer authentication/replay checks only. The app MUST still open the
     /// returned packet with its ordinary server/session cipher and E2EE keys.
     pub fn receive(&mut self, packet: &[u8], now: Instant) -> Option<Vec<u8>> {
+        match self.open_kind(packet, now)? {
+            (DATA, inner) if valid_inner(&inner, self.lease.grant.session) => Some(inner),
+            _ => None,
+        }
+    }
+    /// Opens one gateway envelope. Health replies are consumed here.
+    fn open_kind(&mut self, packet: &[u8], now: Instant) -> Option<(u8, Vec<u8>)> {
         let clear = self.lease.open(1, packet, now)?;
-        match clear.first().copied()? {
-            PONG if clear.len() == 9 => {
+        let kind = *clear.first()?;
+        if kind == PONG {
+            if clear.len() == 9 {
                 let id = u64::from_le_bytes(clear[1..].try_into().ok()?);
                 if let Some(index) = self.pending.iter().position(|(pending, _)| *pending == id) {
                     let (_, sent) = self.pending.remove(index);
@@ -260,11 +273,10 @@ impl Client {
                         self.last_reply = Some(now);
                     }
                 }
-                None
             }
-            DATA if valid_inner(&clear[1..], self.lease.grant.session) => Some(clear[1..].to_vec()),
-            _ => None,
+            return None;
         }
+        Some((kind, clear[1..].to_vec()))
     }
 }
 

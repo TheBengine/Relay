@@ -63,6 +63,10 @@ struct Journal {
     rtc_cleanup_binding: Option<String>,
     #[serde(default)]
     rtc_legacy_cleanup: bool,
+    /// Set only on a host that a majority of approved copies chose after an
+    /// unexpected outage. It replaces the old host's grant as the reason for this term.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    takeover: Option<relay_protocol::takeover::Mandate>,
 }
 impl Journal {
     fn route_history(&self)->Vec<model::ActivationGrant> {
@@ -229,6 +233,7 @@ impl Authority {
                     rtc_cleanup_prefix: None,
                     rtc_cleanup_binding: None,
                     rtc_legacy_cleanup: false,
+                    takeover: None,
                 };
                 persist(&path, &value)?;
                 value
@@ -503,6 +508,7 @@ impl Authority {
                     | "/api/health"
                     | ROOT
                     | "/api/hosting/handover/route"
+                    | TAKEOVER_ROUTE
                     | "/api/hosting/handover/cancel"
                     | "/api/hosting/handover/export"
                     | "/api/hosting/handover/part"
@@ -653,6 +659,7 @@ pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route(ROOT, get(status))
         .route("/api/hosting/handover/route", post(route))
+        .route(TAKEOVER_ROUTE, post(takeover_route))
         .route(relay_protocol::host_locator::ISSUE_PATH, post(crate::handover_locator::issue))
         .route("/api/hosting/handover/offer", post(offer))
         .route("/api/hosting/handover/answer", post(answer))
@@ -710,6 +717,78 @@ async fn route(
         signature,
     }))
 }
+/// A host chosen after an unexpected outage proves itself to members who
+/// pinned the old host: a fresh signed route plus the majority mandate.
+pub(crate) const TAKEOVER_ROUTE: &str = "/api/hosting/takeover/route";
+
+#[derive(Serialize)]
+pub(crate) struct TakeoverRoute {
+    proof: model::RouteProof,
+    mandate: relay_protocol::takeover::Mandate,
+}
+
+async fn takeover_route(
+    State(state): State<AppState>,
+    Json(input): Json<model::RouteChallenge>,
+) -> ApiResult<Json<TakeoverRoute>> {
+    let mandate = lock(&state.0.handover.value)
+        .takeover
+        .clone()
+        .ok_or_else(missing)?;
+    let Json(proof) = route(State(state), Json(input)).await?;
+    Ok(Json(TakeoverRoute { proof, mandate }))
+}
+
+/// Writes the authority journal for a host chosen by a takeover mandate. The
+/// caller has already placed the matching database and copied the key.
+pub(crate) fn install_takeover_journal(
+    data: &FsPath,
+    source_host_id: &str,
+    mandate: &relay_protocol::takeover::Mandate,
+    pin: &model::RoutePin,
+) -> std::io::Result<()> {
+    let journal = Journal {
+        schema: model::SCHEMA,
+        server_id: pin.server_id.clone(),
+        source_host_id: source_host_id.into(),
+        term: pin.term,
+        preparation: None,
+        destination: None,
+        restore_target: None,
+        target_proof: None,
+        source_identity: Some(pin.host.clone()),
+        receipt_challenge: None,
+        received: None,
+        retired: None,
+        history: Vec::new(),
+        accepted_from: None,
+        activation_database_sha256: None,
+        activation_pending: false,
+        media_epoch: Some(id()),
+        rtc_cleanup_prefix: None,
+        rtc_cleanup_binding: None,
+        rtc_legacy_cleanup: false,
+        takeover: Some(mandate.clone()),
+    };
+    persist(&data.join(JOURNAL), &journal)
+}
+
+/// Binds a database to its new authority, as an ordinary host's own start does.
+pub(crate) fn mark_database(db: &Connection, source_host_id: &str, term: u64) -> rusqlite::Result<()> {
+    for (key, value) in [(DB_MARKER, source_host_id.to_owned()), (DB_TERM, term.to_string())] {
+        db.execute(
+            "INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn database_marker(db: &Connection) -> rusqlite::Result<Option<String>> {
+    db.query_row("SELECT value FROM metadata WHERE key=?1", [DB_MARKER], |r| r.get(0))
+        .optional()
+}
+
 async fn status(
     State(state): State<AppState>,
     headers: HeaderMap,

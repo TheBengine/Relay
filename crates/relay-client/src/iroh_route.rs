@@ -1563,3 +1563,78 @@ mod tests {
         );
     }
 }
+
+/// This gateway's endpoint for links to other homes' gateways.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct MeshLinkInfo {
+    pub endpoint_id: String,
+    #[serde(default)]
+    pub relay_url: Option<String>,
+}
+
+/// One link to another home's gateway: the loopback port to send to, and the
+/// path iroh uses now (direct or relay) with its round trip.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(crate) struct MeshPeerInfo {
+    pub port: u16,
+    pub connected: bool,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub rtt_ms: Option<f64>,
+}
+
+/// Starts (or reuses) the helper's mesh endpoint and points it at the local
+/// mesh worker's loopback port. Fails when the helper is not installed.
+pub(crate) fn mesh_link_start(worker_port: u16) -> Result<MeshLinkInfo, String> {
+    if !available() {
+        return Err("The account-free connection is not installed.".into());
+    }
+    let info: MeshLinkInfo = with_helper(true, |helper| {
+        api(
+            helper,
+            "/mesh-link/start",
+            Some(serde_json::json!({"worker_port":worker_port})),
+            Duration::from_secs(10),
+        )
+    })?;
+    if info.endpoint_id.is_empty() || info.endpoint_id.len() > 200 {
+        return Err("The mesh endpoint could not be verified.".into());
+    }
+    Ok(info)
+}
+
+/// Allows one peer gateway (from the server's offer) and returns its link.
+pub(crate) fn mesh_link_peer(endpoint_id: &str, relay_url: Option<&str>) -> Result<MeshPeerInfo, String> {
+    let info: MeshPeerInfo = with_helper(false, |helper| {
+        api(
+            helper,
+            "/mesh-link/peer",
+            Some(serde_json::json!({"endpoint_id":endpoint_id,"relay_url":relay_url})),
+            Duration::from_secs(2),
+        )
+    })?;
+    if info.port == 0 {
+        return Err("The mesh link could not be verified.".into());
+    }
+    Ok(info)
+}
+
+/// Keeps links to exactly these peers; every other link ends at once.
+pub(crate) fn mesh_link_retain(endpoint_ids: &[String]) -> Result<(), String> {
+    let _: serde_json::Value = with_helper(false, |helper| {
+        api(
+            helper,
+            "/mesh-link/retain",
+            Some(serde_json::json!({"endpoint_ids":endpoint_ids})),
+            Duration::from_secs(2),
+        )
+    })?;
+    Ok(())
+}
+
+pub(crate) fn mesh_link_stop() {
+    let _: Result<serde_json::Value, String> = with_helper(false, |helper| {
+        api(helper, "/mesh-link/stop", Some(serde_json::json!({})), Duration::from_secs(2))
+    });
+}

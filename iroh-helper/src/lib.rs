@@ -12,6 +12,7 @@ pub mod client;
 pub mod control;
 pub mod host;
 mod media;
+pub mod mesh_link;
 pub mod path;
 pub mod policy;
 pub mod protocol;
@@ -45,6 +46,15 @@ pub(crate) async fn bind(
     } else {
         Vec::new()
     };
+    bind_alpns(network, key, alpns).await
+}
+
+/// Binds one endpoint that accepts exactly these protocols.
+pub(crate) async fn bind_alpns(
+    network: &Network,
+    key: Option<SecretKey>,
+    alpns: Vec<Vec<u8>>,
+) -> Result<Endpoint> {
     let mut builder = match network {
         Network::Internet => Endpoint::builder(presets::N0),
         Network::Loopback => Endpoint::builder(presets::Minimal)

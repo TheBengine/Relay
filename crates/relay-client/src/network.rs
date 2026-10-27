@@ -157,6 +157,13 @@ pub enum Command {
         /// that sent it can place a field error without guessing.
         request_id: u64,
     },
+    /// A reset or recovery code sets a new community password and signs in.
+    ResetPassword {
+        url: String,
+        username: String,
+        code: String,
+        new_password: String,
+    },
     CheckServer {
         locator_invite: Option<String>,
         cancel: Arc<AtomicBool>,
@@ -903,6 +910,13 @@ fn same_account_provider(a: Option<&AccountProvider>, b: Option<&AccountProvider
         (Some(a), Some(b)) => a.issuer == b.issuer && a.client_id == b.client_id,
         _ => false,
     }
+}
+
+/// Shown when a verified new host needs a fresh sign-in after a move.
+pub(crate) fn moved_sign_in(url: &str) -> String {
+    format!(
+        "This community now runs at {url}. Sign in there again: with your Relay account, or with a reset code from an administrator or your recovery code. Your conversations and drafts have been kept."
+    )
 }
 
 struct MovingSession {
@@ -2312,18 +2326,23 @@ impl Worker {
         moved: Option<MovingSession>,
         login_authority: Option<handover::RoutePin>,
     ) -> Result<(), String> {
+        let response = self
+            .http
+            .get(crate::embedded_network::endpoint(&format!(
+                "{url}/api/bootstrap"
+            )))
+            .bearer_auth(&session.token)
+            .send()
+            .map_err(network_error)?;
+        if moved.is_some() && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            // Sessions never travel with a community copy, so a verified new
+            // host does not know this one. Say exactly what works there.
+            return Err(moved_sign_in(&url));
+        }
         let call_alerts::BootstrapReply {
             bootstrap,
             cursor: alert_cursor,
-        } = parse::<call_alerts::BootstrapReply>(
-            self.http
-                .get(crate::embedded_network::endpoint(&format!(
-                    "{url}/api/bootstrap"
-                )))
-                .bearer_auth(&session.token)
-                .send()
-                .map_err(network_error)?,
-        )?;
+        } = parse::<call_alerts::BootstrapReply>(response)?;
         let call_received = Instant::now();
         if account_attempt
             .as_ref()
@@ -2519,6 +2538,7 @@ impl Worker {
             Command::Resume { .. }
                 | Command::SwitchCommunity { .. }
                 | Command::Auth { .. }
+                | Command::ResetPassword { .. }
                 | Command::AccountLoginBegin { .. }
                 | Command::AccountLoginFinish { .. }
                 | Command::Logout
@@ -2651,6 +2671,7 @@ impl Worker {
         }
         match &command {
             Command::Auth { url, .. }
+            | Command::ResetPassword { url, .. }
             | Command::AccountLoginBegin { url, .. }
             | Command::AccountLoginFinish { url, .. }
             | Command::Resume { url, .. }
@@ -2710,6 +2731,7 @@ impl Worker {
         let barrier = matches!(
             &command,
             Command::Auth { .. }
+                | Command::ResetPassword { .. }
                 | Command::AccountLoginFinish { .. }
                 | Command::Resume { .. }
                 | Command::Logout
@@ -2787,6 +2809,32 @@ impl Worker {
                         .map_err(network_error)?,
                 )?;
                 self.adopt_session_checked(url, expected_server_id, session, None, None, authority)?;
+            }
+            Command::ResetPassword {
+                url,
+                username,
+                code,
+                new_password,
+            } => {
+                let url = crate::community::normalize_url(&url)?;
+                // The same route proof as a password sign-in, before the code is sent.
+                let authority = self.confirm_login_authority(&url, None, None)?;
+                let code = zeroize::Zeroizing::new(code);
+                let new_password = zeroize::Zeroizing::new(new_password);
+                let session: Session = parse(
+                    self.http
+                        .post(crate::embedded_network::endpoint(&format!(
+                            "{url}/api/password/reset"
+                        )))
+                        .json(&serde_json::json!({
+                            "username": username,
+                            "code": code.as_str(),
+                            "new_password": new_password.as_str(),
+                        }))
+                        .send()
+                        .map_err(network_error)?,
+                )?;
+                self.adopt_session_checked(url, None, session, None, None, authority)?;
             }
             Command::Logout => {
                 self.cancel_transfers();

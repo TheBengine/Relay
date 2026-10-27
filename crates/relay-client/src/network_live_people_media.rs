@@ -340,6 +340,7 @@ fn owned_live_friends_native_media_uses_real_admission_and_tls_turn() {
                         deafened: true,
                         sharing: true,
                         camera: true,
+                        ..Default::default()
                     }))
                     .is_err()
                 {

@@ -21,6 +21,9 @@ use std::{
 use zeroize::{Zeroize, Zeroizing};
 
 const ROOT: &str = "/api/hosting/voice-gateways";
+
+/// The voice mesh between homes: gateway reports and each person's place.
+mod mesh;
 const PERIOD: Duration = Duration::from_millis(400);
 const RETRY: Duration = Duration::from_secs(5);
 const MAX_IDS: usize = 4096;
@@ -152,6 +155,11 @@ pub(crate) struct Config {
     lease: RequestBuilder,
     release: RequestBuilder,
     deregister: RequestBuilder,
+    mesh: RequestBuilder,
+    mesh_member: RequestBuilder,
+    hosting: RequestBuilder,
+    measurements: RequestBuilder,
+    upload_probe: RequestBuilder,
 }
 impl Config {
     pub fn new(
@@ -167,6 +175,11 @@ impl Config {
             lease: request(Method::POST, &format!("{ROOT}/leases")).ok()?,
             release: request(Method::DELETE, &format!("{ROOT}/leases")).ok()?,
             deregister: request(Method::DELETE, &format!("{ROOT}/registration")).ok()?,
+            mesh: request(Method::POST, &format!("{ROOT}/mesh")).ok()?,
+            mesh_member: request(Method::POST, &format!("{ROOT}/mesh/member")).ok()?,
+            hosting: request(Method::GET, "/api/hosting").ok()?,
+            measurements: request(Method::POST, "/api/hosting/measurements").ok()?,
+            upload_probe: request(Method::POST, "/api/hosting/measurements/upload").ok()?,
         })
     }
     /// Only the authenticated call worker supplies this already pinned route.
@@ -189,6 +202,11 @@ impl Config {
             lease: self.lease.try_clone()?,
             release: self.release.try_clone()?,
             deregister: self.deregister.try_clone()?,
+            mesh: self.mesh.try_clone()?,
+            mesh_member: self.mesh_member.try_clone()?,
+            hosting: self.hosting.try_clone()?,
+            measurements: self.measurements.try_clone()?,
+            upload_probe: self.upload_probe.try_clone()?,
         })
     }
 }
@@ -264,6 +282,12 @@ pub(crate) struct Session {
     state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
     enabled: Arc<Toggle>,
+    /// This person's place in the voice mesh between homes, if any.
+    mesh: Arc<Mutex<mesh::Member>>,
+    /// This machine's own round trip to the host, for a gateway's report.
+    host_rtt_us: Arc<AtomicU64>,
+    /// Incoming voice quality per speaker, for the host overview.
+    heard: Arc<Mutex<Vec<(String, crate::voice_quality::Quality)>>>,
 }
 impl Session {
     #[cfg(test)]
@@ -276,6 +300,9 @@ impl Session {
             state: Arc::new(Mutex::new(state)),
             stop: Arc::new(AtomicBool::new(false)),
             enabled,
+            mesh: Arc::default(),
+            host_rtt_us: Arc::default(),
+            heard: Arc::default(),
         }
     }
     pub fn start(
@@ -291,6 +318,11 @@ impl Session {
             return None;
         }
         let serving = config.copy()?;
+        let meshing = config.copy()?;
+        let measuring = config.copy()?;
+        let heard: Arc<Mutex<Vec<(String, crate::voice_quality::Quality)>>> = Arc::default();
+        let member = Arc::new(Mutex::new(mesh::Member::default()));
+        let host_rtt_us = Arc::new(AtomicU64::new(0));
         let state = Arc::new(Mutex::new(State::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let valid = {
@@ -318,12 +350,29 @@ impl Session {
             })
             .ok()?;
         let serve_enabled = enabled.clone();
+        let serve_rtt = host_rtt_us.clone();
+        let (mesh_valid, mesh_alive, mesh_enabled, mesh_member) =
+            (valid.clone(), alive.clone(), enabled.clone(), member.clone());
+        let measure_alive = alive.clone();
         if thread::Builder::new()
             .name("voice-gateway-grants".into())
             .spawn(move || {
-                serve_loop(serving, upstream, valid, alive, serve_enabled);
+                serve_loop(serving, upstream, valid, alive, serve_enabled, serve_rtt);
             })
             .is_err()
+            || thread::Builder::new()
+                .name("voice-mesh-member".into())
+                .spawn(move || {
+                    mesh::member_loop(meshing, mesh_member, mesh_valid, mesh_alive, mesh_enabled);
+                })
+                .is_err()
+            || {
+                let (heard, rtt, alive) = (heard.clone(), host_rtt_us.clone(), measure_alive);
+                thread::Builder::new()
+                    .name("host-measurements".into())
+                    .spawn(move || measurement_loop(measuring, heard, rtt, alive))
+                    .is_err()
+            }
         {
             stop.store(true, Ordering::Release);
             enabled.wake();
@@ -333,6 +382,9 @@ impl Session {
             state,
             stop,
             enabled,
+            mesh: member,
+            host_rtt_us,
+            heard,
         })
     }
     pub fn with_path<T>(&self, f: impl FnOnce(&mut Path) -> T) -> Option<T> {
@@ -360,6 +412,46 @@ impl Session {
     }
     pub fn active(&self) -> bool {
         self.state.lock().is_ok_and(|state| state.active)
+    }
+    fn mesh_allowed(&self) -> bool {
+        self.enabled.load(Ordering::Acquire) && !self.stop.load(Ordering::Acquire)
+    }
+    /// The original protected frame for this person's mesh gateway, in
+    /// addition to the ordinary send to the host. Empty when the mesh does not
+    /// carry them now.
+    pub fn mesh_frame(&self, protected: &[u8], now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+        if !self.mesh_allowed() || protected.first() != Some(&relay_protocol::AUDIO_PACKET_V3) {
+            return Vec::new();
+        }
+        self.mesh.lock().map(|mut m| m.frame(protected, now)).unwrap_or_default()
+    }
+    pub fn mesh_probes(&self, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+        if !self.mesh_allowed() {
+            return Vec::new();
+        }
+        self.mesh.lock().map(|mut m| m.probes(now)).unwrap_or_default()
+    }
+    /// A datagram from a mesh hop: see mesh::Member::receive.
+    pub fn mesh_receive(
+        &self,
+        from: SocketAddr,
+        bytes: &[u8],
+        deafened: bool,
+        now: Instant,
+    ) -> Option<Option<Vec<u8>>> {
+        if !self.mesh_allowed() {
+            return None;
+        }
+        self.mesh.lock().ok()?.receive(from, bytes, deafened, now)
+    }
+    pub fn set_host_rtt_us(&self, rtt_us: u64) {
+        self.host_rtt_us.store(rtt_us, Ordering::Relaxed);
+    }
+    /// What this member hears from each speaker now, for the host overview.
+    pub fn set_heard(&self, heard: Vec<(String, crate::voice_quality::Quality)>) {
+        if let Ok(mut slot) = self.heard.lock() {
+            *slot = heard;
+        }
     }
     /// Err means the selected path expired mid-batch. Drop that packet; the next
     /// loop commits fallback first, rather than sending audio to an unbound path.
@@ -392,6 +484,69 @@ impl Drop for Session {
         }
         // Bounded HTTP requests finish off the audio/UI thread. Cleanup names
         // this exact session/instance/id, never a newer call with the same login.
+    }
+}
+
+/// The host overview's real numbers (#19): this machine's capacity when its
+/// member is a co-host, and voice quality to each co-host in the call. Runs
+/// for the whole call, apart from the gateway opt-in; never on the audio path.
+fn measurement_loop(
+    config: Config,
+    heard: Arc<Mutex<Vec<(String, crate::voice_quality::Quality)>>>,
+    host_rtt_us: Arc<AtomicU64>,
+    alive: Arc<dyn Fn() -> bool + Send + Sync>,
+) {
+    use crate::host_measurements as measure;
+    const EVERY: Duration = Duration::from_secs(30);
+    let mut cpu = measure::CpuSampler::default();
+    let _ = cpu.sample();
+    let mut next = Instant::now() + Duration::from_secs(10);
+    let mut next_upload = Instant::now() + Duration::from_secs(20);
+    while alive() {
+        if Instant::now() < next {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        next = Instant::now() + EVERY;
+        let Some(view): Option<relay_protocol::hosting::HostingView> =
+            config.hosting.try_clone().and_then(reply)
+        else {
+            continue;
+        };
+        let cohost = view
+            .candidates
+            .iter()
+            .any(|c| c.candidate.user_id == view.you && !c.candidate.effective().is_empty());
+        if cohost && Instant::now() >= next_upload {
+            next_upload = Instant::now() + Duration::from_secs(15 * 60);
+            if let Some(request) = config.upload_probe.try_clone() {
+                let started = Instant::now();
+                let sent = request
+                    .timeout(Duration::from_secs(20))
+                    .body(vec![0u8; measure::UPLOAD_PROBE_BYTES])
+                    .send()
+                    .is_ok_and(|r| r.status().is_success());
+                if let Some(kbps) =
+                    sent.then(|| measure::kbps(measure::UPLOAD_PROBE_BYTES, started.elapsed())).flatten()
+                {
+                    measure::set_upload_kbps(kbps);
+                }
+            }
+        }
+        let capacity = cohost.then(|| relay_protocol::hosting::CapacityFacts {
+            upload_kbps: measure::upload_kbps(),
+            cpu_free_pct: cpu.sample(),
+            free_disk_mb: crate::local_host::data_directory()
+                .ok()
+                .and_then(|dir| measure::free_disk_mb(&dir)),
+            participants: 0,
+        });
+        let heard = heard.lock().map(|h| h.clone()).unwrap_or_default();
+        let rtt_us = host_rtt_us.load(Ordering::Relaxed);
+        let rtt_ms = (rtt_us > 0).then(|| rtt_us as f32 / 1000.0);
+        if let Some(report) = measure::report(&view, &heard, rtt_ms, capacity) {
+            discard(config.measurements.try_clone().map(|r| r.json(&report)));
+        }
     }
 }
 
@@ -552,6 +707,7 @@ fn serve_loop(
     valid: Arc<dyn Fn() -> bool + Send + Sync>,
     alive: Arc<dyn Fn() -> bool + Send + Sync>,
     enabled: Arc<Toggle>,
+    host_rtt_us: Arc<AtomicU64>,
 ) {
     let mut backoff = RETRY;
     let mut nic_cursor = 0usize;
@@ -594,6 +750,8 @@ fn serve_loop(
             enabled.wait(alive.as_ref(), RETRY, revision);
             continue;
         };
+        // The mesh between homes runs beside the LAN hop on the same NIC.
+        let mut mesh = mesh::Gateway::start(local);
         let mut private_renewal = Instant::now() + Duration::from_secs(30);
         let mut idle_until = Instant::now() + Duration::from_secs(12);
         let mut random = [0; 16];
@@ -688,6 +846,13 @@ fn serve_loop(
                 installed.remove(&session);
             }
             if !okay { break; }
+            if let Some(gateway) = mesh.as_mut() {
+                let rtt_us = host_rtt_us.load(Ordering::Relaxed);
+                let rtt_ms = (rtt_us > 0).then(|| (rtt_us / 1000).clamp(1, 10_000) as u32);
+                if !gateway.tick(&config, &instance, rtt_ms) {
+                    mesh = None;
+                }
+            }
             // A gateway is renewed only after this exact account/call's grant
             // poll succeeded. Failed auth, ended calls and disabled opt-in leave
             // the loop; no keeper thread can keep a stale private route alive.
@@ -703,6 +868,7 @@ fn serve_loop(
             }
             enabled.wait(alive.as_ref(), PERIOD, revision);
         }
+        drop(mesh);
         drop(worker);
         drop(private);
         discard(config.deregister.try_clone().map(|r| {

@@ -344,3 +344,119 @@ async fn damaged_or_newer_host_settings_are_refused_instead_of_guessed() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+/// Anna hosts; Bo holds an approved data-copy role; Clara is a member.
+async fn approved_bo() -> (tempfile::TempDir, AppState, Router, Session, Session, Session) {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path(), "Hosts", 0).unwrap();
+    let app = router(state.clone());
+    let anna = signup(&app, "Anna", "").await;
+    let bo = signup(&app, "Bo", &new_invite(&app, &anna).await).await;
+    let clara = signup(&app, "Clara", &new_invite(&app, &anna).await).await;
+    post(&app, &anna.token, "/api/hosting/offers", json!({"user_id":bo.user.id,"roles":["replica"]})).await;
+    assert_eq!(
+        post(&app, &bo.token, "/api/hosting/answer", json!({"accepted":["replica"]})).await.0,
+        StatusCode::OK
+    );
+    (temp, state, app, anna, bo, clara)
+}
+
+async fn post(app: &Router, token: &str, path: &str, body: Value) -> (StatusCode, Value) {
+    request(app, "POST", path, Some(token), body).await
+}
+
+#[tokio::test]
+async fn measured_capacity_and_the_worst_participant_reach_the_overview() {
+    let (_temp, _state, app, anna, bo, clara) = approved_bo().await;
+    // Nothing measured: grey, never green.
+    let view = get(&app, &anna.token).await.1;
+    assert_eq!(dimension(&view, &bo.user.id, "data_standby", "capacity")["verdict"], "unknown");
+    // Only an approved co-host reports its own machine; nobody measures themselves.
+    let capacity = json!({"capacity":{"upload_kbps":20000,"cpu_free_pct":80,"free_disk_mb":50000,"participants":0}});
+    let measurements = "/api/hosting/measurements";
+    assert_eq!(post(&app, &clara.token, measurements, capacity.clone()).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(post(&app, &bo.token, measurements, capacity).await.0, StatusCode::NO_CONTENT);
+    let quality = |host: &str, loss: f32| json!({"voice":[{"host_user_id":host,"quality":{"rtt_ms":30.0,"jitter_ms":5.0,"loss_pct":loss,"late_pct":0.5}}]});
+    assert_eq!(post(&app, &bo.token, measurements, quality(&bo.user.id, 0.0)).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(post(&app, &clara.token, measurements, quality(&bo.user.id, 150.0)).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(post(&app, &clara.token, measurements, quality(&bo.user.id, 0.2)).await.0, StatusCode::NO_CONTENT);
+    let view = get(&app, &anna.token).await.1;
+    let capacity = dimension(&view, &bo.user.id, "data_standby", "capacity");
+    assert_eq!(capacity["verdict"], "green", "{capacity}");
+    let voice = dimension(&view, &bo.user.id, "planned_handover", "voice_quality");
+    assert_eq!(voice["verdict"], "green", "{voice}");
+    // The worst-off participant decides.
+    assert_eq!(post(&app, &anna.token, measurements, quality(&bo.user.id, 9.0)).await.0, StatusCode::NO_CONTENT);
+    let view = get(&app, &anna.token).await.1;
+    let voice = dimension(&view, &bo.user.id, "planned_handover", "voice_quality");
+    assert_eq!(voice["verdict"], "red", "{voice}");
+    assert!(voice["text"].as_str().unwrap().contains("packet loss"));
+}
+
+#[tokio::test]
+async fn the_outage_matrix_never_promises_what_this_build_cannot_do() {
+    let (_temp, _state, app, _anna, bo, _clara) = approved_bo().await;
+    let view = get(&app, &bo.token).await.1;
+    assert_eq!(view["takeover"]["state"], "not_set_up");
+    let row = |what: &str| {
+        view["outage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["what"] == what)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row("Friends: messages and calls")["available"], true);
+    assert_eq!(row("Sign in with a community password")["available"], false);
+    assert_eq!(row("Keep chatting in this community")["available"], false);
+    assert!(row("Keep chatting in this community")["text"].as_str().unwrap().starts_with("Not yet"));
+}
+
+#[tokio::test]
+async fn host_switching_choices_are_for_administrators_and_approved_hosts_only() {
+    let (temp, state, app, anna, bo, clara) = approved_bo().await;
+    let switching = "/api/hosting/switching";
+    let use_host = |who: &str| json!({"mode":"use_this_host","preferred":who,"backups":[]});
+    assert_eq!(post(&app, &bo.token, switching, use_host(&bo.user.id)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(post(&app, &anna.token, switching, use_host(&clara.user.id)).await.0, StatusCode::BAD_REQUEST);
+    let (code, view) = post(&app, &anna.token, switching, json!({"mode":"automatic","preferred":null,"backups":[bo.user.id]})).await;
+    assert_eq!(code, StatusCode::OK, "{view}");
+    assert_eq!(view["switching"]["mode"], "automatic");
+    assert!(view["switch_advice"].as_str().unwrap().contains("waits until moving a community is available"));
+    // The choice survives a restart with the roster.
+    drop(app);
+    drop(state);
+    let state = AppState::open(temp.path(), "Hosts", 0).unwrap();
+    let app = router(state);
+    let view = get(&app, &bo.token).await.1;
+    assert_eq!(view["switching"]["backups"][0], bo.user.id.as_str());
+}
+
+#[tokio::test]
+async fn the_takeover_setup_is_a_checklist_of_what_the_host_actually_measured() {
+    let (_temp, _state, app, anna, bo, clara) = approved_bo().await;
+    let steps = |view: &Value| {
+        view["takeover_setup"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["what"].as_str().unwrap().to_owned(), s["done"].as_bool().unwrap(), s["text"].as_str().unwrap().to_owned()))
+            .collect::<Vec<_>>()
+    };
+    let view = get(&app, &anna.token).await.1;
+    let first = steps(&view);
+    assert_eq!(first.len(), 5, "{first:?}");
+    assert!(!first[0].1 && first[0].2.starts_with("1 of 2"), "{first:?}");
+    assert!(!first[1].1 && first[1].2.starts_with("0 of 2"));
+    assert!(!first[2].1);
+    assert!(!first[3].1 && first[3].2 == "No co-host has a copy yet.");
+    assert!(!first[4].1 && first[4].2.starts_with("Not available in this version"));
+    // A second approved co-host completes the first step, and only that one.
+    post(&app, &anna.token, "/api/hosting/offers", json!({"user_id":clara.user.id,"roles":["replica"]})).await;
+    post(&app, &clara.token, "/api/hosting/answer", json!({"accepted":["replica"]})).await;
+    let view = get(&app, &bo.token).await.1;
+    let second = steps(&view);
+    assert!(second[0].1, "{second:?}");
+    assert!(second[1..].iter().all(|step| !step.1));
+}

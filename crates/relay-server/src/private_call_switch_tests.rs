@@ -135,7 +135,7 @@ async fn atomic_answer_validates_before_replacing_exact_seat_and_preserves_mute_
         crate::rtc::RtcMembership {
             channel_id: f.call.channel_id.clone(),
             room: "successor-room".into(),
-            token_hash: token_hash(&f.recipient.token),
+            token_hash: crate::session_hash(&f.recipient.token),
             can_publish: true,
         },
     );
@@ -171,7 +171,7 @@ async fn exact_release_rejects_other_device_protection_or_instance_without_revok
         crate::rtc::RtcMembership {
             channel_id: f.old_room.clone(),
             room: "current-room".into(),
-            token_hash: token_hash(&f.recipient.token),
+            token_hash: crate::session_hash(&f.recipient.token),
             can_publish: true,
         },
     );

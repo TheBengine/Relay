@@ -90,7 +90,7 @@ fn admit(
     if protection.level == ProtectionLevel::Open {
         if input.open_revision != Some(protection.revision)
             || input.device_id.as_deref()
-                != Some(protection::open_device(&auth.token_hash).as_str())
+                != Some(protection::open_device(&auth.token_digest).as_str())
         {
             return Err(bad(
                 "Accept this server's current encryption choice before joining voice",
@@ -168,8 +168,7 @@ fn admit(
         saved_state = VoiceState {
             muted: request.state.muted,
             deafened: request.state.deafened,
-            sharing: false,
-            camera: false,
+            ..Default::default()
         };
     }
     let private_call_id;
@@ -298,6 +297,7 @@ fn admit(
             channel_id: input.channel_id.clone(),
             device_id: input.device_id,
             token_hash: auth.token_hash,
+            token_digest: auth.token_digest,
             private_call_id,
             recovery_deadline: saved_expiry,
             key,
@@ -408,7 +408,7 @@ pub(super) async fn leave_exact(
     let protection = protection::current(&db)?;
     if (protection.level == ProtectionLevel::Open
         && (input.open_revision != Some(protection.revision)
-            || input.device_id != protection::open_device(&auth.token_hash)))
+            || input.device_id != protection::open_device(&auth.token_digest)))
         || (protection.level == ProtectionLevel::Protected
             && (input.open_revision.is_some()
                 || e2ee::device(&db, &auth.user.id, &input.device_id).is_err()))

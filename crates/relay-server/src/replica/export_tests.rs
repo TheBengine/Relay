@@ -33,6 +33,7 @@ fn roster(accepted: bool) -> String {
             offered_by: "a1".into(),
             updated_ms: 1,
         }],
+        switching: Default::default(),
     })
     .unwrap()
 }

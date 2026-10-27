@@ -34,6 +34,8 @@ pub struct Control {
     /// Route-proof exchanges. Apart from `client`: its own budget and no shared route.
     proofs: crate::route_proof::Prover,
     prepared: crate::prepared_route::Store,
+    /// Links between voice gateways of different homes; see `mesh_link`.
+    mesh: tokio::sync::Mutex<Option<crate::mesh_link::MeshLinks>>,
     /// Signalled by `/shutdown`; the program then ends.
     pub stop: Notify,
 }
@@ -52,6 +54,7 @@ impl Control {
             client: tokio::sync::Mutex::new(None),
             proofs: crate::route_proof::Prover::new(),
             prepared: crate::prepared_route::Store::new(),
+            mesh: tokio::sync::Mutex::new(None),
             stop: Notify::new(),
         }))
     }
@@ -99,6 +102,26 @@ struct PrepareIdentity {
     scope: String,
     #[serde(default)]
     expected_endpoint: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeshStart {
+    worker_port: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeshPeer {
+    endpoint_id: String,
+    #[serde(default)]
+    relay_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeshKeep {
+    endpoint_ids: Vec<String>,
 }
 
 fn default_media_port() -> u16 {
@@ -757,6 +780,80 @@ impl Control {
                     client.close_route(&id).await;
                 }
                 json(StatusCode::OK, &serde_json::json!({ "closed": true }))
+            }
+            (Method::POST, "/mesh-link/start") => {
+                let input: MeshStart = match body(request).await {
+                    Ok(v) => v,
+                    Err(reply) => return reply,
+                };
+                let mut slot = self.mesh.lock().await;
+                if slot.is_none() {
+                    match crate::mesh_link::MeshLinks::start(&self.network).await {
+                        Ok(links) => *slot = Some(links),
+                        Err(_) => {
+                            return error(StatusCode::BAD_GATEWAY, "The mesh link could not start")
+                        }
+                    }
+                }
+                let links = slot.as_ref().expect("started above");
+                if links.set_worker(input.worker_port).is_err() {
+                    return error(StatusCode::BAD_REQUEST, "A worker port is required");
+                }
+                json(
+                    StatusCode::OK,
+                    &serde_json::json!({"endpoint_id":links.endpoint_id().to_string(),
+                        "relay_url":links.relay_url()}),
+                )
+            }
+            (Method::POST, "/mesh-link/peer") => {
+                let input: MeshPeer = match body(request).await {
+                    Ok(v) => v,
+                    Err(reply) => return reply,
+                };
+                let Ok((id, relay)) =
+                    crate::mesh_link::parse_peer(&input.endpoint_id, input.relay_url.as_deref())
+                else {
+                    return error(StatusCode::BAD_REQUEST, "The peer is invalid");
+                };
+                let slot = self.mesh.lock().await;
+                let Some(links) = slot.as_ref() else {
+                    return error(StatusCode::CONFLICT, "Start the mesh link first");
+                };
+                match links.peer(id, relay, Vec::new()).await {
+                    Ok(port) => {
+                        let path = links.path(&id).await;
+                        json(
+                            StatusCode::OK,
+                            &serde_json::json!({"port":port,"connected":path.is_some(),
+                                "kind":path.as_ref().map(|p| p.kind),
+                                "rtt_ms":path.map(|p| p.rtt_ms)}),
+                        )
+                    }
+                    Err(_) => error(StatusCode::TOO_MANY_REQUESTS, "The mesh link was refused"),
+                }
+            }
+            (Method::POST, "/mesh-link/retain") => {
+                let input: MeshKeep = match body(request).await {
+                    Ok(v) => v,
+                    Err(reply) => return reply,
+                };
+                let mut keep = Vec::new();
+                for text in input.endpoint_ids.iter().take(crate::mesh_link::MAX_PEERS) {
+                    match crate::mesh_link::parse_peer(text, None) {
+                        Ok((id, _)) => keep.push(id),
+                        Err(_) => return error(StatusCode::BAD_REQUEST, "A peer is invalid"),
+                    }
+                }
+                if let Some(links) = self.mesh.lock().await.as_ref() {
+                    links.retain(&keep).await;
+                }
+                json(StatusCode::OK, &serde_json::json!({"ok":true}))
+            }
+            (Method::POST, "/mesh-link/stop") => {
+                if let Some(links) = self.mesh.lock().await.take() {
+                    links.close().await;
+                }
+                json(StatusCode::OK, &serde_json::json!({"ok":true}))
             }
             (Method::POST, "/shutdown") => {
                 self.stop.notify_one();

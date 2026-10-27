@@ -83,6 +83,23 @@ struct Options {
         "migrate_only","status","stop","public_hosting_status","people","lan_discovery","tailscale_bind"
     ])]
     handover_ready: Option<PathBuf>,
+    /// Start this --data folder as the community host that a majority of approved
+    /// copies chose, from the takeover prepared in the given standby folder.
+    #[arg(long, value_name = "DIR", requires = "data", conflicts_with_all = [
+        "replica_pull", "handover_target", "handover_ready", "backup", "raw_backup",
+        "restore", "init_admin", "recover_admin", "people"
+    ])]
+    takeover_from: Option<PathBuf>,
+    /// Allow administrators to turn on live 2-of-3 takeover protection. Off by
+    /// default: while it is on, changes stop when no approved co-host confirms them.
+    #[arg(long)]
+    takeover_protection: bool,
+    /// Companion mode for the app: keep this computer's takeover copy (one run).
+    #[arg(long, value_name = "DIR", hide = true, conflicts_with_all = ["data", "replica_pull", "handover_target"])]
+    takeover_copy: Option<PathBuf>,
+    /// Companion mode for the app: follow the host's live changes until stopped.
+    #[arg(long, value_name = "DIR", hide = true, conflicts_with_all = ["data", "replica_pull", "handover_target", "takeover_copy"])]
+    takeover_follow: Option<PathBuf>,
     /// Account-wide friends, private messages and calls. Use a separate new --data directory.
     #[arg(long)]
     people: bool,
@@ -423,6 +440,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(directory) = &options.handover_target {
         return relay_server::handover_target::run(directory);
     }
+    if let Some(directory) = &options.takeover_copy {
+        let outcome = relay_server::takeover_cohost_run::copy_stdin(directory);
+        println!("{}", serde_json::to_string(&outcome)?);
+        return Ok(());
+    }
+    if let Some(directory) = &options.takeover_follow {
+        return relay_server::takeover_cohost_run::follow_stdin(directory).map_err(Into::into);
+    }
     if let Some(directory) = &options.replica_pull {
         let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         match runtime.block_on(relay_server::replica_agent::run_stdin(directory)) {
@@ -591,6 +616,15 @@ async fn run(mut options: Options) -> Result<(), Box<dyn std::error::Error>> {
     lock.try_lock().map_err(|_| {
         "This data directory is in use; stop its server before maintenance or a second launch"
     })?;
+    if let Some(standby) = &options.takeover_from {
+        if !data.join("host-authority.json").try_exists()? {
+            let pin = relay_server::install_takeover(standby, &data)?;
+            eprintln!(
+                "Continuing the community as host term {} chosen by a majority of approved copies.",
+                pin.term
+            );
+        }
+    }
     let inherited = relay_server::handover_target::active_runtime(&data)?;
     let mut config = ServerConfig {
         people: options.people,
@@ -682,6 +716,9 @@ async fn run(mut options: Options) -> Result<(), Box<dyn std::error::Error>> {
     mark_voice_priority(&udp);
     let udp_address = udp.local_addr()?;
     let state = AppState::open_with_config(&data, &options.name, udp_address.port(), config)?;
+    if options.takeover_protection {
+        state.enable_takeover_protection();
+    }
     if !options.people
         && requires_admin_initialization(options.bind, udp_bind)
         && !state.has_users()?

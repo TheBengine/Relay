@@ -872,6 +872,39 @@ impl<J: LogStore, S: HostSigner> Voter<J, S> {
         }
     }
 
+    /// Whether `votes` are a majority mandate for exactly this signed `request`: at least
+    /// `QUORUM` distinct current members, each vote bound to this server, set, epoch and
+    /// term and to the candidate, tip and consent the request carries, and correctly
+    /// signed. Counting never stores anything and never grants a vote itself.
+    pub(crate) fn majority_for(&self, request: &VoteRequest, votes: &[Vote]) -> bool {
+        let b = &request.body;
+        if self.poisoned
+            || votes.len() > MAX_EVIDENCE
+            || request.validate().is_err()
+            || !self.bound(&b.server_id, &b.set_sha256, b.epoch)
+            || !self.state.set.body.is_candidate(&b.candidate)
+            || !signed_by(request)
+        {
+            return false;
+        }
+        let consent = accept_digest(&b.accept);
+        let mut voters: Vec<&str> = Vec::new();
+        for vote in votes {
+            let v = &vote.body;
+            let exact = vote.validate().is_ok()
+                && self.bound(&v.server_id, &v.set_sha256, v.epoch)
+                && v.term == b.term
+                && v.candidate == b.candidate
+                && v.candidate_tip == b.tip
+                && v.accept_sha256 == consent
+                && self.member_signed(vote);
+            if exact && !voters.contains(&v.voter.host_id.as_str()) {
+                voters.push(&v.voter.host_id);
+            }
+        }
+        voters.len() >= wire::QUORUM
+    }
+
     /// Authenticate historical commit evidence against this configured cohort and
     /// the exact retained entry. Unlike commit_gate this does not grant a new
     /// write, count an unsigned local vote, or reject an older committed term.

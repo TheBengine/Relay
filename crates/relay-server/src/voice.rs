@@ -24,6 +24,9 @@ pub(crate) struct VoiceSession {
     pub channel_id: String,
     pub device_id: Option<String>,
     pub token_hash: String,
+    /// The plain digest of the session token, never stored: the app derives
+    /// its open-call device name from it.
+    pub token_digest: String,
     pub private_call_id: Option<String>,
     /// A resumed private seat cannot manufacture more recovery time through
     /// bootstrap/repeated restarts. Authenticated transport confirms it is live.
@@ -358,6 +361,9 @@ pub(crate) fn relay_packet(
                 && (whisper_target.is_none() || !whisper_channels.contains(&recipient.channel_id)))
             || recipient.state.deafened
             || !recipient.alive_at(now())
+            // The voice mesh between homes carries this pair now.
+            || (whisper_target.is_none()
+                && state.0.gateways.mesh_carries(session_id, recipient_id))
         {
             continue;
         }
@@ -825,7 +831,8 @@ mod tests {
         ] {
             let mut ticket = session(id as u8, room, address);
             ticket.user = user.clone();
-            ticket.token_hash = crate::token_hash(token);
+            ticket.token_hash = crate::session_hash(token);
+            ticket.token_digest = crate::token_hash(token);
             lock(&state.0.voice).insert(id, ticket);
         }
         assert_eq!(
@@ -1072,10 +1079,12 @@ mod tests {
         let source = "127.0.0.1:12001".parse().unwrap();
         let mut sender = session(1, &source_room, source);
         sender.user = member.user.clone();
-        sender.token_hash = crate::token_hash(&member.token);
+        sender.token_hash = crate::session_hash(&member.token);
+        sender.token_digest = crate::token_hash(&member.token);
         let mut recipient = session(2, &destination_room, "127.0.0.1:12002".parse().unwrap());
         recipient.user = admin.user.clone();
-        recipient.token_hash = crate::token_hash(&admin.token);
+        recipient.token_hash = crate::session_hash(&admin.token);
+        recipient.token_digest = crate::token_hash(&admin.token);
         let inner = private_fixture(&member.user.id);
         let payload = relay_protocol::wrap_whisper(&admin.user.id, &inner).unwrap();
         lock(&state.0.voice).insert(1, sender);
@@ -1386,6 +1395,7 @@ mod tests {
             channel_id: channel.into(),
             device_id: None,
             token_hash: "test".into(),
+            token_digest: "test".into(),
             key: [key; 32],
             state: VoiceState::default(),
             remote: Some(remote),

@@ -140,7 +140,7 @@ async fn restart_resume_is_bound_to_account_login_channel_device_and_single_use(
     let mut f = Fixture::new().await;
     let ticket = f.join("selected").await;
     let other_channel = create_test_channel(&f.app, &f.admin, "voice", false).await;
-    let replacement_login = new_session(&lock(&f.state.0.db), f.user.user.clone()).unwrap();
+    let replacement_login = new_session(&lock(&f.state.0.db), &f.state.0.seal, f.user.user.clone()).unwrap();
     f.restart();
     for (key, value) in [
         ("channel_id", other_channel),
@@ -338,7 +338,7 @@ async fn authenticated_bootstrap_renews_live_voice_without_rejoin_or_key_change(
         v.state.muted = true;
         v.key
     };
-    let replacement = new_session(&lock(&f.state.0.db), f.user.user.clone()).unwrap();
+    let replacement = new_session(&lock(&f.state.0.db), &f.state.0.seal, f.user.user.clone()).unwrap();
     for login in [&f.admin, &replacement] {
         assert_eq!(
             request(
@@ -465,7 +465,7 @@ async fn live_voice_renewal_is_capped_by_login_expiry_and_requires_valid_login()
     lock(&f.state.0.db)
         .execute(
             "UPDATE sessions SET expires=?1 WHERE token_hash=?2",
-            params![login_expiry, token_hash(&f.user.token)],
+            params![login_expiry, crate::session_hash(&f.user.token)],
         )
         .unwrap();
     lock(&f.state.0.voice)
@@ -492,7 +492,7 @@ async fn live_voice_renewal_is_capped_by_login_expiry_and_requires_valid_login()
     lock(&f.state.0.db)
         .execute(
             "DELETE FROM sessions WHERE token_hash=?1",
-            [token_hash(&f.user.token)],
+            [crate::session_hash(&f.user.token)],
         )
         .unwrap();
     assert_eq!(

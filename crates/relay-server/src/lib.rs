@@ -31,6 +31,17 @@ mod profiles;
 mod protection;
 #[allow(dead_code)]
 mod replica;
+mod host_copy_secrets;
+mod credential_seal;
+mod hosting_measurements;
+mod password_reset;
+mod upload_probe;
+mod takeover_failover;
+mod takeover_setup;
+mod takeover_live;
+pub mod takeover_cohost;
+pub mod takeover_cohost_run;
+pub use takeover_setup::{EnrollRequest as TakeoverEnroll, Manifest as TakeoverManifest};
 pub mod replica_agent;
 mod request_host;
 pub use request_host::validate_names as validate_allowed_hosts;
@@ -165,6 +176,20 @@ struct Inner {
     handover_exports: handover_transfer::Service,
     takeover: Mutex<Option<Arc<takeover_runtime::Source>>>,
     takeover_failed: std::sync::atomic::AtomicBool,
+    failover: Mutex<Option<Arc<takeover_failover::Failover>>>,
+    measurements: hosting_measurements::Measurements,
+    switch_advisor: Mutex<relay_protocol::host_switch::Advisor>,
+    /// Co-host addresses announced to members once takeover protection is set up.
+    standby_urls: Mutex<Vec<String>>,
+    /// Off unless the operator turns it on (`--takeover-protection`).
+    protection_enabled: std::sync::atomic::AtomicBool,
+    /// Writes are stopped while co-hosts install the arming copy.
+    arming: Mutex<Option<takeover_live::Arming>>,
+    /// What the co-hosts pull once protection is on.
+    feed: Mutex<Option<Arc<takeover_live::Feed>>>,
+    /// Host-local key: password hashes and session verifiers in the database
+    /// are useless without it, so a copy of the pages holds no usable secret.
+    seal: credential_seal::Seal,
 }
 
 #[derive(Clone)]
@@ -186,6 +211,8 @@ struct Auth {
     user: User,
     permissions: u32,
     token_hash: String,
+    /// Plain digest of the token, in memory only (open-call device names).
+    token_digest: String,
     expires: u64,
 }
 
@@ -322,6 +349,12 @@ fn id() -> String {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
+/// The stored verifier for a session token under the unit tests' fixed key.
+#[cfg(test)]
+pub(crate) fn session_hash(token: &str) -> String {
+    credential_seal::Seal::fixed(credential_seal::TEST_KEY).session(&token_hash(token))
+}
+
 fn token_hash(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
@@ -345,7 +378,11 @@ impl AppState {
         udp_port: u16,
         mut config: ServerConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        takeover_runtime::require_ordinary_boot(data)?;
+        // A protected community reopens only through its replicating database.
+        let protected = takeover_runtime::protected_boot(data);
+        if !protected {
+            takeover_runtime::require_ordinary_boot(data)?;
+        }
         if config.people && config.account_provider.is_none() {
             return Err("Friends require a configured Relay account provider".into());
         }
@@ -369,6 +406,18 @@ impl AppState {
         let previous: u32 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if previous > SCHEMA_VERSION {
             return Err("Database belongs to a newer Relay release; retained unchanged".into());
+        }
+        if protected {
+            if previous != SCHEMA_VERSION {
+                return Err("Turn takeover protection off on this version before upgrading the database".into());
+            }
+            // Only confirmed changes ever reached the file; fold them in so the
+            // replicating database can open with an empty write-ahead log.
+            let busy: i64 = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+            if busy != 0 {
+                return Err("The protected database is busy; stop other programs using it".into());
+            }
+            connection.pragma_update(None, "query_only", true)?;
         }
         let existing_authority = if previous > 0 {
             Some(handover::Authority::open_database(data, &connection)?)
@@ -409,8 +458,15 @@ impl AppState {
         let handover_exports = handover_transfer::Service::default();
         handover_exports.recover(data, &authority.status());
         replica::service::startup(data);
+        let seal = credential_seal::Seal::open(data)?;
         people::initialize(&connection, &config, existing)?;
-        if authority.writes_allowed() {
+        // Startup housekeeping writes; a protected host skips them, since every
+        // write must first be confirmed by a co-host that is not connected yet.
+        let startup_writes = authority.writes_allowed() && !protected;
+        if startup_writes {
+            seal_stored_credentials(&connection, &seal)?;
+        }
+        if startup_writes {
             // Rebase only implausible future timestamps after a clock adjustment.
             // A restart never grants a free send; rebasing retains one full cooldown.
             connection.execute(
@@ -456,7 +512,7 @@ impl AppState {
         }
         let discord_credential = discord_host::Store::new(data, server_id(&connection)?)?;
         let (events, _) = broadcast::channel(256);
-        Ok(Self(Arc::new(Inner {
+        let state = Self(Arc::new(Inner {
             db: Mutex::new(connection),
             name: name.chars().take(100).collect(),
             udp_port,
@@ -506,17 +562,44 @@ impl AppState {
             handover_exports,
             takeover: Mutex::new(None),
             takeover_failed: std::sync::atomic::AtomicBool::new(false),
-        })))
+            failover: Mutex::new(None),
+            measurements: Default::default(),
+            switch_advisor: Default::default(),
+            standby_urls: Default::default(),
+            protection_enabled: std::sync::atomic::AtomicBool::new(false),
+            arming: Mutex::new(None),
+            feed: Mutex::new(None),
+            seal,
+        }));
+        if protected {
+            state.resume_protection()?;
+        }
+        Ok(state)
     }
 
     fn authenticate_token(&self, token: &str) -> ApiResult<Auth> {
         if token.len() > 128 {
             return Err(unauthorized());
         }
-        let hash = token_hash(token);
+        let digest = token_hash(token);
+        let hash = self.0.seal.session(&digest);
         let db = lock(&self.0.db);
+        // A session written in the older, unkeyed form (by an earlier release or
+        // an external tool) is keyed on first use instead of being refused.
+        if self.writes_allowed()
+            && db
+                .query_row(
+                    "SELECT 1 FROM sessions WHERE token_hash=?1 AND locator IS NULL",
+                    [&digest],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+        {
+            seal_stored_credentials(&db, &self.0.seal)?;
+        }
         let mut auth = db.query_row("SELECT u.id,u.username,u.role,p.display_name,p.bio,p.version,p.avatar IS NOT NULL,p.appearance,s.expires FROM sessions s JOIN users u ON u.id=s.user_id LEFT JOIN user_profiles p ON p.user_id=u.id JOIN membership m ON m.user_id=u.id WHERE m.status='active' AND s.token_hash=?1 AND s.expires>?2", params![hash,now()], |r| {
-            Ok(Auth { user: row_user(r)?, permissions: 0, token_hash: hash.clone(), expires:r.get(8)? })
+            Ok(Auth { user: row_user(r)?, permissions: 0, token_hash: hash.clone(), token_digest: digest.clone(), expires:r.get(8)? })
         }).optional()?.ok_or_else(unauthorized)?;
         auth.permissions = roles::permissions(&db, &auth.user.id)?;
         // Handover status/cancellation still authenticate while the source DB
@@ -661,6 +744,14 @@ impl AppState {
         });
         Ok(())
     }
+}
+
+/// Prepares `host_data` as the host a takeover mandate chose; see `--takeover-from`.
+pub fn install_takeover(
+    standby_data: &FsPath,
+    host_data: &FsPath,
+) -> Result<relay_protocol::handover::RoutePin, Box<dyn std::error::Error>> {
+    takeover_failover::install(standby_data, host_data)
 }
 
 pub fn router(state: AppState) -> Router {
@@ -843,6 +934,14 @@ pub fn router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(1024)),
         )
         .route(
+            "/api/hosting/voice-gateways/mesh",
+            post(gateway_admission::mesh_report).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/api/hosting/voice-gateways/mesh/member",
+            post(gateway_admission::mesh_member).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
             "/api/replica/token",
             post(replica::service::mint_token).delete(replica::service::revoke_token),
         )
@@ -872,6 +971,36 @@ pub fn router(state: AppState) -> Router {
             post(replica::service::post_status).layer(DefaultBodyLimit::max(1024)),
         )
         .route("/api/hosting", get(hosting::get_hosting))
+        .route(
+            "/api/hosting/measurements",
+            post(hosting_measurements::report).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/api/hosting/measurements/upload",
+            post(upload_probe::upload).layer(DefaultBodyLimit::max(upload_probe::MAX_BYTES)),
+        )
+        .route("/api/hosting/takeover/enroll", post(takeover_setup::enroll))
+        .route("/api/hosting/takeover/cohort", get(takeover_setup::cohort))
+        .route("/api/hosting/takeover/consent", post(takeover_setup::consent))
+        .route("/api/hosting/takeover/snapshot", post(takeover_setup::snapshot))
+        .route(
+            "/api/hosting/takeover/snapshot/{id}/parts/{index}",
+            get(takeover_setup::part),
+        )
+        .route("/api/hosting/takeover/verified", post(takeover_setup::verified))
+        .route("/api/hosting/takeover/arm", post(takeover_live::arm))
+        .route(
+            "/api/hosting/takeover/feed",
+            post(takeover_live::feed).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/hosting/takeover/answers",
+            post(takeover_live::answers).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/api/hosting/switching",
+            post(hosting::set_switching).layer(DefaultBodyLimit::max(2 * 1024)),
+        )
         .route(
             "/api/hosting/offers",
             post(hosting::offer_roles).layer(DefaultBodyLimit::max(1024)),
@@ -954,6 +1083,10 @@ pub fn router(state: AppState) -> Router {
             "/api/channels/{id}/permissions",
             get(permissions).put(set_permissions),
         )
+        .route(
+            "/api/channels/{id}/access/{user_id}",
+            get(community::effective_access),
+        )
         .route("/api/categories", get(categories).post(create_category))
         .route(
             "/api/categories/{id}",
@@ -967,6 +1100,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{id}", delete(revoke_session))
         .route("/api/password", axum::routing::patch(change_password))
+        .route(
+            "/api/password/reset",
+            post(password_reset::redeem).layer(DefaultBodyLimit::max(2048)),
+        )
+        .route("/api/password/recovery-code", post(password_reset::issue_recovery))
+        .route(
+            "/api/members/{id}/password-reset",
+            post(password_reset::issue_reset),
+        )
         .route("/api/storage", get(storage))
         .route("/api/admin/metadata", get(admin_metadata))
         .route("/api/admin/shutdown", post(admin_shutdown))
@@ -1187,9 +1329,13 @@ async fn rate_limit(
             | "/api/health"
             | "/api/register"
             | "/api/login"
+            | "/api/password/reset"
             | "/api/account-login"
             | "/api/account-login/challenge"
             | "/api/hosting/handover/route"
+            | "/api/hosting/takeover/route"
+            | "/api/hosting/takeover/feed"
+            | "/api/hosting/takeover/answers"
             | "/api/events"
             | "/api/voice/tunnel"
             | "/api/rtc/authorize"
@@ -1226,7 +1372,11 @@ async fn rate_limit(
     let path = request.uri().path();
     let signin = matches!(
         path,
-        "/api/register" | "/api/login" | "/api/account-login" | "/api/account-login/challenge"
+        "/api/register"
+            | "/api/login"
+            | "/api/password/reset"
+            | "/api/account-login"
+            | "/api/account-login/challenge"
     );
     let mutation = !matches!(
         *request.method(),
@@ -1240,8 +1390,14 @@ async fn rate_limit(
             | "/api/hosting/handover/part"
             | "/api/local/shutdown"
             | "/api/local/account-destination"
+            // Co-hosts poll and answer continuously while protection is on.
+            | "/api/hosting/takeover/feed"
+            | "/api/hosting/takeover/answers"
     );
-    let route_probe = path == "/api/hosting/handover/route";
+    let route_probe = matches!(
+        path,
+        "/api/hosting/handover/route" | "/api/hosting/takeover/route"
+    );
     if signin || route_probe || mutation {
         let direct = request
             .extensions()
@@ -1364,13 +1520,49 @@ fn validate_auth(input: &AuthRequest) -> ApiResult<()> {
     Ok(())
 }
 
-fn new_session(db: &Connection, user: User) -> ApiResult<Session> {
+fn new_session(db: &Connection, seal: &credential_seal::Seal, user: User) -> ApiResult<Session> {
     let token = random_token();
+    let digest = token_hash(&token);
     db.execute(
-        "INSERT INTO sessions(token_hash,user_id,expires,created_at) VALUES(?1,?2,?3,?4)",
-        params![token_hash(&token), user.id, now() + TOKEN_LIFETIME, now()],
+        "INSERT INTO sessions(token_hash,user_id,expires,created_at,locator) VALUES(?1,?2,?3,?4,?5)",
+        params![seal.session(&digest), user.id, now() + TOKEN_LIFETIME, now(), seal.seal_locator(&digest)],
     )?;
     Ok(Session { token, user })
+}
+
+/// Seals plain password hashes and re-keys older session rows in one
+/// transaction, so the database never again holds a usable login secret.
+fn seal_stored_credentials(db: &Connection, seal: &credential_seal::Seal) -> rusqlite::Result<()> {
+    let tx = db.unchecked_transaction()?;
+    let plain: Vec<(String, String)> = tx
+        .prepare("SELECT id,password_hash FROM users WHERE password_hash LIKE '$%'")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (id, hash) in plain {
+        tx.execute(
+            "UPDATE users SET password_hash=?2 WHERE id=?1",
+            params![id, seal.seal_password(&id, &hash)],
+        )?;
+    }
+    let old: Vec<String> = tx
+        .prepare("SELECT token_hash FROM sessions WHERE locator IS NULL")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for digest in old {
+        // Short-lived rows bound to the old verifier are dropped, not migrated.
+        for sql in [
+            "DELETE FROM voice_resume_leases WHERE token_hash=?1",
+            "DELETE FROM authenticator_setup WHERE session_hash=?1",
+            "DELETE FROM identity_link_challenges WHERE session_hash=?1",
+        ] {
+            tx.execute(sql, [&digest])?;
+        }
+        tx.execute(
+            "UPDATE sessions SET token_hash=?2,locator=?3 WHERE token_hash=?1",
+            params![digest, seal.session(&digest), seal.seal_locator(&digest)],
+        )?;
+    }
+    tx.commit()
 }
 
 async fn register(
@@ -1399,11 +1591,14 @@ async fn register(
             )
         })?;
     let password = input.password.clone();
+    let sealing = state.clone();
+    let new_user_id = id();
+    let sealed_for = new_user_id.clone();
     let password_hash = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         Argon2::default()
             .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
-            .map(|hash| hash.to_string())
+            .map(|hash| sealing.0.seal.seal_password(&sealed_for, &hash.to_string()))
     })
     .await
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Password hashing failed"))?
@@ -1444,7 +1639,7 @@ async fn register(
             ));
         }
         let user = User {
-            id: id(),
+            id: new_user_id,
             username: input.username.trim().to_string(),
             role: if first { "admin" } else { "member" }.into(),
             profile: Default::default(),
@@ -1477,7 +1672,7 @@ async fn register(
             )?;
         }
         server_settings::record_system_event(&tx, &user.id, "joined")?;
-        let result = new_session(&tx, user)?;
+        let result = new_session(&tx, &state.0.seal, user)?;
         tx.commit()?;
         result
     };
@@ -1518,7 +1713,16 @@ async fn login(
     // Run a real password hash even for an unknown account, to avoid a cheap username timing oracle.
     let mfa_password = zeroize::Zeroizing::new(input.password.clone());
     let password = zeroize::Zeroizing::new(input.password);
-    let hash = found.as_ref().map(|(_, hash)| hash.clone());
+    let moved = found.as_ref().is_some_and(|(_, hash)| hash == host_copy_secrets::NOT_COPIED);
+    // The stored value is sealed; an unreadable one verifies like a wrong password.
+    let hash = found.as_ref().map(|(user, stored)| {
+        state
+            .0
+            .seal
+            .password(&user.id, stored)
+            .map(|h| h.to_string())
+            .unwrap_or_default()
+    });
     let valid = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         match hash {
@@ -1541,6 +1745,13 @@ async fn login(
             "Password verification failed",
         )
     })?;
+    if !valid && moved {
+        // The hash stayed with the previous host. Say what works instead.
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "This community moved to a new host and passwords were not copied. Sign in with your Relay account, or use a reset code from an administrator or your recovery code.",
+        ));
+    }
     if !valid {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -1585,7 +1796,7 @@ async fn login(
     } else if status != "active" {
         return Err(forbidden());
     }
-    let result = new_session(&tx, user)?;
+    let result = new_session(&tx, &state.0.seal, user)?;
     tx.commit()?;
     Ok(Json(result))
 }
@@ -1630,6 +1841,8 @@ fn voice_members(state: &AppState) -> Vec<VoiceMember> {
             camera: v.state.camera,
             session_id: *session_id,
             device_id: v.device_id.clone(),
+            chosen_camera: v.state.chosen_camera,
+            chosen_screen: v.state.chosen_screen,
         })
         .collect()
 }
@@ -2376,6 +2589,16 @@ async fn voice_state(
             input.sharing = false;
             input.camera = false;
         }
+        // A chosen quality is forwarded only for a source that is shared, and
+        // only within what any sender can choose.
+        input.chosen_camera = input
+            .chosen_camera
+            .filter(|_| input.camera)
+            .and_then(relay_protocol::ChosenVideo::checked);
+        input.chosen_screen = input
+            .chosen_screen
+            .filter(|_| input.sharing)
+            .and_then(relay_protocol::ChosenVideo::checked);
         voice_recovery::save_state(&db, &auth, &input)?;
         session.state = input.clone();
         session.last_seen = now();
@@ -2621,6 +2844,8 @@ pub async fn cleanup_loop(state: AppState) {
         interval.tick().await;
         ticks = ticks.wrapping_add(1);
         let _ = state.flush_handover_media().await;
+        state.failover_tick().await;
+        state.expire_arming();
         if !state.writes_allowed() {
             // External media removals must still drain while database writes are
             // barred. Otherwise a freeze would leave LiveKit seats connected.
@@ -2669,6 +2894,10 @@ mod tests;
 
 #[cfg(test)]
 mod chat_control_tests;
+#[cfg(test)]
+mod effective_access_tests;
+#[cfg(test)]
+mod chosen_video_tests;
 
 #[cfg(test)]
 mod network_ingress_tests {

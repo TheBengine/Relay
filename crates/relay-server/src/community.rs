@@ -3,7 +3,7 @@ use super::*;
 use axum::extract::OriginalUri;
 use std::path::PathBuf;
 
-pub const SCHEMA_VERSION: u32 = 28;
+pub const SCHEMA_VERSION: u32 = 30;
 pub const READ: u32 = 1;
 pub const SEND: u32 = 2;
 pub const JOIN: u32 = 4;
@@ -204,6 +204,11 @@ pub fn migrate_database(db: &mut Connection) -> rusqlite::Result<()> {
             )?,
             // File policy is durable community metadata, including replica deltas.
             28 => crate::replica::refresh_upload_metadata_triggers(&tx)?,
+            // Reset and recovery codes (digests only) for members with a community password.
+            29 => crate::password_reset::migrate(&tx)?,
+            // The digest the host directory needs, sealed under the host-local key;
+            // the session verifier itself becomes keyed at startup.
+            30 => add_column(&tx, "sessions", "locator", "TEXT")?,
             _ => unreachable!(),
         }
         tx.execute(
@@ -276,7 +281,22 @@ pub fn channel_access(
         // It remains readable when no call is active; JOIN is not required to chat.
         return channel_access(db, &parent, user_id, permission);
     }
-    let role = get_user(db, user_id)?.role;
+    let facts = access_facts(db, channel_id, user_id)?;
+    if relay_protocol::channel_access::resolve(&facts).allows(permission) {
+        Ok(())
+    } else {
+        Err(forbidden())
+    }
+}
+
+/// Current rows for one member and one regular channel. `channel_access` and
+/// the access explanation both decide from this, through the shared rule.
+fn access_facts(
+    db: &Connection,
+    channel_id: &str,
+    user_id: &str,
+) -> ApiResult<relay_protocol::channel_access::Facts> {
+    let user = get_user(db, user_id)?;
     let visibility: String = db
         .query_row(
             "SELECT visibility FROM channels WHERE id=?1",
@@ -285,28 +305,54 @@ pub fn channel_access(
         )
         .optional()?
         .ok_or_else(missing)?;
-    if roles::has(db, user_id, PERMISSION_ADMIN) {
-        return Ok(());
-    }
-    let personal=db.query_row("SELECT permissions FROM channel_permissions WHERE channel_id=?1 AND subject_kind='user' AND subject_id=?2",params![channel_id,user_id],|r|r.get::<_,u32>(0)).optional()?;
-    let baseline=db.query_row("SELECT permissions FROM channel_permissions WHERE channel_id=?1 AND subject_kind='role' AND subject_id=?2",params![channel_id,role],|r|r.get::<_,u32>(0)).optional()?.unwrap_or(if visibility=="public" {roles::permissions(db,user_id)? & 15} else {0});
-    let mut query=db.prepare("SELECT p.permissions FROM channel_permissions p JOIN member_roles m ON m.role_id=p.subject_id WHERE p.channel_id=?1 AND p.subject_kind='role' AND m.user_id=?2")?;
-    let custom = query
-        .query_map(params![channel_id, user_id], |r| r.get::<_, u32>(0))?
+    let active = active_user(db, user_id).is_ok();
+    let community_bits = if active { roles::permissions(db, user_id)? } else { 0 };
+    let person_rule = db.query_row("SELECT permissions FROM channel_permissions WHERE channel_id=?1 AND subject_kind='user' AND subject_id=?2", params![channel_id, user_id], |r| r.get::<_, u32>(0)).optional()?;
+    let base_role_rule = db.query_row("SELECT permissions FROM channel_permissions WHERE channel_id=?1 AND subject_kind='role' AND subject_id=?2", params![channel_id, user.role], |r| r.get::<_, u32>(0)).optional()?;
+    let mut query = db.prepare("SELECT p.subject_id,p.permissions FROM channel_permissions p JOIN member_roles m ON m.role_id=p.subject_id WHERE p.channel_id=?1 AND p.subject_kind='role' AND m.user_id=?2")?;
+    let role_rules = query
+        .query_map(params![channel_id, user_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
-    // Custom role overrides replace the baseline; grants win across assigned roles.
-    // An explicit member override is final. All omitted bits in an entry are denied.
-    let bits = personal.unwrap_or_else(|| {
-        if custom.is_empty() {
-            baseline
-        } else {
-            custom.into_iter().fold(0, |a, b| a | b)
-        }
-    });
-    if bits & READ == 0 || bits & permission != permission {
-        return Err(forbidden());
+    Ok(relay_protocol::channel_access::Facts {
+        active,
+        base_role: user.role,
+        community_bits,
+        public: visibility == "public",
+        person_rule,
+        base_role_rule,
+        role_rules,
+    })
+}
+
+/// What one member can do in one regular channel, and which rule decided it.
+/// Channel managers may ask about anyone; every member may ask about themself.
+pub async fn effective_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, user_id)): Path<(String, String)>,
+) -> ApiResult<Json<relay_protocol::channel_access::EffectiveChannelAccess>> {
+    let auth = state.auth(&headers)?;
+    let db = lock(&state.0.db);
+    if auth.user.id != user_id {
+        roles::require(&db, &auth.user.id, PERMISSION_CHANNELS)?;
     }
-    Ok(())
+    if people::enabled(&db) || conversations::info(&db, &id)?.is_some() {
+        return Err(bad("Group conversations and threads follow their own member list"));
+    }
+    let parent = get_channel(&db, &id)?.voice_parent_id;
+    let rules_channel = parent.clone().unwrap_or_else(|| id.clone());
+    let facts = access_facts(&db, &rules_channel, &user_id)?;
+    Ok(Json(relay_protocol::channel_access::EffectiveChannelAccess {
+        channel_id: id,
+        user_id,
+        rules_from_channel_id: parent,
+        public: facts.public,
+        base_role: facts.base_role.clone(),
+        community_bits: facts.community_bits,
+        access: relay_protocol::channel_access::resolve(&facts),
+    }))
 }
 pub fn row_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<Channel> {
     Ok(Channel {
@@ -1178,6 +1224,14 @@ pub async fn change_password(
     let mfa_record = super::authenticator::record(&lock(&state.0.db), &auth.user.id)?;
     let mfa_user = auth.user.id.clone();
     let previous_hash = hash.clone();
+    let hash = state
+        .0
+        .seal
+        .password(&auth.user.id, &hash)
+        .map(|h| h.to_string())
+        .unwrap_or_default();
+    let sealing = state.clone();
+    let sealed_for = auth.user.id.clone();
     let (updated, rewrap) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let current_password = zeroize::Zeroizing::new(input.current_password);
@@ -1192,7 +1246,7 @@ pub async fn change_password(
         }
         let updated = Argon2::default()
             .hash_password(new_password.as_bytes(), &SaltString::generate(&mut OsRng))
-            .map(|h| h.to_string())
+            .map(|h| sealing.0.seal.seal_password(&sealed_for, &h.to_string()))
             .map_err(|_| {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Password hashing failed")
             })?;
@@ -1534,7 +1588,7 @@ impl AppState {
         let user = id();
         tx.execute(
             "INSERT INTO users VALUES(?1,?2,?3,'admin')",
-            params![user, username.trim(), hash],
+            params![user, username.trim(), self.0.seal.seal_password(&user, &hash)],
         )?;
         tx.execute("INSERT INTO membership VALUES(?1,'active')", [&user])?;
         tx.execute("INSERT INTO user_profiles(user_id) VALUES(?1)", [&user])?;
@@ -1566,7 +1620,7 @@ impl AppState {
         )?;
         tx.execute(
             "UPDATE users SET password_hash=?2 WHERE id=?1",
-            params![user, hash],
+            params![user, self.0.seal.seal_password(&user, &hash)],
         )?;
         let status: String = tx.query_row(
             "SELECT status FROM membership WHERE user_id=?1",
@@ -1675,9 +1729,14 @@ pub async fn dispatch(
         }
     };
     let path = uri.path();
+    // The co-hosts' feed and answers change nothing here and must never wait
+    // for the database: a protected write holds it while it waits for them.
     let mutation = !matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD
+    ) && !matches!(
+        path,
+        "/api/hosting/takeover/feed" | "/api/hosting/takeover/answers"
     );
     let exclusive = mutation
         && (matches!(
@@ -1702,12 +1761,29 @@ pub async fn dispatch(
     let run = move || {
         handle.block_on(async move {
             let _permit = permit;
-            if work_state.takeover_blocked() {
+            // Co-hosts must still be able to reach the feed to reconnect.
+            if work_state.takeover_blocked()
+                && !admission_path.starts_with("/api/hosting/takeover/")
+            {
                 return ApiError::new(StatusCode::SERVICE_UNAVAILABLE,
                     "Protected host is paused while its copies reconnect or recover").into_response();
             }
             if let Err(error) = work_state.0.handover.admit(&admission_path) {
                 return error.into_response();
+            }
+            if mutation
+                && work_state.takeover_waiting()
+                && !admission_path.starts_with("/api/hosting/takeover/")
+            {
+                return ApiError::new(StatusCode::SERVICE_UNAVAILABLE,
+                    "Paused: waiting for a co-host to confirm changes").into_response();
+            }
+            if mutation
+                && work_state.arming()
+                && !admission_path.starts_with("/api/hosting/takeover/")
+            {
+                return ApiError::new(StatusCode::SERVICE_UNAVAILABLE,
+                    "Changes are paused for a few minutes while takeover protection is turned on").into_response();
             }
             let mut response =
                 match tokio::time::timeout(Duration::from_secs(30), next.run(request)).await {
@@ -1734,7 +1810,9 @@ pub async fn dispatch(
                     .into_response();
                 }
             }
-            if work_state.takeover_blocked() {
+            if work_state.takeover_blocked()
+                && !admission_path.starts_with("/api/hosting/takeover/")
+            {
                 return ApiError::new(StatusCode::SERVICE_UNAVAILABLE,
                     "Protected write is not confirmed. Retry with the same message client_id").into_response();
             }

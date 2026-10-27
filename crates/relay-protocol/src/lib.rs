@@ -1,15 +1,18 @@
 pub mod host_locator;
+pub mod channel_access;
 use serde::{Deserialize, Serialize};
 pub mod direct_voice;
 pub mod game_activity;
 pub mod gateway_broker;
 pub mod handover;
+pub mod host_switch;
 pub mod hosting;
 pub mod installation;
 pub mod lan_discovery;
 pub mod lan_pairing;
 pub mod takeover;
 pub mod uploads;
+pub mod voice_mesh;
 pub use uploads::{UploadLimits, UploadPolicy, MAX_PENDING_UPLOAD_BYTES, MAX_SUPPORTED_UPLOAD_BYTES};
 
 pub const CRYPTO_MAX_OPERATION_JSON_BYTES: usize = 1536 * 1024;
@@ -411,6 +414,35 @@ pub struct VoiceMember {
     pub session_id: u64,
     #[serde(default)]
     pub device_id: Option<String>,
+    /// What this member chose for the camera they share, as they sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_camera: Option<ChosenVideo>,
+    /// What this member chose for the screen they share, as they sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_screen: Option<ChosenVideo>,
+}
+
+/// A sender's chosen ceiling for one shared video source. It is the sender's
+/// setting, not a measurement: what arrives can be lower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChosenVideo {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub fps: u32,
+    /// None: the sender lets Relay pick the bitrate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u32>,
+}
+
+impl ChosenVideo {
+    /// Values outside what any sender can choose are refused, not clamped.
+    pub fn checked(self) -> Option<Self> {
+        ((16..=7680).contains(&self.max_width)
+            && (16..=4320).contains(&self.max_height)
+            && (1..=240).contains(&self.fps)
+            && self.bitrate_kbps.is_none_or(|k| (100..=100_000).contains(&k)))
+        .then_some(self)
+    }
 }
 
 /// How a community protects message content. `Protected` is the default and
@@ -881,6 +913,11 @@ pub struct VoiceState {
     pub deafened: bool,
     pub sharing: bool,
     pub camera: bool,
+    /// Older servers ignore these; older clients never send them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_camera: Option<ChosenVideo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_screen: Option<ChosenVideo>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1083,3 +1120,32 @@ pub fn unwrap_whisper(packet: &[u8]) -> Option<(&str, &[u8])> {
     (inner.first() == Some(&AUDIO_PACKET_V3)).then_some((target, inner))
 }
 pub mod discord;
+
+#[cfg(test)]
+mod chosen_video_tests {
+    use super::ChosenVideo;
+
+    #[test]
+    fn checked_refuses_impossible_choices_instead_of_clamping() {
+        let ok = ChosenVideo { max_width: 3840, max_height: 2160, fps: 60, bitrate_kbps: Some(32_000) };
+        assert_eq!(ok.checked(), Some(ok));
+        assert_eq!(ChosenVideo { bitrate_kbps: None, ..ok }.checked(), Some(ChosenVideo { bitrate_kbps: None, ..ok }));
+        for bad in [
+            ChosenVideo { max_width: 0, ..ok },
+            ChosenVideo { max_height: 9000, ..ok },
+            ChosenVideo { fps: 0, ..ok },
+            ChosenVideo { fps: 1000, ..ok },
+            ChosenVideo { bitrate_kbps: Some(1), ..ok },
+        ] {
+            assert_eq!(bad.checked(), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn old_and_new_voice_states_read_each_other() {
+        let old: super::VoiceState = serde_json::from_str(r#"{"muted":true,"deafened":false,"sharing":true,"camera":false}"#).unwrap();
+        assert_eq!(old.chosen_screen, None);
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("chosen"), "nothing extra is sent without a choice");
+    }
+}

@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Compile the stable update channel instead of beta. Release builds pass
+# `--features relay-updater/stable-channel`; see docs/stabil-kanal-og-signering.md.
+stable-channel = []
+
 [dependencies]
 relay-protocol = { path = "../relay-protocol" }
 async-trait = "0.1"

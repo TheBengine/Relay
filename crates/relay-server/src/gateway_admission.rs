@@ -108,12 +108,15 @@ struct Book {
     leases: HashMap<[u8; 16], Lease>,
     by_session: HashMap<u64, [u8; 16]>,
     windows: HashMap<String, VecDeque<Instant>>,
+    meshes: mesh::Meshes,
 }
 
 /// Memory-only broker state. One per server process.
 #[derive(Default)]
 pub(crate) struct Broker {
     book: Mutex<Book>,
+    /// Sessions the voice mesh carries now; see `mesh`.
+    coverage: Mutex<mesh::Coverage>,
 }
 
 /// A lease to re-check against the live session it was issued for.
@@ -352,17 +355,21 @@ impl Broker {
     /// Drop a member's registration and every lease on it, and any lease they hold
     /// as a client (role withdrawal, step-down, leaving).
     pub(crate) fn cancel_user(&self, user: &str) {
-        let mut book = lock(&self.book);
-        book.drop_gateway(user);
-        let ids: Vec<[u8; 16]> = book
-            .leases
-            .iter()
-            .filter(|(_, lease)| lease.client_user == user)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in ids {
-            book.drop_lease(&id);
+        {
+            let mut book = lock(&self.book);
+            book.drop_gateway(user);
+            let ids: Vec<[u8; 16]> = book
+                .leases
+                .iter()
+                .filter(|(_, lease)| lease.client_user == user)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in ids {
+                book.drop_lease(&id);
+            }
         }
+        // The mesh stops carrying them at once; the host delivers again.
+        self.mesh_forget(user);
     }
 
     fn rate(&self, user: &str) -> ApiResult<()> {
@@ -637,6 +644,10 @@ pub(crate) async fn deregister(
     if matches {
         book.drop_gateway(&auth.user.id);
     }
+    drop(book);
+    if matches {
+        state.0.gateways.mesh_forget(&auth.user.id);
+    }
     Ok(Json(serde_json::json!({"ok":true,"dropped":matches})))
 }
 
@@ -897,6 +908,10 @@ pub(crate) async fn release(
     }
     Ok(Json(serde_json::json!({"ok":true,"dropped":matches})))
 }
+
+/// The voice mesh between homes, built on these registrations and leases.
+mod mesh;
+pub(crate) use mesh::{member as mesh_member, report as mesh_report};
 
 #[cfg(test)]
 mod tests;

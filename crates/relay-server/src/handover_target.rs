@@ -76,7 +76,7 @@ pub(crate) fn private_directory(folder: &Path) -> Result<()> {
     Ok(())
 }
 
-fn seed(folder: &Path, name: &str, allow_create: bool) -> Result<Zeroizing<[u8; 32]>> {
+pub(crate) fn seed(folder: &Path, name: &str, allow_create: bool) -> Result<Zeroizing<[u8; 32]>> {
     let path = folder.join(name);
     super::handover::direct(&path)?;
     let mut seed = Zeroizing::new([0u8; 32]);

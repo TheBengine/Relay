@@ -478,7 +478,11 @@ pub(crate) fn forget_central_session(issuer: &str, client_id: &str) -> Result<()
 
 #[cfg(target_os = "windows")]
 fn profile() -> Option<std::ffi::OsString> {
-    std::env::var_os("RELAY_PROFILE_DIR")
+    // A normal profile moved to a chosen folder keeps its saved-login names.
+    crate::data_location::credential_scope(
+        std::env::var_os("RELAY_PROFILE_DIR"),
+        std::env::var_os(crate::data_location::LOCATION_ENV),
+    )
 }
 
 #[cfg(target_os = "windows")]

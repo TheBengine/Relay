@@ -716,6 +716,85 @@ impl Signed for Vote {
     }
 }
 
+/// The signed evidence that a majority of the approved full copies chose a new
+/// host after an unexpected outage: the old host's set, the candidate's request
+/// and the votes. It holds no secret; anyone who pinned the old host can check it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mandate {
+    pub set: AuthoritySet,
+    pub request: VoteRequest,
+    pub votes: Vec<Vote>,
+}
+
+impl Mandate {
+    /// The route this mandate authorizes, if every check holds. Crypto is
+    /// supplied by the caller (`sha256_hex` and an Ed25519 `verify`), so the
+    /// server and the app apply exactly the same rules.
+    ///
+    /// Checks: the old host signed the set; the candidate is one of its two
+    /// candidates, signed its own consent for this set and signed the request;
+    /// the term is later than the set's; at least `QUORUM` distinct members
+    /// signed votes for exactly this request.
+    pub fn route(
+        &self,
+        sha256_hex: impl Fn(&[u8]) -> String,
+        verify: impl Fn(&HostIdentity, &str, &[u8]) -> bool,
+    ) -> Option<RoutePin> {
+        let set = &self.set;
+        let r = &self.request.body;
+        if set.validate().is_err()
+            || self.request.validate().is_err()
+            || self.votes.len() > MEMBERS
+            || !verify(set.body.leader(), &set.signature, &set.body.message())
+        {
+            return None;
+        }
+        let set_sha = sha256_hex(&set.body.message());
+        let mut consent = r.accept.body.message();
+        consent.extend(r.accept.signature.as_bytes());
+        let consent = sha256_hex(&consent);
+        let a = &r.accept.body;
+        if r.server_id != set.body.pin.server_id
+            || r.set_sha256 != set_sha
+            || r.epoch != set.body.epoch
+            || r.term <= set.body.pin.term
+            || !set.body.is_candidate(&r.candidate)
+            || a.candidate != r.candidate
+            || a.set_sha256 != set_sha
+            || a.server_id != r.server_id
+            || a.epoch != r.epoch
+            || !a.takeover
+            || !verify(&a.candidate, &r.accept.signature, &a.message())
+            || !verify(&r.candidate, &self.request.signature, &r.message())
+        {
+            return None;
+        }
+        let mut voters: Vec<&str> = Vec::new();
+        for vote in &self.votes {
+            let v = &vote.body;
+            let exact = vote.validate().is_ok()
+                && v.server_id == r.server_id
+                && v.set_sha256 == set_sha
+                && v.epoch == r.epoch
+                && v.term == r.term
+                && v.candidate == r.candidate
+                && v.candidate_tip == r.tip
+                && v.accept_sha256 == consent
+                && set.body.is_member(&v.voter)
+                && verify(&v.voter, &vote.signature, &v.message());
+            if exact && !voters.contains(&v.voter.host_id.as_str()) {
+                voters.push(&v.voter.host_id);
+            }
+        }
+        (voters.len() >= QUORUM).then(|| RoutePin {
+            server_id: r.server_id.clone(),
+            host: r.candidate.clone(),
+            term: r.term,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

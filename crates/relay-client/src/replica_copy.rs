@@ -836,10 +836,25 @@ fn work(
     ctx: eframe::egui::Context,
 ) {
     let mut failures = 0u32;
+    let mut first = true;
     loop {
         if cancel.load(Ordering::Acquire) {
             return;
         }
+        // Voice first: a scheduled pull waits (bounded) while a call struggles.
+        let deferred = Instant::now();
+        while crate::voice_priority::defer_replica(
+            crate::voice_priority::pressured(),
+            deferred.elapsed(),
+            first,
+            now.load(Ordering::Acquire),
+        ) {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        first = false;
         let _ = events.send(Event::Pulling { generation });
         ctx.request_repaint();
         let outcome = pull_once(&choice, &directory, &cancel, &slot);

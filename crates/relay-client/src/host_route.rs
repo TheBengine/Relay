@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use std::{io::Read, time::Duration};
 #[path = "host_route_cache.rs"]
 mod cache;
+#[path = "takeover_route.rs"]
+pub(crate) mod takeover;
 
 pub const UNAVAILABLE: &str = "The current host cannot answer the route check yet.";
 /// The exact pinned host answered but is paused for a move it has not granted.
@@ -483,6 +485,24 @@ fn with_session_fallback(
     result
 }
 
+/// When neither the pinned host nor a directory answers, the approved co-hosts
+/// may prove that a majority chose one of them. Refusals and pauses are final.
+fn with_takeover_fallback(
+    result: Result<Option<VerifiedMove>, String>,
+    pin: &RoutePin,
+    cancel: &std::sync::atomic::AtomicBool,
+    find: impl FnOnce(&RoutePin, &std::sync::atomic::AtomicBool) -> Option<VerifiedMove>,
+) -> Result<Option<VerifiedMove>, String> {
+    if matches!(&result, Err(error) if error == UNAVAILABLE)
+        && !cancel.load(std::sync::atomic::Ordering::Acquire)
+    {
+        if let Some(found) = find(pin, cancel) {
+            return Ok(Some(found));
+        }
+    }
+    result
+}
+
 /// One bounded background probe per active connection. The network worker stays
 /// free to process Leave/mute/logout while HTTPS or iroh is being checked.
 pub struct Job {
@@ -498,8 +518,9 @@ impl Job {
         wake: impl FnOnce() + Send + 'static,
     ) -> Result<Self, String> {
         Self::spawn(work, wake, move |cancel| {
-            with_session_fallback(discover(&source, &pin, cancel), session.as_ref(), cancel,
-                |capability| crate::host_locator::discover_capability(capability, cancel))
+            let result = with_session_fallback(discover(&source, &pin, cancel), session.as_ref(), cancel,
+                |capability| crate::host_locator::discover_capability(capability, cancel));
+            with_takeover_fallback(result, &pin, cancel, takeover::discover)
         })
     }
     fn spawn(
@@ -565,6 +586,25 @@ impl Drop for Job {
 pub(crate) mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    #[test]
+    fn co_hosts_are_asked_only_when_the_pinned_host_and_directory_are_unreachable() {
+        let (_, _, pin, _) = fixture();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let found = || VerifiedMove { url: "https://bo.example".into(), pin: pin.clone() };
+        let asked = std::cell::Cell::new(0);
+        let find = |_: &RoutePin, _: &std::sync::atomic::AtomicBool| {
+            asked.set(asked.get() + 1);
+            Some(found())
+        };
+        assert!(with_takeover_fallback(Err(UNAVAILABLE.into()), &pin, &cancel, find).unwrap().is_some());
+        for final_answer in [Err(REFUSED.into()), Err(PAUSED.into()), Ok(None)] {
+            let kept = with_takeover_fallback(final_answer.clone(), &pin, &cancel, find);
+            assert_eq!(kept.map(|v| v.is_some()), final_answer.map(|v: Option<VerifiedMove>| v.is_some()));
+        }
+        assert_eq!(asked.get(), 1);
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        assert!(with_takeover_fallback(Err(UNAVAILABLE.into()), &pin, &cancel, find).is_err());
+    }
     pub(crate) fn sign(key: &SigningKey, state: model::RouteState) -> RouteProof {
         RouteProof {
             signature: URL_SAFE_NO_PAD.encode(key.sign(&model::route_message(&state)).to_bytes()),

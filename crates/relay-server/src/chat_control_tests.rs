@@ -286,7 +286,7 @@ async fn concurrent_slowmode_sends_commit_only_once_and_typing_capacity_is_per_u
     assert_eq!(lock(&state.0.typing).len(), 2);
     let second_session = {
         let db = lock(&state.0.db);
-        new_session(&db, member.user.clone()).unwrap()
+        new_session(&db, &state.0.seal, member.user.clone()).unwrap()
     };
     assert_eq!(
         request(
@@ -1451,7 +1451,7 @@ async fn actual_event_sockets_enforce_account_budget_release_slots_revoke_and_st
     lock(&state.0.db)
         .execute(
             "DELETE FROM sessions WHERE token_hash=?1",
-            [token_hash(&admin.token)],
+            [crate::session_hash(&admin.token)],
         )
         .unwrap();
     for socket in &mut sockets {
@@ -1470,7 +1470,7 @@ async fn actual_event_sockets_enforce_account_budget_release_slots_revoke_and_st
     }
     let session = {
         let db = lock(&state.0.db);
-        new_session(&db, admin.user.clone()).unwrap()
+        new_session(&db, &state.0.seal, admin.user.clone()).unwrap()
     };
     let mut held = tokio_tungstenite::connect_async(event_request(address, &session.token))
         .await

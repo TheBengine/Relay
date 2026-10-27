@@ -10,7 +10,7 @@ pub(super) struct Session {
     worker: Option<JoinHandle<()>>,
 }
 
-fn preview_controls(settings: &AudioSettings, ptt_key: i32) -> AudioControls {
+pub(super) fn controls(settings: &AudioSettings, ptt_key: i32) -> AudioControls {
     let mut controls = AudioControls::new(settings);
     controls.local_preview = true;
     controls.ptt_key.store(ptt_key, Ordering::Release);
@@ -20,15 +20,10 @@ fn preview_controls(settings: &AudioSettings, ptt_key: i32) -> AudioControls {
 }
 
 impl Session {
-    pub(super) fn start(
-        stop: Arc<AtomicBool>,
-        settings: &AudioSettings,
-        ptt_key: i32,
-        level: Arc<AtomicU32>,
-        errors: ErrorSlot,
-    ) -> Result<Self, String> {
+    pub(super) fn start(request: MicrophoneStart, level: Arc<AtomicU32>) -> Result<Self, String> {
+        let MicrophoneStart { stop, settings, errors, controls, taps, .. } = request;
+        let settings = &settings;
         ensure_not_cancelled(&stop)?;
-        let controls = Arc::new(preview_controls(settings, ptt_key));
         let counters = Arc::new(Counters::default());
         let capture = sample_queue(VecDeque::with_capacity(MAX_CAPTURE_SAMPLES));
         let playback = sample_queue(VecDeque::with_capacity(MAX_PLAYBACK_SAMPLES));
@@ -94,6 +89,7 @@ impl Session {
                     worker_controls,
                     worker_stop,
                     errors,
+                    taps,
                 );
                 while !monitor.stop.load(Ordering::Acquire) {
                     poll_push_to_talk(&monitor.controls);
@@ -140,6 +136,7 @@ struct Monitor {
     errors: ErrorSlot,
     processor: MicrophoneProcessor,
     generation: u64,
+    taps: Arc<crate::self_listen::MeterTaps>,
 }
 
 impl Monitor {
@@ -150,6 +147,7 @@ impl Monitor {
         controls: Arc<AudioControls>,
         stop: Arc<AtomicBool>,
         errors: ErrorSlot,
+        taps: Arc<crate::self_listen::MeterTaps>,
     ) -> Self {
         let generation = controls.privacy_generation.load(Ordering::Acquire);
         Self {
@@ -161,6 +159,7 @@ impl Monitor {
             errors,
             processor: MicrophoneProcessor::new(),
             generation,
+            taps,
         }
     }
 
@@ -190,6 +189,18 @@ impl Monitor {
         if self.controls.transmission.load(Ordering::Acquire) == TransmissionMode::PushToTalk as u32
             && !self.controls.ptt_pressed.load(Ordering::Acquire)
         {
+            // The meter still shows that the microphone works while the key is up.
+            let raw = self.capture.try_lock().ok().and_then(|mut queue| {
+                let mut peak = None::<f32>;
+                while let Some(sample) = queue.pop_front() {
+                    let sample = if sample.is_finite() { sample.abs() } else { 0.0 };
+                    peak = Some(peak.unwrap_or(0.0).max(sample));
+                }
+                peak
+            });
+            if let Some(raw) = raw {
+                self.taps.record_raw(raw);
+            }
             self.clear();
             return false;
         }
@@ -211,7 +222,9 @@ impl Monitor {
         if !ready {
             return false;
         }
+        self.taps.record_raw(crate::self_listen::peak(frame));
         let audible = self.processor.process(frame, &self.controls);
+        self.taps.record_processed(frame, audible);
         #[cfg(feature = "native-rtc")]
         if let Some(error) = self.processor.echo_error.take() {
             record_error(
@@ -253,9 +266,10 @@ mod tests {
             sample_queue(VecDeque::new()),
             sample_queue(VecDeque::new()),
             Arc::new(AtomicUsize::new(MAX_PLAYBACK_SAMPLES)),
-            Arc::new(preview_controls(settings, 0)),
+            Arc::new(controls(settings, 0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
+            Arc::new(crate::self_listen::MeterTaps::default()),
         )
     }
 
@@ -396,6 +410,45 @@ mod tests {
         assert!(!monitor.step());
         assert!(monitor.capture.lock().unwrap().is_empty());
         assert!(monitor.playback.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn microphone_preview_hears_live_edits_on_the_next_block_without_a_reset() {
+        let mut monitor = monitor(&settings());
+        monitor.capture.lock().unwrap().extend([0.1; 480]);
+        assert!(monitor.step());
+        let first = monitor.taps.take();
+        assert!((first.raw_peak - 0.1).abs() < 1e-6);
+        assert!((first.peak - 0.1).abs() < 1e-6);
+        assert!(first.gate_open);
+        let generation = monitor.generation;
+        let mut edited = settings();
+        edited.microphone_gain = 3.0;
+        monitor.controls.apply_preview(&edited);
+        assert_eq!(monitor.controls.privacy_generation.load(Ordering::Acquire), generation);
+        monitor.playback.lock().unwrap().clear();
+        monitor.capture.lock().unwrap().extend([0.1; 480]);
+        assert!(monitor.step());
+        assert_eq!(monitor.generation, generation, "no processor reset for a gain drag");
+        let louder = monitor.taps.take();
+        assert!((louder.raw_peak - 0.1).abs() < 1e-6, "raw level is measured before gain");
+        assert!((louder.peak - 0.3).abs() < 1e-5);
+        assert!(monitor.playback.lock().unwrap().iter().all(|sample| (*sample - 0.3).abs() < 1e-5));
+        // Switching to push-to-talk is a privacy boundary: queued audio is dropped,
+        // yet the raw meter still shows that the microphone works.
+        edited.transmission = TransmissionMode::PushToTalk;
+        monitor.controls.apply_preview(&edited);
+        assert!(monitor.controls.privacy_generation.load(Ordering::Acquire) > generation);
+        monitor.capture.lock().unwrap().extend([0.2; 480]);
+        assert!(!monitor.step(), "the boundary itself discards queued speech");
+        assert!(monitor.capture.lock().unwrap().is_empty());
+        monitor.capture.lock().unwrap().extend([0.2; 480]);
+        assert!(!monitor.step());
+        assert!(monitor.capture.lock().unwrap().is_empty());
+        let waiting = monitor.taps.take();
+        assert!((waiting.raw_peak - 0.2).abs() < 1e-6);
+        assert_eq!(waiting.peak, 0.0, "nothing is processed while the key is up");
+        assert!(monitor.playback.lock().unwrap().is_empty(), "nothing is played while the key is up");
     }
 
     #[test]

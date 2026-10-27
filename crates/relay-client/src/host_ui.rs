@@ -10,6 +10,7 @@ use crate::settings_ui as controls;
 use relay_protocol::hosting::{
     self, Assessment, CandidateState, CandidateView, Dimension, HostRole, HostingView, Verdict,
 };
+use relay_protocol::host_switch as hosting_switch;
 use serde_json::{json, Value};
 
 #[cfg(all(test, windows))]
@@ -35,6 +36,13 @@ pub(super) struct State {
     accept_roles: [bool; 2],
     accept_revision: Option<u64>,
     withdraw_confirm: Option<String>,
+    /// A running "Keep a takeover copy" job and what the last run reported.
+    takeover_job: Option<std::sync::mpsc::Receiver<crate::takeover_copy::Outcome>>,
+    takeover_text: Option<String>,
+    /// Stops the live follower when the app closes or the community changes.
+    takeover_follow: Option<(String, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    /// The administrator's unsaved host-switching choice, for one roster revision.
+    switch_draft: Option<(u64, hosting_switch::SwitchPolicy)>,
     /// The last answer that passed validation, with the community and account
     /// it belongs to. Nothing else is ever shown as host data.
     view: Option<(CommandOrigin, HostingView)>,
@@ -237,6 +245,16 @@ pub(super) fn role_status(view: &CandidateView, role: HostRole) -> String {
     }
 }
 
+fn takeover_verdict(status: &hosting::TakeoverStatus) -> Verdict {
+    use hosting::TakeoverState as S;
+    match status.state {
+        S::CopyUpToDate | S::ProtectedHost | S::TookOver => Verdict::Green,
+        S::NotSetUp => Verdict::Unknown,
+        _ if status.is_problem() => Verdict::Red,
+        _ => Verdict::Yellow,
+    }
+}
+
 fn verdict_color(ui: &egui::Ui, verdict: Verdict) -> Color32 {
     match verdict {
         Verdict::Green => c_good(),
@@ -351,6 +369,16 @@ impl RelayApp {
 
     /// An answer to `/api/hosting` or to a change of it.
     pub(super) fn hosting_received(&mut self, key: &str, data: Value) {
+        if let (Some(urls), Some(origin)) = (
+            data.get("standby_urls").and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok()),
+            self.command_origin(),
+        ) {
+            // Remembered only when announced; nothing is ever forgotten by a
+            // view that simply has none, so an older host cannot erase them.
+            if !urls.is_empty() {
+                let _ = crate::host_route::takeover::remember(&origin.server_id, &urls);
+            }
+        }
         let origin = self.command_origin();
         let instance_id = self
             .bootstrap
@@ -400,6 +428,105 @@ impl RelayApp {
                 Value::Null,
                 "hosting",
             );
+        }
+    }
+
+    /// "Keep a takeover copy on this computer": runs in the background over the
+    /// current connection and reports where it got to.
+    fn takeover_copy_card(&mut self, ui: &mut egui::Ui) {
+        if let Some(outcome) = self
+            .admin_ui
+            .hosting
+            .takeover_job
+            .as_ref()
+            .and_then(|job| job.try_recv().ok())
+        {
+            self.admin_ui.hosting.takeover_text = Some(outcome.text());
+            self.admin_ui.hosting.takeover_job = None;
+            self.request_hosting();
+        }
+        // While protection is on, this computer keeps following live changes.
+        if let (Some(bootstrap), None) = (self.bootstrap.as_ref(), self.admin_ui.hosting.takeover_job.as_ref()) {
+            let server = bootstrap.server_id.clone();
+            let running_here = self
+                .admin_ui
+                .hosting
+                .takeover_follow
+                .as_ref()
+                .is_some_and(|(s, _)| *s == server);
+            if !running_here {
+                if let Some(dir) = crate::takeover_copy::folder(&server).filter(|d| crate::takeover_copy::following(d)) {
+                    if let Some((_, old)) = self.admin_ui.hosting.takeover_follow.take() {
+                        old.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let (url, flag) = (self.login.url.clone(), stop.clone());
+                    if std::thread::Builder::new()
+                        .name("relay-takeover-follow".into())
+                        .spawn(move || crate::takeover_copy::follow(url, dir, flag))
+                        .is_ok()
+                    {
+                        self.admin_ui.hosting.takeover_follow = Some((server, stop));
+                        self.admin_ui.hosting.takeover_text = Some(crate::takeover_copy::Outcome::Following.text());
+                    }
+                }
+            }
+        }
+        let running = self.admin_ui.hosting.takeover_job.is_some();
+        let text = self.admin_ui.hosting.takeover_text.clone();
+        let mut start = false;
+        card(ui, |ui| {
+            ui.label(RichText::new("Takeover copy on this computer").strong());
+            ui.label(
+                RichText::new("Keeps a verified full copy here, so this computer can continue the community if the host disappears and the other approved copies agree. It is fetched over your current connection and resumes where it stopped. Sign-ins and passwords in it are unusable without the host.")
+                    .size(font_size(TEXT_CAPTION))
+                    .color(c_muted()),
+            );
+            ui.horizontal(|ui| {
+                start = ui
+                    .add_enabled(!running, primary("Keep a takeover copy on this computer"))
+                    .clicked();
+                if running {
+                    ui.spinner();
+                    ui.label("Working…");
+                }
+            });
+            if let Some(text) = &text {
+                ui.label(text);
+            }
+        });
+        if !start {
+            return;
+        }
+        let host = (|| {
+            let bootstrap = self.bootstrap.as_ref()?;
+            Some(crate::takeover_copy::Host {
+                url: self.login.url.clone(),
+                token: self.session.as_ref()?.token.clone(),
+                server_id: bootstrap.server_id.clone(),
+                user_id: self.session.as_ref()?.user.id.clone(),
+                pin: bootstrap.host_authority.clone()?,
+            })
+        })();
+        let Some(host) = host else {
+            self.admin_ui.hosting.takeover_text =
+                Some("This host does not prove its identity yet, so no takeover copy can be kept.".into());
+            return;
+        };
+        let Some(dir) = crate::takeover_copy::folder(&host.server_id) else {
+            self.admin_ui.hosting.takeover_text = Some("No private folder is available for the copy.".into());
+            return;
+        };
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let ctx = ui.ctx().clone();
+        let spawned = std::thread::Builder::new()
+            .name("relay-takeover-copy".into())
+            .spawn(move || {
+                let _ = send.send(crate::takeover_copy::run(host, dir));
+                ctx.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.admin_ui.hosting.takeover_job = Some(receive);
         }
     }
 
@@ -510,6 +637,168 @@ impl RelayApp {
             );
         });
 
+        // Continuing without the host.
+        let mut arm = false;
+        card(ui, |ui| {
+            ui.label(RichText::new("If the host goes offline").strong());
+            let verdict = takeover_verdict(&view.takeover);
+            ui.horizontal(|ui| {
+                verdict_badge(ui, verdict);
+                ui.label(RichText::new(view.takeover.text()).color(verdict_color(ui, verdict)));
+            });
+            ui.label(
+                RichText::new(format!(
+                    "An approved co-host with an up-to-date full copy continues the community after the host has been silent for {} seconds, but only when 2 of 3 approved copies agree. Nobody has to approve anything during the outage, and two hosts can never accept changes at the same time.",
+                    hosting::TAKEOVER_SILENCE_SECONDS
+                ))
+                .size(font_size(TEXT_CAPTION))
+                .color(c_muted()),
+            );
+            let ready_to_arm = view.takeover_setup.len() >= 4
+                && view.takeover_setup[..view.takeover_setup.len() - 2].iter().all(|step| step.done)
+                && !view.takeover_setup.last().is_some_and(|step| step.done);
+            if view.can_manage
+                && ready_to_arm
+                && ui
+                    .add(primary("Turn on takeover protection"))
+                    .on_hover_text("Changes pause for a few minutes while both co-hosts install the same copy. Afterwards every change waits for a co-host to confirm it, and changes stop while both co-hosts are offline.")
+                    .clicked()
+            {
+                arm = true;
+            }
+            if !view.takeover_setup.is_empty() && view.takeover_setup.iter().any(|step| !step.done) {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Setting it up").strong());
+                for step in &view.takeover_setup {
+                    let verdict = if step.done { Verdict::Green } else { Verdict::Unknown };
+                    ui.horizontal_wrapped(|ui| {
+                        verdict_badge(ui, verdict);
+                        ui.label(RichText::new(&step.what).strong());
+                        ui.label(RichText::new(if step.done { "done" } else { "not yet" }).color(verdict_color(ui, verdict)));
+                    });
+                    ui.label(
+                        RichText::new(&step.text)
+                            .size(font_size(TEXT_CAPTION))
+                            .color(c_muted()),
+                    );
+                }
+            }
+            if !view.outage.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new("What members can still do if the host disappears now").strong());
+                for row in &view.outage {
+                    let verdict = if row.available { Verdict::Green } else { Verdict::Unknown };
+                    ui.horizontal_wrapped(|ui| {
+                        verdict_badge(ui, verdict);
+                        ui.label(RichText::new(&row.what).strong());
+                    });
+                    ui.label(
+                        RichText::new(&row.text)
+                            .size(font_size(TEXT_CAPTION))
+                            .color(c_muted()),
+                    );
+                }
+            }
+        });
+
+        if arm {
+            self.admin_request(
+                AdminMethod::Post,
+                "/api/hosting/takeover/arm".into(),
+                Value::Null,
+                "action:takeover-arm".into(),
+            );
+        }
+
+        // How the host may change.
+        let mut save_switching: Option<hosting_switch::SwitchPolicy> = None;
+        card(ui, |ui| {
+            use hosting_switch::SwitchMode;
+            ui.label(RichText::new("Choosing the host").strong());
+            if !view.switch_advice.is_empty() {
+                ui.label(RichText::new(&view.switch_advice).color(c_muted()));
+            }
+            if !view.can_manage {
+                ui.label(match view.switching.mode {
+                    SwitchMode::KeepCurrent => "The administrators keep the current host.",
+                    SwitchMode::UseThisHost => "The administrators asked to move to another approved host.",
+                    SwitchMode::Automatic => "Automatic switching between approved hosts is allowed.",
+                });
+                return;
+            }
+            let fresh = self.admin_ui.hosting.switch_draft.as_ref().map(|d| d.0) != Some(view.revision);
+            if fresh {
+                self.admin_ui.hosting.switch_draft = Some((view.revision, view.switching.clone()));
+            }
+            let approved: Vec<(String, String)> = view
+                .candidates
+                .iter()
+                .filter(|c| c.candidate.holds(HostRole::Replica))
+                .map(|c| (c.candidate.user_id.clone(), c.name.clone()))
+                .collect();
+            let Some((_, draft)) = self.admin_ui.hosting.switch_draft.as_mut() else {
+                return;
+            };
+            ui.radio_value(&mut draft.mode, SwitchMode::KeepCurrent, "Keep the current host");
+            ui.radio_value(&mut draft.mode, SwitchMode::UseThisHost, "Use this host");
+            if draft.mode == SwitchMode::UseThisHost {
+                let shown = approved
+                    .iter()
+                    .find(|(id, _)| Some(id) == draft.preferred.as_ref())
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| "Choose an approved host".into());
+                egui::ComboBox::from_id_source("host-switch-preferred")
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        for (id, name) in &approved {
+                            ui.selectable_value(&mut draft.preferred, Some(id.clone()), name);
+                        }
+                    });
+            }
+            ui.radio_value(&mut draft.mode, SwitchMode::Automatic, "Allow automatic switching");
+            ui.label(
+                RichText::new(format!(
+                    "Only to an approved host that is clearly better on every measured aspect for {} minutes, and at most once an hour. One good ping is never enough.",
+                    hosting_switch::SUSTAIN_MS / 60_000
+                ))
+                .size(font_size(TEXT_CAPTION))
+                .color(c_muted()),
+            );
+            if approved.is_empty() {
+                ui.label(RichText::new("No member holds an approved data copy yet, so no backup can be chosen.").color(c_muted()));
+            } else {
+                ui.label(RichText::new("Set as backup").strong());
+                for (id, name) in &approved {
+                    let mut on = draft.backups.contains(id);
+                    if ui.checkbox(&mut on, name).changed() {
+                        if on {
+                            draft.backups.push(id.clone());
+                        } else {
+                            draft.backups.retain(|b| b != id);
+                        }
+                    }
+                }
+            }
+            if draft.mode != SwitchMode::UseThisHost {
+                draft.preferred = None;
+            }
+            let changed = *draft != view.switching;
+            if ui
+                .add_enabled(changed && draft.validate().is_ok() && !busy, primary("Save choice"))
+                .clicked()
+            {
+                save_switching = Some(draft.clone());
+            }
+        });
+        if let Some(policy) = save_switching {
+            self.hosting_request(
+                AdminMethod::Post,
+                "/api/hosting/switching".into(),
+                json!(policy),
+                ACTION,
+            );
+        }
+
         // An offer for you.
         if let Some(mine) = view
             .candidates
@@ -574,6 +863,7 @@ impl RelayApp {
                 }
                 if mine.candidate.holds(HostRole::Replica) {
                     self.copy_card(ui, busy);
+                    self.takeover_copy_card(ui);
                 }
                 if mine.candidate.holds(HostRole::VoiceGateway) {
                     card(ui, |ui| {
@@ -842,6 +1132,27 @@ mod tests {
             "can_manage": false,
             "candidates": []
         })
+    }
+
+    #[test]
+    fn takeover_status_is_explicit_and_older_servers_read_as_not_set_up() {
+        let view: HostingView = serde_json::from_value(good(1)).unwrap();
+        assert_eq!(view.takeover.state, hosting::TakeoverState::NotSetUp);
+        assert_eq!(takeover_verdict(&view.takeover), Verdict::Unknown);
+        assert_eq!(view.switching.mode, hosting_switch::SwitchMode::KeepCurrent);
+        assert!(view.outage.is_empty());
+        assert!(view.takeover_setup.is_empty());
+        let mut value = good(1);
+        value["takeover"] = json!({"state": "copy_up_to_date", "term": 3, "votes": 0});
+        let view: HostingView = serde_json::from_value(value).unwrap();
+        assert_eq!(view.takeover.text(), "Data copy up to date");
+        assert_eq!(takeover_verdict(&view.takeover), Verdict::Green);
+        let stale = hosting::TakeoverStatus {
+            state: hosting::TakeoverState::CopyOutOfDate,
+            ..Default::default()
+        };
+        assert_eq!(stale.text(), "Can't take over: copy is out of date");
+        assert_eq!(takeover_verdict(&stale), Verdict::Red);
     }
 
     fn good(revision: u64) -> Value {

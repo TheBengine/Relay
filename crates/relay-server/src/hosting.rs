@@ -93,6 +93,9 @@ fn view(state: &AppState, db: &Connection, viewer: &str) -> ApiResult<HostingVie
     let approved_replicas = 1 + roster.holders(HostRole::Replica).len();
     let now_ms = now_ms();
     let can_manage = roles::has(db, viewer, PERMISSION_ADMIN);
+    let in_voice = state.members_in_voice();
+    let mut copies_ready = 0usize;
+    let mut scores = Vec::new();
     let mut candidates = Vec::new();
     for candidate in &roster.candidates {
         if !can_manage && candidate.user_id != viewer && candidate.effective().is_empty() {
@@ -112,12 +115,25 @@ fn view(state: &AppState, db: &Connection, viewer: &str) -> ApiResult<HostingVie
         let facts = model::Facts {
             candidate: Some(candidate),
             replica: replica_facts,
-            voice: None,
-            capacity: None,
+            voice: state
+                .0
+                .measurements
+                .voice(&candidate.user_id, &in_voice, now_ms),
+            capacity: state
+                .0
+                .measurements
+                .capacity(&candidate.user_id, &in_voice, now_ms),
             abilities: ABILITIES,
             approved_replicas,
             now_ms,
         };
+        if candidate.holds(HostRole::Replica) && model::copy_ready(&facts) {
+            copies_ready += 1;
+        }
+        scores.push((
+            candidate.user_id.clone(),
+            relay_protocol::host_switch::score(&model::assess(Task::PlannedHandover, &facts)),
+        ));
         let assessments = Task::ALL
             .into_iter()
             .filter(|task| candidate.offered.contains(&task.role()))
@@ -129,6 +145,13 @@ fn view(state: &AppState, db: &Connection, viewer: &str) -> ApiResult<HostingVie
             assessments,
         });
     }
+    // The active host is not measured from members' side yet, so automatic
+    // switching compares nothing; the advice says so instead of guessing.
+    let ready = ABILITIES.planned_handover && ABILITIES.unexpected_takeover;
+    let switch_advice = lock(&state.0.switch_advisor)
+        .observe(now_ms, &roster.switching, ready, None, &scores)
+        .text(|id| display_name(db, id));
+    let takeover = state.takeover_status();
     Ok(HostingView {
         schema: model::SCHEMA,
         revision: roster.revision,
@@ -140,6 +163,29 @@ fn view(state: &AppState, db: &Connection, viewer: &str) -> ApiResult<HostingVie
         you: viewer.into(),
         can_manage,
         candidates,
+        takeover: takeover.clone(),
+        switching: roster.switching.clone(),
+        switch_advice,
+        outage: model::outage_options(
+            &takeover,
+            ABILITIES,
+            state.0.config.account_provider.is_some(),
+        ),
+        standby_urls: lock(&state.0.standby_urls).clone(),
+        takeover_setup: {
+            // Approval first, then what this host measured of each co-host's
+            // takeover copy, then turning protection on.
+            let general = model::takeover_setup(
+                roster.holders(HostRole::Replica).len(),
+                copies_ready,
+                &takeover,
+                ABILITIES,
+            );
+            let mut steps = vec![general[0].clone()];
+            steps.extend(crate::takeover_setup::steps(db, |id| display_name(db, id))?);
+            steps.push(general[2].clone());
+            steps
+        },
     })
 }
 
@@ -212,6 +258,9 @@ pub(super) async fn answer_offer(
         save(&tx, &roster)?;
         roles::audit(&tx, &auth.user.id, "hosting.answered", &auth.user.id)?;
         replica::service::drop_token_if_role_lost(&tx, &auth.user.id)?;
+        if crate::takeover_setup::drop_if_role_lost(&tx, &auth.user.id)? {
+            crate::takeover_setup::forget_files(&state, &auth.user.id);
+        }
         let result = view(&state, &tx, &auth.user.id)?;
         tx.commit()?;
         result
@@ -223,6 +272,44 @@ pub(super) async fn answer_offer(
     if !holds_replica(&lock(&state.0.db), &auth.user.id) {
         replica::service::after_roster_change(&state, &auth.user.id);
     }
+    Ok(Json(result))
+}
+
+/// An administrator chooses how the host may change. Named hosts must hold an
+/// approved data-copy role, so a switch can only go to a prepared machine.
+pub(super) async fn set_switching(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(policy): Json<relay_protocol::host_switch::SwitchPolicy>,
+) -> ApiResult<Json<HostingView>> {
+    let auth = state.auth(&headers)?;
+    policy.validate().map_err(bad)?;
+    let result = {
+        let mut db = lock(&state.0.db);
+        let tx = db.transaction()?;
+        roles::require(&tx, &auth.user.id, PERMISSION_ADMIN)?;
+        let mut roster = load(&tx)?;
+        let approved: Vec<&str> = roster
+            .holders(HostRole::Replica)
+            .iter()
+            .map(|c| c.user_id.as_str())
+            .collect();
+        if policy
+            .preferred
+            .iter()
+            .chain(&policy.backups)
+            .any(|id| !approved.contains(&id.as_str()))
+        {
+            return Err(bad("Only an approved co-host with a data copy can be chosen"));
+        }
+        roster.switching = policy;
+        roster.revision = roster.revision.saturating_add(1);
+        save(&tx, &roster)?;
+        roles::audit(&tx, &auth.user.id, "hosting.switching", &auth.user.id)?;
+        let result = view(&state, &tx, &auth.user.id)?;
+        tx.commit()?;
+        result
+    };
     Ok(Json(result))
 }
 
@@ -241,11 +328,13 @@ pub(super) async fn revoke_roles(
         save(&tx, &roster)?;
         roles::audit(&tx, &auth.user.id, "hosting.revoked", &user)?;
         replica::service::drop_token_if_role_lost(&tx, &user)?;
+        crate::takeover_setup::drop_if_role_lost(&tx, &user)?;
         let result = view(&state, &tx, &auth.user.id)?;
         tx.commit()?;
         result
     };
     state.0.gateways.cancel_user(&user);
     replica::service::after_roster_change(&state, &user);
+    crate::takeover_setup::forget_files(&state, &user);
     Ok(Json(result))
 }

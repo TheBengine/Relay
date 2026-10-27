@@ -417,6 +417,7 @@ pub(crate) const TABLES: &[Table] = &[
     whole("replica_state", Never),
     whole("replica_log", Never),
     whole("replica_tokens", Never),
+    whole("password_resets", Never),
     // Ephemeral or derived.
     whole("user_presence", Ephemeral),
     whole("stage_members", Ephemeral),

@@ -5,11 +5,13 @@
 //! on the next frame. Never compiled into a normal build.
 use eframe::egui::{self, accesskit};
 
-/// The text waiting for focus, and the file the next screenshot goes to.
+/// The text waiting for focus, the file the next screenshot goes to, and a
+/// mouse-wheel scroll at a point (background windows get no real wheel input).
 #[derive(Default)]
 pub(crate) struct Pending(
     Option<(accesskit::NodeId, String, u8)>,
     pub(crate) Option<std::path::PathBuf>,
+    pub(crate) Option<(egui::Pos2, f32)>,
 );
 
 pub(crate) fn hook(pending: &mut Pending, ctx: &egui::Context, raw: &mut egui::RawInput) {
@@ -29,6 +31,15 @@ pub(crate) fn hook(pending: &mut Pending, ctx: &egui::Context, raw: &mut egui::R
         } else if frames < 30 {
             pending.0 = Some((target, text, frames + 1));
         }
+        ctx.request_repaint();
+    }
+    if let Some((at, delta)) = pending.2.take() {
+        raw.events.push(egui::Event::PointerMoved(at));
+        raw.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, delta),
+            modifiers: egui::Modifiers::NONE,
+        });
         ctx.request_repaint();
     }
     // egui reads the frame back from the GL surface: window captures of a GL window are black.

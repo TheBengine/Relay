@@ -16,7 +16,8 @@ use axum::{
     routing::post,
     Router,
 };
-use relay_protocol::takeover::{Ack, LogEntry, Nack, MAX_ENTRY_JSON};
+use crate::takeover_voter::VoteAnswer;
+use relay_protocol::takeover::{Ack, LogEntry, Nack, Vote, VoteRequest, MAX_CONTROL_JSON, MAX_ENTRY_JSON};
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
@@ -30,6 +31,7 @@ const BODY_LIMIT: usize = MAX_ENTRY_JSON + 16 * 1024;
 const REPLY_LIMIT: usize = 16 * 1024;
 const APPEND: &str = "/internal/takeover/append";
 const COMMIT: &str = "/internal/takeover/committed";
+const VOTE: &str = "/internal/takeover/vote";
 
 /// No Debug/Serialize: a scoped access key never belongs in logs or URLs.
 pub(crate) struct Target {
@@ -123,6 +125,7 @@ pub(crate) fn router(replica: Arc<Mutex<Replica>>, access: String) -> Result<Rou
     Ok(Router::new()
         .route(APPEND, post(append))
         .route(COMMIT, post(committed))
+        .route(VOTE, post(vote))
         .with_state(service))
 }
 async fn admitted(
@@ -199,6 +202,115 @@ async fn committed(State(service): State<Service>, request: Request) -> Response
     match result {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         _ => StatusCode::CONFLICT.into_response(),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", content = "evidence", deny_unknown_fields)]
+enum Ballot {
+    Granted(Vote),
+    Refused(Nack),
+}
+async fn vote(State(service): State<Service>, request: Request) -> Response {
+    let (bytes, permit) = match admitted(&service, request).await {
+        Ok(b) => b,
+        Err(s) => return s.into_response(),
+    };
+    if bytes.len() > MAX_CONTROL_JSON {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let ask: VoteRequest = match serde_json::from_slice(&bytes) {
+        Ok(e) => e,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut replica = service.replica.try_lock().map_err(|_| ())?;
+        crate::takeover_failover::answer_vote(&mut replica, &ask, Instant::now())
+            .map(|answer| match answer {
+                VoteAnswer::Granted(v) => Ballot::Granted(v),
+                VoteAnswer::Refused(n) => Ballot::Refused(n),
+            })
+            .map_err(|_| ())
+    })
+    .await;
+    match result {
+        Ok(Ok(ballot)) => axum::Json(ballot).into_response(),
+        _ => StatusCode::CONFLICT.into_response(),
+    }
+}
+
+/// Asks the other approved copies for a vote, each with its own scoped key.
+/// Rare and bounded: one short-lived worker thread per attempt.
+pub(crate) struct HttpVotePeers {
+    targets: Vec<Target>,
+}
+impl HttpVotePeers {
+    pub(crate) fn new(targets: Vec<Target>) -> Self {
+        Self { targets }
+    }
+}
+impl crate::takeover_failover::VotePeers for HttpVotePeers {
+    fn ask(&mut self, request: &VoteRequest) -> Vec<Option<VoteAnswer>> {
+        let Ok(body) = serde_json::to_vec(request) else {
+            return vec![None; self.targets.len()];
+        };
+        let targets = &self.targets;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok()?;
+                    let client = reqwest::Client::builder()
+                        .no_proxy()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .connect_timeout(Duration::from_secs(3))
+                        .timeout(Duration::from_secs(5))
+                        .build()
+                        .ok()?;
+                    Some(runtime.block_on(async {
+                        let mut answers = Vec::new();
+                        for target in targets {
+                            answers.push(ballot(&client, target, &body).await);
+                        }
+                        answers
+                    }))
+                })
+                .join()
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(|| vec![None; self.targets.len()])
+    }
+}
+async fn ballot(client: &reqwest::Client, target: &Target, body: &[u8]) -> Option<VoteAnswer> {
+    let url = target.origin.join(VOTE).ok()?;
+    let mut auth =
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", target.access.as_str()))
+            .ok()?;
+    auth.set_sensitive(true);
+    let response = client
+        .post(url)
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .ok()?;
+    if response.status() != reqwest::StatusCode::OK
+        || response.content_length().is_some_and(|n| n > REPLY_LIMIT as u64)
+    {
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    if bytes.len() > REPLY_LIMIT {
+        return None;
+    }
+    match serde_json::from_slice::<Ballot>(&bytes).ok()? {
+        Ballot::Granted(v) => Some(VoteAnswer::Granted(v)),
+        Ballot::Refused(n) => Some(VoteAnswer::Refused(n)),
     }
 }
 

@@ -629,9 +629,10 @@ impl OwnedSignInVault {
         use std::os::windows::fs::MetadataExt;
         let profile = PathBuf::from(std::env::var_os("RELAY_PROFILE_DIR")
             .expect("the sign-in vault test requires its isolated profile"));
-        let root = PathBuf::from(r"C:\Important\Projects\2026-10-03\can\work\relay-signin-persistence-20261026");
-        assert_eq!(profile.parent(), Some(root.as_path()));
-        assert_eq!(test_work_root().parent(), Some(root.as_path()));
+        // The isolated profile and the test work root share one owned task folder,
+        // whichever checkout runs the suite.
+        let root = profile.parent().expect("an isolated profile has a task folder");
+        assert_eq!(test_work_root().parent(), Some(root));
         for path in profile.ancestors() {
             assert_eq!(fs::symlink_metadata(path).unwrap().file_attributes() & 0x400, 0);
         }

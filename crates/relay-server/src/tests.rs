@@ -616,7 +616,7 @@ async fn accounts_invites_dm_privacy_and_revocation() {
     lock(&state.0.db)
         .execute(
             "UPDATE sessions SET expires=?1 WHERE token_hash=?2",
-            params![now() - 1, token_hash(&admin.token)],
+            params![now() - 1, crate::session_hash(&admin.token)],
         )
         .unwrap();
     let (status, _) = request(

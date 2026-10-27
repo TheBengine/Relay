@@ -3,6 +3,8 @@ use crate::appearance::{TEXT_BODY, TEXT_CAPTION};
 use serde_json::{json, Value};
 #[path = "role_templates.rs"]
 mod role_templates;
+#[path = "access_check.rs"]
+mod access_check;
 include!("roles_ui.rs");
 include!("social_ui.rs");
 include!("friends_overview_ui.rs");
@@ -53,6 +55,8 @@ pub(super) struct ServerUi {
     channel: Option<Channel>,
     permissions: Vec<ChannelPermission>,
     permission_user: String,
+    access_channel: String,
+    access_member: String,
     category_name: String,
     category_edits: HashMap<String, (String, i64)>,
     role_edits: HashMap<String, String>,
@@ -693,10 +697,13 @@ impl RelayApp {
             }
         }
         if let Some(action) = key.strip_prefix("action:") {
+            // Any saved change can alter who may do what; ask again next time.
+            self.admin_data.retain(|key, _| !key.starts_with("access:"));
             let message = match action {
                 "social" => "Friends updated",
                 "presence" => "Status updated",
                 "group-invite" => "Group invitations updated",
+                "takeover-arm" => "Takeover protection is being turned on. Changes pause until both co-hosts have the same copy.",
                 "conversation:create" if self.in_people() => "Invitations sent",
                 _ => "Community settings saved",
             };
@@ -749,6 +756,12 @@ impl RelayApp {
                 }
                 "backups" => self.refresh_admin_data("backups", "/api/admin/backups"),
                 "sessions" => self.refresh_admin_data("sessions", "/api/sessions"),
+                // Shown once on the page that asked for it; never saved.
+                "reset-code" | "recovery-code" => {
+                    let mut shown = data.clone();
+                    shown["for"] = Value::from(action);
+                    self.admin_data.insert("issued-code".into(), shown);
+                }
                 "password" => {
                     self.admin_ui.current_password.clear();
                     self.admin_ui.new_password.clear();
@@ -1164,6 +1177,10 @@ impl RelayApp {
                     if ui.add_enabled(!self.admin_ui.permission_user.is_empty(),secondary("Add person")).clicked(){let id=self.admin_ui.permission_user.clone();if !self.admin_ui.permissions.iter().any(|entry|entry.subject_kind=="user"&&entry.subject_id==id){self.admin_ui.permissions.push(ChannelPermission{subject_kind:"user".into(),subject_id:id,read:true,send:true,join:true,stream:true});}}
                 });
                 if ui.add(primary("Save permissions")).clicked(){self.admin_request(AdminMethod::Put,format!("/api/channels/{}/permissions",channel.id),json!({"entries":self.admin_ui.permissions}),"action:permissions".into());}
+                ui.add_space(8.0);
+                ui.label(RichText::new("Check a person's access").strong());
+                ui.label(RichText::new("Shows what the server allows right now, using saved rules. Save changes first to check them.").size(font_size(TEXT_CAPTION)).color(c_muted()));
+                self.access_check_ui(ui, bootstrap, Some(&channel.id), None);
                 for role in &bootstrap.roles {
                     if !self.admin_ui.permissions.iter().any(|entry|entry.subject_kind=="role"&&entry.subject_id==role.id) && ui.small_button(format!("Add {} permissions",role.name)).clicked() {
                         self.admin_ui.permissions.push(ChannelPermission{subject_kind:"role".into(),subject_id:role.id.clone(),read:false,send:false,join:false,stream:false});
@@ -1332,6 +1349,22 @@ impl RelayApp {
                     } else {
                         ui.label(role);
                     }
+                    if bootstrap.user.role == "admin"
+                        && id != bootstrap.user.id
+                        && role != "admin"
+                        && ui
+                            .add(secondary("Create reset code"))
+                            .on_hover_text("A one-time code, valid 24 hours, that lets this member set a new community password.")
+                            .clicked()
+                    {
+                        self.admin_data.remove("issued-code");
+                        self.admin_request(
+                            AdminMethod::Post,
+                            format!("/api/members/{id}/password-reset"),
+                            Value::Null,
+                            "action:reset-code".into(),
+                        );
+                    }
                     if ui
                         .add_enabled(
                             id != bootstrap.user.id
@@ -1406,8 +1439,18 @@ impl RelayApp {
                 }
             });
         }
+        issued_code_ui(ui, &self.admin_data, "reset-code", "Give this code to the member privately. It works once, within 24 hours, and replaces their community password.");
         if ui.small_button("Refresh members").clicked() {
             self.refresh_admin_data("members", "/api/members");
+        }
+        if bootstrap.has_permission(PERMISSION_CHANNELS) {
+            ui.add_space(16.0);
+            settings_heading(
+                ui,
+                "Check access",
+                "What a member can do in a channel right now, and which rule decides it.",
+            );
+            self.access_check_ui(ui, bootstrap, None, None);
         }
     }
 
@@ -1545,6 +1588,14 @@ impl RelayApp {
         {
             return;
         }
+        ui.collapsing("Recovery code", |ui| {
+            ui.label(RichText::new("Save a recovery code somewhere safe. If this community moves to a new host, community passwords do not move with it; the code lets you set a new one. Creating a new code replaces the old one.").size(font_size(TEXT_CAPTION)).color(c_muted()));
+            if ui.add(secondary("Create recovery code")).clicked() {
+                self.admin_data.remove("issued-code");
+                self.admin_request(AdminMethod::Post, "/api/password/recovery-code".into(), Value::Null, "action:recovery-code".into());
+            }
+            issued_code_ui(ui, &self.admin_data, "recovery-code", "Write this down now. It is shown only once.");
+        });
         ui.collapsing("Change password",|ui|{
             field(ui,"CURRENT PASSWORD",&mut self.admin_ui.current_password,true);field(ui,"NEW PASSWORD",&mut self.admin_ui.new_password,true);
             ui.label(RichText::new("Use at least 10 characters. Changing it signs out every session.").size(font_size(TEXT_CAPTION)).color(c_muted()));
@@ -1746,4 +1797,21 @@ mod tests {
             assert_eq!(selected.as_ref().unwrap().name, channel.name);
         }
     }
+}
+
+/// A just-created reset or recovery code, with what to do with it.
+fn issued_code_ui(ui: &mut egui::Ui, data: &std::collections::HashMap<String, Value>, kind: &str, advice: &str) {
+    let Some(issued) = data.get("issued-code").filter(|v| v["for"] == kind) else {
+        return;
+    };
+    let Some(code) = issued["code"].as_str() else {
+        return;
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(code).monospace().strong());
+        if ui.small_button("Copy").clicked() {
+            ui.output_mut(|o| o.copied_text = code.to_owned());
+        }
+    });
+    ui.label(RichText::new(advice).size(font_size(TEXT_CAPTION)).color(c_muted()));
 }

@@ -334,7 +334,7 @@ pub(crate) async fn finish(
             server_settings::record_system_event(&tx, &user.id, "joined")?;
             user
         };
-        let session = new_session(&tx, user)?;
+        let session = new_session(&tx, &state.0.seal, user)?;
         tx.commit()?;
         session
     };

@@ -44,6 +44,11 @@ pub struct Provider {
 }
 
 impl Provider {
+    /// The configured issuer, for the public discovery check. Not a secret.
+    pub fn issuer_url(&self) -> &Url {
+        &self.issuer
+    }
+
     pub fn configured() -> Result<Option<Self>> {
         let issuer = std::env::var("RELAY_ACCOUNT_ISSUER")
             .ok()

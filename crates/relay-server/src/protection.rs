@@ -39,6 +39,11 @@ pub(super) async fn open_call(
         .collect();
     peers.sort();
     peers.dedup();
+    // The device name each app derives from its own token digest; kept in memory only.
+    let digests: std::collections::HashMap<String, String> = lock(&state.0.voice)
+        .values()
+        .map(|v| (v.token_hash.clone(), v.token_digest.clone()))
+        .collect();
     if peers.len() > MAX_OPEN_CALL_PEERS
         || !peers
             .iter()
@@ -118,7 +123,7 @@ pub(super) async fn open_call(
     };
     let mut senders = Vec::new();
     for (user, token) in peers {
-        let device = open_device(&token);
+        let device = open_device(digests.get(&token).ok_or_else(forbidden)?);
         senders.push(OpenCallSender {
             opus: derive(&user, &device, "opus")?,
             rtc: derive(&user, &device, "rtc")?,

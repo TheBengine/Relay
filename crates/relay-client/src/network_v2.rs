@@ -2534,6 +2534,7 @@ impl Worker {
                 let _permit = permit;
                 let mut reader = ProgressReader {
                     reader: Box::new(file),
+                    paced: None,
                     size,
                     read: 0,
                     last: Instant::now() - Duration::from_secs(1),
@@ -2597,6 +2598,7 @@ impl Worker {
                         }
                         let reader = ProgressReader {
                             reader: Box::new(std::io::Cursor::new(wire)),
+                            paced: Some((Instant::now(), 0)),
                             size: wire_size,
                             read: 0,
                             last: Instant::now() - Duration::from_secs(1),
@@ -3470,6 +3472,8 @@ impl TransferMeta {
 
 struct ProgressReader {
     reader: Box<dyn Read + Send>,
+    /// Voice first applies to bytes on the wire only, never to reading the file.
+    paced: Option<(Instant, u64)>,
     size: u64,
     read: u64,
     last: Instant,
@@ -3488,7 +3492,33 @@ impl Read for ProgressReader {
                 "Upload cancelled",
             ));
         }
+        // Voice first: a byte-rate cap while incoming voice struggles.
+        if let Some((window, sent)) = self.paced.as_mut() {
+            loop {
+                if window.elapsed() >= Duration::from_secs(1) {
+                    *window = Instant::now();
+                    *sent = 0;
+                }
+                let Some(wait) = crate::voice_priority::upload_wait(
+                    crate::voice_priority::pressured(),
+                    *sent,
+                    window.elapsed(),
+                ) else {
+                    break;
+                };
+                if self.cancel.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "Upload cancelled",
+                    ));
+                }
+                std::thread::sleep(wait.min(Duration::from_millis(250)));
+            }
+        }
         let n = self.reader.read(buffer)?;
+        if let Some((_, sent)) = self.paced.as_mut() {
+            *sent += n as u64;
+        }
         self.read += n as u64;
         if self.read > self.size || self.read > MAX_SUPPORTED_UPLOAD_BYTES as u64 {
             return Err(std::io::Error::new(

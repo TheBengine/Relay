@@ -521,6 +521,8 @@ fn build(
             }
         }
     }
+    // The destination is trusted with the community, not with login secrets.
+    crate::host_copy_secrets::strip(&snapshot).map_err(|_| unavailable())?;
     drop(snapshot);
     drop(source);
     let mut file = fs::File::open(&snapshot_path).map_err(|_| unavailable())?;
@@ -838,6 +840,7 @@ pub(crate) fn verify_database(
         || integrity != "ok"
         || server_id(&db)? != manifest.context.server_id
         || db.prepare("PRAGMA foreign_key_check")?.exists([])?
+        || !crate::host_copy_secrets::is_stripped(&db)?
     {
         return Err("Standby database validation failed".into());
     }

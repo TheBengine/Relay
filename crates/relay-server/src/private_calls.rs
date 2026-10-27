@@ -72,6 +72,7 @@ pub(super) fn reconcile(state: &AppState, db: &Connection) -> ApiResult<()> {
                     id.clone(),
                     v.user.id.clone(),
                     v.token_hash.clone(),
+                    v.token_digest.clone(),
                     v.device_id.clone(),
                     v.alive_at(at),
                 )
@@ -82,9 +83,9 @@ pub(super) fn reconcile(state: &AppState, db: &Connection) -> ApiResult<()> {
     let protection = protection::current(&tx)?;
     let mut live = std::collections::HashSet::new();
     let mut revoked = std::collections::HashSet::new();
-    for (id, user, token, device, alive) in seats {
+    for (id, user, token, digest, device, alive) in seats {
         let device = if protection.level == ProtectionLevel::Open
-            && device.as_deref() == Some(protection::open_device(&token).as_str())
+            && device.as_deref() == Some(protection::open_device(&digest).as_str())
         {
             None
         } else {

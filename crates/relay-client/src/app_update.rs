@@ -1924,6 +1924,7 @@ impl RelayApp {
                             continue;
                         }
                         let key = format!("{}:{}", metadata.user.id, metadata.kind);
+                        self.video_delivery.record(&key, frame.size, Instant::now());
                         let Some(frame) =
                             display_video_frame(frame, ctx.input(|input| input.max_texture_side))
                         else {
@@ -2192,6 +2193,8 @@ impl RelayApp {
                 {
                     continue;
                 }
+                self.video_delivery
+                    .record(&key, frame.image.size, Instant::now());
                 let Some(image) =
                     display_video_frame(frame.image, ctx.input(|input| input.max_texture_side))
                 else {
@@ -2259,6 +2262,11 @@ impl RelayApp {
             .as_mut()
             .and_then(MediaEngine::take_device_change_failure)
         {
+            if failure.follow {
+                // Following Windows never rewrites the person's saved choice;
+                // the next device notification tries again.
+                self.notice = Some((format!("Relay could not switch audio devices yet and keeps the current ones. Details: {}", failure.error), Instant::now()));
+            } else {
             crate::audio_settings::restore_device_selection(
                 &mut self.audio_applied,
                 &failure.attempted,
@@ -2271,6 +2279,7 @@ impl RelayApp {
             );
             self.error = Some(format!("Could not switch audio devices. The previous devices are still in use; choose another input/output in Voice & Video. Details: {}", failure.error));
             self.save_preferences();
+            }
         }
         if let Some(error) = self.media.as_mut().and_then(MediaEngine::take_error) {
             if self.voice_channel.is_none() && self.joining_voice.is_none() {
@@ -2390,6 +2399,7 @@ impl eframe::App for RelayApp {
         }
         self.updates(ctx);
         self.replica_copy_tick();
+        self.device_follow_tick();
         self.handover_tick();
         self.lan_pairing_tick();
         self.game_activity_tick(ctx);
@@ -2445,6 +2455,8 @@ impl eframe::App for RelayApp {
                 self.prepare_join_capture_panel(&panel);
             }
         }
+        // Ctrl + Shift shortcuts first: Ctrl-only matches ignore an extra Shift.
+        self.handle_voice_shortcuts(ctx);
         if self.session.is_some() && !self.modal_open() {
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
                 self.settings_open = true;

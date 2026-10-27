@@ -153,6 +153,9 @@ pub struct Roster {
     pub schema: u32,
     pub revision: u64,
     pub candidates: Vec<Candidate>,
+    /// How the host may change. Older rosters have none: keep the current host.
+    #[serde(default)]
+    pub switching: crate::host_switch::SwitchPolicy,
 }
 
 impl Default for Roster {
@@ -161,6 +164,7 @@ impl Default for Roster {
             schema: SCHEMA,
             revision: 0,
             candidates: Vec::new(),
+            switching: Default::default(),
         }
     }
 }
@@ -510,6 +514,11 @@ fn permission(task: Task, facts: &Facts) -> (Verdict, String) {
     (Verdict::Red, text)
 }
 
+/// True when the copy's own fresh report says it holds everything.
+pub fn copy_ready(facts: &Facts) -> bool {
+    data_copy(facts).0 == Verdict::Green
+}
+
 fn data_copy(facts: &Facts) -> (Verdict, String) {
     let Some(copy) = facts.replica else {
         return (Verdict::Unknown, "No data copy has reported yet.".into());
@@ -811,6 +820,295 @@ pub struct HostingView {
     /// Administrators can offer and withdraw roles.
     pub can_manage: bool,
     pub candidates: Vec<CandidateView>,
+    /// Whether this machine could continue the community after an unexpected
+    /// outage of the active host. Older servers omit it: not set up.
+    #[serde(default)]
+    pub takeover: TakeoverStatus,
+    /// How the host may change, and what that means right now.
+    #[serde(default)]
+    pub switching: crate::host_switch::SwitchPolicy,
+    #[serde(default)]
+    pub switch_advice: String,
+    /// What still works for members if the host disappears now.
+    #[serde(default)]
+    pub outage: Vec<OutageOption>,
+    /// Addresses of the approved co-hosts that could continue the community.
+    /// The app remembers them and asks them for a majority mandate only when
+    /// this host is unreachable; an address alone grants nothing.
+    #[serde(default)]
+    pub standby_urls: Vec<String>,
+    /// The steps to continuing without the host, each with its live state.
+    #[serde(default)]
+    pub takeover_setup: Vec<SetupStep>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupStep {
+    pub what: String,
+    pub done: bool,
+    pub text: String,
+}
+
+/// The takeover setup as a checklist. `approved` co-hosts hold the data-copy
+/// role; `copies_ready` of them report a fresh, complete copy. Nothing here is
+/// claimed beyond what the host measured.
+pub fn takeover_setup(approved: usize, copies_ready: usize, takeover: &TakeoverStatus, abilities: Abilities) -> Vec<SetupStep> {
+    const NEEDED: usize = 2;
+    let step = |what: &str, done: bool, text: String| SetupStep {
+        what: what.into(),
+        done,
+        text,
+    };
+    let armed = matches!(
+        takeover.state,
+        TakeoverState::ProtectedHost | TakeoverState::CopyUpToDate | TakeoverState::TookOver
+    );
+    vec![
+        step(
+            "Approve two co-hosts",
+            approved >= NEEDED,
+            if approved >= NEEDED {
+                format!("{approved} members hold an approved data-copy role.")
+            } else {
+                format!("{approved} of {NEEDED}: offer the data-copy role under Ask a member to help host; each member accepts it themselves.")
+            },
+        ),
+        step(
+            "Each co-host keeps an up-to-date copy",
+            copies_ready >= NEEDED,
+            format!("{copies_ready} of {NEEDED} report a complete copy within the last two minutes. A co-host turns this on under Your host roles."),
+        ),
+        step(
+            "Turn on takeover protection",
+            armed,
+            if armed {
+                "On: every change is kept by at least two of three approved copies.".into()
+            } else if abilities.unexpected_takeover {
+                "Ready to turn on once both steps above are done.".into()
+            } else {
+                "Not available in this version: the host and both co-hosts cannot yet exchange the signed set, consent and first full copy.".into()
+            },
+        ),
+    ]
+}
+
+/// One row of the outage matrix: what a member can still do, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutageOption {
+    pub what: String,
+    pub available: bool,
+    pub text: String,
+}
+
+/// What members can do after the active host disappears, for this build and
+/// this community. Says "not yet" rather than promising what is not wired.
+pub fn outage_options(
+    takeover: &TakeoverStatus,
+    abilities: Abilities,
+    account_sign_in: bool,
+) -> Vec<OutageOption> {
+    let continues = abilities.unexpected_takeover && takeover.state == TakeoverState::TookOver;
+    let row = |what: &str, available: bool, text: String| OutageOption {
+        what: what.into(),
+        available,
+        text,
+    };
+    let not_yet = "Not yet: a co-host can prepare the community, but members' apps cannot follow a new host in this version.";
+    vec![
+        row(
+            "Friends: messages and calls",
+            true,
+            "Works: Friends run on the separate Friends service, not on this community's host.".into(),
+        ),
+        row(
+            "Read history already on your device",
+            true,
+            "Works: messages your app already received stay readable offline.".into(),
+        ),
+        row(
+            "Keep chatting in this community",
+            continues,
+            if continues {
+                "Works after you sign in again on the new host.".into()
+            } else {
+                not_yet.into()
+            },
+        ),
+        row(
+            "Sign in again with your Relay account",
+            continues && account_sign_in,
+            if !account_sign_in {
+                "Not available: this community does not use Relay accounts.".into()
+            } else if continues {
+                "Works: sign-ins are not copied, so every device signs in once on the new host.".into()
+            } else {
+                not_yet.into()
+            },
+        ),
+        row(
+            "Sign in with a community password",
+            false,
+            "Not available: password hashes are never copied to another host, and no reset exists yet.".into(),
+        ),
+        row(
+            "Add a new device",
+            continues && account_sign_in,
+            if continues && account_sign_in {
+                "Works after signing in; encrypted history needs approval from one of your existing devices.".into()
+            } else {
+                "Not available until the new host runs and you can sign in there.".into()
+            },
+        ),
+        row(
+            "Invite a new member",
+            continues,
+            if continues {
+                "Works: open invitations are part of the copy.".into()
+            } else {
+                not_yet.into()
+            },
+        ),
+    ]
+}
+
+/// What a member's or co-host's app measured, for the host overview.
+pub const MAX_VOICE_SAMPLES: usize = 16;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceSample {
+    /// The co-host whose machine was measured.
+    pub host_user_id: String,
+    pub quality: ParticipantQuality,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementReport {
+    /// The reporter's own machine. Group size is counted by the server.
+    #[serde(default)]
+    pub capacity: Option<CapacityFacts>,
+    #[serde(default)]
+    pub voice: Vec<VoiceSample>,
+}
+
+impl MeasurementReport {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.capacity.is_none() && self.voice.is_empty() {
+            return Err("The report is empty");
+        }
+        if let Some(c) = self.capacity {
+            if c.cpu_free_pct.is_some_and(|v| v > 100) {
+                return Err("Free processor must be 0-100 %");
+            }
+        }
+        if self.voice.len() > MAX_VOICE_SAMPLES {
+            return Err("Too many voice measurements");
+        }
+        let mut hosts: Vec<&str> = Vec::new();
+        for s in &self.voice {
+            let q = s.quality;
+            let ok = |v: f32, max: f32| v.is_finite() && (0.0..=max).contains(&v);
+            if s.host_user_id.is_empty()
+                || s.host_user_id.len() > 64
+                || hosts.contains(&s.host_user_id.as_str())
+                || !ok(q.rtt_ms, 10_000.0)
+                || !ok(q.jitter_ms, 10_000.0)
+                || !ok(q.loss_pct, 100.0)
+                || !ok(q.late_pct, 100.0)
+            {
+                return Err("A voice measurement is invalid");
+            }
+            hosts.push(&s.host_user_id);
+        }
+        Ok(())
+    }
+}
+
+/// How long the active host must be silent before an approved co-host may ask
+/// for a takeover. A short network blip never moves the community.
+pub const TAKEOVER_SILENCE_SECONDS: u64 = 30;
+
+/// One state per reason, so the client never guesses from free text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TakeoverState {
+    /// This machine holds no approved full copy for unexpected takeover.
+    #[default]
+    NotSetUp,
+    /// This machine is the active host and writes only with a majority of copies.
+    ProtectedHost,
+    /// Protected, but no co-host is confirming changes right now: changes wait.
+    Paused,
+    /// The active host stopped this machine: a majority chose another host.
+    Fenced,
+    /// The copy has every confirmed change; a takeover is possible if the host disappears.
+    CopyUpToDate,
+    /// Changes are missing or not yet applied; this copy may not take over.
+    CopyOutOfDate,
+    /// The copy failed a check and must be repaired before it can take over.
+    CopyNeedsRepair,
+    /// The host was silent, but too few approved copies agreed.
+    NoMajority,
+    /// A majority of approved copies chose this machine.
+    TookOver,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TakeoverStatus {
+    pub state: TakeoverState,
+    /// Term of the latest election this machine knows of.
+    #[serde(default)]
+    pub term: u64,
+    /// Approved full copies that agreed in the latest attempt, this one included.
+    #[serde(default)]
+    pub votes: u32,
+}
+
+impl TakeoverStatus {
+    /// Approved full copies needed: the active host plus two co-hosts, 2 of 3.
+    pub const NEEDED: u32 = 2;
+
+    /// The one sentence the client shows. Never claims more than the state proves.
+    pub fn text(&self) -> String {
+        match self.state {
+            TakeoverState::NotSetUp => {
+                "Not set up yet: continuing without the host needs two approved co-hosts with a full data copy. Setting that up between machines is not available in this version.".into()
+            }
+            TakeoverState::ProtectedHost => format!(
+                "Protected: every change is kept by at least {} of 3 approved copies",
+                Self::NEEDED
+            ),
+            TakeoverState::Paused => "Paused: waiting for a co-host to confirm changes".into(),
+            TakeoverState::Fenced => {
+                "Stopped: approved co-hosts chose a new host while this one was unreachable".into()
+            }
+            TakeoverState::CopyUpToDate => "Data copy up to date".into(),
+            TakeoverState::CopyOutOfDate => "Can't take over: copy is out of date".into(),
+            TakeoverState::CopyNeedsRepair => "Can't take over: copy needs repair".into(),
+            TakeoverState::NoMajority => format!(
+                "Can't take over: only {} of {} approved copies agreed",
+                self.votes,
+                Self::NEEDED
+            ),
+            TakeoverState::TookOver => format!(
+                "Took over: {} of 3 approved copies chose this machine (term {})",
+                self.votes, self.term
+            ),
+        }
+    }
+
+    /// True for states that block every write or takeover until someone acts.
+    pub fn is_problem(&self) -> bool {
+        matches!(
+            self.state,
+            TakeoverState::Paused
+                | TakeoverState::Fenced
+                | TakeoverState::CopyOutOfDate
+                | TakeoverState::CopyNeedsRepair
+                | TakeoverState::NoMajority
+        )
+    }
 }
 
 #[cfg(test)]

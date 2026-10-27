@@ -635,6 +635,10 @@ impl Standby {
         check_context(set, member).is_ok_and(|context| context == self.state.context)
     }
 
+    /// Where the owned image lives. Callers copy it; they never open or move it.
+    pub(crate) fn image_path(&self) -> &Path {
+        &self.image
+    }
     pub(crate) fn applied(&self) -> &Tip {
         &self.state.applied
     }

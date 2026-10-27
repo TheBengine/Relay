@@ -96,6 +96,18 @@ pub enum VideoCodecPreference {
     Hardware,
 }
 
+/// What the encoder protects first when upload or CPU runs short.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoPriority {
+    /// Unchanged behaviour: smooth camera, sharp screen share.
+    #[default]
+    Auto,
+    /// Keep resolution and lower the frame rate first: text and slides stay readable.
+    Detail,
+    /// Keep the frame rate and lower the resolution first: games and video stay fluid.
+    Motion,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureOptions {
     pub quality: CaptureQuality,
@@ -109,6 +121,8 @@ pub struct CaptureOptions {
     pub adaptive_video: bool,
     #[serde(default)]
     pub bitrate: VideoBitrate,
+    #[serde(default)]
+    pub priority: VideoPriority,
 }
 
 impl Default for CaptureOptions {
@@ -121,6 +135,7 @@ impl Default for CaptureOptions {
             application_audio: false,
             adaptive_video: true,
             bitrate: VideoBitrate::Auto,
+            priority: VideoPriority::Auto,
         }
     }
 }
@@ -196,6 +211,12 @@ pub struct CaptureDiagnostics {
     pub outbound_mbps: Option<f64>,
     #[cfg_attr(not(feature = "native-rtc"), allow(dead_code))]
     pub outbound_sample_at: Option<Instant>,
+    /// What the encoder actually sent recently, from the same RTC samples.
+    #[cfg_attr(not(feature = "native-rtc"), allow(dead_code))]
+    pub sent: Option<crate::adaptive_video::SentVideo>,
+    /// The options the live publication started with, to compare `sent` against.
+    #[cfg_attr(not(feature = "native-rtc"), allow(dead_code))]
+    pub sent_options: Option<CaptureOptions>,
 }
 
 #[derive(Debug)]

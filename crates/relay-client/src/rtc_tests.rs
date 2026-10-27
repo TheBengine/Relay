@@ -116,6 +116,7 @@ pub(super) fn recovery_fixture_publication(
         previous_sample: None,
         previous_sample_at: None,
         outbound_mbps: None,
+        sent_video: None,
         next_frame: None,
         rate_bitrate: None,
         adaptive_samples: 0,
@@ -680,6 +681,7 @@ async fn software_publication_delivers_native_frames_while_hidden_and_rejects_st
         previous_sample: None,
         previous_sample_at: None,
         outbound_mbps: None,
+        sent_video: None,
         next_frame: None,
         rate_bitrate: None,
         adaptive_samples: 0,
@@ -1586,13 +1588,13 @@ async fn video_upload_is_measured_without_enabling_adaptive_quality() {
     publication.next_stats = Instant::now() + Duration::from_secs(10);
     publication.previous_sample = Some(VideoSample {
         id: "owned-upload".into(), timestamp: 100, encoded: 50,
-        bytes_sent: 500_000, pressure: VideoPressure::Bandwidth,
+        bytes_sent: 500_000, pressure: VideoPressure::Bandwidth, width: 1280, height: 720,
     });
     publication.previous_sample_at = Some(Instant::now() - Duration::from_secs(2));
     publication.stats_task = Some(tokio::spawn(async {
         Some((VideoSample {
             id: "owned-upload".into(), timestamp: 200, encoded: 100,
-            bytes_sent: 1_500_000, pressure: VideoPressure::Bandwidth,
+            bytes_sent: 1_500_000, pressure: VideoPressure::Bandwidth, width: 1280, height: 720,
         }, Instant::now()))
     }));
     while !publication.stats_task.as_ref().unwrap().is_finished() {
@@ -1601,6 +1603,9 @@ async fn video_upload_is_measured_without_enabling_adaptive_quality() {
     let profile = publication.adaptation.profile();
     update_video_adaptation(&mut publication, &state, false).await;
     assert!(publication.outbound_mbps.is_some_and(|(rate, _)| (3.5..4.5).contains(&rate)));
+    let sent = publication.sent_video.expect("encoded size and rate from the same samples");
+    assert_eq!((sent.width, sent.height, sent.pressure), (1280, 720, VideoPressure::Bandwidth));
+    assert!((20.0..30.0).contains(&sent.fps), "50 frames over about two seconds");
     assert_eq!(publication.adaptive_samples, 0);
     assert_eq!(publication.adaptation.profile(), profile);
     // An unavailable next poll clears the displayed rate instead of reporting zero.
@@ -1610,6 +1615,7 @@ async fn video_upload_is_measured_without_enabling_adaptive_quality() {
     }
     update_video_adaptation(&mut publication, &state, false).await;
     assert!(publication.outbound_mbps.is_none());
+    assert!(publication.sent_video.is_none());
     assert!(publication.previous_sample_at.is_none());
 }
 
@@ -1633,7 +1639,7 @@ async fn video_upload_uses_collection_time_and_rejects_delayed_stale_results() {
     let now = Instant::now();
     let sample = VideoSample {
         id: "owned-delayed-upload".into(), timestamp: 100, encoded: 50,
-        bytes_sent: 500_000, pressure: VideoPressure::Bandwidth,
+        bytes_sent: 500_000, pressure: VideoPressure::Bandwidth, width: 1280, height: 720,
     };
     // Old completed work must not look freshly collected or affect adaptation.
     consume(&mut publication, &state, sample.clone(), now - Duration::from_secs(6)).await;
@@ -1657,7 +1663,7 @@ async fn video_upload_uses_collection_time_and_rejects_delayed_stale_results() {
 fn measured_video_upload_rejects_reset_stale_and_nonprogressing_samples() {
     let previous = VideoSample {
         id: "screen-sender".into(), timestamp: 100, encoded: 50,
-        bytes_sent: 500_000, pressure: VideoPressure::Unknown,
+        bytes_sent: 500_000, pressure: VideoPressure::Unknown, width: 1920, height: 1080,
     };
     let current = VideoSample {
         timestamp: 200, encoded: 100, bytes_sent: 1_500_000,
@@ -1674,7 +1680,10 @@ fn measured_video_upload_rejects_reset_stale_and_nonprogressing_samples() {
         VideoSample { bytes_sent: previous.bytes_sent - 1, ..current.clone() },
     ] {
         assert_eq!(video_upload_mbps(&previous, &invalid, Duration::from_secs(2)), None);
+        assert_eq!(sent_video(&previous, &invalid, Duration::from_secs(2)), None);
     }
+    let sent = sent_video(&previous, &current, Duration::from_secs(2)).unwrap();
+    assert_eq!((sent.width, sent.height, sent.fps), (1920, 1080, 25.0));
     for elapsed in [Duration::ZERO, Duration::from_millis(499), Duration::from_millis(5001)] {
         assert_eq!(video_upload_mbps(&previous, &current, elapsed), None);
     }
@@ -1690,6 +1699,8 @@ fn adaptive_video_measurements_require_a_live_unambiguous_video_sender() {
         video_sample(std::slice::from_ref(&stats)).unwrap().pressure,
         VideoPressure::Bandwidth
     ));
+    let parsed = video_sample(std::slice::from_ref(&stats)).unwrap();
+    assert_eq!((parsed.width, parsed.height), (1280, 720));
     assert!(video_sample(&[stats.clone(), stats]).is_none());
     for field in [
         "id",

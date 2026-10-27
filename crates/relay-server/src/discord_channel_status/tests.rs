@@ -512,7 +512,7 @@ async fn cleanup_without_record_turns_off_and_admin_session_is_required() {
     lock(&s.0.db)
         .execute(
             "DELETE FROM sessions WHERE token_hash=?1",
-            [token_hash(&admin.token)],
+            [crate::session_hash(&admin.token)],
         )
         .unwrap();
     assert_eq!(
@@ -555,7 +555,7 @@ async fn recovery_in_flight_rechecks_logout_and_never_commits_after_revocation()
     lock(&s.0.db)
         .execute(
             "DELETE FROM sessions WHERE token_hash=?1",
-            [token_hash(&admin.token)],
+            [crate::session_hash(&admin.token)],
         )
         .unwrap();
     l.f.release.notify_one();
@@ -908,7 +908,7 @@ async fn cleanup_in_flight_rechecks_revoked_admin_before_delete() {
     lock(&s.0.db)
         .execute(
             "DELETE FROM sessions WHERE token_hash=?1",
-            [token_hash(&admin.token)],
+            [crate::session_hash(&admin.token)],
         )
         .unwrap();
     l.f.release.notify_one();

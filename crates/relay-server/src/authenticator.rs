@@ -332,7 +332,12 @@ pub(super) async fn reauthenticate(
         [user],
         |r| r.get(0),
     )?;
-    let expected = hash.clone();
+    let expected = state
+        .0
+        .seal
+        .password(user, &hash)
+        .map(|h| h.to_string())
+        .unwrap_or_default();
     let password = Zeroizing::new(password.to_owned());
     let permit = state
         .0

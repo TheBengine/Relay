@@ -35,6 +35,12 @@ pub(crate) fn require_ordinary_boot(data: &Path) -> Result<(), Refusal> {
         )),
     }
 }
+/// True when this data folder holds a protected community that can be reopened
+/// through its replicating database (its takeover state and feed keys exist).
+pub(crate) fn protected_boot(data: &Path) -> bool {
+    data.join(BOOT_GUARD).is_file()
+        && data.join("takeover").join("feed-keys.json").is_file()
+}
 fn retain_boot_guard(data: &Path) -> Result<(), Refusal> {
     use std::io::Write;
     crate::handover_target::private_directory(data)
@@ -86,6 +92,11 @@ impl CommitSink for Control {
             return Err(Refusal("protected host is paused"));
         }
         let mut state = lock(&self.state);
+        if !state.peers.ready() {
+            // Refused before anything is proposed: the host stays usable and
+            // resumes as soon as a co-host is back.
+            return Err(Refusal("no co-host is confirming changes"));
+        }
         if state.approved.is_some() {
             self.pause();
             return Err(Refusal("local receipt is pending"));
@@ -182,6 +193,47 @@ impl Source {
 }
 
 impl AppState {
+    fn wake_readers(&self) -> Box<dyn Fn() + Send + Sync> {
+        let weak = Arc::downgrade(&self.0);
+        Box::new(move || {
+            if let Some(inner) = weak.upgrade() {
+                let _ = inner.events.send(crate::Notice {
+                    event: relay_protocol::Event {
+                        kind: "server_paused".into(),
+                        channel_id: None,
+                        user_id: None,
+                        recipient_id: None,
+                        typing: None,
+                        expires_at_ms: None,
+                    },
+                    audience: None,
+                });
+            }
+        })
+    }
+
+    /// Reopens a protected community at startup, before anything is served:
+    /// the same swap as arming, without writing a new boot guard.
+    pub(crate) fn resume_takeover_source(
+        &self,
+        voter: DiskVoter,
+        recovery: Inflight,
+        peers: Box<dyn Replicate + Send>,
+    ) -> Result<(), Refusal> {
+        if voter.identity() != &self.0.handover.route_pin().host {
+            return Err(Refusal("protected state belongs to another host"));
+        }
+        let mut db = lock(&self.0.db);
+        let placeholder =
+            Connection::open_in_memory().map_err(|_| Refusal("protected reopen failed"))?;
+        drop(std::mem::replace(&mut *db, placeholder));
+        let path = self.0.data.join("relay.sqlite3");
+        let (source, conn) = Source::open(&path, voter, recovery, peers, self.wake_readers())?;
+        *db = conn;
+        *lock(&self.0.takeover) = Some(source);
+        Ok(())
+    }
+
     pub(crate) fn takeover_blocked(&self) -> bool {
         if self.0.takeover_failed.load(Ordering::Acquire) {
             return true;
@@ -191,7 +243,17 @@ impl AppState {
             .is_some_and(|source| source.blocks_publication())
     }
     pub(crate) fn writes_allowed(&self) -> bool {
-        self.0.handover.writes_allowed() && !self.takeover_blocked()
+        self.0.handover.writes_allowed()
+            && !self.takeover_blocked()
+            && !self.arming()
+            && !self.takeover_waiting()
+    }
+    /// Protected, and no co-host is present to confirm a change right now.
+    pub(crate) fn takeover_waiting(&self) -> bool {
+        lock(&self.0.takeover).is_some()
+            && lock(&self.0.feed)
+                .as_ref()
+                .is_some_and(|feed| !feed.present(std::time::Instant::now()))
     }
     /// Called only by explicit setup after P0/cohort admission. All ordinary
     /// requests are drained before replacing the connection. No HTTP/UI route
@@ -204,7 +266,8 @@ impl AppState {
     ) -> Result<(), Refusal> {
         let _maintenance = self.0.maintenance.write().await;
         if self.0.config.people
-            || !self.writes_allowed()
+            || !self.0.handover.writes_allowed()
+            || self.takeover_blocked()
             || lock(&self.0.takeover).is_some()
             || voter.identity() != &self.0.handover.route_pin().host
         {
@@ -274,6 +337,11 @@ impl AppState {
 pub(crate) struct Replica {
     voter: DiskVoter,
     standby: crate::takeover_standby::Standby,
+    /// Last accepted append or commit from the host, or last vote this copy granted.
+    /// Starts at construction, so a restart never looks like a long outage.
+    heard: Instant,
+    /// This copy won a majority. It never votes for anyone again in this set.
+    won: bool,
 }
 impl Replica {
     pub(crate) fn new(
@@ -290,15 +358,97 @@ impl Replica {
         {
             return Err(Refusal("replica context differs"));
         }
-        Ok(Self { voter, standby })
+        Ok(Self {
+            voter,
+            standby,
+            heard: Instant::now(),
+            won: false,
+        })
+    }
+    /// How long nothing has been heard from the host (or from a candidate this
+    /// copy voted for).
+    pub(crate) fn silent_for(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.heard)
+    }
+    #[cfg(test)]
+    pub(crate) fn pretend_silent_since(&mut self, when: Instant) {
+        self.heard = when;
+    }
+    pub(crate) fn identity(&self) -> &relay_protocol::handover::HostIdentity {
+        self.voter.identity()
+    }
+    pub(crate) fn tip(&self) -> &relay_protocol::takeover::Tip {
+        self.voter.tip()
+    }
+    pub(crate) fn term(&self) -> u64 {
+        self.voter.promised_term()
+    }
+    pub(crate) fn needs_repair(&self) -> bool {
+        self.voter.is_poisoned()
+            || self.standby.is_poisoned()
+            || self.standby.recovery_needed().is_some()
+    }
+    pub(crate) fn has_won(&self) -> bool {
+        self.won
+    }
+    pub(crate) fn mark_won(&mut self) {
+        self.won = true;
+    }
+    pub(crate) fn image(&self) -> &Path {
+        self.standby.image_path()
+    }
+    pub(crate) fn start_election(
+        &mut self,
+    ) -> Result<
+        (
+            relay_protocol::takeover::VoteRequest,
+            relay_protocol::takeover::Vote,
+        ),
+        Refusal,
+    > {
+        self.voter
+            .start_election()
+            .map_err(|_| Refusal("this copy may not ask for a takeover"))
+    }
+    /// A vote for another candidate. A copy that already won never votes again,
+    /// and a granted vote restarts the silence timer, so a fresh winner gets
+    /// time to take over before anyone else asks.
+    pub(crate) fn grant_vote(
+        &mut self,
+        request: &relay_protocol::takeover::VoteRequest,
+        now: Instant,
+    ) -> Result<crate::takeover_voter::VoteAnswer, Refusal> {
+        if self.won {
+            return Err(Refusal("this copy is already the chosen host"));
+        }
+        let answer = self
+            .voter
+            .grant_vote(request)
+            .map_err(|_| Refusal("vote request refused"))?;
+        if matches!(answer, crate::takeover_voter::VoteAnswer::Granted(_)) {
+            self.heard = now;
+        }
+        Ok(answer)
+    }
+    pub(crate) fn majority_for(
+        &self,
+        request: &relay_protocol::takeover::VoteRequest,
+        votes: &[relay_protocol::takeover::Vote],
+    ) -> bool {
+        self.voter.majority_for(request, votes)
     }
     pub(crate) fn append(
         &mut self,
         entry: &relay_protocol::takeover::LogEntry,
     ) -> Result<crate::takeover_voter::AppendAnswer, Refusal> {
-        self.voter
+        let answer = self
+            .voter
             .append(entry)
-            .map_err(|_| Refusal("replica append refused"))
+            .map_err(|_| Refusal("replica append refused"))?;
+        if matches!(answer, crate::takeover_voter::AppendAnswer::Ack(_)) {
+            self.heard = Instant::now();
+        }
+        Ok(answer)
     }
     pub(crate) fn committed(
         &mut self,
@@ -310,6 +460,7 @@ impl Replica {
         if self.standby.is_poisoned() {
             return Err(Refusal("replica storage requires reopen"));
         }
+        self.heard = Instant::now();
         if self.standby.recovery_needed().is_none() && self.standby.applied() == &notice.end {
             return Ok(()); // Exact authenticated retransmission, no repeated page writes.
         }

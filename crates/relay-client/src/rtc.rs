@@ -32,7 +32,10 @@ use livekit::webrtc::{
     video_stream::native::NativeVideoStream,
 };
 use livekit::{
-    options::{TrackPublishOptions, VideoCodec, VideoEncoderBackend, VideoEncoding},
+    options::{
+        DegradationPreference, TrackPublishOptions, VideoCodec, VideoEncoderBackend,
+        VideoEncoding,
+    },
     prelude::*,
 };
 use relay_protocol::RtcTicket;
@@ -439,6 +442,7 @@ impl RtcSession {
             Instant::now().saturating_duration_since(at) > Duration::from_secs(5)
         }) {
             diagnostics.outbound_mbps = None;
+            diagnostics.sent = None;
         }
         Some(diagnostics)
     }
@@ -581,6 +585,7 @@ struct Publication {
     previous_sample: Option<VideoSample>,
     previous_sample_at: Option<Instant>,
     outbound_mbps: Option<(f64, Instant)>,
+    sent_video: Option<crate::adaptive_video::SentVideo>,
     next_frame: Option<Instant>,
     rate_bitrate: Option<u64>,
     adaptive_samples: u64,
@@ -1078,7 +1083,7 @@ async fn worker(
                 for (camera,publication) in publications.iter_mut(){
                     let recovering=jobs.pending.get(camera).is_some_and(|job|job.recovering);
                     if !recovering{update_video_adaptation(publication,state,*camera).await;}
-                    if let Ok(mut diagnostics)=state.diagnostics.lock(){let mut current=publication.capture.diagnostics();current.video_codec=publication.pipeline.name();current.adaptive_output=publication.options.adaptive_video.then(||publication.adaptation.description());current.adaptive_samples=publication.adaptive_samples;current.outbound_sample_at=publication.outbound_mbps.map(|(_,at)|at);current.outbound_mbps=publication.outbound_mbps.filter(|(_,at)|Instant::now().saturating_duration_since(*at)<=Duration::from_secs(5)).map(|(rate,_)|rate);diagnostics.insert(*camera,current);}
+                    if let Ok(mut diagnostics)=state.diagnostics.lock(){let mut current=publication.capture.diagnostics();current.video_codec=publication.pipeline.name();current.adaptive_output=(publication.options.adaptive_video||publication.adaptation.voice_first()).then(||publication.adaptation.description());current.adaptive_samples=publication.adaptive_samples;current.outbound_sample_at=publication.outbound_mbps.map(|(_,at)|at);current.outbound_mbps=publication.outbound_mbps.filter(|(_,at)|Instant::now().saturating_duration_since(*at)<=Duration::from_secs(5)).map(|(rate,_)|rate);current.sent=publication.sent_video.filter(|_|current.outbound_mbps.is_some());current.sent_options=Some(publication.options);diagnostics.insert(*camera,current);}
                     if let Some(error)=publication.capture.take_error(){if let Ok(mut slot)=state.errors.lock(){*slot=Some(error);}failed.push(*camera);state.ctx.request_repaint();continue;}
                     if publication.capture.is_active(){set_source_phase(&state.source_states[usize::from(*camera)],publication.generation,3);}
                     let mut latest=None;for _ in 0..2{match publication.receiver.try_recv(){Ok(frame)=>latest=Some(frame),Err(_)=>break}}
@@ -1820,6 +1825,7 @@ fn begin_video_rebind(
     current.previous_sample = None;
     current.previous_sample_at = None;
     current.outbound_mbps = None;
+    current.sent_video = None;
     current.rate_bitrate = None;
     current.next_frame = None;
     current
@@ -1872,6 +1878,7 @@ fn begin_video_rebind(
                                 max_bitrate: u64::from(options.target_bitrate()),
                                 max_framerate: f64::from(options.fps),
                             }),
+                            degradation_preference: degradation(options),
                             simulcast: false,
                             ..Default::default()
                         },
@@ -2693,6 +2700,7 @@ async fn recover_software_publication_inner(
     current.previous_sample = None;
     current.previous_sample_at = None;
     current.outbound_mbps = None;
+    current.sent_video = None;
     current.rate_bitrate = None;
     current.next_frame = None;
     current
@@ -2728,6 +2736,7 @@ async fn recover_software_publication_inner(
                 max_bitrate: u64::from(current.options.target_bitrate()),
                 max_framerate: f64::from(current.options.fps),
             }),
+            degradation_preference: degradation(current.options),
             simulcast: false,
             ..Default::default()
         },
@@ -2926,6 +2935,7 @@ async fn start_publication(
                     max_bitrate: bitrate as u64,
                     max_framerate: options.fps as f64,
                 }),
+                degradation_preference: degradation(options),
                 simulcast: false,
                 ..Default::default()
             },
@@ -2994,6 +3004,7 @@ async fn start_publication(
         previous_sample: None,
         previous_sample_at: None,
         outbound_mbps: None,
+        sent_video: None,
         next_frame: None,
         rate_bitrate: None,
         adaptive_samples: 0,
@@ -3306,6 +3317,8 @@ struct VideoSample {
     encoded: u32,
     bytes_sent: u64,
     pressure: VideoPressure,
+    width: u32,
+    height: u32,
 }
 
 fn video_sample(stats: &[livekit::webrtc::stats::RtcStats]) -> Option<VideoSample> {
@@ -3344,6 +3357,8 @@ fn video_sample(stats: &[livekit::webrtc::stats::RtcStats]) -> Option<VideoSampl
             encoded: data.frames_encoded,
             bytes_sent: outbound.sent.bytes_sent,
             pressure,
+            width: data.frame_width,
+            height: data.frame_height,
         })
     });
     let sample = samples.next()?;
@@ -3370,10 +3385,38 @@ fn video_upload_mbps(previous: &VideoSample, current: &VideoSample, elapsed: Dur
     Some((current.bytes_sent - previous.bytes_sent) as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0)
 }
 
+/// Encoded size and frame rate over the same interval as the upload rate.
+fn sent_video(
+    previous: &VideoSample,
+    current: &VideoSample,
+    elapsed: Duration,
+) -> Option<crate::adaptive_video::SentVideo> {
+    video_upload_mbps(previous, current, elapsed)?;
+    crate::adaptive_video::SentVideo::new(
+        current.width,
+        current.height,
+        current.encoded - previous.encoded,
+        elapsed,
+        current.pressure,
+    )
+}
+
+/// Auto keeps the SDK's per-source default (smooth camera, sharp screen).
+fn degradation(options: CaptureOptions) -> Option<DegradationPreference> {
+    match options.priority {
+        crate::capture::VideoPriority::Auto => None,
+        crate::capture::VideoPriority::Detail => Some(DegradationPreference::MaintainResolution),
+        crate::capture::VideoPriority::Motion => Some(DegradationPreference::MaintainFramerate),
+    }
+}
+
 async fn update_video_adaptation(publication: &mut Publication, state: &WorkerState, camera: bool) {
     if !current_source(state, camera, publication.generation) {
         return;
     }
+    publication
+        .adaptation
+        .set_voice_first(crate::voice_priority::pressured());
     if publication
         .stats_task
         .as_ref()
@@ -3402,6 +3445,17 @@ async fn update_video_adaptation(publication: &mut Publication, state: &WorkerSt
             (Some(previous), Some(at), Some(current), Some(collected_at)) => {
                 video_upload_mbps(previous, current, collected_at.saturating_duration_since(at))
                     .map(|rate| (rate, collected_at))
+            }
+            _ => None,
+        };
+        publication.sent_video = match (
+            &publication.previous_sample,
+            publication.previous_sample_at,
+            &sample,
+            sampled_at,
+        ) {
+            (Some(previous), Some(at), Some(current), Some(collected_at)) => {
+                sent_video(previous, current, collected_at.saturating_duration_since(at))
             }
             _ => None,
         };

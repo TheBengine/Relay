@@ -324,7 +324,22 @@ fn serve(state: AppState, body: Bytes, purpose: Purpose) -> ApiResult<Json<Page>
     let pairs = select(&db, purpose, input.after.as_ref(), &anchors, now())?;
     let mut records = Vec::with_capacity(pairs.len());
     for pair in &pairs {
-        let hash = hash_bytes(&pair.hash).ok_or_else(|| bad("Invalid page position"))?;
+        // A session row stores a keyed verifier; the directory needs the token's
+        // own digest, which only this host can unseal.
+        let hash = match purpose {
+            Purpose::Invitation => hash_bytes(&pair.hash),
+            Purpose::Session => db
+                .query_row(
+                    "SELECT locator FROM sessions WHERE token_hash=?1",
+                    [&pair.hash],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+                .and_then(|sealed| state.0.seal.locator(&sealed))
+                .and_then(|digest| hash_bytes(&digest)),
+        }
+        .ok_or_else(|| bad("Invalid page position"))?;
         let issue = Issue {
             invite_id: pair.hash.clone(),
             anchor: pair.anchor.clone(),
@@ -1240,7 +1255,12 @@ mod tests {
             .unwrap();
         }
         let pin = state.0.handover.route_pin();
-        let mut hashes: Vec<_> = sessions[..5].iter().map(|s| token_hash(&s.token)).collect();
+        // The cursor names the stored, keyed verifier; records open with the token's own digest.
+        let digests: std::collections::HashMap<String, String> = sessions[..5]
+            .iter()
+            .map(|s| (crate::session_hash(&s.token), token_hash(&s.token)))
+            .collect();
+        let mut hashes: Vec<_> = digests.keys().cloned().collect();
         hashes.sort();
         let ask = |after: Option<Value>| wanted(&state, after);
         let page = |body: Vec<u8>| {
@@ -1299,10 +1319,10 @@ mod tests {
             ));
             let owners: Vec<_> = hashes
                 .iter()
-                .filter(|h| open_session(&record, &pin, &hash_bytes(h).unwrap()).is_some())
+                .filter(|h| open_session(&record, &pin, &hash_bytes(&digests[*h]).unwrap()).is_some())
                 .collect();
             assert_eq!(owners.len(), 1);
-            let bytes = hash_bytes(owners[0]).unwrap();
+            let bytes = hash_bytes(&digests[owners[0]]).unwrap();
             assert!(
                 open(&record, &pin, &bytes).is_none(),
                 "an invitation key does not open it"

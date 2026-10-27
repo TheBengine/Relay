@@ -187,8 +187,8 @@ impl RelayApp {
                             "Before you join voice"
                         } else { "The owner turned off end-to-end encryption" }).strong()).wrap(true));
                         ui.add(egui::Label::new(RichText::new(if for_call {
-                            "Calls require accepting this server's choice. If you accept, the host can read your messages, files and calls. iroh still encrypts the connection."
-                        } else { "Your messages stay encrypted until you accept. If you accept, messages, files and calls in this community can be read by whoever runs the server." }).color(c_muted())).wrap(true));
+                            format!("Calls require accepting this server's choice. If you accept, the host can read your messages, files and calls. {}", connection_note(&self.login.url))
+                        } else { "Your messages stay encrypted until you accept. If you accept, messages, files and calls in this community can be read by whoever runs the server.".to_owned() }).color(c_muted())).wrap(true));
                         if for_call {
                             ui.add(egui::Label::new(RichText::new("You can keep using encrypted text. Accepting does not join a call or open your microphone.").color(c_muted())).wrap(true));
                         }
@@ -261,7 +261,7 @@ impl RelayApp {
                         .strong()
                         .color(c_bad()),
                 );
-                controls::description(ui, "The server manages protection for messages, files and calls in this mode and can read them. Calls do not need device approval. iroh still encrypts the connection. Earlier encrypted history stays protected.");
+                controls::description(ui, &format!("The server manages protection for messages, files and calls in this mode and can read them. Calls do not need device approval. {} Earlier encrypted history stays protected.", connection_note(&self.login.url)));
                 match state {
                     Standing::Accepted => {
                         controls::description(
@@ -326,5 +326,31 @@ impl RelayApp {
         if switch_on {
             self.change_protection(ProtectionLevel::Protected, protection.revision);
         }
+    }
+}
+
+/// What protects the link to the host, by route. Only the account-free iroh
+/// route, Tailscale and HTTPS encrypt it; a plain address does not.
+pub(super) fn connection_note(address: &str) -> &'static str {
+    use crate::connection_path::{transport_for, Transport};
+    match transport_for(address) {
+        Transport::Iroh => "iroh still encrypts the connection to the host.",
+        Transport::Tailscale => "Tailscale still encrypts the connection to the host.",
+        Transport::Direct if address.starts_with("https://") || address.starts_with("wss://") => {
+            "HTTPS still encrypts the connection to the host."
+        }
+        Transport::Direct => "This plain address does not encrypt the connection to the host either.",
+    }
+}
+
+#[cfg(test)]
+mod connection_note_tests {
+    use super::connection_note;
+
+    #[test]
+    fn only_routes_that_encrypt_say_so() {
+        assert!(connection_note("http://127.0.0.1:4595").contains("does not encrypt"));
+        assert!(connection_note("https://relay.example.com").starts_with("HTTPS"));
+        assert!(connection_note("http://7c2308a6837001a0b9a58960d92cf679692751af52710add936cce0f1c7e8b58.iroh:4580").starts_with("iroh"));
     }
 }

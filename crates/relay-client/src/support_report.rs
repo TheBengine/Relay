@@ -21,7 +21,17 @@ const INTRO: [&str; 3] = [
     "Read it first. You decide whether to share it.",
     RECORDED_NOTE,
 ];
-const SECTIONS: [&str; 5] = ["App", "Relay account", "Community", "Friends", "Video"];
+const SECTIONS: [&str; 6] = [
+    "App",
+    "Relay account",
+    "Community",
+    "Friends",
+    "Video",
+    "Live checks",
+];
+const LIVE_NOTE: &str =
+    "HTTP checks show that a service answered. They do not test calls, voice or video.";
+const MAX_MS: u32 = 9999;
 const OUTRO: [&str; 2] = [
     "Left out on purpose:",
     "messages, files, names, ids, addresses, passwords, keys and logs.",
@@ -319,6 +329,88 @@ fn arch_label(arch: &str) -> &'static str {
     }
 }
 
+/// Live HTTP checks for one service within the measurement window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Checks {
+    pub answered: u16,
+    pub failed: u16,
+    pub median_ms: Option<u32>,
+}
+
+impl Checks {
+    fn bounded(self) -> Self {
+        Self {
+            answered: self.answered.min(MAX_COUNT),
+            failed: self.failed.min(MAX_COUNT),
+            median_ms: self.median_ms.map(|ms| ms.min(MAX_MS)),
+        }
+    }
+
+    fn line(self) -> String {
+        let mut text = format!("{} answered, {} failed", self.answered, self.failed);
+        if let Some(ms) = self.median_ms {
+            text.push_str(&format!(", median {ms} ms"));
+        }
+        text
+    }
+}
+
+fn small_number(text: &str, max: u32) -> Option<u32> {
+    if text.is_empty() || text.len() > 4 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok().filter(|n| *n <= max)
+}
+
+fn parse_checks(value: &str) -> Option<Checks> {
+    let mut parts = value.split(", ");
+    let answered = small_number(parts.next()?.strip_suffix(" answered")?, MAX_COUNT.into())?;
+    let failed = small_number(parts.next()?.strip_suffix(" failed")?, MAX_COUNT.into())?;
+    let median_ms = match parts.next() {
+        Some(part) => Some(small_number(part.strip_prefix("median ")?.strip_suffix(" ms")?, MAX_MS)?),
+        None => None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let checks = Checks {
+        answered: answered as u16,
+        failed: failed as u16,
+        median_ms,
+    };
+    (checks.line() == value).then_some(checks)
+}
+
+/// What the live checks measured, and over which period. Numbers only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Live {
+    /// Minutes from the oldest kept sample to the report. None: nothing measured.
+    pub window_minutes: Option<u16>,
+    pub community: Option<Checks>,
+    pub account: Option<Checks>,
+    pub friends: Option<Checks>,
+    /// Samples with video frames arriving, of all video samples.
+    pub video_frames: Option<(u16, u16)>,
+}
+
+fn checks_value(checks: Option<Checks>) -> String {
+    checks.map_or_else(|| "none".into(), |c| c.bounded().line())
+}
+
+fn frames_value(frames: Option<(u16, u16)>) -> String {
+    match frames {
+        Some((seen, total)) => {
+            let total = total.min(MAX_COUNT);
+            format!("seen in {} of {total} samples", seen.min(total))
+        }
+        None => "none".into(),
+    }
+}
+
+fn window_value(minutes: Option<u16>) -> String {
+    minutes.map_or_else(|| "none".into(), |m| format!("last {} minutes", m.clamp(1, 15)))
+}
+
 /// Everything the report can say. Nothing here is free text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Facts {
@@ -333,9 +425,15 @@ pub(super) struct Facts {
     pub saved: Counts,
     pub friends: FriendsState,
     pub video: VideoState,
+    pub live: Live,
 }
 
 impl Facts {
+    pub(super) fn with_live(mut self, live: Live) -> Self {
+        self.live = live;
+        self
+    }
+
     /// Identifiers that do not match their strict pattern become "unknown"
     /// instead of being copied.
     pub(super) fn new(
@@ -363,6 +461,7 @@ impl Facts {
             saved: rest.saved,
             friends: rest.friends,
             video: rest.video,
+            live: Live::default(),
         }
     }
 }
@@ -477,6 +576,14 @@ pub(super) fn render(facts: &Facts) -> String {
     line("Video service health: unknown");
     line(&format!("Next step: {}", facts.video.hint()));
     line("");
+    line(SECTIONS[5]);
+    line(LIVE_NOTE);
+    line(&format!("Measurement window: {}", window_value(facts.live.window_minutes)));
+    line(&format!("Community checks: {}", checks_value(facts.live.community)));
+    line(&format!("Relay account checks: {}", checks_value(facts.live.account)));
+    line(&format!("Friends checks: {}", checks_value(facts.live.friends)));
+    line(&format!("Video frames: {}", frames_value(facts.live.video_frames)));
+    line("");
     for text in OUTRO {
         line(text);
     }
@@ -546,6 +653,30 @@ fn value_ok(key: &str, value: &str) -> bool {
         .iter()
         .any(|s| s.label() == value),
         "Video service health" => value == "unknown",
+        "Measurement window" => {
+            value == "none"
+                || value
+                    .strip_prefix("last ")
+                    .and_then(|v| v.strip_suffix(" minutes"))
+                    .and_then(|v| small_number(v, 15))
+                    .is_some_and(|m| m >= 1 && window_value(Some(m as u16)) == value)
+        }
+        "Community checks" | "Relay account checks" | "Friends checks" => {
+            value == "none" || parse_checks(value).is_some()
+        }
+        "Video frames" => {
+            value == "none"
+                || value
+                    .strip_prefix("seen in ")
+                    .and_then(|v| v.strip_suffix(" samples"))
+                    .and_then(|v| v.split_once(" of "))
+                    .and_then(|(seen, total)| {
+                        Some((small_number(seen, MAX_COUNT.into())?, small_number(total, MAX_COUNT.into())?))
+                    })
+                    .is_some_and(|(seen, total)| {
+                        seen <= total && frames_value(Some((seen as u16, total as u16))) == value
+                    })
+        }
         "Next step" => HINTS.contains(&value),
         _ => false,
     }
@@ -570,6 +701,7 @@ pub(super) fn is_clean(text: &str) -> bool {
             || line == TITLE
             || INTRO.contains(&line)
             || SECTIONS.contains(&line)
+            || line == LIVE_NOTE
             || OUTRO.contains(&line)
     };
     text.lines().all(|line| {
@@ -660,7 +792,7 @@ pub(super) fn current_community(
 // ---------------------------------------------------------------------------
 // Connection status on the Help page
 
-const STATUS_NOTE: &str = "Last recorded by this app on this PC. This is not a network test.";
+const STATUS_NOTE: &str = "Last recorded by this app on this PC. These states are not a network test; the live lines under them come from checks that run only while this page is open.";
 const VIDEO_NOTE: &str = "Video service health is unknown. A video session state does not show it.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -669,6 +801,8 @@ pub(super) struct StatusRow {
     pub state: &'static str,
     pub next: Option<&'static str>,
     pub note: Option<String>,
+    /// Live evidence lines from `service_health`, kept apart from the state.
+    pub live: Vec<String>,
     /// Offer the existing Account page (a settings tab; nothing is started).
     pub open_account: bool,
 }
@@ -689,6 +823,7 @@ pub(super) fn status_rows(rest: &Rest) -> [StatusRow; 4] {
             state: rest.account.label(),
             next: next_step(rest.account.hint(rest.account_problem)),
             note: None,
+            live: Vec::new(),
             open_account: account_needs_you,
         },
         StatusRow {
@@ -696,6 +831,7 @@ pub(super) fn status_rows(rest: &Rest) -> [StatusRow; 4] {
             state: rest.current.label(),
             next: next_step(rest.current.hint()),
             note: Some(format!("Saved communities: {}", rest.saved.line())),
+            live: Vec::new(),
             open_account: false,
         },
         StatusRow {
@@ -703,6 +839,7 @@ pub(super) fn status_rows(rest: &Rest) -> [StatusRow; 4] {
             state: rest.friends.label(),
             next: next_step(rest.friends.hint()),
             note: None,
+            live: Vec::new(),
             open_account: rest.friends == FriendsState::NeedsAccount,
         },
         StatusRow {
@@ -710,9 +847,23 @@ pub(super) fn status_rows(rest: &Rest) -> [StatusRow; 4] {
             state: rest.video.label(),
             next: next_step(rest.video.hint()),
             note: Some(VIDEO_NOTE.into()),
+            live: Vec::new(),
             open_account: false,
         },
     ]
+}
+
+/// Camera and screen sources other members in this call say they share.
+pub(super) fn shared_sources(
+    members: &[relay_protocol::VoiceMember],
+    channel: Option<&str>,
+    own: Option<&str>,
+) -> usize {
+    members
+        .iter()
+        .filter(|m| Some(m.channel_id.as_str()) == channel && Some(m.user.id.as_str()) != own)
+        .map(|m| usize::from(m.sharing) + usize::from(m.camera))
+        .sum()
 }
 
 /// Draws the rows. Returns true when an Open Account button was clicked.
@@ -739,6 +890,9 @@ pub(super) fn status_content(ui: &mut egui::Ui, rows: &[StatusRow; 4]) -> bool {
             }
             if let Some(note) = &row.note {
                 ui.add(small(note.clone()));
+            }
+            for line in &row.live {
+                ui.add(small(line.clone()));
             }
             if row.open_account && ui.add(secondary("Open Account")).clicked() {
                 open = true;
@@ -822,16 +976,209 @@ impl RelayApp {
             &chrono::Utc::now().format("%Y-%m-%d").to_string(),
             self.support_rest(),
         )
+        .with_live(self.live_facts(Instant::now()))
+    }
+
+    /// The measurement window for the report: counts from the live log only.
+    fn live_facts(&self, now: Instant) -> Live {
+        use crate::service_health::Service;
+        let log = &self.service_health;
+        let checks = |service| {
+            let summary = log.summary(service, now);
+            (summary.checks() > 0).then_some(Checks {
+                answered: summary.answered,
+                failed: summary.failed,
+                median_ms: summary.median_ms,
+            })
+        };
+        let video = log.summary(Service::Video, now);
+        Live {
+            window_minutes: log.window_minutes(now),
+            community: checks(Service::Community),
+            account: checks(Service::Account),
+            friends: checks(Service::Friends),
+            video_frames: (video.media_samples > 0)
+                .then_some((video.media_seen, video.media_samples)),
+        }
+    }
+
+    /// Video evidence from the remote tiles of the current call: only frames
+    /// that arrived recently count.
+    fn video_media_now(&self, now: Instant) -> crate::service_health::Media {
+        let own = self.session.as_ref().map(|s| s.user.id.as_str());
+        let remote: Vec<_> = self
+            .video
+            .values()
+            .filter(|tile| Some(tile.metadata.user.id.as_str()) != own)
+            .collect();
+        // What others in this call say they share, not what already arrived:
+        // a share whose frames never come must read as "no frames".
+        let expected = self
+            .bootstrap
+            .as_ref()
+            .map(|b| shared_sources(&b.voice_members, self.voice_channel.as_deref(), own))
+            .unwrap_or(0);
+        crate::service_health::media_evidence(
+            self.voice_channel.is_some(),
+            expected.max(remote.len()),
+            remote
+                .iter()
+                .map(|tile| now.saturating_duration_since(tile.updated)),
+        )
+    }
+
+    /// Start the HTTP checks that are due. Only called while the status is shown.
+    fn run_live_checks(&mut self, now: Instant) {
+        use crate::service_health::{account_check, service_check, Service};
+        self.service_health.collect();
+        let people = self.people_url();
+        if self.session.is_some() && people.as_deref() != Some(self.login.url.as_str()) {
+            let address = self.login.url.clone();
+            self.service_health
+                .start(Service::Community, now, move || service_check(&address));
+        }
+        if let Some(address) = people {
+            self.service_health
+                .start(Service::Friends, now, move || service_check(&address));
+        }
+        if let Some(issuer) = self
+            .central_account
+            .provider
+            .as_ref()
+            .map(|provider| provider.issuer_url().clone())
+        {
+            self.service_health
+                .start(Service::Account, now, move || account_check(&issuer));
+        }
+        let media = self.video_media_now(now);
+        self.service_health.sample_media(media, now);
+    }
+
+    fn live_lines(&self, now: Instant) -> [Vec<String>; 4] {
+        use crate::service_health::{http_line, media_line, Service};
+        let log = &self.service_health;
+        let http = |service| vec![http_line(&log.summary(service, now), log.running(service))];
+        let people = self.people_url();
+        let community_open =
+            self.session.is_some() && people.as_deref() != Some(self.login.url.as_str());
+        [
+            if self.central_account.provider.is_some() {
+                http(Service::Account)
+            } else {
+                Vec::new()
+            },
+            if community_open { http(Service::Community) } else { Vec::new() },
+            if people.is_some() { http(Service::Friends) } else { Vec::new() },
+            {
+                let mut lines = vec![media_line(
+                    self.video_media_now(now),
+                    &log.summary(Service::Video, now),
+                )];
+                lines.extend(self.sent_video_lines());
+                lines
+            },
+        ]
+    }
+
+    /// For each source this PC is sharing: what was chosen, what the capture
+    /// produced and what was measured leaving this PC.
+    #[cfg(feature = "native-rtc")]
+    fn sent_video_lines(&self) -> Vec<String> {
+        {
+            let Some(rtc) = self.rtc.as_ref() else {
+                return Vec::new();
+            };
+            [("Camera", true), ("Screen", false)]
+                .into_iter()
+                .filter(|(_, camera)| rtc.is_sharing(*camera))
+                .map(|(label, camera)| {
+                    let options = if camera {
+                        &self.prefs.camera_options
+                    } else {
+                        &self.prefs.screen_options
+                    };
+                    let (width, height) = options.quality.dimensions();
+                    let diagnostics = rtc.source_diagnostics(camera);
+                    let captured = diagnostics
+                        .as_ref()
+                        .filter(|d| d.actual_width > 0)
+                        .map(|d| (d.actual_width, d.actual_height, d.delivered_fps));
+                    format!(
+                        "{label} you share: {}",
+                        crate::video_quality::sent_line(
+                            (width, height, options.fps),
+                            captured,
+                            diagnostics.and_then(|d| d.outbound_mbps),
+                        )
+                    )
+                })
+                .collect()
+        }
+    }
+
+    #[cfg(not(feature = "native-rtc"))]
+    fn sent_video_lines(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The delivered-quality caption for a received stream; none for this
+    /// PC's own previews, which do not travel over the network.
+    pub(super) fn delivered_caption(&self, key: &str, tile: &VideoTile) -> Option<String> {
+        let own = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.user.id == tile.metadata.user.id);
+        (!own && tile.metadata.url.is_empty()).then(|| {
+            let member = self.bootstrap.as_ref().and_then(|b| {
+                b.voice_members
+                    .iter()
+                    .find(|m| m.user.id == tile.metadata.user.id)
+            });
+            let chosen = member.and_then(|m| {
+                if tile.metadata.kind == "screen" {
+                    m.chosen_screen.as_ref()
+                } else {
+                    m.chosen_camera.as_ref()
+                }
+            });
+            crate::video_quality::received_caption(
+                chosen,
+                self.video_delivery.delivery(key, Instant::now()),
+            )
+        })
     }
 
     /// The Help page's compact status list. It reads the same recorded state as
     /// the report (`support_rest`), so there is one collector, no probe and no
     /// polling: it is drawn from what the app already holds.
     pub(super) fn connection_status_section(&mut self, ui: &mut egui::Ui) {
-        let rows = status_rows(&self.support_rest());
+        let now = Instant::now();
+        self.run_live_checks(now);
+        let mut rows = status_rows(&self.support_rest());
+        for (row, live) in rows.iter_mut().zip(self.live_lines(now)) {
+            row.live = live;
+        }
         if status_content(ui, &rows) {
             self.settings_tab = SettingsTab::Account;
         }
+        for note in [
+            crate::service_health::HTTP_NOTE,
+            crate::service_health::MEDIA_NOTE,
+        ] {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(note)
+                        .size(font_size(TEXT_CAPTION))
+                        .color(c_muted()),
+                )
+                .wrap(true),
+            );
+        }
+        if ui.add(secondary("Check now")).clicked() {
+            self.service_health.check_now();
+        }
+        // Keep the page fresh while checks run; nothing repaints when it is closed.
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
     }
 
     /// The Help page section: preview first, then an explicit save.
@@ -1141,6 +1488,96 @@ mod tests {
             }
         }
         assert!(largest < MAX_BYTES, "{largest}");
+    }
+
+    #[test]
+    fn a_share_in_this_call_is_expected_video_even_before_frames_arrive() {
+        let member = |id: &str, room: &str, sharing: bool, camera: bool| relay_protocol::VoiceMember {
+            user: relay_protocol::User { id: id.into(), ..Default::default() },
+            channel_id: room.into(),
+            sharing,
+            camera,
+            ..Default::default()
+        };
+        let members = [
+            member("me", "a", true, true),
+            member("bo", "a", true, false),
+            member("kai", "a", true, true),
+            member("far", "b", true, true),
+        ];
+        assert_eq!(shared_sources(&members, Some("a"), Some("me")), 3);
+        assert_eq!(shared_sources(&members, None, Some("me")), 0);
+        let expected = shared_sources(&members, Some("a"), Some("me"));
+        assert_eq!(
+            crate::service_health::media_evidence(true, expected, []),
+            crate::service_health::Media::NoFrames
+        );
+    }
+
+    #[test]
+    fn the_measurement_window_is_stated_and_says_none_without_checks() {
+        let text = render(&facts());
+        assert!(is_clean(&text), "{text}");
+        assert!(text.contains("Live checks
+"));
+        assert!(text.contains(&format!("{LIVE_NOTE}
+")));
+        assert!(text.contains("Measurement window: none
+"));
+        for key in ["Community checks", "Relay account checks", "Friends checks", "Video frames"] {
+            assert!(text.contains(&format!("{key}: none
+")), "{key}");
+        }
+        let live = Live {
+            window_minutes: Some(12),
+            community: Some(Checks { answered: 23, failed: 1, median_ms: Some(41) }),
+            account: Some(Checks { answered: 2, failed: 0, median_ms: None }),
+            friends: Some(Checks { answered: 5000, failed: 5000, median_ms: Some(70_000) }),
+            video_frames: Some((9, 4)),
+        };
+        let text = render(&facts().with_live(live));
+        assert!(is_clean(&text), "{text}");
+        assert!(text.contains("Measurement window: last 12 minutes
+"));
+        assert!(text.contains("Community checks: 23 answered, 1 failed, median 41 ms
+"));
+        assert!(text.contains("Relay account checks: 2 answered, 0 failed
+"));
+        assert!(text.contains("Friends checks: 999 answered, 999 failed, median 9999 ms
+"));
+        // Never more frames seen than samples taken.
+        assert!(text.contains("Video frames: seen in 4 of 4 samples
+"));
+        assert!(text.len() < MAX_BYTES);
+        // A green HTTP check never turns into a video health claim.
+        assert!(text.contains("Video service health: unknown
+"));
+    }
+
+    #[test]
+    fn live_values_outside_their_shape_are_refused() {
+        let good = render(&facts().with_live(Live {
+            window_minutes: Some(3),
+            community: Some(Checks { answered: 1, failed: 0, median_ms: Some(5) }),
+            ..Live::default()
+        }));
+        assert!(is_clean(&good));
+        for (from, to) in [
+            ("Measurement window: last 3 minutes", "Measurement window: last 16 minutes"),
+            ("Measurement window: last 3 minutes", "Measurement window: last 03 minutes"),
+            ("Measurement window: last 3 minutes", "Measurement window: all day"),
+            ("Community checks: 1 answered, 0 failed, median 5 ms", "Community checks: 1 answered, 0 failed, median 5 ms, host x"),
+            ("Community checks: 1 answered, 0 failed, median 5 ms", "Community checks: 1000 answered, 0 failed"),
+            ("Community checks: 1 answered, 0 failed, median 5 ms", "Community checks: healthy"),
+            ("Video frames: none", "Video frames: seen in 5 of 4 samples"),
+            ("Video frames: none", "Video frames: working"),
+            (LIVE_NOTE, "HTTP checks prove video works."),
+        ] {
+            assert!(good.contains(from), "{from}");
+            assert!(!is_clean(&good.replacen(from, to, 1)), "{to}");
+        }
+        assert_eq!(parse_checks("0 answered, 2 failed"), Some(Checks { answered: 0, failed: 2, median_ms: None }));
+        assert_eq!(parse_checks("0 answered,2 failed"), None);
     }
 
     #[test]

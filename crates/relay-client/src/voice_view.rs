@@ -5,6 +5,38 @@ use super::*;
 use crate::voice_ui_state;
 
 impl RelayApp {
+    /// Route and microphone causes in a call. Deafen and zero volumes already
+    /// have their own help with a one-click fix.
+    fn call_voice_problem(&mut self) -> Option<crate::voice_problem::VoiceProblem> {
+        let media = self.media.as_ref()?;
+        let stats = media.network_stats();
+        let route_down = matches!(
+            crate::voice_connection::Status::from_stats(&stats).route,
+            crate::voice_connection::Route::Reconnecting
+        );
+        let sending_allowed = !self.muted
+            && !self.deafened
+            && (self.audio_applied.transmission != TransmissionMode::PushToTalk || media.is_transmitting());
+        let silent_for = self.mic_silence.observe(media.capture_level(), sending_allowed, Instant::now());
+        // Following Windows: a missing chosen output plays on the default meanwhile
+        // (with a notice naming it); only without following is it a problem.
+        let output_missing = self.device_watch.is_none()
+            && self.inventory_loaded
+            && self
+                .audio_applied
+                .output_device
+                .as_ref()
+                .is_some_and(|name| !self.inventory.audio.outputs.contains(name));
+        crate::voice_problem::diagnose(&crate::voice_problem::Inputs {
+            route_down,
+            microphone_silent_for: silent_for,
+            input_volume: self.audio_applied.microphone_gain.max(0.01),
+            output_volume: 1.0,
+            output_device_missing: output_missing,
+            ..Default::default()
+        })
+    }
+
     /// Who you hear in the call, one dot per person, and a hint when
     /// someone stays silent.
     fn sound_check(&mut self, ui: &mut egui::Ui, members: &[VoiceMember]) {
@@ -17,6 +49,9 @@ impl RelayApp {
             if voice_room_ui::local_volume_help(ui, issue) {
                 self.apply_quick_audio_change(|audio| issue.restore(audio));
             }
+            ui.add_space(8.0);
+        } else if let Some(problem) = self.call_voice_problem() {
+            voice_room_ui::voice_problem_help(ui, problem);
             ui.add_space(8.0);
         }
         let own = self.session.as_ref().map(|s| s.user.id.clone());
@@ -517,6 +552,7 @@ impl RelayApp {
                                 if let Some(media) = &self.media {
                                     media.select_whisper(&member.user.id);
                                 }
+                                self.squads.active = None;
                                 ui.close_menu();
                             }
                             if self
@@ -545,7 +581,11 @@ impl RelayApp {
                                 if let Some(media) = &self.media {
                                     media.select_whisper_group(peers);
                                 }
+                                self.squads.active = None;
                                 ui.close_menu();
+                            }
+                            if self.session.as_ref().is_some_and(|s| s.user.id != member.user.id) {
+                                self.squad_menu(ui, &member.user.id);
                             }
                             ui.label("User Volume").on_hover_text(
                                 "Changes this person's voice and shared application audio only for you.",
@@ -568,6 +608,10 @@ impl RelayApp {
                 }
             }
             if joined {
+                // Same side margin as the stream tiles below.
+                egui::Frame::none()
+                    .inner_margin(Margin::symmetric(24.0, 8.0))
+                    .show(ui, |ui| {
                 if let Some(media) = &self.media {
                     if media.active_settings().whisper_enabled {
                         let targets = media.whisper_targets();
@@ -598,6 +642,14 @@ impl RelayApp {
                         }
                     }
                 }
+                let whisper_on = self
+                    .media
+                    .as_ref()
+                    .is_some_and(|media| media.active_settings().whisper_enabled);
+                if whisper_on {
+                    self.squad_bar(ui);
+                }
+                    });
             }
             ui.add_space(28.0);
             if self.focused_stream.is_some()
@@ -654,6 +706,14 @@ impl RelayApp {
                                 .strong(),
                             );
                         });
+                        if let Some(line) = self.delivered_caption(key, tile) {
+                            ui.label(
+                                RichText::new(line)
+                                    .size(font_size(TEXT_CAPTION))
+                                    .color(c_muted()),
+                            )
+                            .on_hover_text(crate::video_quality::DELIVERED_HINT);
+                        }
                         ui.horizontal(|ui| {
                             if ui.small_button("View larger").clicked() {
                                 self.stream_preview = Some(key.clone());

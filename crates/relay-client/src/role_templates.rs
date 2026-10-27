@@ -30,7 +30,7 @@ pub(super) const PERMISSION_LABELS: [(u32, &str); 10] = [
     ),
 ];
 
-pub(super) const OVERRIDE_NOTE: &str = "A role grants community-wide permissions. What a person can actually do in a channel can differ: private channels, per-channel rules for roles or people, and administrator access are decided by the server. This editor does not load those channel rules, so this preview is not a complete answer for any member or channel.";
+pub(super) const OVERRIDE_NOTE: &str = "A role grants community-wide permissions. What a person can actually do in a channel can differ: private channels, per-channel rules for roles or people, and administrator access are decided by the server. This editor does not load those channel rules, so this preview is not a complete answer for any member or channel. To see one person's result in one channel, use Check access under Members or in the channel's permissions.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Template {
@@ -440,6 +440,7 @@ mod tests {
         assert!(note.contains("private channels"));
         assert!(note.contains("does not load those channel rules"));
         assert!(note.contains("not a complete answer"));
+        assert!(note.contains("Check access"));
         for claim in [
             "can access",
             "will be able",

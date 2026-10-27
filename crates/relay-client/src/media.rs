@@ -103,6 +103,13 @@ struct AudioControls {
     echo_reference: EchoReference,
     ptt_pressed: AtomicBool,
     ptt_key: AtomicI32,
+    /// Capture RMS before gain and processing, for "no sound from the microphone".
+    capture_rms: AtomicU32,
+    /// The app follows Windows device changes; an unplugged device then
+    /// reopens instead of ending the call.
+    follow_devices: AtomicBool,
+    /// A stream reported that its device disappeared.
+    device_lost: AtomicBool,
     transmitting: AtomicBool,
     peer_volumes: Mutex<HashMap<String, f32>>,
     priority_users: Mutex<BTreeSet<String>>,
@@ -179,6 +186,9 @@ impl AudioControls {
             echo_reference: EchoReference::default(),
             ptt_pressed: AtomicBool::new(false),
             ptt_key: AtomicI32::new(0),
+            capture_rms: AtomicU32::new(0),
+            follow_devices: AtomicBool::new(false),
+            device_lost: AtomicBool::new(false),
             transmitting: AtomicBool::new(false),
             peer_volumes: Mutex::new(HashMap::new()),
             priority_users: Mutex::default(),
@@ -209,6 +219,15 @@ impl AudioControls {
         }
     }
     fn apply(&self, settings: &AudioSettings) {
+        self.apply_with(settings, false);
+    }
+    /// A running local preview: only a transmission-mode change is a privacy
+    /// boundary there, so dragging gain or threshold never restarts RNNoise.
+    fn apply_preview(&self, settings: &AudioSettings) {
+        self.apply_with(settings, true);
+    }
+    fn apply_with(&self, settings: &AudioSettings, preview: bool) {
+        let mode_changed = self.transmission.load(Ordering::Relaxed) != settings.transmission as u32;
         // Changing playback/receive settings must not reset VAD, RNNoise, gain
         // tracking or Opus history halfway through the local person's sentence.
         let capture_changed = self.gain.load(Ordering::Relaxed)
@@ -293,6 +312,7 @@ impl AudioControls {
             self.echo_delay_ms
                 .store(settings.echo_delay_ms, Ordering::Relaxed);
         }
+        let capture_changed = if preview { mode_changed } else { capture_changed };
         // Publish after the changed capture policy, so an acquired generation
         // includes those stores before accepting queued microphone/tunnel audio.
         if capture_changed {
@@ -431,6 +451,8 @@ pub struct NetworkStats {
     pub udp_probe_timed_out: bool,
     /// Remaining bounded recovery time after five seconds without a valid probe.
     pub udp_recovery_remaining_ms: Option<u32>,
+    /// Incoming voice over the last 5–10 s, worst speaker; None until enough packets.
+    pub voice_quality: Option<crate::voice_quality::Quality>,
 }
 
 struct StatsClock(Instant);
@@ -480,6 +502,11 @@ struct Counters {
     tcp_rtt_us: AtomicU64,
     tcp_rtt_at: AtomicU64,
     tcp_active: AtomicBool,
+    /// Worst current speaker, valid only while `voice_quality_known`.
+    voice_quality_known: AtomicBool,
+    voice_loss_permille: AtomicU32,
+    voice_late_permille: AtomicU32,
+    voice_jitter_us: AtomicU32,
     // Publish reachability, timeout and its countdown in one atomic value.
     // Bits 0/1 are connected/timed-out; the upper bits hold remaining ms.
     udp_link: AtomicU64,
@@ -504,6 +531,8 @@ impl Counters {
         // Retain the final timeout diagnosis, but retire live reachability and
         // the countdown when this worker stops.
         self.udp_link.fetch_and(2, Ordering::AcqRel);
+        self.voice_quality_known.store(false, Ordering::Release);
+        crate::voice_priority::publish(false);
     }
     fn snapshot(&self) -> NetworkStats {
         let link = self.udp_link.load(Ordering::Acquire);
@@ -558,7 +587,28 @@ impl Counters {
                 0 => None,
                 remaining => Some(remaining),
             },
+            voice_quality: self.voice_quality(),
         }
+    }
+    fn publish_voice_quality(&self, quality: Option<crate::voice_quality::Quality>) {
+        let permille = |percent: f32| (percent * 10.0).round().clamp(0.0, 1000.0) as u32;
+        if let Some(q) = quality {
+            self.voice_loss_permille.store(permille(q.loss_percent), Ordering::Relaxed);
+            self.voice_late_permille.store(permille(q.late_percent), Ordering::Relaxed);
+            self.voice_jitter_us.store(
+                (q.jitter_ms * 1000.0).round().clamp(0.0, u32::MAX as f32) as u32,
+                Ordering::Relaxed,
+            );
+        }
+        self.voice_quality_known.store(quality.is_some(), Ordering::Release);
+    }
+    fn voice_quality(&self) -> Option<crate::voice_quality::Quality> {
+        self.voice_quality_known.load(Ordering::Acquire).then(|| crate::voice_quality::Quality {
+            loss_percent: self.voice_loss_permille.load(Ordering::Relaxed) as f32 / 10.0,
+            late_percent: self.voice_late_permille.load(Ordering::Relaxed) as f32 / 10.0,
+            jitter_ms: self.voice_jitter_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            expected: 0,
+        })
     }
 }
 
@@ -598,8 +648,17 @@ struct VoiceStart {
 struct MicrophoneStart {
     stop: Arc<AtomicBool>,
     settings: AudioSettings,
-    ptt_key: i32,
     errors: ErrorSlot,
+    /// Owned by the engine too, so edits reach the running preview live.
+    controls: Arc<AudioControls>,
+    taps: Arc<crate::self_listen::MeterTaps>,
+}
+
+/// The engine's view of a running "Listen to Myself" preview.
+struct PreviewLink {
+    settings: AudioSettings,
+    controls: Arc<AudioControls>,
+    taps: Arc<crate::self_listen::MeterTaps>,
 }
 
 pub struct DeviceChangeFailure {
@@ -608,6 +667,8 @@ pub struct DeviceChangeFailure {
     pub attempted: AudioSettings,
     pub restored: AudioSettings,
     pub error: String,
+    /// Started by following Windows, not by the person: saved choices stay.
+    pub follow: bool,
 }
 
 struct DeviceReopenRequest {
@@ -618,6 +679,7 @@ struct DeviceReopenRequest {
     controls: Arc<AudioControls>,
     errors: ErrorSlot,
     failures: Arc<Mutex<Option<DeviceChangeFailure>>>,
+    follow: bool,
 }
 
 enum DeviceReopen {
@@ -686,6 +748,7 @@ pub struct MediaEngine {
     counters: Arc<Counters>,
     pending_devices: Arc<Mutex<Option<DeviceReopenRequest>>>,
     device_failures: Arc<Mutex<Option<DeviceChangeFailure>>>,
+    preview: Option<PreviewLink>,
 }
 
 /// Output-only access to the existing owner; no microphone or voice lifecycle.
@@ -760,6 +823,7 @@ impl MediaEngine {
             counters: Arc::new(Counters::default()),
             pending_devices: Arc::new(Mutex::new(None)),
             device_failures: Arc::new(Mutex::new(None)),
+            preview: None,
         })
     }
     fn phase(&self) -> AudioPhase {
@@ -950,6 +1014,10 @@ impl MediaEngine {
     /// Coalesce rapid device choices; retain the voice worker, ticket, nonce
     /// sequence and receive state. No server rejoin or RTC restart is involved.
     pub fn reopen_voice_devices(&mut self) -> Result<(), String> {
+        self.reopen_voice_devices_for(false)
+    }
+
+    fn reopen_voice_devices_for(&mut self, follow: bool) -> Result<(), String> {
         if self.operation != Some(AudioOperation::Voice) {
             return Ok(());
         }
@@ -976,9 +1044,59 @@ impl MediaEngine {
             controls: self.shared.controls.clone(),
             errors: self.errors.clone(),
             failures: self.device_failures.clone(),
+            follow,
         });
         if state.phase == AudioPhase::ActiveVoice {
             state.phase = AudioPhase::ChangingDevices;
+        }
+        Ok(())
+    }
+
+    /// The input and output names the engine opens (None: Windows default).
+    pub(crate) fn device_selection(&self) -> (Option<String>, Option<String>) {
+        (self.settings.input_device.clone(), self.settings.output_device.clone())
+    }
+
+    /// Windows moved a default or a device came or went: reopen the same names.
+    /// Only the device streams are replaced; the call, mute, deafen and
+    /// per-person volumes are untouched.
+    pub(crate) fn follow_device_change(&mut self, effective: AudioSettings) -> Result<(), String> {
+        self.configure(effective);
+        self.shared.controls.device_revision.fetch_add(1, Ordering::AcqRel);
+        if self.operation == Some(AudioOperation::Voice) {
+            self.reopen_voice_devices_for(true)?;
+        }
+        Ok(())
+    }
+
+    /// Turn on reopening (instead of stopping) when a device disappears.
+    pub(crate) fn set_device_following(&mut self, on: bool) {
+        self.shared.controls.follow_devices.store(on, Ordering::Release);
+    }
+
+    /// A call or preview stream lost its device since the last check.
+    pub(crate) fn take_device_lost(&mut self) -> bool {
+        let call = self.shared.controls.device_lost.swap(false, Ordering::AcqRel);
+        let preview = self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.controls.device_lost.swap(false, Ordering::AcqRel));
+        call || preview
+    }
+
+    /// The preview's input and output names, while it runs.
+    pub(crate) fn preview_device_selection(&self) -> Option<(Option<String>, Option<String>)> {
+        self.preview
+            .as_ref()
+            .filter(|_| self.is_microphone_test_active())
+            .map(|preview| (preview.settings.input_device.clone(), preview.settings.output_device.clone()))
+    }
+
+    /// Reopen a running Listen to Myself preview on the current devices.
+    pub(crate) fn reopen_microphone_preview(&mut self, settings: &AudioSettings) -> Result<(), String> {
+        if self.preview.is_some() && self.is_microphone_test_active() {
+            self.stop_microphone_test();
+            self.preview_microphone(settings.clone())?;
         }
         Ok(())
     }
@@ -1011,10 +1129,17 @@ impl MediaEngine {
     /// A zero key preserves manually supplied state for tests and non-Windows callers.
     pub fn set_push_to_talk_key(&mut self, key: i32) {
         self.shared.controls.ptt_key.store(key, Ordering::Release);
+        if let Some(preview) = &self.preview {
+            preview.controls.ptt_key.store(key, Ordering::Release);
+            preview.controls.ptt_pressed.store(false, Ordering::Release);
+            preview.controls.privacy_generation.fetch_add(1, Ordering::AcqRel);
+            preview.controls.wake.notify();
+        }
     }
     pub fn is_transmitting(&self) -> bool {
         self.shared.controls.transmitting.load(Ordering::Relaxed)
     }
+    #[cfg(test)]
     pub fn start_microphone_test(&mut self) -> Result<(), String> {
         self.preview_microphone(self.settings.clone())
     }
@@ -1024,11 +1149,20 @@ impl MediaEngine {
             return Err("Leave voice before starting a microphone test.".into());
         }
         let (generation, stop) = self.begin(AudioPhase::StartingMicrophone);
+        let settings = crate::self_listen::preview_settings(&settings);
+        let ptt_key = self.shared.controls.ptt_key.load(Ordering::Acquire);
+        let controls = Arc::new(microphone_preview::controls(&settings, ptt_key));
+        controls.follow_devices.store(
+            self.shared.controls.follow_devices.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        let taps = Arc::new(crate::self_listen::MeterTaps::default());
         let request = MicrophoneStart {
             stop,
-            settings: settings.normalized(),
-            ptt_key: self.shared.controls.ptt_key.load(Ordering::Acquire),
+            settings: settings.clone(),
             errors: self.errors.clone(),
+            controls: controls.clone(),
+            taps: taps.clone(),
         };
         if let Err(error) = self.enqueue(AudioCommand::Microphone {
             generation,
@@ -1037,9 +1171,54 @@ impl MediaEngine {
             self.cancel();
             return Err(error);
         }
+        self.preview = Some(PreviewLink { settings, controls, taps });
         Ok(())
     }
+    /// Apply an edited draft to the running preview. Device edits reopen the
+    /// preview's own streams; everything else is heard on the next block.
+    pub fn update_microphone_preview(
+        &mut self,
+        settings: &AudioSettings,
+    ) -> Result<crate::self_listen::PreviewChange, String> {
+        use crate::self_listen::PreviewChange;
+        if !self.is_microphone_test_active() {
+            self.preview = None;
+        }
+        let Some(preview) = self.preview.as_mut() else {
+            return Ok(PreviewChange::None);
+        };
+        let settings = crate::self_listen::preview_settings(settings);
+        match crate::self_listen::preview_change(&preview.settings, &settings) {
+            PreviewChange::None => Ok(PreviewChange::None),
+            PreviewChange::Live => {
+                preview.controls.apply_preview(&settings);
+                preview.settings = settings;
+                Ok(PreviewChange::Live)
+            }
+            PreviewChange::Reopen => {
+                self.stop_microphone_test();
+                self.preview_microphone(settings).map(|()| PreviewChange::Reopen)
+            }
+        }
+    }
+    /// Level taps since the previous read, the device periods measured by the
+    /// preview's own streams, and whether its push-to-talk key is held.
+    pub(crate) fn microphone_preview_meter(
+        &self,
+    ) -> Option<(crate::self_listen::MeterSample, Option<f32>, Option<f32>, bool)> {
+        let preview = self.preview.as_ref().filter(|_| self.is_microphone_test_active())?;
+        let period = |timing: &Mutex<Option<DeviceTiming>>| {
+            timing.lock().ok().and_then(|timing| timing.as_ref().map(|timing| timing.period_ms))
+        };
+        Some((
+            preview.taps.take(),
+            period(&preview.controls.input_timing),
+            period(&preview.controls.output_timing),
+            preview.controls.ptt_pressed.load(Ordering::Acquire),
+        ))
+    }
     pub fn stop_microphone_test(&mut self) {
+        self.preview.take();
         if self.operation == Some(AudioOperation::Microphone) {
             self.cancel();
         }
@@ -1052,9 +1231,6 @@ impl MediaEngine {
             self.phase(),
             AudioPhase::StartingMicrophone | AudioPhase::ActiveMicrophone
         )
-    }
-    pub fn is_microphone_test_starting(&self) -> bool {
-        self.phase() == AudioPhase::StartingMicrophone
     }
     pub fn play_tone(&mut self, cue: AudioCue) -> Result<(), String> {
         self.queue_tone(cue, self.settings.clone(), false)
@@ -1103,6 +1279,11 @@ impl MediaEngine {
         self.shared.controls.wake.notify();
         #[cfg(feature = "native-rtc")]
         self.shared.controls.application_audio.clear();
+    }
+
+    /// Raw microphone RMS of the call (before gain and noise suppression).
+    pub(crate) fn capture_level(&self) -> f32 {
+        f32::from_bits(self.shared.controls.capture_rms.load(Ordering::Relaxed))
     }
 
     pub fn input_level(&self) -> f32 {
@@ -1447,6 +1628,7 @@ fn audio_owner<B: AudioBackend>(
                                     attempted: request.settings,
                                     restored: *settings,
                                     error,
+                                    follow: request.follow,
                                 });
                             }
                             publish_phase(&state, request.generation, AudioPhase::ActiveVoice);
@@ -2011,20 +2193,12 @@ impl NativeAudio {
     }
 
     /// Explicit local processed preview. Its devices, queues and DSP are isolated from calls.
-    fn start_microphone_test(
-        &mut self,
-        stop: Arc<AtomicBool>,
-        settings: AudioSettings,
-        ptt_key: i32,
-        errors: ErrorSlot,
-    ) -> Result<(), String> {
+    fn start_microphone_test(&mut self, request: MicrophoneStart) -> Result<(), String> {
         if self.is_active() {
             return Err("Leave voice before starting a microphone test.".into());
         }
         self.stop_microphone_test();
-        self.microphone_test = Some(microphone_preview::Session::start(
-            stop, &settings, ptt_key, self.level.clone(), errors,
-        )?);
+        self.microphone_test = Some(microphone_preview::Session::start(request, self.level.clone())?);
         Ok(())
     }
     pub fn stop_microphone_test(&mut self) {
@@ -2193,7 +2367,7 @@ impl AudioBackend for NativeAudio {
         NativeAudio::stop_voice(self);
     }
     fn microphone(&mut self, request: MicrophoneStart) -> Result<(), String> {
-        self.start_microphone_test(request.stop, request.settings, request.ptt_key, request.errors)
+        self.start_microphone_test(request)
     }
     fn stop_microphone(&mut self) {
         self.stop_microphone_test();
@@ -2269,6 +2443,13 @@ fn record_device_error(
     if stop.load(Ordering::Acquire) {
         return;
     }
+    let detail = detail.to_string();
+    if controls.follow_devices.load(Ordering::Acquire) && device_gone(&detail) {
+        // The app reopens on the Windows default (and back when replugged).
+        controls.device_lost.store(true, Ordering::Release);
+        controls.wake.notify();
+        return;
+    }
     let message = format!(
         "{} stopped. Reconnect it or choose an {} in Voice & Video, then try again. Details: {detail}",
         if input { "Microphone" } else { "Audio output" },
@@ -2296,6 +2477,14 @@ fn record_device_error(
         message,
     );
     controls.wake.notify();
+}
+
+/// cpal's DeviceNotAvailable, or WASAPI's AUDCLNT_E_DEVICE_INVALIDATED.
+fn device_gone(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("no longer available")
+        || detail.contains("0x88890004")
+        || detail.contains("device_invalidated")
 }
 
 fn resolve_voice_host(host: &str, port: u16) -> Result<SocketAddr, String> {
@@ -2519,6 +2708,7 @@ where
         };
         let gain = f32::from_bits(controls.gain.load(Ordering::Relaxed));
         level.store((rms * gain * 3.0).min(1.0).to_bits(), Ordering::Relaxed);
+        controls.capture_rms.store(rms.to_bits(), Ordering::Relaxed);
         controls.wake.notify();
     }
 }
@@ -3712,9 +3902,15 @@ fn voice_worker(mut w: VoiceWorker) {
     let wait = crate::audio_wake::WorkerWait::new(&w.controls.wake, &w.socket);
     let mut sequence = 1u64;
     let mut media_sequence = 1u64;
+    // Voice first: sustained incoming trouble throttles video, uploads and copies.
+    let mut voice_first = crate::voice_priority::Detector::default();
+    let _clear_voice_first = crate::voice_priority::ClearOnExit;
     let mut sample_clock = 0u64;
     let mut replay = ReplayWindow::default();
     let mut speakers: HashMap<String, Speaker> = HashMap::new();
+    // Loss, jitter and lateness per person; outlives short pauses in speech.
+    let mut arrivals: HashMap<String, crate::voice_quality::ArrivalStats> = HashMap::new();
+    let mut heard_at = Instant::now();
     let mut private_receive_generation = w
         .controls
         .whisper_receive_generation
@@ -3779,7 +3975,17 @@ fn voice_worker(mut w: VoiceWorker) {
                         w.counters.rejected.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    let via_gateway = !via_tcp && from != w.remote && buffer[..n].starts_with(b"RGW1")
+                    // A frame from this person's gateway in the voice mesh between homes.
+                    let mesh_frame = if !via_tcp && from != w.remote && buffer[..n].starts_with(b"RGW1") {
+                        match w.gateway.as_ref().and_then(|gateway| gateway.mesh_receive(
+                            from, &buffer[..n], w.deafened.load(Ordering::Acquire), Instant::now(),
+                        )) {
+                            Some(Some(frame)) => Some(frame),
+                            Some(None) => continue,
+                            None => None,
+                        }
+                    } else { None };
+                    let via_gateway = mesh_frame.is_none() && !via_tcp && from != w.remote && buffer[..n].starts_with(b"RGW1")
                         && w.gateway.as_ref().and_then(|gateway| gateway.with_path(|path| path.address == from)).unwrap_or(false);
                     let n = if via_gateway {
                         let inner = w.gateway.as_ref().and_then(|gateway| gateway.with_path(
@@ -3791,7 +3997,9 @@ fn voice_worker(mut w: VoiceWorker) {
                         from = w.remote;
                         n
                     } else { n };
-                    let plaintext = if !via_tcp
+                    let plaintext = if let Some(frame) = mesh_frame {
+                        frame
+                    } else if !via_tcp
                         && from != w.remote
                         && buffer[..n].starts_with(relay_protocol::direct_voice::MARKER)
                     {
@@ -3947,13 +4155,23 @@ fn voice_worker(mut w: VoiceWorker) {
                         speaker.configure_adaptation(
                             w.controls.adaptive_jitter.load(Ordering::Relaxed),
                         );
+                        let arrived = Instant::now();
+                        let late_before = speaker.stats.late;
+                        let arrival = arrivals
+                            .entry(speaker_key.clone())
+                            .or_insert_with(|| crate::voice_quality::ArrivalStats::new(arrived));
+                        arrival.observe(frame.sequence, frame.timestamp, frame.restart, arrived);
                         speaker.push_timed(
                             frame.sequence,
                             frame.timestamp,
                             frame.restart,
                             frame.opus,
-                            Instant::now(),
+                            arrived,
                         );
+                        // Too late to play, or pushed out of a full queue.
+                        for _ in late_before..speaker.stats.late {
+                            arrival.late(arrived);
+                        }
                     }
                 }
                 Err(e) if voice_io_retryable(&e) => break,
@@ -4388,6 +4606,25 @@ fn voice_worker(mut w: VoiceWorker) {
                 .unwrap_or(0),
             Ordering::Relaxed,
         );
+        arrivals.retain(|_, arrival| !arrival.expired(now));
+        let incoming = crate::voice_quality::worst(
+            arrivals.values_mut().filter_map(|arrival| arrival.quality(now)),
+        );
+        w.counters.publish_voice_quality(incoming);
+        // Per speaker, for the host overview's measurements (#19); once a second.
+        if now >= heard_at {
+            heard_at = now + Duration::from_secs(1);
+            if let Some(gateway) = &w.gateway {
+                gateway.set_heard(
+                    arrivals
+                        .iter_mut()
+                        .filter(|(speaker, _)| !speaker.starts_with("whisper:"))
+                        .filter_map(|(speaker, arrival)| Some((speaker.clone(), arrival.quality(now)?)))
+                        .collect(),
+                );
+            }
+        }
+        crate::voice_priority::publish(voice_first.observe(incoming, now));
         let priority_users = w
             .controls
             .priority_users
@@ -4554,6 +4791,10 @@ fn discard_encoder_history(encoder: &mut Encoder, errors: &ErrorSlot, stop: &Ato
 fn gateway_tick(w: &VoiceWorker, sequence: &mut u64, now: Instant) -> bool {
     if w.stop.load(Ordering::Acquire) { return false; }
     let Some(gateway) = &w.gateway else { return false; };
+    for (address, probe) in gateway.mesh_probes(now) {
+        let _ = w.socket.send_to(&probe, address);
+    }
+    gateway.set_host_rtt_us(w.counters.udp_rtt_us.load(Ordering::Relaxed));
     gateway.with_path(|path| {
         if let Some(packet) = path.hop_probe(now) {
             let _ = w.socket.send_to(&packet, path.address);
@@ -4688,6 +4929,12 @@ fn send_packet_at(w: &VoiceWorker, sequence: &mut u64, plaintext: &[u8], generat
             return false;
         }
         if let Some(gateway) = &w.gateway {
+            // The voice mesh between homes gets the same protected frame,
+            // unchanged; the host still gets its copy and skips only the
+            // people the mesh verifiably carries.
+            for (address, packet) in gateway.mesh_frame(plaintext, Instant::now()) {
+                let _ = w.socket.send_to(&packet, address);
+            }
             match gateway.wrap_selected(&packet, Instant::now()) {
                 Ok(Some((address, packet))) => {
                     if !packet_send_allowed(w, plaintext)
@@ -5627,6 +5874,130 @@ mod tests {
         assert!(engine.is_active());
     }
     #[test]
+    fn an_unplugged_device_is_followed_instead_of_ending_the_call() {
+        let controls = AudioControls::new(&AudioSettings::default());
+        let stop = AtomicBool::new(false);
+        let errors: ErrorSlot = Arc::new(Mutex::new(None));
+        // Without following, the old behaviour stays: the call stops with a message.
+        record_device_error(&errors, &stop, &controls, true, "The requested device is no longer available.");
+        assert!(stop.load(Ordering::Acquire));
+        let stop = AtomicBool::new(false);
+        let errors: ErrorSlot = Arc::new(Mutex::new(None));
+        controls.follow_devices.store(true, Ordering::Release);
+        record_device_error(&errors, &stop, &controls, false, "Windows audio: unplugged (0x88890004)");
+        assert!(!stop.load(Ordering::Acquire), "the call keeps running");
+        assert!(errors.lock().unwrap().is_none());
+        assert!(controls.device_lost.load(Ordering::Acquire));
+        // Other device failures still stop as before.
+        record_device_error(&errors, &stop, &controls, true, "format not supported");
+        assert!(stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn following_a_device_change_keeps_the_call_mute_deafen_and_volumes() {
+        let mut engine = MediaEngine::new().unwrap();
+        let saved = AudioSettings {
+            input_device: Some("USB Headset".into()),
+            ..Default::default()
+        }
+        .normalized();
+        engine.configure(saved.clone());
+        let (sender, receiver) = mpsc::sync_channel(8);
+        engine.sender = Some(sender);
+        engine
+            .start_voice("host", voice_ticket(), test_call_keys("local"))
+            .unwrap();
+        assert!(matches!(receiver.recv().unwrap(), AudioCommand::Voice { .. }));
+        engine.set_muted(true);
+        engine.set_deafened(true);
+        engine.set_user_volume("friend", 0.4);
+        let revision = engine.shared.controls.device_revision.load(Ordering::Acquire);
+        // The headset was unplugged: open the Windows default instead.
+        let fallback = crate::device_follow::effective(&saved, &[], &[]);
+        engine.follow_device_change(fallback).unwrap();
+        assert_eq!(engine.device_selection(), (None, None));
+        assert!(engine.shared.controls.device_revision.load(Ordering::Acquire) > revision);
+        assert!(engine.pending_devices.lock().unwrap().as_ref().is_some_and(|r| r.follow), "only the devices reopen");
+        assert!(engine.operation == Some(AudioOperation::Voice), "the call keeps running");
+        assert!(engine.shared.muted.load(Ordering::Acquire));
+        assert!(engine.shared.deafened.load(Ordering::Acquire));
+        assert_eq!(engine.shared.controls.peer_volumes.lock().unwrap().get("friend"), Some(&0.4));
+        // A default change with the same names still forces a reopen.
+        let revision = engine.shared.controls.device_revision.load(Ordering::Acquire);
+        engine.follow_device_change(crate::device_follow::effective(&saved, &[], &[])).unwrap();
+        assert!(engine.shared.controls.device_revision.load(Ordering::Acquire) > revision);
+    }
+
+    #[test]
+    fn microphone_preview_hears_edits_live_and_reopens_only_for_devices() {
+        use crate::self_listen::PreviewChange;
+        let mut engine = MediaEngine::new().unwrap();
+        let applied = AudioSettings::default().normalized();
+        engine.configure(applied.clone());
+        let (sender, receiver) = mpsc::sync_channel(8);
+        engine.sender = Some(sender);
+        assert_eq!(engine.update_microphone_preview(&applied).unwrap(), PreviewChange::None);
+        let draft = AudioSettings {
+            transmission: TransmissionMode::Continuous,
+            noise_suppression: true,
+            whisper_enabled: true,
+            ..applied.clone()
+        };
+        engine.preview_microphone(draft.clone()).unwrap();
+        let first = match receiver.recv().unwrap() {
+            AudioCommand::Microphone { request, .. } => request,
+            _ => panic!("expected microphone preview"),
+        };
+        assert!(!first.controls.whisper_enabled.load(Ordering::Acquire));
+        assert!(first.controls.local_preview);
+        let generation = first.controls.privacy_generation.load(Ordering::Acquire);
+        // Dragging gain or threshold must not restart noise suppression.
+        let mut edited = draft.clone();
+        edited.microphone_gain = 2.5;
+        edited.playback_volume = 0.4;
+        edited.noise_suppression = false;
+        assert_eq!(engine.update_microphone_preview(&edited).unwrap(), PreviewChange::Live);
+        assert_eq!(f32::from_bits(first.controls.gain.load(Ordering::Relaxed)), 2.5);
+        assert_eq!(f32::from_bits(first.controls.playback_volume.load(Ordering::Relaxed)), 0.4);
+        assert!(!first.controls.suppression.load(Ordering::Relaxed));
+        assert_eq!(first.controls.privacy_generation.load(Ordering::Acquire), generation);
+        assert!(!first.controls.whisper_enabled.load(Ordering::Acquire));
+        // A transmission-mode change is a privacy boundary: queued audio is discarded.
+        edited.transmission = TransmissionMode::PushToTalk;
+        assert_eq!(engine.update_microphone_preview(&edited).unwrap(), PreviewChange::Live);
+        assert!(first.controls.privacy_generation.load(Ordering::Acquire) > generation);
+        // The push-to-talk key reaches the preview without restarting it, and
+        // drops anything queued under the old key.
+        let before_key = first.controls.privacy_generation.load(Ordering::Acquire);
+        first.controls.ptt_pressed.store(true, Ordering::Release);
+        engine.set_push_to_talk_key(0x42);
+        assert_eq!(first.controls.ptt_key.load(Ordering::Acquire), 0x42);
+        assert!(!first.controls.ptt_pressed.load(Ordering::Acquire));
+        assert!(first.controls.privacy_generation.load(Ordering::Acquire) > before_key);
+        // The saved call settings are untouched by any of this.
+        assert_eq!(engine.settings, applied);
+        assert_eq!(f32::from_bits(engine.shared.controls.gain.load(Ordering::Relaxed)), applied.microphone_gain);
+        // A new output device reopens only the preview's own streams.
+        edited.output_device = Some("USB headset".into());
+        assert_eq!(engine.update_microphone_preview(&edited).unwrap(), PreviewChange::Reopen);
+        assert!(first.stop.load(Ordering::Acquire));
+        assert!(matches!(receiver.recv().unwrap(), AudioCommand::StopMicrophone));
+        let second = match receiver.recv().unwrap() {
+            AudioCommand::Microphone { request, .. } => request,
+            _ => panic!("expected a reopened preview"),
+        };
+        assert_eq!(second.settings.output_device.as_deref(), Some("USB headset"));
+        assert_eq!(f32::from_bits(second.controls.gain.load(Ordering::Relaxed)), 2.5);
+        assert_eq!(second.controls.ptt_key.load(Ordering::Acquire), 0x42);
+        second.taps.record_raw(0.25);
+        let (sample, _, _, held) = engine.microphone_preview_meter().unwrap();
+        assert_eq!(sample.raw_peak, 0.25);
+        assert!(!held);
+        engine.stop_microphone_test();
+        assert!(engine.microphone_preview_meter().is_none());
+        assert_eq!(engine.update_microphone_preview(&draft).unwrap(), PreviewChange::None);
+    }
+    #[test]
     fn microphone_preview_uses_draft_without_changing_the_next_call() {
         let mut engine = MediaEngine::new().unwrap();
         let applied = AudioSettings {
@@ -5653,7 +6024,7 @@ mod tests {
             _ => panic!("expected microphone preview"),
         };
         assert_eq!(request.settings, draft);
-        assert_eq!(request.ptt_key, 0x06);
+        assert_eq!(request.controls.ptt_key.load(Ordering::Acquire), 0x06);
         assert_eq!(engine.settings, applied);
         assert_eq!(
             engine.shared.controls.transmission.load(Ordering::Relaxed),

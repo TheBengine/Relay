@@ -88,6 +88,9 @@ pub struct JoinFlow {
     pub factor_binding: Option<(String, String, bool)>,
     pub invite: String,
     pub registering: bool,
+    /// A reset or recovery code and the new password it sets; never saved.
+    pub reset_code: String,
+    pub new_password: String,
 }
 
 impl JoinFlow {
