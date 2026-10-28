@@ -15,6 +15,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit, Nonce, XChaCha20Poly1305, XNonce,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(test)]
 use nnnoiseless::DenoiseState;
 #[cfg(test)]
 use opus::{Application, Channels, Decoder};
@@ -71,7 +72,7 @@ fn received_audio_activity(power: f32) -> bool {
     power.is_finite() && power > 0.000001
 }
 
-struct AudioControls {
+pub(crate) struct AudioControls {
     /// Only the isolated local preview clears rendered history on PTT changes.
     local_preview: bool,
     call_tones: ToneQueue,
@@ -85,6 +86,7 @@ struct AudioControls {
     hold_ms: AtomicU32,
     bitrate_kbps: AtomicU32,
     recover_packet_loss: AtomicBool,
+    automatic_loss_recovery: AtomicBool,
     packet_samples: AtomicU32,
     jitter_ms: AtomicU32,
     adaptive_jitter: AtomicBool,
@@ -160,7 +162,7 @@ impl AudioControls {
         self.tcp_enabled.load(Ordering::Acquire) || self.automatic_tcp.load(Ordering::Acquire)
     }
 
-    fn new(settings: &AudioSettings) -> Self {
+    pub(crate) fn new(settings: &AudioSettings) -> Self {
         Self {
             local_preview: false,
             call_tones: Arc::new(Mutex::new(VecDeque::new())),
@@ -174,6 +176,7 @@ impl AudioControls {
             hold_ms: AtomicU32::new(settings.activation_hold_ms),
             bitrate_kbps: AtomicU32::new(settings.bitrate_kbps),
             recover_packet_loss: AtomicBool::new(settings.recover_packet_loss),
+            automatic_loss_recovery: AtomicBool::new(settings.automatic_loss_recovery),
             packet_samples: AtomicU32::new(settings.packet_samples() as u32),
             jitter_ms: AtomicU32::new(settings.jitter_ms),
             adaptive_jitter: AtomicBool::new(settings.adaptive_jitter),
@@ -287,6 +290,8 @@ impl AudioControls {
             .store(settings.bitrate_kbps, Ordering::Relaxed);
         self.recover_packet_loss
             .store(settings.recover_packet_loss, Ordering::Relaxed);
+        self.automatic_loss_recovery
+            .store(settings.automatic_loss_recovery, Ordering::Relaxed);
         self.packet_samples
             .store(settings.packet_samples() as u32, Ordering::Relaxed);
         if self
@@ -2672,7 +2677,7 @@ fn make_input(
                 if let Ok(mut timing) = state.controls.input_timing.lock() {
                     *timing = Some(device_timing(stream.info));
                 }
-                eprintln!("WASAPI capture: {:.3} ms period, default {} frames, buffer {} frames, {} channels", stream.info.period_ms(), stream.info.default_frames, stream.info.buffer_frames, stream.info.channels);
+                eprintln!("WASAPI capture: {:.3} ms period (device minimum {:.3} ms, step {:.3} ms), default {} frames, buffer {} frames, driver latency {:.3} ms, {} Hz, {} channels", stream.info.period_ms(), stream.info.frames_ms(stream.info.min_frames), stream.info.frames_ms(stream.info.fundamental_frames), stream.info.default_frames, stream.info.buffer_frames, stream.info.stream_latency_ms(), stream.info.sample_rate, stream.info.channels);
                 return Ok(DeviceStream::Windows(stream));
             }
         }
@@ -2833,6 +2838,12 @@ impl InputResampler {
         })
     }
     fn feed_into(&mut self, sample: f32, mut emit: impl FnMut(f32) -> bool) -> usize {
+        if self.filter.is_none() && self.step == 1.0 {
+            // 48 kHz needs no interpolation. Holding the last sample for the
+            // next callback would leave every block one sample short until
+            // then: a whole extra capture period of delay.
+            return usize::from(!emit(sample));
+        }
         let mut dropped = 0;
         if let Some(previous) = self.previous {
             if let Some(filter) = self.filter.as_mut() {
@@ -2902,7 +2913,7 @@ fn make_output(
                     crate::voice_output::reserve_samples(Some(stream.info.period_ms())),
                     Ordering::Release,
                 );
-                eprintln!("WASAPI output: {:.3} ms period, default {} frames, buffer {} frames, {} channels", stream.info.period_ms(), stream.info.default_frames, stream.info.buffer_frames, stream.info.channels);
+                eprintln!("WASAPI output: {:.3} ms period (device minimum {:.3} ms, step {:.3} ms), default {} frames, buffer {} frames, driver latency {:.3} ms, {} Hz, {} channels", stream.info.period_ms(), stream.info.frames_ms(stream.info.min_frames), stream.info.frames_ms(stream.info.fundamental_frames), stream.info.default_frames, stream.info.buffer_frames, stream.info.stream_latency_ms(), stream.info.sample_rate, stream.info.channels);
                 return Ok(DeviceStream::Windows(stream));
             }
         }
@@ -3265,16 +3276,24 @@ fn capture_processing_samples(packet_samples: usize, controls: &AudioControls) -
 const AGC_HOLD_SAMPLES: u32 = 300 * 48;
 /// Automatic volume learns only from blocks above -60 dBFS.
 const AGC_LEARN_FLOOR: f32 = 0.001;
+/// Automatic volume never lifts the background above -50 dBFS.
+const AGC_NOISE_CEILING: f32 = 0.00316;
+/// Automatic volume rises at most this fast.
+const AGC_RISE_DB_PER_SECOND: f32 = 15.0;
 /// Below this fraction of the far end's level, a block with an echo path is
 /// treated as the canceller's residue (-34 dB).
 #[cfg(feature = "native-rtc")]
 const ECHO_RESIDUE_RATIO: f32 = 0.02;
 
-struct MicrophoneProcessor {
-    denoiser: Option<Box<DenoiseState<'static>>>,
+pub(crate) struct MicrophoneProcessor {
+    /// The broadband noise suppressor, built on first use.
+    denoiser: Option<Box<dyn crate::noise_suppressor::Suppressor>>,
+    /// Which suppressor `denoiser` is, to rebuild it when the setting changes.
+    denoiser_kind: Option<crate::noise_suppressor::SuppressorKind>,
+    /// Fixed suppressor regardless of the noise model setting (audio bench).
+    forced_suppressor: Option<crate::noise_suppressor::SuppressorKind>,
     #[cfg(feature = "native-rtc")]
     voice_detector: Option<crate::audio_activity::VoiceDetector>,
-    first_denoised: bool,
     clicks: crate::click_suppression::ClickSuppressor,
     gate: crate::voice_gate::NoiseGate,
     noise_floor: f32,
@@ -3295,12 +3314,13 @@ struct MicrophoneProcessor {
     privacy_closed: bool,
 }
 impl MicrophoneProcessor {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             denoiser: None,
+            denoiser_kind: None,
+            forced_suppressor: None,
             #[cfg(feature = "native-rtc")]
             voice_detector: None,
-            first_denoised: true,
             clicks: crate::click_suppression::ClickSuppressor::new(),
             gate: crate::voice_gate::NoiseGate::new(),
             noise_floor: 0.0005,
@@ -3320,7 +3340,16 @@ impl MicrophoneProcessor {
             privacy_closed: false,
         }
     }
-    fn process(&mut self, input: &mut [f32], controls: &AudioControls) -> bool {
+    /// A processor that always uses `kind`, whatever the noise model setting
+    /// says; the setting still decides whether click suppression runs.
+    #[cfg(any(test, feature = "audio-bench"))]
+    pub(crate) fn with_suppressor(kind: crate::noise_suppressor::SuppressorKind) -> Self {
+        Self {
+            forced_suppressor: Some(kind),
+            ..Self::new()
+        }
+    }
+    pub(crate) fn process(&mut self, input: &mut [f32], controls: &AudioControls) -> bool {
         if input.is_empty() {
             return false;
         }
@@ -3333,11 +3362,11 @@ impl MicrophoneProcessor {
             // Discard denoiser history while the talk key is up, so earlier private speech
             // cannot emerge from its lookahead when the key is next pressed.
             self.denoiser = None;
+            self.denoiser_kind = None;
             #[cfg(feature = "native-rtc")]
             {
                 self.voice_detector = None;
             }
-            self.first_denoised = true;
             self.clicks = crate::click_suppression::ClickSuppressor::new();
             self.gate = crate::voice_gate::NoiseGate::new();
             self.automatic_gain = 1.0;
@@ -3398,9 +3427,12 @@ impl MicrophoneProcessor {
             let strength = crate::click_suppression::NoiseStrength::from_u32(
                 controls.noise_strength.load(Ordering::Relaxed),
             );
-            if self.denoiser.is_none() {
-                self.denoiser = Some(DenoiseState::new());
-                self.first_denoised = true;
+            let kind = self
+                .forced_suppressor
+                .unwrap_or_else(|| crate::noise_suppressor::for_setting(enhanced, strength));
+            if self.denoiser.is_none() || self.denoiser_kind != Some(kind) {
+                self.denoiser = Some(crate::noise_suppressor::make(kind));
+                self.denoiser_kind = Some(kind);
             }
             #[cfg(feature = "native-rtc")]
             {
@@ -3412,27 +3444,14 @@ impl MicrophoneProcessor {
                     self.voice_detector = None;
                 }
             }
-            let state = self.denoiser.as_mut().unwrap();
-            let mut source = [0.0; DenoiseState::FRAME_SIZE];
-            let mut output = [0.0; DenoiseState::FRAME_SIZE];
-            for chunk in input.chunks_exact_mut(DenoiseState::FRAME_SIZE) {
-                for (to, from) in source.iter_mut().zip(chunk.iter()) {
-                    *to = (*from * 32768.0).clamp(-32768.0, 32767.0);
-                }
-                let voice = state.process_frame(&mut output, &source);
-                if self.first_denoised {
-                    output.fill(0.0);
-                    self.first_denoised = false;
-                }
-                for (to, from) in chunk.iter_mut().zip(output) {
-                    *to = if from.is_finite() {
-                        (from / 32768.0).clamp(-1.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                }
+            let suppressor = self.denoiser.as_mut().unwrap();
+            for chunk in input.chunks_exact_mut(crate::noise_suppressor::BLOCK) {
+                let block: &mut [f32; crate::noise_suppressor::BLOCK] =
+                    chunk.try_into().expect("chunks_exact yields whole blocks");
+                suppressor.process(block);
                 // Before speech detection, so a click cannot open the gate.
-                if enhanced {
+                // Click suppression needs a voice probability to spare speech.
+                if let (true, Some(voice)) = (enhanced, suppressor.voice_probability()) {
                     self.clicks.process(chunk, voice, strength);
                 }
                 #[cfg(feature = "native-rtc")]
@@ -3450,6 +3469,7 @@ impl MicrophoneProcessor {
             }
         } else {
             self.denoiser = None;
+            self.denoiser_kind = None;
             self.clicks = crate::click_suppression::ClickSuppressor::new();
             #[cfg(feature = "native-rtc")]
             {
@@ -3481,7 +3501,13 @@ impl MicrophoneProcessor {
                 .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
             let speech = detected.unwrap_or(rms >= 0.0015) && !echo_like;
             // A detector that fires on microphone hiss must not teach a huge gain.
-            if speech && !far_talking && rms >= AGC_LEARN_FLOOR {
+            // Nor may a fan the detector mistakes for speech: learn only from
+            // blocks that rise clear of the recent background.
+            if speech
+                && !far_talking
+                && rms >= AGC_LEARN_FLOOR
+                && self.gate.speech_like_level(rms)
+            {
                 // Learn from speech, retaining its level across normal pauses.
                 // Explicit privacy boundaries and disabling AGC still reset it.
                 // Track a speech envelope rather than flattening each 10 ms
@@ -3504,11 +3530,30 @@ impl MicrophoneProcessor {
                 // the unchanged immediate peak ceiling protects loud inputs.
                 let desired = (0.085 / self.speech_power.sqrt().max(0.00001)).clamp(0.25, 16.0);
                 let desired = desired.min(0.95 / peak.max(0.0001));
+                // Never lift the background of the last 2 s above -50 dBFS.
+                let desired = self.gate.noise_floor().map_or(desired, |floor| {
+                    desired.min((AGC_NOISE_CEILING / floor).max(1.0))
+                });
                 if desired < self.automatic_gain {
                     self.automatic_gain = desired;
                 } else {
                     let blend = 1.0 - (-(input.len() as f32) / 4800.0).exp();
-                    self.automatic_gain += (desired - self.automatic_gain) * blend;
+                    // At most 15 dB per second upward, so a sudden rise in background
+                    // (RNNoise letting a fan through) cannot be lifted at once. The
+                    // limit applies once the gate knows the room's noise floor, which
+                    // is where a fan can be told from a voice; before that, and in
+                    // modes where the gate learns no floor, quiet speech is lifted as
+                    // quickly as before.
+                    let step = (desired - self.automatic_gain) * blend;
+                    let step = if self.gate.noise_floor().is_some() {
+                        let seconds = input.len() as f32 / AUDIO_SAMPLE_RATE as f32;
+                        let limit = self.automatic_gain
+                            * (10f32.powf(AGC_RISE_DB_PER_SECOND * seconds / 20.0) - 1.0);
+                        step.min(limit)
+                    } else {
+                        step
+                    };
+                    self.automatic_gain += step;
                 }
             }
             if speech {
@@ -4054,6 +4099,8 @@ fn voice_worker(mut w: VoiceWorker) {
     let mut encoded_history = false;
     let mut last_bitrate = 0;
     let mut last_recovery = w.encoder.get_inband_fec().unwrap_or(false);
+    // Automatic loss recovery, from incoming loss.
+    let mut loss_policy = crate::voice_quality::LossRecoveryPolicy::default();
     let mut last_packet_samples = 0;
     let mut last_whisper: Option<Vec<String>> = None;
     let mut last_privacy_generation = w.controls.privacy_generation.load(Ordering::Acquire);
@@ -4527,18 +4574,33 @@ fn voice_worker(mut w: VoiceWorker) {
                 microphone = MicrophoneProcessor::new();
                 last_packet_samples = packet_samples;
             }
-            let recovery =
-                w.controls.recover_packet_loss.load(Ordering::Relaxed) && packet_samples >= 480;
+            let choice = if w.controls.recover_packet_loss.load(Ordering::Relaxed) {
+                crate::audio_settings::LossRecovery::Always
+            } else if w.controls.automatic_loss_recovery.load(Ordering::Relaxed) {
+                crate::audio_settings::LossRecovery::Automatic
+            } else {
+                crate::audio_settings::LossRecovery::Off
+            };
+            // The worst incoming loss over the 5 s window among people with
+            // enough packets to measure it.
+            let high_loss = loss_policy.observe(
+                crate::voice_quality::loss_evidence(
+                    arrivals.values_mut().filter_map(|arrival| arrival.quality(now)),
+                ),
+                now,
+            );
+            let recovery = choice.active(high_loss, packet_samples);
             if recovery != last_recovery {
                 match crate::audio_settings::make_voice_encoder_with_recovery(
                     w.controls.bitrate_kbps.load(Ordering::Relaxed),
                     recovery,
                 ) {
                     Ok(encoder) => {
+                        // Not a restart: listeners keep decoding across the
+                        // rebuilt encoder. A restart would make their buffer
+                        // start over mid-sentence (a gap on older Relay).
                         w.encoder = encoder;
                         last_recovery = recovery;
-                        encoded_history = false;
-                        speech_preroll.clear();
                     }
                     Err(error) => {
                         record_error(&w.errors, format!("Configure voice recovery: {error}"));
@@ -5268,6 +5330,123 @@ impl ReplayWindow {
     }
 }
 
+// Read by the delay tests and docs/send-delay-budget-20261028.md; the settings
+// page still shows voice_delay_budget().
+#[cfg_attr(not(test), allow(dead_code))]
+/// The Windows shared-mode default period, and what most devices negotiate.
+const DEFAULT_CAPTURE_PERIOD_MS: f32 = 10.0;
+
+#[cfg_attr(not(test), allow(dead_code))]
+/// Send-side delay from the capture callback to the packet leaving, part by
+/// part, in milliseconds. Built on [`AudioSettings::voice_delay_budget`] (the
+/// settings page's figures) and adds the parts that budget leaves implicit.
+/// Algorithmic waits only: thread wakeups and the device's own buffering
+/// before the callback are measured separately.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DelayBudget {
+    /// How long a whole block can wait beyond its own length because device
+    /// callbacks do not line up with it.
+    pub capture_period: f32,
+    /// Conversion to 48 kHz: none at 48 kHz, the sinc filter otherwise.
+    pub resample: f32,
+    /// AEC3 runs on the current 10 ms block in place.
+    pub aec: f32,
+    /// RNNoise's overlap-add synthesis returns each frame one frame late.
+    pub suppression: f32,
+    /// Click suppression works on the current block only.
+    pub clicks: f32,
+    /// The attack is a fade on the current block, never a lookahead.
+    pub gate_attack: f32,
+    /// Opus LowDelay lookahead, as the linked encoder reports it.
+    pub encoder_lookahead: f32,
+    /// The oldest sample of a packet waits for its newest one.
+    pub packetization: f32,
+    /// Only the first packet of a talkspurt: the retained speech start is sent
+    /// with it, so that packet's oldest audio is one block older.
+    pub speech_start: f32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl DelayBudget {
+    /// Steady speech: every part that applies to every packet.
+    pub(crate) fn total(&self) -> f32 {
+        self.capture_period
+            + self.resample
+            + self.aec
+            + self.suppression
+            + self.clicks
+            + self.gate_attack
+            + self.encoder_lookahead
+            + self.packetization
+    }
+
+    /// The first packet after the voice gate opens.
+    pub(crate) fn first_packet_total(&self) -> f32 {
+        self.total() + self.speech_start
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+/// The send budget for these settings on a 48 kHz device with the Windows
+/// default 10 ms period.
+pub(crate) fn send_delay_budget_ms(settings: &AudioSettings) -> DelayBudget {
+    send_delay_budget_for_capture(settings, AUDIO_SAMPLE_RATE, DEFAULT_CAPTURE_PERIOD_MS)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+/// The send budget for a capture device running at `sample_rate` with a
+/// callback every `period_ms`.
+pub(crate) fn send_delay_budget_for_capture(
+    settings: &AudioSettings,
+    sample_rate: u32,
+    period_ms: f32,
+) -> DelayBudget {
+    let settings = settings.clone().normalized();
+    let shown = settings.voice_delay_budget();
+    let packet_samples = settings.packet_samples();
+    let needs_dsp = settings.noise_suppression;
+    #[cfg(feature = "native-rtc")]
+    let needs_dsp = needs_dsp || settings.echo_cancellation;
+    let block = if needs_dsp {
+        packet_samples.max(480)
+    } else {
+        packet_samples
+    };
+    let period = (period_ms * AUDIO_SAMPLE_RATE as f32 / 1000.0).round() as usize;
+    let capture_period = if sample_rate != AUDIO_SAMPLE_RATE {
+        // Resampled callbacks never line up with a block: up to a period more.
+        period_ms
+    } else if period == 0 {
+        0.0
+    } else {
+        // Block k is complete with the callback that delivers its last sample.
+        // Over all k the longest wait past the block's end is period - gcd.
+        let (mut a, mut b) = (period, block);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        (period - a) as f32 * 1000.0 / AUDIO_SAMPLE_RATE as f32
+    };
+    let resample = if sample_rate == AUDIO_SAMPLE_RATE {
+        0.0
+    } else {
+        // Half the sinc filter plus the one native sample interpolation needs.
+        (crate::audio_resample::TAPS / 2 + 1) as f32 * 1000.0 / sample_rate as f32
+    };
+    DelayBudget {
+        capture_period,
+        resample,
+        aec: 0.0,
+        suppression: shown.suppression_ms as f32,
+        clicks: 0.0,
+        gate_attack: 0.0,
+        encoder_lookahead: shown.codec_ms.unwrap_or(0.0),
+        // A DSP block longer than the packet is sent as several packets at once.
+        packetization: block as f32 * 1000.0 / AUDIO_SAMPLE_RATE as f32,
+        speech_start: shown.speech_start_ms,
+    }
+}
+
 pub use crate::capture::CaptureFrame;
 
 // Opt-in local measurement of the production voice encryption (R4.5).
@@ -5438,6 +5617,174 @@ mod tests {
         assert_eq!(dropped, 0);
         assert!(queue.len() >= 4799);
         assert_eq!(capture_sample_limit(usize::MAX, 1), MAX_CAPTURE_SAMPLES);
+    }
+
+    fn capture_test_state() -> InputState {
+        InputState {
+            queue: sample_queue(VecDeque::new()),
+            level: Arc::new(AtomicU32::new(0)),
+            muted: Arc::new(AtomicBool::new(false)),
+            deafened: Arc::new(AtomicBool::new(false)),
+            counters: Arc::new(Counters::default()),
+            errors: Arc::new(Mutex::new(None)),
+            controls: Arc::new(AudioControls::new(&AudioSettings::default())),
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn capture_at_48khz_completes_each_10ms_block_in_the_callback_that_delivers_it() {
+        // A 10 ms device period delivers exactly one processing block. Holding
+        // back its last sample would leave the block one sample short until
+        // the next callback: a whole extra capture period of delay.
+        let state = capture_test_state();
+        let config = cpal::StreamConfig {
+            channels: 2,
+            sample_rate: cpal::SampleRate(48_000),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        let mut capture = input_callback::<f32>(&config, state.clone());
+        for callback in 1..=3 {
+            capture(&[0.25; 960]);
+            assert_eq!(
+                state.queue.lock().unwrap().len(),
+                480 * callback,
+                "callback {callback} must leave its whole 10 ms in the queue"
+            );
+        }
+    }
+
+    #[test]
+    fn send_delay_budget_sums_its_parts_for_default_settings() {
+        let settings = AudioSettings::default();
+        let budget = send_delay_budget_ms(&settings);
+        println!("default send delay budget (ms): {budget:#?}");
+        println!(
+            "steady {:.2} ms, first packet of a talkspurt {:.2} ms",
+            budget.total(),
+            budget.first_packet_total()
+        );
+        let parts = [
+            budget.capture_period,
+            budget.resample,
+            budget.aec,
+            budget.suppression,
+            budget.clicks,
+            budget.gate_attack,
+            budget.encoder_lookahead,
+            budget.packetization,
+        ];
+        assert_eq!(budget.total(), parts.iter().sum::<f32>());
+        assert_eq!(budget.first_packet_total(), budget.total() + budget.speech_start);
+        // The default 10 ms Windows period lines up with the 10 ms block.
+        assert_eq!(budget.capture_period, 0.0);
+        assert_eq!(budget.resample, 0.0, "48 kHz capture passes straight through");
+        assert_eq!(budget.aec, 0.0, "echo cancellation is off by default");
+        assert_eq!(budget.suppression, 10.0, "RNNoise overlap-add holds one frame");
+        assert_eq!(budget.clicks, 0.0);
+        assert_eq!(budget.gate_attack, 0.0, "the attack fades in, it never looks ahead");
+        assert_eq!(budget.encoder_lookahead, 2.5);
+        assert_eq!(budget.packetization, 10.0);
+        assert_eq!(budget.speech_start, 10.0);
+        assert_eq!(budget.total(), 22.5);
+        assert!(budget.first_packet_total() <= 35.0);
+        // It extends the settings page's budget rather than competing with it.
+        let shown = settings.voice_delay_budget();
+        assert_eq!(budget.suppression, shown.suppression_ms as f32);
+        assert_eq!(Some(budget.encoder_lookahead), shown.codec_ms);
+        assert_eq!(budget.speech_start, shown.speech_start_ms);
+    }
+
+    #[test]
+    fn send_delay_budget_counts_a_capture_period_that_does_not_fit_the_block() {
+        let settings = AudioSettings::default();
+        let at = |rate, period| send_delay_budget_for_capture(&settings, rate, period);
+        assert_eq!(at(48_000, 10.0).capture_period, 0.0);
+        assert_eq!(at(48_000, 5.0).capture_period, 0.0);
+        assert_eq!(at(48_000, 2.5).capture_period, 0.0);
+        // 3 ms (144 frames) and 480 share 48 frames: a block can wait 2 ms more.
+        assert_eq!(at(48_000, 3.0).capture_period, 2.0);
+        // The measured Scarlett Solo: 7 ms (336 frames), up to 6 ms more.
+        let measured = at(48_000, 7.0);
+        assert_eq!(measured.capture_period, 6.0);
+        assert_eq!(measured.total(), 28.5);
+        assert_eq!(measured.first_packet_total(), 38.5);
+        // A 20 ms period delivers two blocks at once; the first waited 10 ms.
+        assert_eq!(at(48_000, 20.0).capture_period, 10.0);
+        // Resampled capture never lines up with the block; count the whole period.
+        let resampled = at(44_100, 10.0);
+        assert_eq!(resampled.capture_period, 10.0);
+        let filter = (crate::audio_resample::TAPS / 2 + 1) as f32 * 1000.0 / 44_100.0;
+        assert!((resampled.resample - filter).abs() < 1e-4);
+        let mut off = settings.clone();
+        off.noise_suppression = false;
+        let plain = send_delay_budget_ms(&off);
+        assert_eq!(plain.suppression, 0.0);
+        assert_eq!(plain.total(), 12.5);
+    }
+
+    #[test]
+    fn agc_after_suppression_does_not_raise_the_noise_floor_between_words() {
+        use crate::audio_bench::{corpus, run_chain, CurrentChain, SendChain, BLOCK};
+        let corpus = corpus();
+        let row = |name: &str| corpus.iter().find(|item| item.name == name).unwrap();
+        // Chain gain over whole 10 ms frames: what reaches the listener against
+        // what the microphone heard, with the chain's own delay taken out.
+        let gain_db = |output: &[f32], input: &[f32], frames: &[usize], delay: usize| {
+            let (mut out, mut heard) = (0.0f64, 0.0f64);
+            for &start in frames {
+                for index in start..start + BLOCK {
+                    heard += f64::from(input[index]).powi(2);
+                    out += f64::from(output[index + delay]).powi(2);
+                }
+            }
+            10.0 * (out.max(1e-20) / heard).log10()
+        };
+        let energy = |samples: &[f32]| samples.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>();
+
+        let talk = row("keyboard_between_words");
+        let noisy = talk.noisy();
+        let mut chain = CurrentChain::rnnoise_enhanced();
+        let delay = chain.algorithmic_delay_samples();
+        let output = run_chain(&mut chain, &noisy).output;
+        let frames = (noisy.len() - delay) / BLOCK;
+        let clean: Vec<f64> = (0..frames)
+            .map(|f| energy(&talk.clean[f * BLOCK..(f + 1) * BLOCK]))
+            .collect();
+        let peak = clean.iter().copied().fold(0.0, f64::max);
+        let speech: Vec<usize> = (0..frames)
+            .filter(|f| clean[*f] >= peak * 1e-3)
+            .map(|f| f * BLOCK)
+            .collect();
+        // Pauses that still hold keyboard noise above -70 dBFS.
+        let pauses: Vec<usize> = (0..frames)
+            .filter(|f| {
+                clean[*f] <= peak * 1e-6
+                    && energy(&talk.noise[f * BLOCK..(f + 1) * BLOCK]) > 1e-7 * BLOCK as f64
+            })
+            .map(|f| f * BLOCK)
+            .collect();
+        assert!(speech.len() > 100 && pauses.len() > 20);
+        let speech_gain = gain_db(&output, &noisy, &speech, delay);
+        let pause_gain = gain_db(&output, &noisy, &pauses, delay);
+
+        let quiet = row("silence_floor");
+        let noisy = quiet.noisy();
+        let mut chain = CurrentChain::rnnoise_enhanced();
+        let output = run_chain(&mut chain, &noisy).output;
+        let all: Vec<usize> = (0..(noisy.len() - delay) / BLOCK).map(|f| f * BLOCK).collect();
+        let floor_gain = gain_db(&output, &noisy, &all, delay);
+        println!(
+            "speech gain {speech_gain:.1} dB, keyboard pauses {pause_gain:.1} dB, fan alone {floor_gain:.1} dB"
+        );
+        assert!(
+            pause_gain <= speech_gain + 3.0,
+            "pauses raised to {pause_gain:.1} dB against speech {speech_gain:.1} dB"
+        );
+        assert!(
+            floor_gain <= speech_gain + 3.0,
+            "a fan with nobody talking raised to {floor_gain:.1} dB against speech {speech_gain:.1} dB"
+        );
     }
     pub(super) fn test_call_keys(local: &str) -> Arc<CallKeys> {
         let sender_keys = [("local", 31_u8), ("remote", 47_u8)]
@@ -10250,10 +10597,7 @@ mod tests {
         for sample in &input {
             resampler.feed(*sample, &mut converted);
         }
-        assert_eq!(
-            converted.into_iter().collect::<Vec<_>>(),
-            input[..input.len() - 1]
-        );
+        assert_eq!(converted.into_iter().collect::<Vec<_>>(), input);
     }
 
     #[test]

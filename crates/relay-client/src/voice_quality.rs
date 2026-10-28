@@ -141,6 +141,47 @@ impl ArrivalStats {
     }
 }
 
+/// Measured loss above this share turns automatic loss recovery on.
+pub(crate) const RECOVERY_LOSS_PERCENT: f32 = 2.0;
+/// Automatic loss recovery turns off after this long without loss above it.
+pub(crate) const RECOVERY_CLEAN_TIME: Duration = Duration::from_secs(60);
+/// Packets a person must have sent in the window before their loss counts:
+/// one second of 10 ms packets. One loss in the first 30 is not 3 % loss.
+pub(crate) const LOSS_EVIDENCE_PACKETS: u64 = 100;
+
+/// The worst loss among people with enough packets to measure it.
+pub(crate) fn loss_evidence(qualities: impl IntoIterator<Item = Quality>) -> Option<Quality> {
+    worst(qualities.into_iter().filter(|q| q.expected >= LOSS_EVIDENCE_PACKETS))
+}
+
+/// Automatic Opus loss recovery, decided from the incoming `Quality` window. Relay has no report of how others receive us, so the
+/// loss we measure on their packets stands in for the loss on ours: most
+/// loss on home Wi-Fi and mobile links hits both directions.
+#[derive(Default)]
+pub(crate) struct LossRecoveryPolicy {
+    active: bool,
+    clean_since: Option<Instant>,
+}
+
+impl LossRecoveryPolicy {
+    /// Returns whether automatic recovery should be on now. `None` (too few
+    /// packets heard) is no evidence: it neither starts nor ends the clean minute.
+    pub(crate) fn observe(&mut self, quality: Option<Quality>, now: Instant) -> bool {
+        let quality = quality.filter(|q| q.expected >= LOSS_EVIDENCE_PACKETS);
+        if quality.is_some_and(|q| q.loss_percent > RECOVERY_LOSS_PERCENT) {
+            self.active = true;
+            self.clean_since = None;
+        } else if self.active && quality.is_some() {
+            let since = *self.clean_since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= RECOVERY_CLEAN_TIME {
+                self.active = false;
+                self.clean_since = None;
+            }
+        }
+        self.active
+    }
+}
+
 /// The worst figure across speakers, each taken separately: one bad sender is
 /// what the listener hears.
 pub(crate) fn worst(qualities: impl IntoIterator<Item = Quality>) -> Option<Quality> {
@@ -273,6 +314,49 @@ mod tests {
         assert!(stats.quality(last).unwrap().jitter_ms < 1.0);
         assert!(!stats.expired(last + Duration::from_secs(9)));
         assert!(stats.expired(last + Duration::from_secs(10)));
+    }
+
+    fn with_loss(loss_percent: f32) -> Option<Quality> {
+        Some(Quality { loss_percent, late_percent: 0.0, jitter_ms: 2.0, expected: 500 })
+    }
+
+    #[test]
+    fn fec_turns_on_when_measured_loss_exceeds_two_percent_and_off_again_after_a_clean_minute() {
+        let start = Instant::now();
+        let mut policy = LossRecoveryPolicy::default();
+        assert!(!policy.observe(None, start), "no evidence, no recovery");
+        // One lost packet in the first 30 is not yet a loss rate.
+        let early = Quality { loss_percent: 3.3, late_percent: 0.0, jitter_ms: 2.0, expected: 30 };
+        assert!(!policy.observe(Some(early), start));
+        assert_eq!(loss_evidence([early]), None);
+        let a = Quality { expected: 400, ..early };
+        let b = Quality { loss_percent: 9.0, expected: 40, ..early };
+        assert_eq!(loss_evidence([a, b]), Some(a), "each person's own count decides");
+        assert!(!policy.observe(with_loss(2.0), start), "exactly 2 % is not above it");
+        assert!(policy.observe(with_loss(2.5), start + Duration::from_secs(1)));
+        // Loss falls back: recovery stays on for a whole clean minute.
+        let clean = start + Duration::from_secs(2);
+        for second in 0..60 {
+            assert!(policy.observe(with_loss(0.4), clean + Duration::from_secs(second)), "{second}");
+        }
+        // Another loss spike restarts the minute.
+        assert!(policy.observe(with_loss(4.0), clean + Duration::from_secs(59)));
+        assert!(policy.observe(with_loss(0.0), clean + Duration::from_secs(60)));
+        // Silence is no evidence either way: it neither ends nor restarts the minute.
+        assert!(policy.observe(None, clean + Duration::from_secs(100)));
+        assert!(policy.observe(with_loss(0.0), clean + Duration::from_secs(119)));
+        assert!(!policy.observe(with_loss(0.0), clean + Duration::from_secs(120)));
+        assert!(!policy.observe(with_loss(1.9), clean + Duration::from_secs(121)));
+
+        // Driven by real arrival counts over the 5 s window: 3 % loss turns it on.
+        let mut stats = ArrivalStats::new(start);
+        let mut policy = LossRecoveryPolicy::default();
+        let now = stream(&mut stats, start, 200, |sequence| sequence % 33 == 0);
+        assert!(policy.observe(stats.quality(now), now));
+        let mut stats = ArrivalStats::new(start);
+        let mut policy = LossRecoveryPolicy::default();
+        let now = stream(&mut stats, start, 200, |sequence| sequence % 100 == 0);
+        assert!(!policy.observe(stats.quality(now), now), "1 % stays off");
     }
 
     #[test]

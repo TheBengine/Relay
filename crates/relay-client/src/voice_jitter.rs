@@ -21,6 +21,50 @@ fn near_silence(samples: &[f32]) -> bool {
         && samples.iter().map(|s| s * s).sum::<f32>() / (samples.len() as f32) < 1.0e-8
 }
 
+/// Whether an Opus packet carries redundancy for the frame before it (in-band
+/// FEC). Only SILK and hybrid packets can. For one frame of up to 20 ms the
+/// SILK layer starts with two equiprobable range-coded flags: voice activity,
+/// then redundancy (RFC 6716 4.2.3). This decodes exactly those two bits.
+fn carries_redundancy(packet: &[u8]) -> bool {
+    let Some((&toc, frame)) = packet.split_first() else {
+        return false;
+    };
+    // Configurations 0-15 are SILK or hybrid; code 0 is one frame.
+    if toc >> 3 >= 16 || toc & 3 != 0 || frame.is_empty() {
+        return false;
+    }
+    if !opus::packet::get_nb_samples(packet, AUDIO_SAMPLE_RATE).is_ok_and(|n| n <= 960) {
+        return false;
+    }
+    // Range decoder of RFC 6716 4.1 / libopus entdec.c.
+    let mut bytes = frame.iter().copied();
+    let mut rem = u32::from(bytes.next().unwrap_or(0));
+    let mut rng: u32 = 128;
+    let mut val: u32 = 127 - (rem >> 1);
+    let mut normalize = |rng: &mut u32, val: &mut u32| {
+        while *rng <= 1 << 23 {
+            *rng <<= 8;
+            let previous = rem;
+            rem = u32::from(bytes.next().unwrap_or(0));
+            let symbol = ((previous << 8) | rem) >> 1;
+            *val = ((*val << 8) + (255 & !symbol)) & ((1 << 31) - 1);
+        }
+    };
+    normalize(&mut rng, &mut val);
+    let mut bit = |rng: &mut u32, val: &mut u32| {
+        let s = *rng >> 1;
+        let set = *val < s;
+        if !set {
+            *val -= s;
+        }
+        *rng = if set { s } else { *rng - s };
+        normalize(rng, val);
+        set
+    };
+    let _voice_activity = bit(&mut rng, &mut val);
+    bit(&mut rng, &mut val)
+}
+
 /// Queue depth is judged over the last one to two of these windows.
 const QUEUE_WINDOW: Duration = Duration::from_millis(500);
 
@@ -74,7 +118,10 @@ pub(crate) struct Packet {
 pub(crate) struct JitterStats {
     pub late: u64,
     pub reordered: u64,
+    /// Missing frames played without their packet and without redundancy.
     pub concealed: u64,
+    /// Missing frames rebuilt from Opus redundancy in the next packet.
+    pub recovered: u64,
     pub held: u64,
     pub quiet_skips: u64,
 }
@@ -337,12 +384,17 @@ impl Speaker {
             let _ = self.decoder.reset_state();
         }
         // A fresh talkspurt adopts the learned target at its own receive time.
-        // It never copies or resets a transport/replay counter.
+        // It never copies or resets a transport/replay counter. A restart that
+        // continues the source clock exactly is a rebuilt encoder mid-sentence
+        // (loss recovery switching, a packet size change), not a talkspurt:
+        // playout keeps its timing and only the decoder is reset below.
         if self.adaptation.is_some() && self.expected.is_some() {
             if let (Some((&sequence, first)), Some((played, at))) =
                 (self.packets.first_key_value(), self.last_packet_played)
             {
+                let continues = self.expected == Some((sequence, first.timestamp));
                 if first.restart
+                    && !continues
                     && sequence >= self.expected.unwrap().0
                     && sequence > played
                     && first.timestamp > at
@@ -440,22 +492,28 @@ impl Speaker {
                 self.first_packet = now;
                 return false;
             }
-            self.stats.concealed += 1;
             // Recover from an already queued successor when the sender supplied
             // Opus redundancy. Never wait for it or consume its normal playout.
             // Without redundant data Opus performs ordinary concealment. Source
             // continuity excludes gated silence, restarts and duration changes.
+            // The successor's redundancy is for exactly this frame, so the last
+            // frame of a short burst is rebuilt too.
             let successor = sequence
                 .checked_add(1)
-                .and_then(|next| self.packets.get(&next));
-            if let Some(next) = successor.filter(|packet| {
-                self.missing == 1
-                    && !packet.restart
-                    && !packet.legacy
-                    && packet.timestamp == timestamp.saturating_add(frame_samples as u64)
-                    && opus::packet::get_nb_samples(&packet.bytes, AUDIO_SAMPLE_RATE)
-                        .is_ok_and(|samples| samples == frame_samples)
-            }) {
+                .and_then(|next| self.packets.get(&next))
+                .filter(|packet| {
+                    !packet.restart
+                        && !packet.legacy
+                        && packet.timestamp == timestamp.saturating_add(frame_samples as u64)
+                        && opus::packet::get_nb_samples(&packet.bytes, AUDIO_SAMPLE_RATE)
+                            .is_ok_and(|samples| samples == frame_samples)
+                });
+            if successor.is_some_and(|packet| carries_redundancy(&packet.bytes)) {
+                self.stats.recovered += 1;
+            } else {
+                self.stats.concealed += 1;
+            }
+            if let Some(next) = successor {
                 self.decoder.decode_float(&next.bytes, output, true)
             } else {
                 self.decoder.decode_float(&[], output, false)
@@ -516,6 +574,257 @@ impl Speaker {
                 false
             }
         }
+    }
+}
+
+/// Deterministic network profiles for the receive path. Real Opus packets go
+/// through the real `Speaker` on a simulated clock (1 ms ticks, 5 ms mixer
+/// quanta), like `stable_ten_ms_path_starts_ten_ms_earlier_without_losing_audio`.
+/// No devices, sockets or wall-clock sleeps.
+#[cfg(test)]
+pub(crate) mod network_profiles {
+    use super::*;
+    use crate::audio_settings::LossRecovery;
+    use crate::voice_quality::{ArrivalStats, LossRecoveryPolicy};
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct NetworkProfile {
+        pub name: &'static str,
+        /// Fixed one-way network delay.
+        pub one_way_ms: u32,
+        /// Extra queueing delay per packet, drawn evenly from 0 to this value.
+        /// Packets keep their order unless `reorder_pct` swaps them.
+        pub jitter_ms: u32,
+        /// Share of packets that never arrive, 0–100.
+        pub loss_pct: f32,
+        /// Share of packets that arrive just after their successor, 0–100.
+        pub reorder_pct: f32,
+        /// Packets lost together in one loss event.
+        pub burst_len: u32,
+    }
+
+    pub(crate) const PROFILES: [NetworkProfile; 5] = [
+        NetworkProfile {
+            name: "lan_wired",
+            one_way_ms: 5,
+            jitter_ms: 0,
+            loss_pct: 0.0,
+            reorder_pct: 0.0,
+            burst_len: 1,
+        },
+        NetworkProfile {
+            name: "wifi_good",
+            one_way_ms: 8,
+            jitter_ms: 5,
+            loss_pct: 0.5,
+            reorder_pct: 0.0,
+            burst_len: 1,
+        },
+        NetworkProfile {
+            name: "wifi_busy",
+            one_way_ms: 10,
+            jitter_ms: 20,
+            loss_pct: 3.0,
+            reorder_pct: 0.0,
+            burst_len: 2,
+        },
+        NetworkProfile {
+            name: "dsl_far",
+            one_way_ms: 40,
+            jitter_ms: 10,
+            loss_pct: 1.0,
+            reorder_pct: 0.0,
+            burst_len: 1,
+        },
+        NetworkProfile {
+            name: "mobile_hotspot",
+            one_way_ms: 30,
+            jitter_ms: 40,
+            loss_pct: 5.0,
+            reorder_pct: 2.0,
+            burst_len: 1,
+        },
+    ];
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct ReceiveReport {
+        /// Frames played without their own packet and without redundancy.
+        pub concealed: u64,
+        /// Missing frames rebuilt from the next packet's redundancy.
+        pub recovered: u64,
+        pub late: u64,
+        pub held: u64,
+        /// Simulated time of the first audible output; packet 1 leaves at 10 ms.
+        pub first_playout_ms: Option<u64>,
+        /// Output samples from the first playout until the last source frame.
+        pub rendered_samples: usize,
+        /// Output quanta with no audio between first playout and the last frame.
+        pub silent_gaps: u64,
+        /// Packets the network dropped.
+        pub lost: u64,
+        /// When the sender first turned loss recovery on.
+        pub recovery_on_ms: Option<u64>,
+        /// Sent packets that carry redundancy for the frame before them.
+        pub redundant_packets: u64,
+        /// Near-silent frames left out to shorten a standing queue.
+        pub quiet_skips: u64,
+        /// Receive buffering in use at the end of the run.
+        pub final_delay_ms: u32,
+    }
+
+    /// splitmix64: a fixed seed gives the same network on every run.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// Arrival time in µs for each packet (index = sequence - 1), or None if lost.
+    /// Drawn before any audio is encoded, so every sender mode sees one network.
+    fn network(profile: &NetworkProfile, packets: u64) -> Vec<Option<u64>> {
+        let seed = profile.name.bytes().fold(0x5EED_D00D_u64, |seed, byte| {
+            seed.rotate_left(8) ^ u64::from(byte)
+        });
+        let mut rng = Rng(seed);
+        let start = f64::from(profile.loss_pct) / 100.0 / f64::from(profile.burst_len.max(1));
+        let mut burst = 0;
+        let mut previous = 0;
+        let mut arrivals: Vec<Option<u64>> = (1..=packets)
+            .map(|sequence| {
+                let sent = sequence * 10_000;
+                let jitter = (rng.unit() * f64::from(profile.jitter_ms) * 1000.0) as u64;
+                let lost = if burst > 0 {
+                    burst -= 1;
+                    true
+                } else if rng.unit() < start {
+                    burst = profile.burst_len.saturating_sub(1);
+                    true
+                } else {
+                    false
+                };
+                // One queue: a packet never overtakes the one sent before it.
+                let arrival = (sent + u64::from(profile.one_way_ms) * 1000 + jitter).max(previous);
+                previous = arrival;
+                (!lost).then_some(arrival)
+            })
+            .collect();
+        for index in 0..arrivals.len().saturating_sub(1) {
+            if rng.unit() * 100.0 < f64::from(profile.reorder_pct) {
+                if let (Some(_), Some(next)) = (arrivals[index], arrivals[index + 1]) {
+                    arrivals[index] = Some(next + 500);
+                }
+            }
+        }
+        arrivals
+    }
+
+    /// The factory sender setting.
+    pub(crate) fn simulate(profile: &NetworkProfile, packets: u64) -> ReceiveReport {
+        simulate_with(profile, packets, LossRecovery::default())
+    }
+
+    /// The sender decides recovery from the loss the receiver measures: the
+    /// simulated path is symmetric, which is what a real sender assumes when
+    /// it uses its own incoming loss.
+    pub(crate) fn simulate_with(
+        profile: &NetworkProfile,
+        packets: u64,
+        choice: LossRecovery,
+    ) -> ReceiveReport {
+        let origin = Instant::now();
+        let fate = network(profile, packets);
+        // The audio bench's talker and seed: syllables, formants and short
+        // pauses, sent continuously as with an open voice gate.
+        let speech =
+            crate::voice_test_signals::talker(packets as f32 / 100.0, (105.0, 135.0), 13, 0.3);
+        let mut policy = LossRecoveryPolicy::default();
+        let mut recovery = choice.active(false, 480);
+        let mut encoder =
+            crate::audio_settings::make_voice_encoder_with_recovery(96, recovery).unwrap();
+        let mut speaker = Speaker::new(origin).unwrap();
+        // Factory receive setting: Automatic with a 10 ms manual fallback.
+        speaker.configure_adaptation(true);
+        let mut stats = ArrivalStats::new(origin);
+        let mut in_flight: Vec<(u64, u64, bool, Vec<u8>)> = Vec::new();
+        let mut report = ReceiveReport {
+            lost: fate.iter().filter(|arrival| arrival.is_none()).count() as u64,
+            ..ReceiveReport::default()
+        };
+        let mut encoded = [0u8; 1500];
+        let last_send_ms = packets * 10;
+        let mut done = false;
+        let mut tick = 0u64;
+        while !done && tick <= last_send_ms + 2_000 {
+            let now = origin + Duration::from_millis(tick);
+            if tick.is_multiple_of(10) && (1..=packets).contains(&(tick / 10)) {
+                let sequence = tick / 10;
+                let wanted = choice.active(policy.observe(stats.quality(now), now), 480);
+                // Switching rebuilds the encoder without a restart flag, as
+                // the call worker does: the listener keeps decoding.
+                let restart = sequence == 1;
+                if wanted != recovery {
+                    encoder = crate::audio_settings::make_voice_encoder_with_recovery(96, wanted)
+                        .unwrap();
+                    recovery = wanted;
+                    if wanted {
+                        report.recovery_on_ms.get_or_insert(tick);
+                    }
+                }
+                let start = (sequence as usize - 1) * 480;
+                let size = encoder
+                    .encode_float(&speech[start..start + 480], &mut encoded)
+                    .unwrap();
+                report.redundant_packets += u64::from(carries_redundancy(&encoded[..size]));
+                if let Some(arrival) = fate[sequence as usize - 1] {
+                    in_flight.push((arrival, sequence, restart, encoded[..size].to_vec()));
+                }
+            }
+            in_flight.sort_by_key(|&(arrival, sequence, _, _)| (arrival, sequence));
+            while in_flight
+                .first()
+                .is_some_and(|&(arrival, ..)| arrival <= tick * 1000)
+            {
+                let (arrival, sequence, restart, bytes) = in_flight.remove(0);
+                let at = origin + Duration::from_micros(arrival);
+                let timestamp = (sequence - 1) * 480;
+                stats.observe(sequence, timestamp, restart, at);
+                let late = speaker.stats.late;
+                speaker.push_timed(sequence, timestamp, restart, bytes, at);
+                for _ in late..speaker.stats.late {
+                    stats.late(at);
+                }
+            }
+            if tick.is_multiple_of(5) {
+                let mut output = [0.0; 240];
+                let played = speaker.render_quantum(now, &mut output, 10);
+                assert!(output.iter().all(|sample| sample.is_finite()));
+                if played {
+                    report.first_playout_ms.get_or_insert(tick);
+                    report.rendered_samples += output.len();
+                } else if report.first_playout_ms.is_some() {
+                    report.silent_gaps += 1;
+                }
+                done = speaker.last_played.is_some_and(|played| played >= packets)
+                    && speaker.pending_pcm.is_empty();
+            }
+            tick += 1;
+        }
+        assert!(done, "{}: the last source frame never played", profile.name);
+        report.concealed = speaker.stats.concealed;
+        report.recovered = speaker.stats.recovered;
+        report.late = speaker.stats.late;
+        report.held = speaker.stats.held;
+        report.quiet_skips = speaker.stats.quiet_skips;
+        report.final_delay_ms = speaker.actual_delay_us / 1000;
+        report
     }
 }
 
@@ -625,7 +934,107 @@ mod tests {
                 assert_eq!(speaker.next_deadline, Some(at + FRAME));
             }
         }
-        assert_eq!(speaker.stats.concealed, 1);
+        // Rebuilt from redundancy, not guessed.
+        assert_eq!((speaker.stats.concealed, speaker.stats.recovered), (0, 1));
+    }
+
+    fn fec_packets(count: usize, fec: bool) -> Vec<Vec<u8>> {
+        let mut encoder = crate::audio_settings::make_voice_encoder_with_recovery(96, fec).unwrap();
+        (0..count)
+            .map(|seq| {
+                let pcm: Vec<_> = (0..480)
+                    .map(|i| (((seq * 480 + i) as f32) * 0.07).sin() * 0.2)
+                    .collect();
+                encoder.encode_vec_float(&pcm, 1500).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_encoder_restart_that_continues_the_source_clock_keeps_playout_timing() {
+        // Automatic loss recovery rebuilds the sender's encoder mid-sentence.
+        // That restart is not a new talkspurt and must not re-prime the buffer.
+        let origin = Instant::now();
+        let plain = fec_packets(10, false);
+        let protected = fec_packets(10, true);
+        let mut speaker = Speaker::new(origin).unwrap();
+        speaker.configure_adaptation(true);
+        let frame = Duration::from_millis(10);
+        let mut output = [0.0; AUDIO_FRAME_SAMPLES];
+        let mut gaps = 0;
+        for index in 0..20u64 {
+            let bytes = if index < 10 {
+                plain[index as usize].clone()
+            } else {
+                protected[index as usize - 10].clone()
+            };
+            let at = origin + frame * index as u32;
+            speaker.push_timed(index + 1, index * 480, index == 0 || index == 10, bytes, at);
+            if index == 10 {
+                // The link just got worse: the learned target rises to 20 ms.
+                speaker.adaptation.as_mut().unwrap().late_packet(at);
+            }
+            if !speaker.render(at, &mut output, 10) {
+                gaps += 1;
+            }
+        }
+        assert_eq!(gaps, 0, "silence inserted mid-sentence");
+        assert_eq!(speaker.last_packet_played.unwrap().0, 19);
+        // The higher target is reached with one concealed hold instead.
+        assert_eq!((speaker.stats.concealed, speaker.stats.held), (0, 1));
+    }
+
+    #[test]
+    fn redundancy_flag_reads_the_silk_header_of_real_opus_packets() {
+        let with = fec_packets(20, true);
+        let without = fec_packets(20, false);
+        // The first packet has no earlier frame to protect.
+        assert!(!carries_redundancy(&with[0]));
+        assert!(with[2..].iter().all(|packet| carries_redundancy(packet)));
+        assert!(without.iter().all(|packet| !carries_redundancy(packet)));
+        assert!(!carries_redundancy(&[]));
+        assert!(!carries_redundancy(&[with[5][0]]));
+    }
+
+    #[test]
+    fn a_two_packet_burst_recovers_its_second_frame_from_redundancy() {
+        let origin = Instant::now();
+        let packets = fec_packets(30, true);
+        let mut speaker = Speaker::new(origin).unwrap();
+        let mut reference = Decoder::new(48_000, Channels::Mono).unwrap();
+        let frame = Duration::from_millis(10);
+        // Packets 11 and 12 are lost; 13 is queued when 11 is due. Three
+        // packets wait ahead of playout, well inside the storage cap.
+        let push = |speaker: &mut Speaker, index: usize| {
+            if index != 10 && index != 11 {
+                // No restart flag: a quiet first frame would be skipped as preroll.
+                speaker.push_timed(
+                    index as u64 + 1,
+                    index as u64 * 480,
+                    false,
+                    packets[index].clone(),
+                    origin,
+                );
+            }
+        };
+        for index in 0..3 {
+            push(&mut speaker, index);
+        }
+        for index in 0..18usize {
+            push(&mut speaker, index + 3);
+            let mut expected = [0.0; 480];
+            match index {
+                10 => reference.decode_float(&[], &mut expected, false),
+                11 => reference.decode_float(&packets[12], &mut expected, true),
+                _ => reference.decode_float(&packets[index], &mut expected, false),
+            }
+            .unwrap();
+            let mut output = [0.0; AUDIO_FRAME_SAMPLES];
+            assert!(speaker.render(origin + frame * index as u32, &mut output, 20));
+            assert_eq!(output[..480], expected, "frame {index}");
+        }
+        assert_eq!((speaker.stats.concealed, speaker.stats.recovered), (1, 1));
+        assert_eq!(speaker.last_packet_played.unwrap().0, 18);
     }
 
     #[test]
@@ -1626,6 +2035,74 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn every_profile_renders_all_samples_and_reports_concealment() {
+        use super::network_profiles::{simulate, PROFILES};
+        for profile in &PROFILES {
+            let report = simulate(profile, 1000);
+            println!("{}: {report:?}", profile.name);
+            assert!(
+                report.rendered_samples >= 1000 * 480,
+                "{}: lost rendered audio {report:?}",
+                profile.name
+            );
+            assert_eq!(report.silent_gaps, 0, "{}: {report:?}", profile.name);
+            if profile.loss_pct > 0.0 {
+                assert!(report.lost > 0, "{}: no network loss drawn", profile.name);
+                assert!(report.concealed > 0, "{}: {report:?}", profile.name);
+            } else {
+                assert_eq!(report.concealed, 0, "{}: {report:?}", profile.name);
+            }
+        }
+        let lan = simulate(&PROFILES[0], 1000);
+        assert_eq!(PROFILES[0].name, "lan_wired");
+        assert_eq!(lan.first_playout_ms, Some(15));
+        assert_eq!((lan.late, lan.held), (0, 0));
+        assert_eq!(lan.rendered_samples, 480_000);
+        // A fixed seed: the same profile always produces the same report.
+        assert_eq!(simulate(&PROFILES[2], 1000), simulate(&PROFILES[2], 1000));
+    }
+
+    #[test]
+    fn automatic_loss_recovery_rebuilds_lost_speech_without_touching_a_clean_lan() {
+        use super::network_profiles::{simulate_with, PROFILES};
+        use crate::audio_settings::LossRecovery;
+        for profile in &PROFILES {
+            let off = simulate_with(profile, 1000, LossRecovery::Off);
+            let automatic = simulate_with(profile, 1000, LossRecovery::Automatic);
+            println!(
+                "{}: off {off:?}\n{}: automatic {automatic:?}",
+                profile.name, profile.name
+            );
+            assert!(
+                automatic.rendered_samples >= 480_000,
+                "{}: {automatic:?}",
+                profile.name
+            );
+            assert_eq!(automatic.silent_gaps, 0, "{}: {automatic:?}", profile.name);
+            assert!(automatic.concealed <= off.concealed, "{}", profile.name);
+            if profile.name == "lan_wired" {
+                assert_eq!(automatic, off, "a clean network never switches recovery on");
+                assert_eq!(automatic.first_playout_ms, Some(15));
+                assert_eq!(automatic.recovery_on_ms, None);
+            }
+            if profile.name == "wifi_busy" {
+                // Measured 74 -> 66 with 8 rebuilt. Opus redundancy covers one
+                // frame, so the first frame of each two-packet burst and the
+                // packets that arrive late stay concealed: see
+                // docs/network-profiles-20261028.md. It switches on once a
+                // second of packets (100) shows the loss.
+                assert!(automatic.recovery_on_ms.is_some_and(|at| at <= 1100));
+                assert!(automatic.recovered > 0, "{automatic:?}");
+                assert!(automatic.concealed < off.concealed, "{automatic:?}");
+                assert!(
+                    automatic.final_delay_ms <= off.final_delay_ms,
+                    "recovery added buffering"
+                );
+            }
+        }
+    }
+
     #[test]
     fn steady_path_never_skips_audio() {
         let (frames, _) = talker(600);

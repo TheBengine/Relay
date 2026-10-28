@@ -31,6 +31,9 @@ struct AudioProcessingConfig {
   bool gain_controller_enabled;
   bool high_pass_filter_enabled;
   bool noise_suppression_enabled;
+  // 0 low (6 dB), 1 moderate (12 dB, WebRTC's default), 2 high (18 dB),
+  // 3 very high (21 dB). Relay: chosen by measurement for the send chain.
+  int noise_suppression_level = 1;
 
   webrtc::AudioProcessing::Config ToWebrtcConfig() const {
     webrtc::AudioProcessing::Config config;
@@ -39,6 +42,11 @@ struct AudioProcessingConfig {
     config.gain_controller2.adaptive_digital.enabled = gain_controller_enabled;
     config.high_pass_filter.enabled = high_pass_filter_enabled;
     config.noise_suppression.enabled = noise_suppression_enabled;
+    config.noise_suppression.level =
+        static_cast<webrtc::AudioProcessing::Config::NoiseSuppression::Level>(
+            noise_suppression_level < 0   ? 0
+            : noise_suppression_level > 3 ? 3
+                                          : noise_suppression_level);
     return config;
   }
 };
@@ -72,5 +80,12 @@ std::unique_ptr<AudioProcessingModule> create_apm(
     bool gain_controller_enabled,
     bool high_pass_filter_enabled,
     bool noise_suppression_enabled);
+
+std::unique_ptr<AudioProcessingModule> create_apm_with_ns_level(
+    bool echo_canceller_enabled,
+    bool gain_controller_enabled,
+    bool high_pass_filter_enabled,
+    bool noise_suppression_enabled,
+    int noise_suppression_level);
 
 }  // namespace livekit_ffi

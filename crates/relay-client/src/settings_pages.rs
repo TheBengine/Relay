@@ -1385,14 +1385,23 @@ impl RelayApp {
             });
         self.prefs.audio.set_packet_samples(packet_samples);
         controls::description(ui, "Shorter packets send audio sooner and use more network overhead. Everyone needs an updated Relay client to receive 2.5 ms packets. Noise suppression and echo cancellation process at least 10 ms at a time. Save Changes applies your choice.");
-        controls::switch_row(
-            ui,
-            "recover-voice-packets",
-            "Help others hear me through brief network losses",
-            "Send extra speech recovery data in 10 or 20 ms packets. Uses a little more codec delay; the displayed delay budget includes it. Recovery needs the next packet to arrive on time and cannot repair every dropout. Off keeps the shortest codec delay.",
-            &mut self.prefs.audio.recover_packet_loss,
-        );
-        if self.prefs.audio.recover_packet_loss && self.prefs.audio.packet_samples() < 480 {
+        {
+            use crate::audio_settings::LossRecovery;
+            controls::nav_group(ui, "HELP OTHERS HEAR ME THROUGH BRIEF NETWORK LOSSES");
+            let mut choice = self.prefs.audio.loss_recovery();
+            for (option, label, body) in [
+                (LossRecovery::Automatic, "Automatic (recommended)", "Turns on by itself when more than 2 in 100 of the packets you receive go missing, and off again after a clean minute. Adds about 4 ms of delay only while it is on."),
+                (LossRecovery::Always, "Always", "Sends extra speech recovery data in every 10 or 20 ms packet. The displayed delay budget includes the extra codec delay."),
+                (LossRecovery::Off, "Off", "The shortest codec delay. A lost packet is filled in by guessing."),
+            ] {
+                controls::radio_value(ui, ("loss-recovery", label), &mut choice, option, label, body);
+            }
+            self.prefs.audio.set_loss_recovery(choice);
+            controls::description(ui, "Recovery needs the next packet to arrive on time and cannot repair every dropout.");
+        }
+        if self.prefs.audio.loss_recovery() != crate::audio_settings::LossRecovery::Off
+            && self.prefs.audio.packet_samples() < 480
+        {
             controls::description(ui, "Recovery is inactive with 2.5 or 5 ms packets. Choose 10 or 20 ms packets to use it.");
         }
         controls::divider(ui);

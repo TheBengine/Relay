@@ -1,5 +1,9 @@
 #![cfg_attr(
-    all(not(debug_assertions), target_os = "windows"),
+    all(
+        not(debug_assertions),
+        target_os = "windows",
+        not(feature = "audio-bench")
+    ),
     windows_subsystem = "windows"
 )]
 
@@ -93,6 +97,7 @@ mod message_format;
 mod native_invitation_wake;
 mod native_render_probe;
 mod network;
+mod noise_suppressor;
 mod notifications;
 mod online_gifs;
 #[cfg(all(windows, feature = "native-rtc"))]
@@ -132,14 +137,22 @@ mod voice_output;
 mod voice_gate;
 mod camera_watch;
 mod click_suppression;
-#[cfg(test)]
+#[cfg(any(test, feature = "audio-bench"))]
+#[cfg_attr(not(test), allow(dead_code))]
 mod voice_test_signals;
+#[cfg(any(test, feature = "audio-bench"))]
+mod audio_bench;
 mod voice_preroll;
 mod voice_recovery;
 mod voice_tunnel;
 mod voice_ui_state;
 
 fn main() -> eframe::Result<()> {
+    // The audio bench is this binary's module tree with its own entry point.
+    #[cfg(feature = "audio-bench")]
+    if option_env!("CARGO_BIN_NAME") == Some("audio-bench") {
+        std::process::exit(audio_bench::run_cli());
+    }
     tls_crypto::initialize();
     // A Relay restarted by this process re-reads its data location itself.
     data_location::forget_inherited();

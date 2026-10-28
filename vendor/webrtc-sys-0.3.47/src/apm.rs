@@ -49,6 +49,16 @@ pub mod ffi {
             high_pass_filter_enabled: bool,
             noise_suppression_enabled: bool,
         ) -> UniquePtr<AudioProcessingModule>;
+
+        /// As `create_apm`, with the noise suppression level
+        /// (0 low, 1 moderate, 2 high, 3 very high).
+        fn create_apm_with_ns_level(
+            echo_canceller_enabled: bool,
+            gain_controller_enabled: bool,
+            high_pass_filter_enabled: bool,
+            noise_suppression_enabled: bool,
+            noise_suppression_level: i32,
+        ) -> UniquePtr<AudioProcessingModule>;
     }
 }
 

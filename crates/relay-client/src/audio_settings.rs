@@ -93,6 +93,30 @@ impl VoiceDelayBudget {
     }
 }
 
+/// "Help others hear me through brief network losses": Opus speech redundancy
+/// in 10 and 20 ms packets. Automatic turns it on while the loss measured on
+/// incoming voice is above 2 % and off again after a clean minute.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LossRecovery {
+    Off,
+    #[default]
+    Automatic,
+    Always,
+}
+
+impl LossRecovery {
+    /// Whether the encoder should carry redundancy now. `high_loss` is the
+    /// automatic decision; shorter packets never carry it.
+    pub(crate) fn active(self, high_loss: bool, packet_samples: usize) -> bool {
+        packet_samples >= 480
+            && match self {
+                Self::Off => false,
+                Self::Automatic => high_loss,
+                Self::Always => true,
+            }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioSettings {
@@ -116,8 +140,11 @@ pub struct AudioSettings {
     /// Retain 10 ms (one whole packet minimum) before the Voice Activity gate opens.
     pub preserve_speech_start: bool,
     pub bitrate_kbps: u32,
-    /// Optional speech redundancy; inactive for packets shorter than 10 ms.
+    /// Speech redundancy in every packet ("Always"); inactive for packets
+    /// shorter than 10 ms. Kept under its old name so saved profiles keep it.
     pub recover_packet_loss: bool,
+    /// When `recover_packet_loss` is off: Automatic (true) or Off (false).
+    pub automatic_loss_recovery: bool,
     /// Opus audio per transmitted packet: 5, 10 or 20 milliseconds.
     pub packet_ms: u32,
     /// Keep the legacy integer preference for older profiles. This selects 120 samples.
@@ -176,6 +203,7 @@ impl Default for AudioSettings {
             preserve_speech_start: true,
             bitrate_kbps: 96,
             recover_packet_loss: false,
+            automatic_loss_recovery: true,
             packet_ms: 10,
             ultra_short_packets: false,
             direct_voice_enabled: false,
@@ -285,6 +313,21 @@ impl AudioSettings {
         }
     }
 
+    pub fn loss_recovery(&self) -> LossRecovery {
+        match (self.recover_packet_loss, self.automatic_loss_recovery) {
+            (true, _) => LossRecovery::Always,
+            (false, true) => LossRecovery::Automatic,
+            (false, false) => LossRecovery::Off,
+        }
+    }
+
+    pub fn set_loss_recovery(&mut self, choice: LossRecovery) {
+        self.recover_packet_loss = choice == LossRecovery::Always;
+        self.automatic_loss_recovery = choice != LossRecovery::Off;
+    }
+
+    /// Recovery from the first packet of a call: Always only. Automatic
+    /// starts without it and switches on measured loss.
     pub fn loss_recovery_enabled(&self) -> bool {
         self.recover_packet_loss && self.packet_samples() >= 480
     }
@@ -693,6 +736,32 @@ mod tests {
                 .unwrap()
                 .recover_packet_loss
         );
+    }
+
+    #[test]
+    fn loss_recovery_defaults_to_automatic_and_keeps_a_saved_always_or_off() {
+        assert_eq!(AudioSettings::default().loss_recovery(), LossRecovery::Automatic);
+        let parse = |json: &str| serde_json::from_str::<AudioSettings>(json).unwrap();
+        // Profiles from before the choice existed: on stays Always, the old
+        // default (off) becomes Automatic.
+        assert_eq!(parse("{}").loss_recovery(), LossRecovery::Automatic);
+        assert_eq!(parse(r#"{"recover_packet_loss":false}"#).loss_recovery(), LossRecovery::Automatic);
+        assert_eq!(parse(r#"{"recover_packet_loss":true}"#).loss_recovery(), LossRecovery::Always);
+        for choice in [LossRecovery::Off, LossRecovery::Automatic, LossRecovery::Always] {
+            let mut settings = AudioSettings::default();
+            settings.set_loss_recovery(choice);
+            let saved = serde_json::to_string(&settings).unwrap();
+            assert_eq!(parse(&saved).loss_recovery(), choice);
+            // Only Always starts a call with recovery; Automatic waits for measured loss.
+            assert_eq!(settings.loss_recovery_enabled(), choice == LossRecovery::Always);
+        }
+        // Measured loss switches Automatic only, and never below 10 ms packets.
+        assert!(LossRecovery::Automatic.active(true, 480));
+        assert!(!LossRecovery::Automatic.active(false, 480));
+        assert!(!LossRecovery::Automatic.active(true, 240));
+        assert!(!LossRecovery::Off.active(true, 960));
+        assert!(LossRecovery::Always.active(false, 960));
+        assert!(!LossRecovery::Always.active(false, 120));
     }
 
     #[test]

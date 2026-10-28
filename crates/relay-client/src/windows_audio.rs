@@ -26,13 +26,24 @@ use windows::{
 pub(crate) struct PeriodInfo {
     pub engine_frames: u32,
     pub default_frames: u32,
+    /// The smallest period the device offers, and the step between periods.
+    pub min_frames: u32,
+    pub fundamental_frames: u32,
     pub buffer_frames: u32,
+    /// What the driver reports for the stream's own latency (100 ns units).
+    pub stream_latency_hns: i64,
     pub sample_rate: u32,
     pub channels: u16,
 }
 impl PeriodInfo {
     pub(crate) fn period_ms(self) -> f32 {
-        self.engine_frames as f32 * 1000.0 / self.sample_rate as f32
+        self.frames_ms(self.engine_frames)
+    }
+    pub(crate) fn frames_ms(self, frames: u32) -> f32 {
+        frames as f32 * 1000.0 / self.sample_rate as f32
+    }
+    pub(crate) fn stream_latency_ms(self) -> f32 {
+        self.stream_latency_hns as f32 / 10_000.0
     }
 }
 type CaptureCallback = Box<dyn FnMut(&[f32]) + Send>;
@@ -321,7 +332,11 @@ fn run(
         let info = PeriodInfo {
             engine_frames: selected,
             default_frames: default,
+            min_frames: min,
+            fundamental_frames: fundamental,
             buffer_frames: frames,
+            // Diagnostic only: a driver that cannot say reports zero.
+            stream_latency_hns: client.GetStreamLatency().unwrap_or(0),
             sample_rate: rate,
             channels,
         };
@@ -427,11 +442,124 @@ mod tests {
         let info = PeriodInfo {
             engine_frames: 120,
             default_frames: 480,
+            min_frames: 120,
+            fundamental_frames: 120,
             buffer_frames: 240,
+            stream_latency_hns: 25_000,
             sample_rate: 48000,
             channels: 2,
         };
         assert_eq!(info.period_ms(), 2.5);
+        assert_eq!(info.frames_ms(info.default_frames), 10.0);
+        assert_eq!(info.stream_latency_ms(), 2.5);
+    }
+
+    /// Opens the default microphone, then the default speakers, for 3 s each
+    /// and prints the period Windows negotiated and the callback interval
+    /// actually seen. Audio is never stored: only callback times and sizes.
+    /// `RELAY_MEASURE_INPUT` / `RELAY_MEASURE_OUTPUT` pick a device by name.
+    #[test]
+    #[ignore = "Opens the real default microphone and speakers; run by hand to measure timing"]
+    fn actual_shared_streams_report_period_and_callback_interval() {
+        use std::{
+            sync::Mutex,
+            time::{Duration, Instant},
+        };
+        fn default_endpoint(capture: bool) -> (String, u32, u16) {
+            unsafe {
+                CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap();
+                let _com = Com;
+                let enumerator: IMMDeviceEnumerator =
+                    CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).unwrap();
+                let flow = if capture { eCapture } else { eRender };
+                let device = enumerator.GetDefaultAudioEndpoint(flow, eConsole).unwrap();
+                let value = device
+                    .OpenPropertyStore(STGM_READ)
+                    .unwrap()
+                    .GetValue(&PKEY_Device_FriendlyName)
+                    .unwrap();
+                let text = PropVariantToStringAlloc(&value).unwrap();
+                let name = text.to_string().unwrap();
+                CoTaskMemFree(Some(text.0.cast()));
+                let client: IAudioClient = device.Activate(CLSCTX_ALL, None).unwrap();
+                let format = client.GetMixFormat().unwrap();
+                let (rate, channels) = ((*format).nSamplesPerSec, (*format).nChannels);
+                CoTaskMemFree(Some(format.cast()));
+                (name, rate, channels)
+            }
+        }
+        for capture in [true, false] {
+            let (mut name, rate, channels) = default_endpoint(capture);
+            let variable = if capture { "RELAY_MEASURE_INPUT" } else { "RELAY_MEASURE_OUTPUT" };
+            if let Ok(chosen) = std::env::var(variable) {
+                name = chosen;
+            }
+            let calls: Arc<Mutex<Vec<(Instant, usize)>>> =
+                Arc::new(Mutex::new(Vec::with_capacity(4096)));
+            let record = calls.clone();
+            let errors = Arc::new(Mutex::new(Vec::new()));
+            let failures = errors.clone();
+            let on_error = move |error: String| failures.lock().unwrap().push(error);
+            let frames = move |samples: usize| samples / channels as usize;
+            let stream = if capture {
+                Stream::input(name.clone(), rate, channels, move |data| {
+                    record.lock().unwrap().push((Instant::now(), frames(data.len())));
+                }, on_error)
+            } else {
+                Stream::output(name.clone(), rate, channels, move |data| {
+                    data.fill(0.0);
+                    record.lock().unwrap().push((Instant::now(), frames(data.len())));
+                }, on_error)
+            }
+            .unwrap();
+            stream.play().unwrap();
+            thread::sleep(Duration::from_secs(3));
+            let info = stream.info;
+            drop(stream);
+            assert!(errors.lock().unwrap().is_empty(), "{:?}", errors.lock().unwrap());
+            // Skip the start-up burst: the first half second.
+            let calls = calls.lock().unwrap();
+            let start = calls[0].0 + Duration::from_millis(500);
+            let steady: Vec<_> = calls.iter().filter(|(at, _)| *at >= start).collect();
+            let mut gaps: Vec<f64> = steady
+                .windows(2)
+                .map(|pair| (pair[1].0 - pair[0].0).as_secs_f64() * 1000.0)
+                .collect();
+            gaps.sort_by(f64::total_cmp);
+            let span = (steady.last().unwrap().0 - steady[0].0).as_secs_f64() * 1000.0;
+            let delivered: usize = steady.iter().skip(1).map(|(_, n)| n).sum();
+            let sizes = (
+                steady.iter().map(|(_, n)| *n).min().unwrap(),
+                steady.iter().map(|(_, n)| *n).max().unwrap(),
+            );
+            let at = |q: f64| gaps[((gaps.len() - 1) as f64 * q).round() as usize];
+            println!(
+                "{} \"{name}\": {rate} Hz, {channels} ch; negotiated {:.3} ms ({} frames), \
+                 default {:.3} ms, minimum {:.3} ms, step {:.3} ms, buffer {:.3} ms, \
+                 driver stream latency {:.3} ms",
+                if capture { "capture" } else { "render" },
+                info.period_ms(),
+                info.engine_frames,
+                info.frames_ms(info.default_frames),
+                info.frames_ms(info.min_frames),
+                info.frames_ms(info.fundamental_frames),
+                info.frames_ms(info.buffer_frames),
+                info.stream_latency_ms(),
+            );
+            println!(
+                "  {} callbacks in {span:.0} ms: interval mean {:.3} ms, median {:.3}, \
+                 p95 {:.3}, max {:.3}, min {:.3}; {sizes:?} frames per callback; \
+                 {:.3} ms of audio per ms",
+                steady.len(),
+                span / gaps.len() as f64,
+                at(0.5),
+                at(0.95),
+                gaps[gaps.len() - 1],
+                gaps[0],
+                delivered as f64 * 1000.0 / rate as f64 / span,
+            );
+            assert!(steady.len() > 50);
+        }
     }
     #[test]
     fn untrusted_driver_sizes_are_bounded_before_slices_or_allocations() {
