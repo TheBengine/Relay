@@ -49,7 +49,9 @@ fn a_published_problem_survives_cached_local_verification_and_ordinary_refresh()
             device_id: "cached-device".into(),
             fingerprint: "a".repeat(64),
             verified: true,
+            trusted: true,
             changed: false,
+            needs_review: false,
         });
     client
         .worker

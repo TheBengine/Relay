@@ -49,6 +49,9 @@ mod delivery_tests;
 #[path = "e2ee_invitation_tests.rs"]
 mod invitation_tests;
 #[cfg(all(test, windows))]
+#[path = "e2ee_trust_tests.rs"]
+mod trust_tests;
+#[cfg(all(test, windows))]
 #[path = "e2ee_tests.rs"]
 mod tests;
 const MAX_PRIVATE_BYTES: usize = 64 * 1024 * 1024;
@@ -131,9 +134,34 @@ pub struct CryptoUiStatus {
     /// Devices of other people approved because they proved the secret of the
     /// invitation they joined through (shown as "Verified via invitation").
     pub via_invitation: Vec<String>,
-    /// Devices whose invitation proof did not check out; they stay unapproved.
+    /// Devices whose invitation proof did not check out; they stay unverified.
     pub invitation_unconfirmed: Vec<String>,
+    /// Key changes and new own devices to tell the user about, until dismissed.
+    /// Changes that need the user's decision are `CryptoPeerStatus::needs_review`.
+    pub notices: Vec<TrustNotice>,
 }
+
+/// Something about another device's key the user should know. It never blocks
+/// messaging by itself; see `CryptoPeerStatus::needs_review` for that.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustNotice {
+    pub user_id: String,
+    pub device_id: String,
+    pub fingerprint: String,
+    pub kind: TrustNoticeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrustNoticeKind {
+    /// A device of someone not verified here presented a new key, which is
+    /// now trusted in place of the old one.
+    CodeChanged,
+    /// Another device was added to this account.
+    NewOwnDevice,
+}
+
+const MAX_TRUST_NOTICES: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CryptoProblemSource {
@@ -181,8 +209,30 @@ pub struct CryptoPeerStatus {
     pub name: String,
     pub device_id: String,
     pub fingerprint: String,
+    /// Security codes were compared (or an invitation proof checked out) for
+    /// exactly this key. Shown as the "Verified" badge.
     pub verified: bool,
+    /// This key is trusted, verified or trusted on first use.
+    pub trusted: bool,
+    /// An earlier key of this device is trusted here, not this one.
     pub changed: bool,
+    /// Nothing is shared with this device until the user accepts its new code
+    /// or verifies it: the person was verified by hand.
+    pub needs_review: bool,
+}
+
+/// The trust flags of one listed device, as this device sees it.
+pub(crate) fn peer_trust(device: &Device, public: &PublicDevice) -> (bool, bool, bool, bool) {
+    let trust = device.trust(public);
+    let changed = trust.is_none() && device.expected_fingerprint(&public.identity.device_id).is_some();
+    let needs_review = trust.is_none()
+        && device.first_use_decision(public) == relay_crypto::FirstUse::Held;
+    (
+        trust == Some(relay_crypto::Trust::Verified),
+        trust.is_some(),
+        changed,
+        needs_review,
+    )
 }
 #[derive(Clone, Debug)]
 pub enum MessageProtection {
@@ -271,6 +321,13 @@ pub(crate) struct PrivateState {
     /// Device IDs approved through an invitation proof.
     #[serde(default)]
     via_invitation: Vec<String>,
+    /// Key changes not yet dismissed by the user.
+    #[serde(default)]
+    trust_notices: Vec<TrustNotice>,
+    /// Set after the first complete directory read. Before it, every device is
+    /// a first contact and no "new device on your account" notice is shown.
+    #[serde(default)]
+    trust_started: bool,
 }
 
 const MAX_ACTIVE_INVITATIONS: usize = 64;
@@ -518,6 +575,7 @@ impl CryptoSession {
                         || !state.via_invitation.is_empty()))
                 || state.invitations.len() > MAX_ACTIVE_INVITATIONS
                 || state.via_invitation.len() > MAX_VIA_INVITATION
+                || state.trust_notices.len() > MAX_TRUST_NOTICES
                 || state
                     .invitations
                     .iter()
@@ -580,6 +638,8 @@ impl CryptoSession {
                 call: call::CallState::default(),
                 invitations: Vec::new(),
                 via_invitation: Vec::new(),
+                trust_notices: Vec::new(),
+                trust_started: false,
             }
         };
         if let Some(head) = protected::head(&binding)? {
@@ -621,7 +681,8 @@ impl CryptoSession {
         session.status.own_fingerprint = session.device.fingerprint()?;
         session.status.supported = true;
         session.status.via_invitation = session.state.via_invitation.clone();
-        session.status.status = "Verify the other devices before sharing encryption keys.".into();
+        session.status.notices = session.state.trust_notices.clone();
+        session.status.status = "Messages are end-to-end encrypted. Compare security codes any time to verify someone.".into();
         Ok(session)
     }
     #[cfg(test)]
@@ -1086,27 +1147,184 @@ impl CryptoSession {
             if fingerprint != public.fingerprint {
                 return Err("The device fingerprint does not match. No key was shared.".into());
             }
-            // Existing MLS members may be listed without an unused KeyPackage.
-            // Keep their already-validated signing-key pin; comparing again
-            // changes only the recorded source of this exact approval.
-            if !device.is_approved(&public) {
+            // Existing MLS members may be listed without an unused KeyPackage:
+            // a matching pin only changes its recorded source to "verified".
+            // A changed key was compared by hand here, so it replaces the pin.
+            if device.expected_fingerprint(device_id).is_some() && device.trust(&public).is_none() {
+                device.accept_new_key(&public, Some(fingerprint))?;
+            } else {
                 device.approve(&public, fingerprint)?;
             }
             state.via_invitation.retain(|id| id != device_id);
+            state.trust_notices.retain(|n| n.device_id != device_id);
             Ok(())
         })?;
         self.status.via_invitation.retain(|id| id != device_id);
+        self.refresh_trust_status();
         Ok(())
     }
+    /// Removes the "Verified" mark. The same key stays trusted, as if it had
+    /// been trusted on first use, so conversations keep working.
     pub fn unapprove(&mut self, device_id: &str) -> Result<(), String> {
         self.cancel_invited_host_retry(device_id);
         self.mutate(|device, state| {
-            device.unapprove(device_id)?;
+            device.unverify(device_id)?;
             state.via_invitation.retain(|id| id != device_id);
             Ok(())
         })?;
         self.status.via_invitation.retain(|id| id != device_id);
+        self.refresh_trust_status();
         Ok(())
+    }
+    /// One click: trust the new security code of a device that needed review.
+    /// It is trusted, not verified; comparing codes later adds the badge.
+    pub fn accept_new_key(&mut self, device_id: &str, fingerprint: &str) -> Result<(), String> {
+        self.cancel_invited_host_retry(device_id);
+        let public = self
+            .directory
+            .get(device_id)
+            .ok_or("Refresh the device list before accepting this security code.")?
+            .clone();
+        if public.fingerprint != fingerprint {
+            return Err("This device's security code changed again. Review the new code.".into());
+        }
+        if public.identity == *self.device.identity() {
+            return Err("You cannot replace the key of this device.".into());
+        }
+        if self.device.trust(&public).is_none() {
+            self.mutate(|device, state| {
+                device.accept_new_key(&public, None)?;
+                state.via_invitation.retain(|id| id != device_id);
+                state.trust_notices.retain(|n| n.device_id != device_id);
+                Ok(())
+            })?;
+        } else {
+            self.dismiss_notice(device_id)?;
+        }
+        self.status.via_invitation = self.state.via_invitation.clone();
+        self.refresh_trust_status();
+        Ok(())
+    }
+    pub fn trust_notices(&self) -> Vec<TrustNotice> {
+        self.state.trust_notices.clone()
+    }
+    /// The user read a key-change notice. Trust does not change.
+    pub fn dismiss_notice(&mut self, device_id: &str) -> Result<(), String> {
+        if self.state.trust_notices.iter().any(|n| n.device_id == device_id) {
+            self.mutate(|_, state| {
+                state.trust_notices.retain(|n| n.device_id != device_id);
+                Ok(())
+            })?;
+        }
+        self.status.notices = self.state.trust_notices.clone();
+        Ok(())
+    }
+
+    /// Trust on first use for every listed device. New people and new devices
+    /// of people nobody verified are trusted at once; a person the user
+    /// verified by hand never gets a new device or key trusted here. Returns
+    /// the notices this pass created. Writes a checkpoint only on a change.
+    pub fn trust_directory(&mut self, complete: bool) -> Result<Vec<TrustNotice>, String> {
+        let mut listed: Vec<PublicDevice> = self.directory.values().cloned().collect();
+        listed.sort_by(|a, b| a.identity.device_id.cmp(&b.identity.device_id));
+        // A listing without a KeyPackage only becomes an in-memory candidate;
+        // one with a foreign community or malformed code is not trusted at all.
+        for public in &listed {
+            if self.device.first_use_decision(public) == relay_crypto::FirstUse::Deferred {
+                // A refused listing stays untrusted; there is nothing to undo.
+                self.device.trust_on_first_use(public).ok();
+            }
+        }
+        // Only valid listings count as a change, so an unusable entry does not
+        // cause a checkpoint write on every directory read.
+        let changes: Vec<_> = listed
+            .into_iter()
+            .filter(|public| {
+                matches!(
+                    self.device.first_use_decision(public),
+                    relay_crypto::FirstUse::Trusted | relay_crypto::FirstUse::KeyReplaced
+                ) && self.device.listing_is_valid(public)
+            })
+            .collect();
+        let start = complete && !self.state.trust_started;
+        if changes.is_empty() && !start {
+            self.refresh_trust_status();
+            return Ok(Vec::new());
+        }
+        if complete && self.device.pin_count() + changes.len() > relay_crypto::MAX_PINS * 3 / 4 {
+            let keep: HashSet<String> = self.directory.keys().cloned().collect();
+            self.mutate(|device, _| device.forget_unused_first_use(&keep))?;
+        }
+        let own = self.device.identity().clone();
+        let started = self.state.trust_started;
+        let created = self.mutate(|device, state| {
+            let mut created = Vec::new();
+            for public in &changes {
+                let decision = device.trust_on_first_use(public)?;
+                let own_account = public.identity.user_id == own.user_id;
+                let kind = match decision {
+                    // A new key on an own device is, to its owner, a new device.
+                    relay_crypto::FirstUse::KeyReplaced if own_account => {
+                        TrustNoticeKind::NewOwnDevice
+                    }
+                    relay_crypto::FirstUse::KeyReplaced => TrustNoticeKind::CodeChanged,
+                    relay_crypto::FirstUse::Trusted if started && own_account => {
+                        TrustNoticeKind::NewOwnDevice
+                    }
+                    _ => continue,
+                };
+                let notice = TrustNotice {
+                    user_id: public.identity.user_id.clone(),
+                    device_id: public.identity.device_id.clone(),
+                    fingerprint: public.fingerprint.clone(),
+                    kind,
+                };
+                state.trust_notices.retain(|n| n.device_id != notice.device_id);
+                if state.trust_notices.len() >= MAX_TRUST_NOTICES {
+                    state.trust_notices.remove(0);
+                }
+                state.trust_notices.push(notice.clone());
+                created.push(notice);
+            }
+            if complete {
+                state.trust_started = true;
+            }
+            Ok(created)
+        })?;
+        self.refresh_trust_status();
+        Ok(created)
+    }
+
+    /// Recomputes the trust flags of the listed devices after a pin changed.
+    pub(crate) fn refresh_trust_status(&mut self) {
+        for peer in self
+            .status
+            .peers
+            .iter_mut()
+            .chain(self.status.own_devices.iter_mut())
+        {
+            if peer.device_id == self.device.identity().device_id {
+                continue;
+            }
+            if let Some(public) = self.directory.get(&peer.device_id) {
+                (peer.verified, peer.trusted, peer.changed, peer.needs_review) =
+                    peer_trust(&self.device, public);
+            }
+        }
+        self.status.notices = self.state.trust_notices.clone();
+    }
+    /// Listed devices of this person that wait for the user's review.
+    #[cfg(test)]
+    pub fn devices_needing_review(&self, user_id: &str) -> Vec<String> {
+        self.directory
+            .values()
+            .filter(|public| {
+                public.identity.user_id == user_id
+                    && self.device.trust(public).is_none()
+                    && self.device.first_use_decision(public) == relay_crypto::FirstUse::Held
+            })
+            .map(|public| public.identity.device_id.clone())
+            .collect()
     }
 
     /// Host side: remembers a new one-time secret for the invitation the server
@@ -1175,8 +1393,11 @@ impl CryptoSession {
             let Some(public) = self.directory.get(&entry.device_id).cloned() else {
                 continue;
             };
-            if self.device.is_approved(&public)
-                || self.device.expected_fingerprint(&entry.device_id).is_some()
+            // Only a device trusted on first use with this exact key, or one
+            // seen for the first time, may become verified by its proof.
+            if self.device.is_verified(&public)
+                || (self.device.expected_fingerprint(&entry.device_id).is_some()
+                    && self.device.trust(&public).is_none())
             {
                 continue;
             }
@@ -1235,11 +1456,12 @@ impl CryptoSession {
     /// or sending that one-time attestation again.
     pub(super) fn remember_invited_host(&mut self, proof: &InviteProof, now: std::time::Instant) {
         self.pending_invited_host = None;
-        if self
-            .device
-            .expected_fingerprint(&proof.host_device_id)
-            .is_none()
-        {
+        let pinned = self.device.expected_fingerprint(&proof.host_device_id);
+        // Trust on first use may already hold exactly the named key; the
+        // invitation can still upgrade it to verified.
+        let upgradable = pinned == Some(proof.host_fingerprint.as_str())
+            && self.device.pin_trust(&proof.host_device_id) == Some(relay_crypto::Trust::FirstUse);
+        if pinned.is_none() || upgradable {
             self.pending_invited_host = Some(PendingInvitedHost {
                 device_id: proof.host_device_id.clone(),
                 fingerprint: proof.host_fingerprint.clone(),
@@ -1289,8 +1511,9 @@ impl CryptoSession {
         // existing pin is final; never keep waiting until a different key fits.
         self.cancel_invited_host_retry(host_device_id);
         if public.fingerprint != host_fingerprint
-            || self.device.is_approved(&public)
-            || self.device.expected_fingerprint(host_device_id).is_some()
+            || self.device.is_verified(&public)
+            || (self.device.expected_fingerprint(host_device_id).is_some()
+                && self.device.trust(&public).is_none())
         {
             return Ok(false);
         }

@@ -1,6 +1,9 @@
-//! Explicit, device-bound fingerprint approval. Directory entries are never trusted by the UI.
+//! Encryption settings. Devices are trusted on first use by the network worker;
+//! this page shows that trust, the optional security-code comparison that adds
+//! a "Verified" badge, and the decisions only the user may make: accepting a
+//! changed code of a verified person, removal of a badge, reset and revocation.
 use super::*;
-use crate::e2ee::{CryptoPeerStatus, CryptoUiStatus, MessageProtection};
+use crate::e2ee::{CryptoPeerStatus, CryptoUiStatus, MessageProtection, TrustNotice, TrustNoticeKind};
 use crate::settings_ui as controls;
 #[path = "history_backup_ui.rs"]
 mod history_backup;
@@ -236,11 +239,25 @@ impl EncryptionUi {
         self.expanded_people.insert(user_id.to_owned());
     }
 
-    /// True when the server lists devices for this person and none of them is
-    /// verified here and unchanged: a private message to them cannot be sent.
-    pub(super) fn person_unverified(&self, user_id: &str) -> bool {
-        let mut devices = self.status.peers.iter().filter(|p| p.user_id == user_id).peekable();
-        devices.peek().is_some() && devices.all(|p| !p.verified || p.changed)
+    /// Devices of this person whose new security code waits for the user,
+    /// because the person was verified by hand here.
+    pub(super) fn devices_needing_review(&self, user_id: &str) -> Vec<CryptoPeerStatus> {
+        self.status
+            .peers
+            .iter()
+            .filter(|p| p.user_id == user_id && p.needs_review)
+            .cloned()
+            .collect()
+    }
+
+    /// Key-change notices about this person that were not dismissed yet.
+    pub(super) fn notices_for(&self, user_id: &str) -> Vec<TrustNotice> {
+        self.status
+            .notices
+            .iter()
+            .filter(|n| n.user_id == user_id && n.kind == TrustNoticeKind::CodeChanged)
+            .cloned()
+            .collect()
     }
 
     pub(super) fn apply_status(&mut self, status: CryptoUiStatus) {
@@ -271,14 +288,14 @@ struct PersonDevices<'a> {
 }
 
 impl PersonDevices<'_> {
-    fn needs_confirmation(&self) -> bool {
-        self.devices
-            .iter()
-            .any(|device| !device.verified || device.changed)
+    /// A new code or device of this person waits for the user's decision.
+    fn needs_review(&self) -> bool {
+        self.devices.iter().any(|device| device.needs_review)
     }
 
-    fn changed(&self) -> bool {
-        self.devices.iter().any(|device| device.changed)
+    /// Every listed device was verified with its current code.
+    fn verified(&self) -> bool {
+        self.devices.iter().all(|device| device.verified)
     }
 }
 
@@ -319,13 +336,14 @@ enum EncryptionSummary {
     Unsupported,
     NotReady,
     NoOtherDevices,
-    Changed { people: usize },
-    NeedsConfirmation { people: usize, devices: usize },
-    LocallyConfirmed { people: usize, devices: usize },
+    /// People verified by hand with a new device or code that waits for the user.
+    NeedsReview { people: usize },
+    /// Everyone listed is trusted; `verified` of them were verified by hand.
+    Protected { people: usize, verified: usize },
 }
 
 fn encryption_summary(status: &CryptoUiStatus, compatible_server: bool) -> EncryptionSummary {
-    // Cached directory approvals cannot turn a failed refresh or key-store load green.
+    // Cached trust cannot turn a failed refresh or key-store load green.
     if status.problem.is_some() {
         return EncryptionSummary::NeedsAttention;
     }
@@ -338,30 +356,16 @@ fn encryption_summary(status: &CryptoUiStatus, compatible_server: bool) -> Encry
         return EncryptionSummary::NotReady;
     }
     let people = people_and_devices(&status.peers);
-    let changed = people.iter().filter(|person| person.changed()).count();
-    if changed > 0 {
-        return EncryptionSummary::Changed { people: changed };
-    }
-    let unconfirmed_people = people
-        .iter()
-        .filter(|person| person.needs_confirmation())
-        .count();
-    if unconfirmed_people > 0 {
-        return EncryptionSummary::NeedsConfirmation {
-            people: unconfirmed_people,
-            devices: status
-                .peers
-                .iter()
-                .filter(|device| !device.verified || device.changed)
-                .count(),
-        };
+    let review = people.iter().filter(|person| person.needs_review()).count();
+    if review > 0 {
+        return EncryptionSummary::NeedsReview { people: review };
     }
     if people.is_empty() {
         EncryptionSummary::NoOtherDevices
     } else {
-        EncryptionSummary::LocallyConfirmed {
+        EncryptionSummary::Protected {
             people: people.len(),
-            devices: status.peers.len(),
+            verified: people.iter().filter(|person| person.verified()).count(),
         }
     }
 }
@@ -391,15 +395,19 @@ fn encryption_capture_status(panel: &str) -> Option<CryptoUiStatus> {
             device_id: "synthetic-anna-desktop".into(),
             fingerprint: "1abc".repeat(16),
             verified: true,
+            trusted: true,
             changed: false,
+            needs_review: false,
         },
         CryptoPeerStatus {
             user_id: "synthetic-anna".into(),
             name: "Anna (synthetic)".into(),
             device_id: "synthetic-anna-laptop".into(),
             fingerprint: "2def".repeat(16),
-            verified: confirmed,
+            verified: confirmed && panel != "encryption-changed",
+            trusted: panel != "encryption-changed",
             changed: panel == "encryption-changed",
+            needs_review: panel == "encryption-changed",
         },
         CryptoPeerStatus {
             user_id: "synthetic-bo".into(),
@@ -407,7 +415,9 @@ fn encryption_capture_status(panel: &str) -> Option<CryptoUiStatus> {
             device_id: "synthetic-bo-desktop".into(),
             fingerprint: "3abc".repeat(16),
             verified: confirmed,
+            trusted: true,
             changed: false,
+            needs_review: false,
         },
     ];
     if panel == "encryption-empty" {
@@ -423,6 +433,22 @@ fn encryption_capture_status(panel: &str) -> Option<CryptoUiStatus> {
             .then(|| "Synthetic failure: a protected call could not prepare its keys.".into()),
         ..Default::default()
     })
+}
+
+/// Title and explanation of a notice Relay already acted on. None of them
+/// blocks messaging; a change that needs the user's decision is a device
+/// with `needs_review` instead.
+fn trust_notice_text(notice: &TrustNotice, name: &str) -> (String, String) {
+    match notice.kind {
+        TrustNoticeKind::CodeChanged => (
+            format!("{name}'s security code changed"),
+            format!("This happens when {name} reinstalls Relay or resets a device. Messages stay end-to-end encrypted. To be sure it is really {name}, compare security codes."),
+        ),
+        TrustNoticeKind::NewOwnDevice => (
+            "A new device was added to your account".into(),
+            format!("Device ID: {}. If this wasn't you, revoke it under Advanced and change your password.", notice.device_id),
+        ),
+    }
 }
 
 fn fingerprint_matches(expected: &str, entered: &str) -> bool {
@@ -701,23 +727,22 @@ impl RelayApp {
                         c_muted(),
                     ),
                     EncryptionSummary::NoOtherDevices => (
-                        "No other devices to check yet".to_owned(),
-                        "When another person joins, their devices will appear here. There is nothing to approve yet.".to_owned(),
-                        c_muted(),
+                        "Messages are end-to-end encrypted".to_owned(),
+                        "When other people join, Relay sets up encryption with them automatically. There is nothing to do.".to_owned(),
+                        c_good(),
                     ),
-                    EncryptionSummary::Changed { people } => (
-                        format!("Changed devices to review · {people} people"),
-                        "Compare the new safety number with each person on a call or in person. A previous approval does not cover a replacement device.".to_owned(),
+                    EncryptionSummary::NeedsReview { people } => (
+                        match people { 1 => "A security code changed".to_owned(), n => format!("Security codes changed · {n} people") },
+                        "You verified these people before, so Relay waits for you before trusting their new code. Accept it, or compare codes with them first.".to_owned(),
                         c_bad(),
                     ),
-                    EncryptionSummary::NeedsConfirmation { people, devices } => (
-                        format!("Devices to confirm · {people} people, {devices} devices"),
-                        "Open Verify below and compare the safety number on a call or in person. Choose They match only after checking all three rows.".to_owned(),
-                        c_muted(),
-                    ),
-                    EncryptionSummary::LocallyConfirmed { people, devices } => (
-                        "Listed devices confirmed on this PC".to_owned(),
-                        format!("You have confirmed {devices} listed devices belonging to {people} people. This shows whom this PC trusts; it does not show whether they have confirmed you or whether each conversation is ready."),
+                    EncryptionSummary::Protected { people, verified } => (
+                        "Messages are end-to-end encrypted".to_owned(),
+                        match (people, verified) {
+                            (_, 0) => "Relay set up encryption with everyone automatically. To be sure you are talking to the right person, compare security codes with them. This is optional.".to_owned(),
+                            (p, v) if p == v => format!("You verified all {p} people by comparing security codes."),
+                            (p, v) => format!("You verified {v} of {p} people by comparing security codes. Comparing is optional."),
+                        },
                         c_good(),
                     ),
                 };
@@ -727,22 +752,19 @@ impl RelayApp {
                     ui.add(egui::Label::new(RichText::new(problem).color(c_bad())).wrap(true));
                 }
                 ui.horizontal_wrapped(|ui| {
-                    if matches!(summary, EncryptionSummary::Changed { .. } | EncryptionSummary::NeedsConfirmation { .. }) {
-                        review_people = ui.add(primary("Review devices")).clicked();
+                    if matches!(summary, EncryptionSummary::NeedsReview { .. }) {
+                        review_people = ui.add(primary("Review changes")).clicked();
                     }
                     if ui.add(secondary("Refresh Devices")).clicked() {
                         self.send(Command::CryptoRefresh);
                     }
-                    if matches!(summary, EncryptionSummary::Changed { .. } | EncryptionSummary::NeedsConfirmation { .. } | EncryptionSummary::LocallyConfirmed { .. }) {
-                        show_own_code = ui.add(secondary("Show how to confirm me")).clicked();
+                    if matches!(summary, EncryptionSummary::NeedsReview { .. } | EncryptionSummary::Protected { .. }) {
+                        show_own_code = ui.add(secondary("Show my security code")).clicked();
                     }
                 });
             });
         ui.add_space(10.0);
-        controls::description(
-            ui,
-            "Each device needs its own check. The other person must also confirm your device before you can share protected conversations.",
-        );
+        let dismiss = self.trust_notices(ui, &status);
 
         if !open {
             self.protection_section(ui);
@@ -751,16 +773,17 @@ impl RelayApp {
         controls::section_heading(
             ui,
             "People and devices",
-            "Verify opens the devices for one person. It never approves all of their devices at once.",
+            "Optional: compare security codes with a person to mark them Verified. After that, Relay asks you before trusting a new device or code of theirs.",
         );
         if people.is_empty() {
             controls::description(ui, "No other devices are registered in this community yet.");
         }
         let mut verify = None;
         let mut unverify = None;
+        let mut accept = None;
         let mut safety_open = None;
         for person in people {
-            if review_people && person.needs_confirmation() {
+            if review_people && person.needs_review() {
                 self.encryption_ui
                     .expanded_people
                     .insert(person.user_id.to_owned());
@@ -774,16 +797,16 @@ impl RelayApp {
                         avatar(ui, person.name, 36.0, false);
                         ui.vertical(|ui| {
                             ui.add(egui::Label::new(RichText::new(person.name).strong()).wrap(true));
-                            let (label, color) = if person.changed() {
-                                ("Changed device · check again", c_bad())
-                            } else if person.needs_confirmation() {
-                                ("Devices need confirmation", c_muted())
-                            } else {
+                            let (label, color) = if person.needs_review() {
+                                ("Security code changed · your decision", c_bad())
+                            } else if person.verified() {
                                 (if person.devices.iter().any(|peer| status.via_invitation.contains(&peer.device_id)) {
-                                    "Verified on this PC · invitation used"
+                                    "Verified · invitation used"
                                 } else {
-                                    "Verified on this PC"
+                                    "Verified"
                                 }, c_good())
+                            } else {
+                                ("Encrypted · not verified", c_muted())
                             };
                             ui.label(RichText::new(label).color(color));
                             controls::description(ui, &match person.devices.len() {
@@ -791,7 +814,7 @@ impl RelayApp {
                                 n => format!("{n} registered devices"),
                             });
                         });
-                        let label = if person.needs_confirmation() { "Verify" } else { "Review" };
+                        let label = if person.needs_review() { "Review" } else if person.verified() { "Devices" } else { "Verify" };
                         if ui.push_id(("review-person-devices", &self.login.url, &approval_account, &community, person.user_id), |ui| ui.add(secondary(label))).inner.clicked()
                             && !self.encryption_ui.expanded_people.remove(person.user_id)
                         {
@@ -810,38 +833,40 @@ impl RelayApp {
                             approval.pending = None;
                         }
                         let via_invitation = status.via_invitation.contains(&peer.device_id);
-                        ui.label(RichText::new(if peer.changed {
-                            "Security code changed · check with this person again"
+                        ui.label(RichText::new(if peer.needs_review && peer.changed {
+                            "Security code changed · nothing is shared with the new code yet"
+                        } else if peer.needs_review {
+                            "New device · nothing is shared with it yet"
                         } else if peer.verified && via_invitation {
-                            "Verified via invitation · approved on this PC"
+                            "Verified via invitation"
                         } else if peer.verified {
-                            "Device approved on this PC"
+                            "Verified"
                         } else {
-                            "Needs your approval"
-                        }).color(if peer.changed { c_bad() } else if peer.verified { c_good() } else { c_muted() }));
-                        if peer.verified && !peer.changed && via_invitation {
+                            "Encrypted · not verified"
+                        }).color(if peer.needs_review { c_bad() } else if peer.verified { c_good() } else { c_muted() }));
+                        if peer.verified && via_invitation {
                             controls::description(ui, "Approved through the one-time invitation you shared or received. Compare the safety number any time to confirm it yourself.");
                         }
                         if !peer.verified && status.invitation_unconfirmed.contains(&peer.device_id) {
-                            ui.add(egui::Label::new(RichText::new("The invitation proof for this device could not be confirmed. Verify it manually.").color(c_bad())).wrap(true));
+                            ui.add(egui::Label::new(RichText::new("The invitation proof for this device could not be confirmed. Compare security codes to verify it.").color(c_muted())).wrap(true));
                         }
                         fingerprint_label(ui, &peer.fingerprint);
-                        if ui.add_enabled(approval.pending.is_none(), secondary("Compare safety number")).clicked() {
+                        if peer.needs_review {
+                            controls::description(ui, &format!("You verified {} before. This is usually a new PC or a reinstalled app, but it could also be someone else. Accept the new code, or compare it with {} first.", person.name, person.name));
+                            if ui.add_enabled(approval.pending.is_none(), primary("Accept new code")).clicked() {
+                                approval.pending = Some(Instant::now());
+                                accept = Some(identity.clone());
+                            }
+                        }
+                        if ui.add_enabled(approval.pending.is_none(), secondary("Compare security code")).clicked() {
                             safety_open = Some((identity.clone(), person.name.to_owned()));
                         }
-                        if peer.verified && !peer.changed {
-                            if ui.add_enabled(approval.pending.is_none(), secondary("Remove Verification")).clicked() {
+                        if peer.verified {
+                            if ui.add_enabled(approval.pending.is_none(), secondary("Remove Verified mark")).clicked() {
                                 approval.pending = Some(Instant::now());
                                 unverify = Some(identity.clone());
                             }
                         } else {
-                            if peer.changed {
-                                controls::description(ui, "This may be a new PC or a reinstalled app. Check the new code with the person before sharing protected content with this device.");
-                                if ui.add_enabled(approval.pending.is_none(), secondary("Remove Previous Verification")).clicked() {
-                                    approval.pending = Some(Instant::now());
-                                    unverify = Some(identity.clone());
-                                }
-                            }
                             ui.push_id(("legacy-approval", &identity), |ui| ui.collapsing("Advanced · paste a code or card", |ui| {
                             controls::description(ui, "Or paste the full code or card they sent you. Do not copy the code from this device list.");
                             let approval_input = approval_code_input(
@@ -853,7 +878,7 @@ impl RelayApp {
                             let matches = approval_matches(peer, &community, &approval.entered);
                             if !approval.entered.trim().is_empty() {
                                 ui.add(egui::Label::new(RichText::new(if matches {
-                                    "Matches this device. Approve only if it came from the person you trust."
+                                    "Matches this device. Verify only if it came from the person you trust."
                                 } else {
                                     "No match yet. Ask them to copy their full code or card and check that this is the right device."
                                 }).color(if matches { c_good() } else { c_bad() })).wrap(true));
@@ -879,7 +904,7 @@ impl RelayApp {
             .default_open(false)
             .open(show_own_code.then_some(true))
             .show(ui, |ui| {
-                controls::description(ui, "Send your code or verification card through a contact method you already trust. Ask the other person to open your device in Encryption, paste it and choose Approve Device. These contain public information only.");
+                controls::description(ui, "Optional. Compare this code with someone on a call or in person, or send it through a contact method you already trust, so they can mark you Verified. It contains public information only.");
                 fingerprint_label(ui, &status.own_fingerprint);
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_enabled(
@@ -904,7 +929,7 @@ impl RelayApp {
                         }
                     }
                 });
-                controls::description(ui, "An existing group may also need the device that started its protected conversation to be online before a new device can join.");
+                controls::description(ui, "A new device of yours joins each conversation automatically once the device that manages its keys is online.");
             });
 
         ui.add_space(12.0);
@@ -962,7 +987,7 @@ impl RelayApp {
                     });
                 }
                 self.encryption_recovery_confirmation(ui, &status);
-                controls::description(ui, "New or changed devices must be approved before group keys are shared with them. There is no server-side recovery for encryption keys. The server can still see account, channel, membership, timing and traffic metadata.");
+                controls::description(ui, "New people and devices are trusted the first time they are seen. A new device or code of someone you verified is only trusted after you accept it. There is no server-side recovery for encryption keys. The server can still see account, channel, membership, timing and traffic metadata.");
             });
 
         if let Some((identity, name)) = safety_open {
@@ -986,18 +1011,64 @@ impl RelayApp {
                     Some("Connect to a community before changing device verification.".into());
                 return;
             };
-            let had_voice = self.voice_channel.is_some() || self.joining_voice.is_some();
-            self.stop_media();
-            self.video.clear();
-            if had_voice {
-                self.send(Command::LeaveVoice);
-            }
+            // Only the badge goes; the key stays trusted and calls continue.
             self.send(Command::CryptoUnverify {
                 origin,
                 user_id: identity.user_id,
                 device_id: identity.device_id,
             });
         }
+        if let Some(identity) = accept {
+            let Some(origin) = self.command_origin() else {
+                self.error = Some("Connect to a community before accepting a security code.".into());
+                return;
+            };
+            self.send(Command::CryptoAcceptKey {
+                origin,
+                user_id: identity.user_id,
+                device_id: identity.device_id,
+                fingerprint: identity.fingerprint,
+            });
+        }
+        if let Some(device_id) = dismiss {
+            if let Some(origin) = self.command_origin() {
+                self.send(Command::CryptoDismissNotice { origin, device_id });
+            }
+        }
+    }
+
+    /// Key changes Relay already handled, and new devices on this account.
+    /// Shown until dismissed; returns the device whose notice was dismissed.
+    fn trust_notices(&mut self, ui: &mut egui::Ui, status: &CryptoUiStatus) -> Option<String> {
+        let mut dismissed = None;
+        for notice in &status.notices {
+            let name = status
+                .peers
+                .iter()
+                .find(|peer| peer.user_id == notice.user_id)
+                .map(|peer| peer.name.clone())
+                .unwrap_or_else(|| "Someone".into());
+            let (title, body) = trust_notice_text(notice, &name);
+            egui::Frame::none()
+                .fill(c_card())
+                .stroke(Stroke::new(1.0_f32, c_line()))
+                .rounding(8.0)
+                .inner_margin(Margin::same(12.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(egui::Label::new(RichText::new(title).strong()).wrap(true));
+                    controls::description(ui, &body);
+                    if ui
+                        .push_id(("trust-notice", &notice.device_id), |ui| ui.add(secondary("OK")))
+                        .inner
+                        .clicked()
+                    {
+                        dismissed = Some(notice.device_id.clone());
+                    }
+                });
+            ui.add_space(8.0);
+        }
+        dismissed
     }
 
     fn open_safety_check(&mut self, peer: DeviceIdentity, name: String, status: &CryptoUiStatus) {
@@ -1194,21 +1265,43 @@ mod tests {
             device_id: "device".into(),
             fingerprint: fingerprint.into(),
             verified: false,
+            trusted: true,
             changed: false,
+            needs_review: false,
         }
     }
 
     #[test]
-    fn a_person_is_unverified_only_when_no_listed_device_is_verified_and_unchanged() {
+    fn only_a_change_for_a_verified_person_needs_review_in_a_direct_message() {
         let mut ui = EncryptionUi::default();
-        assert!(!ui.person_unverified("person"), "an unknown person is not reported");
+        assert!(ui.devices_needing_review("person").is_empty(), "an unknown person is not reported");
         ui.status.peers = vec![peer("a"), CryptoPeerStatus { device_id: "second".into(), ..peer("b") }];
-        assert!(ui.person_unverified("person"));
-        ui.status.peers[1].verified = true;
-        assert!(!ui.person_unverified("person"), "one verified device is enough to send");
-        ui.status.peers[1].changed = true;
-        assert!(ui.person_unverified("person"), "a changed device needs a new check");
-        assert!(!ui.person_unverified("someone-else"));
+        assert!(
+            ui.devices_needing_review("person").is_empty(),
+            "trusted on first use: nothing to do before messaging"
+        );
+        ui.status.peers[1].needs_review = true;
+        ui.status.peers[1].trusted = false;
+        let review = ui.devices_needing_review("person");
+        assert_eq!(review.len(), 1);
+        assert_eq!(review[0].device_id, "second");
+        assert!(ui.devices_needing_review("someone-else").is_empty());
+        ui.status.notices = vec![
+            TrustNotice {
+                user_id: "person".into(),
+                device_id: "device".into(),
+                fingerprint: "a".into(),
+                kind: TrustNoticeKind::CodeChanged,
+            },
+            TrustNotice {
+                user_id: "own".into(),
+                device_id: "laptop".into(),
+                fingerprint: "c".into(),
+                kind: TrustNoticeKind::NewOwnDevice,
+            },
+        ];
+        assert_eq!(ui.notices_for("person").len(), 1);
+        assert!(ui.notices_for("own").is_empty(), "own-device notices stay on the Encryption page");
     }
 
     fn ready_status(peers: Vec<CryptoPeerStatus>) -> CryptoUiStatus {
@@ -1229,9 +1322,9 @@ mod tests {
             let status = encryption_capture_status(panel).unwrap();
             assert_eq!(
                 encryption_summary(&status, false),
-                EncryptionSummary::NeedsConfirmation {
+                EncryptionSummary::Protected {
                     people: 2,
-                    devices: 2
+                    verified: 0
                 }
             );
             let groups = people_and_devices(&status.peers);
@@ -1242,13 +1335,13 @@ mod tests {
         for (panel, expected) in [
             (
                 "encryption-changed",
-                EncryptionSummary::Changed { people: 1 },
+                EncryptionSummary::NeedsReview { people: 1 },
             ),
             (
                 "encryption-locally-confirmed",
-                EncryptionSummary::LocallyConfirmed {
+                EncryptionSummary::Protected {
                     people: 2,
-                    devices: 3,
+                    verified: 2,
                 },
             ),
             ("encryption-empty", EncryptionSummary::NoOtherDevices),
@@ -1330,63 +1423,54 @@ mod tests {
         assert_eq!(owner.devices[0].device_id, "desktop");
         assert_eq!(owner.devices[1].device_id, "laptop");
         assert!(
-            owner.needs_confirmation(),
-            "one approved device cannot approve another"
+            !owner.verified(),
+            "one verified device does not make another device verified"
         );
+        assert!(!owner.needs_review(), "an unverified, trusted device is not a warning");
         assert_eq!(
             encryption_summary(&status, true),
-            EncryptionSummary::NeedsConfirmation {
-                people: 1,
-                devices: 1
-            }
-        );
-        let mut second_pending = same_name_other_account;
-        second_pending.verified = false;
-        assert_eq!(
-            encryption_summary(&ready_status(vec![first, second, second_pending]), true),
-            EncryptionSummary::NeedsConfirmation {
+            EncryptionSummary::Protected {
                 people: 2,
-                devices: 2
+                verified: 1
             }
         );
     }
 
     #[test]
-    fn changed_devices_and_failures_override_cached_local_approvals() {
-        let mut approved = peer(&"a".repeat(64));
-        approved.verified = true;
-        let clean = ready_status(vec![approved.clone()]);
+    fn only_changes_for_verified_people_stand_out_and_failures_override_cached_trust() {
+        let mut verified = peer(&"a".repeat(64));
+        verified.verified = true;
+        let clean = ready_status(vec![verified.clone()]);
         assert_eq!(
             encryption_summary(&clean, true),
-            EncryptionSummary::LocallyConfirmed {
+            EncryptionSummary::Protected {
                 people: 1,
-                devices: 1
+                verified: 1
             }
         );
-        let mut another_device = approved.clone();
-        another_device.device_id = "another-device".into();
-        another_device.fingerprint = "c".repeat(64);
-        let mut another_person = approved.clone();
-        another_person.user_id = "another-account".into();
+        // A changed code of someone nobody verified was already accepted:
+        // it is a notice, not a warning in the summary.
+        let mut unverified = peer(&"c".repeat(64));
+        unverified.user_id = "another-account".into();
+        unverified.changed = false;
         assert_eq!(
-            encryption_summary(
-                &ready_status(vec![approved.clone(), another_device, another_person]),
-                true
-            ),
-            EncryptionSummary::LocallyConfirmed {
+            encryption_summary(&ready_status(vec![verified.clone(), unverified]), true),
+            EncryptionSummary::Protected {
                 people: 2,
-                devices: 3
+                verified: 1
             }
         );
-        let mut changed = approved.clone();
-        changed.device_id = "replacement".into();
-        changed.fingerprint = "b".repeat(64);
-        changed.changed = true;
-        let mut changed_again = changed.clone();
-        changed_again.device_id = "other-replacement".into();
+        let mut held = verified.clone();
+        held.device_id = "replacement".into();
+        held.fingerprint = "b".repeat(64);
+        held.verified = false;
+        held.trusted = false;
+        held.needs_review = true;
+        let mut held_again = held.clone();
+        held_again.device_id = "other-replacement".into();
         assert_eq!(
-            encryption_summary(&ready_status(vec![approved, changed, changed_again]), true),
-            EncryptionSummary::Changed { people: 1 }
+            encryption_summary(&ready_status(vec![verified, held, held_again]), true),
+            EncryptionSummary::NeedsReview { people: 1 }
         );
         for problem in ["Could not read protected storage", "Refresh failed", ""] {
             assert_eq!(
@@ -1398,9 +1482,25 @@ mod tests {
                     true
                 ),
                 EncryptionSummary::NeedsAttention,
-                "even cached approvals must not hide an explicit failure"
+                "even cached trust must not hide an explicit failure"
             );
         }
+    }
+
+    #[test]
+    fn notices_explain_what_happened_without_asking_for_approval() {
+        let notice = |kind| TrustNotice {
+            user_id: "person".into(),
+            device_id: "laptop".into(),
+            fingerprint: "a".repeat(64),
+            kind,
+        };
+        let (title, body) = trust_notice_text(&notice(TrustNoticeKind::CodeChanged), "Sebastian");
+        assert_eq!(title, "Sebastian's security code changed");
+        assert!(body.contains("stay end-to-end encrypted") && body.contains("compare security codes"));
+        let (title, body) = trust_notice_text(&notice(TrustNoticeKind::NewOwnDevice), "Sebastian");
+        assert_eq!(title, "A new device was added to your account");
+        assert!(body.contains("laptop") && body.contains("revoke"));
     }
 
     #[test]

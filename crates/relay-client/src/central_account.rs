@@ -252,7 +252,15 @@ fn account_transport_error(error: &(dyn std::error::Error + 'static)) -> io::Err
 enum Callback {
     Code(Zeroizing<String>),
     Denied,
+    /// The service does not let this client ask for a long-lived login.
+    InvalidScope,
 }
+
+/// A long-lived login that survives restarts and updates. An ordinary refresh
+/// grant ends when the account service's browser session does (30 minutes
+/// idle or 10 hours by default), so a saved sign-in rarely outlived a restart.
+const OFFLINE_SCOPE: &str = "offline_access";
+const INVALID_SCOPE: &str = "The account service does not allow a long-lived sign-in for Relay.";
 
 fn parse_callback(
     bytes: &[u8],
@@ -332,6 +340,7 @@ fn parse_callback(
         (Some(code), None) if !code.is_empty() && code.len() <= 4096 => {
             Ok(Callback::Code(Zeroizing::new(code)))
         }
+        (None, Some(error)) if error == "invalid_scope" => Ok(Callback::InvalidScope),
         (None, Some(_)) => Ok(Callback::Denied),
         _ => Err("Invalid sign-in callback result."),
     }
@@ -405,6 +414,7 @@ fn wait_for_callback(
         match callback {
             Ok(Callback::Code(code)) => return Ok(code),
             Ok(Callback::Denied) => return Err("Browser sign-in was cancelled."),
+            Ok(Callback::InvalidScope) => return Err(INVALID_SCOPE),
             Err(_) => {}
         }
     }
@@ -654,33 +664,45 @@ fn run_flow_persistent(
     let client = client.set_redirect_uri(
         RedirectUrl::new(callback).map_err(|_| "Cannot create sign-in callback.")?,
     );
-    let (challenge, pkce) = PkceCodeChallenge::new_random_sha256();
-    let requested_nonce = link
-        .as_ref()
-        .map(|request| Nonce::new(request.nonce.clone()))
-        .unwrap_or_else(Nonce::new_random);
-    let mut authorization = client
-        .authorize_url(
-            CoreAuthenticationFlow::AuthorizationCode,
-            CsrfToken::new_random,
-            || requested_nonce,
-        )
-        .add_scope(Scope::new("profile".into()))
-        .set_pkce_challenge(challenge);
-    if link.as_ref().is_some_and(|l| l.recent_auth) {
-        authorization = authorization.set_max_age(Duration::from_secs(300));
-    }
-    if registration {
-        authorization = authorization.add_extra_param("prompt", "create");
-    }
-    let (url, state, nonce) = authorization.url();
-    if cancel.load(Ordering::Acquire) {
-        return Err("Sign-in cancelled.");
-    }
-    events
-        .try_send(Event::Browser(url))
-        .map_err(|_| "Sign-in window closed.")?;
-    let code = wait_for_callback(&listener, &state, &provider, &cancel)?;
+    // Ask for a long-lived login unless this is only a linking proof. A service
+    // that does not allow it answers before showing any page; then Relay asks
+    // once more for an ordinary login, which lasts only while its session does.
+    let mut offline = link.is_none();
+    let (code, state, nonce, pkce) = loop {
+        let (challenge, pkce) = PkceCodeChallenge::new_random_sha256();
+        let requested_nonce = link
+            .as_ref()
+            .map(|request| Nonce::new(request.nonce.clone()))
+            .unwrap_or_else(Nonce::new_random);
+        let mut authorization = client
+            .authorize_url(
+                CoreAuthenticationFlow::AuthorizationCode,
+                CsrfToken::new_random,
+                || requested_nonce,
+            )
+            .add_scope(Scope::new("profile".into()))
+            .set_pkce_challenge(challenge);
+        if offline {
+            authorization = authorization.add_scope(Scope::new(OFFLINE_SCOPE.into()));
+        }
+        if link.as_ref().is_some_and(|l| l.recent_auth) {
+            authorization = authorization.set_max_age(Duration::from_secs(300));
+        }
+        if registration {
+            authorization = authorization.add_extra_param("prompt", "create");
+        }
+        let (url, state, nonce) = authorization.url();
+        if cancel.load(Ordering::Acquire) {
+            return Err("Sign-in cancelled.");
+        }
+        events
+            .try_send(Event::Browser(url))
+            .map_err(|_| "Sign-in window closed.")?;
+        match wait_for_callback(&listener, &state, &provider, &cancel) {
+            Err(error) if offline && error == INVALID_SCOPE => offline = false,
+            result => break (result?, state, nonce, pkce),
+        }
+    };
     drop(listener);
     if cancel.load(Ordering::Acquire) {
         return Err("Sign-in cancelled.");
@@ -772,6 +794,54 @@ type AccountClient = CoreClient<
     EndpointMaybeSet,
     EndpointMaybeSet,
 >;
+/// Ends a saved login at the account service. Failures are ignored: the local
+/// copy is deleted either way, and the service still expires the login.
+fn revoke(provider: &Provider, saved: &SavedSession) {
+    let Ok(http) = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+    else {
+        return;
+    };
+    let Ok(discovery) = provider
+        .issuer
+        .join(".well-known/openid-configuration")
+        .map(|mut url| {
+            // `join` replaces the last path segment; keep the realm path.
+            url.set_path(&format!(
+                "{}/.well-known/openid-configuration",
+                provider.issuer.path().trim_end_matches('/')
+            ));
+            url
+        })
+    else {
+        return;
+    };
+    let Some(endpoint) = http
+        .get(discovery)
+        .send()
+        .ok()
+        .and_then(|response| response.json::<serde_json::Value>().ok())
+        .and_then(|metadata| metadata["revocation_endpoint"].as_str().map(str::to_owned))
+        .and_then(|endpoint| Url::parse(&endpoint).ok())
+        .filter(|endpoint| provider.allows(endpoint))
+    else {
+        return;
+    };
+    let token = Zeroizing::new(saved.refresh_token.clone());
+    let _ = http
+        .post(endpoint)
+        .form(&[
+            ("client_id", provider.client_id.as_str()),
+            ("token", token.as_str()),
+            ("token_type_hint", "refresh_token"),
+        ])
+        .send();
+}
+
 fn account_client(
     provider: &Provider,
     cancel: &Arc<AtomicBool>,
@@ -1104,6 +1174,18 @@ impl Controller {
     }
     /// Explicit sign-out only. Cancellation and application shutdown keep the vault.
     pub fn forget(&mut self) -> Result<()> {
+        let saved = self
+            .persistence
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.current.clone())
+            .or_else(|| self.persistence.store.load().ok().flatten());
+        if let (Some(provider), Some(saved)) = (self.provider.clone(), saved) {
+            // A long-lived login stays valid at the service until it is revoked;
+            // deleting the local copy alone would leave it usable for 30 days.
+            thread::spawn(move || revoke(&provider, &saved));
+        }
         self.disconnect();
         self.last_identity = None;
         self.account_changed = false;

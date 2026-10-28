@@ -543,6 +543,7 @@ fn real_loopback_code_pkce_signature_and_refresh_flow_never_needs_a_community_pa
     assert_eq!(params["response_type"], "code");
     assert_eq!(params["code_challenge_method"], "S256");
     assert!(params["scope"].split_whitespace().any(|s| s == "openid"));
+    assert!(params["scope"].split_whitespace().any(|s| s == OFFLINE_SCOPE));
     assert!(!params["scope"].contains("email"));
     {
         let mut state = fixture.state.lock().unwrap();
@@ -574,6 +575,43 @@ fn real_loopback_code_pkce_signature_and_refresh_flow_never_needs_a_community_pa
     assert!(worker.join().unwrap().is_ok());
     let state = fixture.state.lock().unwrap();
     assert_eq!((state.exchanges, state.refreshes), (1, 1));
+}
+
+#[test]
+fn a_service_without_long_lived_logins_gets_one_ordinary_sign_in_request() {
+    let fixture = Fixture::new();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stop = cancel.clone();
+    let provider = fixture.provider.clone();
+    let (tx, rx) = mpsc::sync_channel(4);
+    let worker = thread::spawn(move || run(provider, stop, &tx, 0));
+    let Event::Browser(first) = rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
+        panic!("expected browser authorization")
+    };
+    let params: HashMap<_, _> = first.query_pairs().into_owned().collect();
+    assert!(params["scope"].split_whitespace().any(|s| s == OFFLINE_SCOPE));
+    // Keycloak answers this way when the client may not ask for offline_access.
+    let mut callback = Url::parse(&params["redirect_uri"]).unwrap();
+    callback
+        .query_pairs_mut()
+        .append_pair("error", "invalid_scope")
+        .append_pair("state", &params["state"]);
+    assert_eq!(reqwest::blocking::get(callback).unwrap().status(), 200);
+    let Event::Browser(second) = rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
+        panic!("expected one ordinary sign-in request")
+    };
+    let retry: HashMap<_, _> = second.query_pairs().into_owned().collect();
+    assert!(!retry["scope"].split_whitespace().any(|s| s == OFFLINE_SCOPE));
+    assert_ne!(retry["state"], params["state"], "a fresh request, not a replay");
+    // Any other refusal still ends the sign-in instead of looping.
+    let mut denied = Url::parse(&retry["redirect_uri"]).unwrap();
+    denied
+        .query_pairs_mut()
+        .append_pair("error", "invalid_scope")
+        .append_pair("state", &retry["state"]);
+    assert_eq!(reqwest::blocking::get(denied).unwrap().status(), 200);
+    assert_eq!(worker.join().unwrap().unwrap_err(), INVALID_SCOPE);
+    cancel.store(true, Ordering::Release);
 }
 
 #[test]
@@ -1104,7 +1142,9 @@ fn replacement_signed_subject_signals_old_community_sessions_must_be_removed() {
 }
 
 #[test]
-fn persistent_signin_keeps_normal_scopes_even_when_offline_access_is_advertised() {
+fn persistent_signin_asks_for_a_long_lived_login_whether_or_not_it_is_advertised() {
+    // Discovery lists offline_access for the whole realm, not per client, so it
+    // cannot tell; a refusal is handled by one ordinary retry (tested above).
     for advertised in [false, true] {
         let fixture = Fixture::new();
         fixture.state.lock().unwrap().offline_supported = advertised;
@@ -1139,7 +1179,7 @@ fn persistent_signin_keeps_normal_scopes_even_when_offline_access_is_advertised(
             parameters["scope"].split_whitespace().collect();
         assert_eq!(
             scopes,
-            std::collections::BTreeSet::from(["openid", "profile"])
+            std::collections::BTreeSet::from(["openid", "profile", OFFLINE_SCOPE])
         );
         cancel.store(true, Ordering::Release);
         let _ = worker.join().unwrap();

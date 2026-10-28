@@ -551,6 +551,12 @@ fn register(server: &CryptoServer, username: &str, invite: &str) -> Session {
     .unwrap()
 }
 
+/// A member who joins through an invitation of `inviter` at this point.
+fn late_member(server: &CryptoServer, inviter: &mut CryptoWorker, name: &str) -> CryptoWorker {
+    let invite: serde_json::Value = inviter.worker.post("/api/invites", &json!({})).unwrap();
+    CryptoWorker::new(server, register(server, name, invite["code"].as_str().unwrap()))
+}
+
 fn workers(server: &CryptoServer) -> (CryptoWorker, CryptoWorker, CryptoWorker, Target) {
     let session = register(server, "crypto_alice", "");
     let mut alice = CryptoWorker::new(server, session);
@@ -986,6 +992,57 @@ fn actual_server_two_nonhost_friends_exchange_open_private_voice_without_mls_app
 }
 
 #[test]
+#[ignore = "requires RELAY_NETWORK_TEST_SERVER; owned first-contact messages, no comparison"]
+fn actual_server_first_contact_messages_work_both_ways_without_comparing_codes() {
+    let server = CryptoServer::start();
+    let (mut alice, mut bob, _eve, channel) = workers(&server);
+    let to_bob = Target::Direct(bob.origin().user_id);
+    let to_alice = Target::Direct(alice.origin().user_id);
+    // Nobody pins or compares anything: the very first message is delivered.
+    alice.send(&to_bob, "first contact 4c1e", vec![], "first-contact", None);
+    bob.select(&to_alice);
+    assert!(bob
+        .history(&to_alice)
+        .iter()
+        .any(|m| m.content == "first contact 4c1e"));
+    bob.send(&to_alice, "first reply 9d2f", vec![], "first-reply", None);
+    alice.select(&to_bob);
+    assert!(alice
+        .history(&to_bob)
+        .iter()
+        .any(|m| m.content == "first reply 9d2f"));
+    // The host stored ciphertext only.
+    assert!(alice
+        .raw_messages(&to_bob)
+        .iter()
+        .all(|m| !m.content.contains("4c1e") && !m.content.contains("9d2f")));
+    // A protected channel works the same way, and nobody is shown as verified.
+    alice.send(&channel, "channel first contact 71aa", vec![], "channel-first", None);
+    bob.select(&channel);
+    assert!(bob
+        .history(&channel)
+        .iter()
+        .any(|m| m.content == "channel first contact 71aa"));
+    let status = alice
+        .worker
+        .connection
+        .as_ref()
+        .unwrap()
+        .crypto
+        .as_ref()
+        .unwrap()
+        .status
+        .clone();
+    let bob_device = status
+        .peers
+        .iter()
+        .find(|p| p.device_id == bob.own().identity.device_id)
+        .unwrap();
+    assert!(bob_device.trusted && !bob_device.verified && !bob_device.needs_review);
+    assert!(status.notices.is_empty(), "first contact shows no warning");
+}
+
+#[test]
 #[ignore = "requires RELAY_NETWORK_TEST_SERVER; owned encrypted unread pages and reopen only"]
 fn actual_server_unread_history_after_keeps_read_floor_and_decrypts_channel_and_direct() {
     let server = CryptoServer::start();
@@ -1175,7 +1232,10 @@ fn actual_server_two_communities_background_epoch_catch_up_keeps_active_actor() 
         "bg-a-old",
         None,
     );
-    alice_a.pin(&eve_a.own());
+    // Trust on first use added Eve with the first message; a member who joins
+    // while Bob is parked brings the membership epoch under test.
+    let late = late_member(&server_a, &mut alice_a, "crypto_parked_late");
+    alice_a.pin(&late.own());
     alice_a
         .worker
         .ensure_crypto_conversation(&target_a)
@@ -1412,7 +1472,10 @@ fn actual_server_background_cancel_between_received_and_bound_history_preserves_
         "bg-a-old",
         None,
     );
-    alice_a.pin(&eve_a.own());
+    // Trust on first use added Eve with the first message; a member who joins
+    // while Bob is parked brings the membership epoch under test.
+    let late = late_member(&server_a, &mut alice_a, "crypto_parked_late");
+    alice_a.pin(&late.own());
     alice_a
         .worker
         .ensure_crypto_conversation(&target_a)
@@ -2435,21 +2498,10 @@ fn actual_server_mls_worker_chat_files_and_restart() {
     let (mut alice, mut bob, mut eve, target) = workers(&server);
     let alice_public = alice.own();
     let bob_public = bob.own();
-    // Unverified direct recipients never trigger an unencrypted send.
+    // Trust on first use: a direct message to someone nobody verified is sent
+    // encrypted right away (see the first-contact test). Verification below
+    // only adds the Verified mark.
     let dm_a = Target::Direct(bob_public.identity.user_id.clone());
-    assert!(alice
-        .worker
-        .handle(Command::SendRich {
-            binding: None,
-            origin: CommandOrigin::from(alice.worker.connection.as_ref().unwrap()),
-            target: dm_a.clone(),
-            content: "forbidden unverified DM".into(),
-            attachment_ids: Vec::new(),
-            client_id: "unverified-dm".into(),
-            reply_to_id: None,
-            mentions: Vec::new()
-        })
-        .is_err());
     assert!(alice.raw_messages(&dm_a).is_empty());
     alice.pin(&bob_public);
     bob.pin(&alice_public);
@@ -2530,9 +2582,10 @@ fn actual_server_mls_worker_chat_files_and_restart() {
     let saved = server.root.join("explicitly-downloaded.txt");
     bob.download(&messages[0].attachments[0], &saved);
     assert_eq!(fs::read(&saved).unwrap(), secret);
-    let outsider = eve.history(&target);
-    assert_eq!(outsider[0].content, "Encrypted message unavailable");
-    assert!(outsider[0].attachments.is_empty());
+    // Eve is a member with access to this channel. Nobody verified her, but
+    // trust on first use gave her device the keys like any new member's.
+    let member = eve.history(&target);
+    assert_eq!(member[0].content, first_text);
     // A verified receiver rejects host edits to ciphertext, outer author and scope.
     for attack in 0..3 {
         let mut altered = raw.clone();
@@ -2838,7 +2891,7 @@ fn actual_server_mls_worker_chat_files_and_restart() {
 fn actual_server_mls_worker_device_revocation_rejoin_and_commit_ack_recovery() {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let server = CryptoServer::start();
-    let (mut alice, mut bob, mut eve, target) = workers(&server);
+    let (mut alice, mut bob, eve, target) = workers(&server);
     let alice_public = alice.own();
     let old_bob = bob.own();
     alice.pin(&old_bob);
@@ -2944,6 +2997,14 @@ fn actual_server_mls_worker_device_revocation_rejoin_and_commit_ack_recovery() {
 
     // Persist an Add+Welcome outbox, lose the server acknowledgement, then reopen
     // the client and retry the exact operation through the production worker.
+    // Trust on first use added the original Eve with the first message, so a
+    // member who joins only now takes her place here.
+    let invite: serde_json::Value = alice.worker.post("/api/invites", &json!({})).unwrap();
+    let _first_eve = eve;
+    let mut eve = CryptoWorker::new(
+        &server,
+        register(&server, "crypto_late_eve", invite["code"].as_str().unwrap()),
+    );
     let eve_public = eve.own();
     alice.pin(&eve_public);
     eve.pin(&alice_public);
@@ -3109,15 +3170,11 @@ fn actual_server_mls_worker_device_revocation_rejoin_and_commit_ack_recovery() {
 #[ignore = "requires RELAY_NETWORK_TEST_SERVER; offline synthetic MLS epoch catch-up"]
 fn actual_server_mls_worker_offline_catch_up_orders_chat_before_multiple_membership_epochs() {
     let server = CryptoServer::start();
-    let (mut alice, mut bob, mut eve, target) = workers(&server);
+    let (mut alice, mut bob, _first_eve, target) = workers(&server);
     let alice_public = alice.own();
     let bob_public = bob.own();
-    let eve_public = eve.own();
     alice.pin(&bob_public);
     bob.pin(&alice_public);
-    // Bob verifies Eve before going offline; the catch-up under test is ordering,
-    // not accepting an unverified device introduced while disconnected.
-    bob.pin(&eve_public);
     alice.send(
         &target,
         "offline initial synchronized message",
@@ -3142,6 +3199,15 @@ fn actual_server_mls_worker_offline_catch_up_orders_chat_before_multiple_members
         );
         expected.push(text);
     }
+    // A member who joins while Bob is offline, and whose device is revoked
+    // before Bob returns: Bob never sees it listed, yet follows both changes
+    // because nobody verified this person (trust on first use).
+    let invite: serde_json::Value = alice.worker.post("/api/invites", &json!({})).unwrap();
+    let mut eve = CryptoWorker::new(
+        &server,
+        register(&server, "crypto_offline_eve", invite["code"].as_str().unwrap()),
+    );
+    let eve_public = eve.own();
     alice.pin(&eve_public);
     eve.pin(&alice_public);
     eve.pin(&bob_public);

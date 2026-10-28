@@ -12,6 +12,8 @@ mod handoff;
 mod release_notice;
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// An automatic update restarts Relay only after this long without input.
+const IDLE_BEFORE_RESTART: Duration = Duration::from_secs(2 * 60);
 const RELEASES_URL: &str = "https://github.com/TheBengine/Relay/releases";
 
 enum State {
@@ -49,6 +51,16 @@ pub(crate) struct Controller {
     next_check: Instant,
     banner_hidden: bool,
     last_available: Option<String>,
+    // This installed copy can take the current release in place (checked once
+    // per release); portable or partial copies keep the manual installer path.
+    in_place: bool,
+    // The update was started by Relay itself: install only while the person
+    // is away, and retry quietly instead of showing pause messages.
+    install_when_idle: bool,
+    // Later or Cancel stops automatic updating until Relay starts again.
+    auto_postponed: bool,
+    unsent_draft: bool,
+    last_input: Instant,
 }
 
 impl Controller {
@@ -106,6 +118,11 @@ impl Controller {
             next_check: Instant::now() + Duration::from_secs(30),
             banner_hidden: false,
             last_available: None,
+            in_place: false,
+            install_when_idle: false,
+            auto_postponed: false,
+            unsent_draft: false,
+            last_input: Instant::now(),
         }
     }
 
@@ -129,6 +146,11 @@ impl Controller {
             next_check: Instant::now() + Duration::from_secs(30),
             banner_hidden: false,
             last_available: None,
+            in_place: false,
+            install_when_idle: false,
+            auto_postponed: false,
+            unsent_draft: false,
+            last_input: Instant::now(),
         }
     }
 
@@ -221,6 +243,7 @@ impl Controller {
                     self.banner_hidden = false;
                 }
                 self.last_available = Some(release.sequence.clone());
+                self.in_place = can_update_in_place(&release);
                 self.state = State::Available(release)
             }
             Ok(Outcome::Downloaded(ready)) => {
@@ -279,6 +302,15 @@ impl Controller {
         automatic_checks: bool,
         #[allow(unused_mut)] mut shutdown: impl FnMut() -> crate::network::ShutdownPoll,
     ) -> bool {
+        let now = Instant::now();
+        if ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO
+            || i.events.iter().any(|e| !matches!(e, egui::Event::WindowFocused(_))))
+        {
+            self.last_input = now;
+        }
+        if automatic_checks {
+            self.automatic_step(ctx, in_call, busy);
+        }
         if let Some(job) = self.notice_job.as_mut() {
             match job.poll() {
                 release_notice::Poll::Finished(result) => {
@@ -319,8 +351,11 @@ impl Controller {
         }
         if self.install_consent.is_some() && !self.consent_allowed(in_call, hosting, busy) {
             self.install_consent = None;
-            self.install_error = Some("Update paused because a call or another operation started. Relay stays open; choose Update and restart when you're ready.".into());
-            self.banner_hidden = false;
+            // Relay's own update simply waits and tries again later.
+            if !self.install_when_idle {
+                self.install_error = Some("Update paused because a call or another operation started. Relay stays open; choose Update and restart when you're ready.".into());
+                self.banner_hidden = false;
+            }
             #[cfg(windows)]
             self.cancel_install();
             if matches!(self.state, State::Downloading) { self.cancel_download(); }
@@ -336,10 +371,15 @@ impl Controller {
             _ => {}
         }
         #[cfg(windows)]
-        if matches!(&self.state, State::Ready(ready) if in_place_update(ready.release()))
+        if matches!(&self.state, State::Ready(ready) if self.updates_in_place(ready.release()))
             && self.consent_allowed(in_call, hosting, busy) && !self.preparing_install()
         {
-            self.begin_install(ctx);
+            let away = now.saturating_duration_since(self.last_input);
+            if restart_due(self.install_when_idle, away, self.unsent_draft) {
+                self.begin_install(ctx);
+            } else {
+                ctx.request_repaint_after(IDLE_BEFORE_RESTART.saturating_sub(away).max(Duration::from_secs(1)));
+            }
         }
         #[cfg(windows)]
         let consent_allowed = self.consent_allowed(in_call, hosting, busy);
@@ -356,6 +396,7 @@ impl Controller {
                             self.waiting = Some(waiting);
                             ctx.request_repaint();
                         }
+                        Ok(_) if self.install_when_idle => {}
                         Ok(_) => self.install_error = Some("Installation cancelled. Relay was left open.".into()),
                         Err(error) => {
                             self.install_consent = None;
@@ -371,10 +412,12 @@ impl Controller {
         if self.waiting.is_some() {
             if !consent_allowed {
                 self.waiting = None; // Dropping the approval cancels the installer.
-                self.install_error = Some(
-                    "Installation stopped because another operation started. Relay was left open."
-                        .into(),
-                );
+                if !self.install_when_idle {
+                    self.install_error = Some(
+                        "Installation stopped because another operation started. Relay was left open."
+                            .into(),
+                    );
+                }
             } else {
                 match shutdown() {
                     crate::network::ShutdownPoll::Pending(remaining) => {
@@ -401,8 +444,9 @@ impl Controller {
         false
     }
 
-    /// Shared by the signed-out screens and the main app. Nothing downloads or
-    /// closes Relay until the user explicitly chooses the corresponding action.
+    /// Shared by the signed-out screens and the main app. An installed copy
+    /// downloads and restarts by itself while the person is away; other copies
+    /// show the manual installer path. One short line per state.
     pub fn show_banner(&mut self, ctx: &egui::Context, in_call: bool, hosting: bool, busy: bool) {
         let visible = self.notice.is_some()
             || matches!(
@@ -418,13 +462,12 @@ impl Controller {
             .frame(
                 egui::Frame::none()
                     .fill(ctx.style().visuals.faint_bg_color)
-                    .inner_margin(egui::Margin::symmetric(12.0, 8.0)),
+                    .inner_margin(egui::Margin::symmetric(12.0, 6.0)),
             )
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if let Some(notice) = &self.notice {
-                        ui.strong("A Relay update is available");
-                        ui.label(&notice.tag);
+                        ui.label(format!("Relay {} is available.", notice.tag));
                         if ui
                             .button("Download update")
                             .on_hover_text("Open this release on GitHub, then run Relay-Setup.exe")
@@ -432,101 +475,191 @@ impl Controller {
                         {
                             ctx.open_url(egui::OpenUrl::new_tab(&notice.url));
                         }
-                        ui.weak("Opens GitHub · install manually");
+                    } else if let Some(error) = self.install_error.clone() {
+                        ui.label(error);
+                        if let State::Ready(ready) = &self.state {
+                            let ready = ready.clone();
+                            if ui.button("Show download").clicked()
+                                && ready.download_directory().and_then(show_folder).is_err()
+                            {
+                                self.failed();
+                            }
+                        }
                     } else {
-                        match &self.state {
-                            State::Available(release) => {
-                                ui.strong(format!("Relay {} is available", release.version));
-                                let restart = in_place_update(release);
-                                let allowed = if restart { install_allowed(in_call, hosting, busy, true) } else { !in_call };
-                                if update_button(ui, allowed, if restart { "Update and restart" } else { "Download update" })
-                                    .on_hover_text(
-                                        if restart { "Download, verify, update this installation and reopen Relay. No setup wizard." }
-                                        else { "Download and verify the update. Relay stays open." },
-                                    )
-                                    .clicked()
-                                {
-                                    self.download(ctx, restart);
-                                }
-                                if restart { ui.weak("Temporarily stops servers hosted on this PC"); }
-                                if in_call {
-                                    ui.label("Available after your call");
-                                } else if restart && busy {
-                                    ui.label("Finish pending work to update");
-                                }
-                            }
-                            State::Downloading | State::Cancelling => {
-                                ui.spinner();
-                                ui.label(if matches!(self.state, State::Downloading) {
-                                    "Downloading and checking the update…"
-                                } else {
-                                    "Cancelling download…"
-                                });
-                                if matches!(self.state, State::Downloading)
-                                    && ui.button("Cancel").clicked()
-                                {
-                                    self.cancel_download();
-                                }
-                            }
-                            State::Ready(ready) => {
-                                let ready = ready.clone();
-                                ui.strong("Update downloaded");
-                                #[cfg(windows)]
-                                if supports_handoff(ready.release()) {
-                                    match install_controls(
-                                        ui,
-                                        in_call,
-                                        hosting,
-                                        busy,
-                                        in_place_update(ready.release()),
-                                        self.preparing_install(),
-                                    ) {
-                                        InstallChoice::Start => self.approve_install(ctx),
-                                        InstallChoice::Cancel => self.cancel_install(),
-                                        InstallChoice::None => {}
-                                    }
-                                }
-                                if !self.preparing_install() && ui.button("Show download").clicked() {
-                                    if ready.download_directory().and_then(show_folder).is_err() {
-                                        self.failed();
-                                    }
-                                }
-                                if in_call {
-                                    ui.label("Leave the call to install");
-                                } else if busy {
-                                    ui.label("Finish pending work to install");
-                                } else if hosting && !in_place_update(ready.release()) {
-                                    ui.label("Stop local hosting before running this older installer");
-                                }
-                            }
-                            State::Failed => {
-                                ui.label("The update couldn't be verified. Relay is still open.");
-                                ui.hyperlink_to("View releases", RELEASES_URL);
-                            }
-                            _ => {}
-                        }
-                        if let Some(error) = &self.install_error {
-                            ui.label(error);
-                        }
+                        self.banner_line(ui, in_call, hosting, busy);
                     }
-                    if !self.preparing_install() && self.install_consent.is_none()
+                    if !self.preparing_install()
                         && ui
                             .small_button("Later")
-                            .on_hover_text(
-                                "Hide this notice until a newer update is found or Relay restarts",
-                            )
+                            .on_hover_text("Hide this until Relay starts again")
                             .clicked()
                     {
-                        self.banner_hidden = true;
+                        self.postpone();
                     }
                 });
             });
     }
 
+    fn banner_line(&mut self, ui: &mut egui::Ui, in_call: bool, hosting: bool, busy: bool) {
+        let ctx = ui.ctx().clone();
+        let waiting_for = if in_call {
+            Some("after your call")
+        } else if busy {
+            Some("when pending work is done")
+        } else {
+            None
+        };
+        match &self.state {
+            State::Available(release) => {
+                let version = release.version.clone();
+                if self.updates_in_place(release) && !self.auto_postponed {
+                    ui.label(format!(
+                        "Relay {version} is available. It updates {}.",
+                        waiting_for.unwrap_or("in a moment")
+                    ));
+                } else {
+                    ui.label(format!("Relay {version} is available."));
+                    if update_button(ui, !in_call, "Download update")
+                        .on_hover_text("Download and verify the installer. Relay stays open.")
+                        .clicked()
+                    {
+                        self.download(&ctx, false);
+                    }
+                }
+            }
+            State::Downloading | State::Cancelling => {
+                ui.spinner();
+                let version = self
+                    .download_release
+                    .as_ref()
+                    .map(|release| release.version.clone())
+                    .unwrap_or_default();
+                ui.label(if matches!(self.state, State::Downloading) {
+                    format!("Downloading Relay {version}…")
+                } else {
+                    "Cancelling download…".into()
+                });
+                if matches!(self.state, State::Downloading) && ui.small_button("Cancel").clicked() {
+                    self.auto_postponed = true;
+                    self.cancel_download();
+                }
+            }
+            State::Ready(ready) => {
+                let ready = ready.clone();
+                let version = ready.release().version.clone();
+                if self.preparing_install() {
+                    ui.spinner();
+                    ui.label(format!("Updating to Relay {version}. Relay restarts by itself."));
+                    #[cfg(windows)]
+                    if ui.small_button("Cancel").clicked() {
+                        self.auto_postponed = true;
+                        self.cancel_install();
+                    }
+                } else if self.updates_in_place(ready.release()) {
+                    ui.label(match waiting_for {
+                        Some(reason) => format!("Relay {version} is ready. It restarts {reason}."),
+                        None => format!("Relay {version} is ready. It restarts when you're not using it."),
+                    });
+                    #[cfg(windows)]
+                    if update_button(ui, install_allowed(in_call, hosting, busy, true), "Restart now")
+                        .on_hover_text("Update and reopen Relay now. Servers hosted on this PC pause briefly.")
+                        .clicked()
+                    {
+                        self.install_when_idle = false;
+                        self.approve_install(&ctx);
+                    }
+                } else {
+                    #[cfg(windows)]
+                    if self.can_hand_off(ready.release()) {
+                        ui.label(format!("Relay {version} is downloaded."));
+                        if update_button(
+                            ui,
+                            install_allowed(in_call, hosting, busy, false),
+                            "Install and reopen Relay",
+                        )
+                        .clicked()
+                        {
+                            self.approve_install(&ctx);
+                        }
+                        if hosting {
+                            ui.weak("Stop local hosting first");
+                        }
+                    } else {
+                        ui.label(format!(
+                            "Relay {version} is downloaded. Run the installer to update this copy."
+                        ));
+                    }
+                    #[cfg(not(windows))]
+                    ui.label(format!("Relay {version} is downloaded."));
+                    if ui.button("Show download").clicked()
+                        && ready.download_directory().and_then(show_folder).is_err()
+                    {
+                        self.failed();
+                    }
+                }
+            }
+            State::Failed => {
+                ui.label("The update couldn't be verified. Relay will try again later.");
+                ui.hyperlink_to("View releases", RELEASES_URL);
+            }
+            _ => {}
+        }
+    }
+
+    /// Relay's own update step: download, then wait for the person to be away.
+    fn automatic_step(&mut self, ctx: &egui::Context, in_call: bool, busy: bool) {
+        if self.auto_postponed
+            || in_call
+            || busy
+            || self.install_error.is_some()
+            || self.install_consent.is_some()
+            || self.preparing_install()
+        {
+            return;
+        }
+        match &self.state {
+            State::Available(release) if self.updates_in_place(release) => {
+                self.download(ctx, true);
+                self.install_when_idle = true;
+            }
+            State::Ready(ready) if self.updates_in_place(ready.release()) => {
+                self.install_consent = Some(Box::new(ready.release().clone()));
+                self.install_when_idle = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn postpone(&mut self) {
+        self.banner_hidden = true;
+        self.auto_postponed = true;
+        if self.install_when_idle {
+            self.install_consent = None;
+        }
+    }
+
+    /// The app reports an unsent message so an automatic restart never drops it.
+    pub fn set_unsent_draft(&mut self, unsent: bool) {
+        self.unsent_draft = unsent;
+    }
+
+    fn updates_in_place(&self, release: &Release) -> bool {
+        self.in_place && in_place_update(release)
+    }
+
+    #[cfg(windows)]
+    fn can_hand_off(&self, release: &Release) -> bool {
+        match release.handoff.as_deref() {
+            Some("wait-parent-v1") => true,
+            Some("in-place-v2") => self.in_place,
+            _ => false,
+        }
+    }
+
     #[cfg(windows)]
     fn approve_install(&mut self, ctx: &egui::Context) {
         let State::Ready(ready) = &self.state else { return; };
-        if !supports_handoff(ready.release()) { return; }
+        if !self.can_hand_off(ready.release()) { return; }
         self.install_consent = Some(Box::new(ready.release().clone()));
         self.begin_install(ctx);
     }
@@ -608,7 +741,7 @@ impl Controller {
             State::Available(_) => "A new version is available.",
             State::Downloading => "Downloading and checking the update…",
             State::Cancelling => "Stopping the update operation…",
-            State::Ready(ready) if in_place_update(ready.release()) => "Download verified. Relay can update and reopen without a setup wizard.",
+            State::Ready(ready) if self.updates_in_place(ready.release()) => "Update ready. Relay restarts by itself when you're not using it.",
             State::Ready(_) => "Download verified. Run the installer to finish this update.",
             State::Failed => "Couldn't check or verify the update. Try again in a moment.",
         };
@@ -634,7 +767,7 @@ impl Controller {
             self.check(ui.ctx());
         }
         if let State::Available(release) = &self.state {
-            let restart = in_place_update(release);
+            let restart = self.updates_in_place(release);
             if in_call {
                 crate::settings_ui::description(ui, "Leave the call before downloading an update.");
             }
@@ -642,7 +775,7 @@ impl Controller {
                 if update_button(ui, install_allowed(in_call, hosting, busy_work, true), "Update and restart").clicked() {
                     self.download(ui.ctx(), true);
                 }
-                crate::settings_ui::description(ui, "Downloads and verifies the update, then reopens Relay. Temporarily stops servers hosted on this PC.");
+                crate::settings_ui::description(ui, "Relay also does this by itself when you're not using it. Servers hosted on this PC pause briefly.");
                 if busy_work { ui.label("Finish pending work to update."); }
             }
             if update_button(ui, !in_call, if restart { "Download only" } else { "Download update" }).clicked() {
@@ -657,8 +790,8 @@ impl Controller {
         if let State::Ready(ready) = &self.state {
             let ready = ready.clone();
             #[cfg(windows)]
-            if supports_handoff(ready.release()) {
-                match install_controls(ui, in_call, hosting, busy_work, in_place_update(ready.release()), self.preparing_install()) {
+            if self.can_hand_off(ready.release()) {
+                match install_controls(ui, in_call, hosting, busy_work, self.updates_in_place(ready.release()), self.preparing_install()) {
                     InstallChoice::Start => {
                         self.approve_install(ui.ctx());
                     }
@@ -673,7 +806,7 @@ impl Controller {
             }
             if busy_work {
                 crate::settings_ui::description(ui, "Finish pending work before updating.");
-            } else if hosting && !in_place_update(ready.release()) {
+            } else if hosting && !self.updates_in_place(ready.release()) {
                 crate::settings_ui::description(
                     ui,
                     "Stop your local server normally and wait for other operations before installing.",
@@ -701,9 +834,22 @@ fn in_place_update(release: &Release) -> bool {
     cfg!(windows) && release.handoff.as_deref() == Some("in-place-v2")
 }
 
-#[cfg(windows)]
-fn supports_handoff(release: &Release) -> bool {
-    matches!(release.handoff.as_deref(), Some("wait-parent-v1" | "in-place-v2"))
+fn can_update_in_place(release: &Release) -> bool {
+    #[cfg(windows)]
+    {
+        in_place_update(release) && relay_updater::handoff::updates_in_place(release)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = release;
+        false
+    }
+}
+
+/// A chosen update installs at once; Relay's own update waits until the person
+/// has been away for a while and has no unsent message.
+fn restart_due(install_when_idle: bool, away: Duration, unsent_draft: bool) -> bool {
+    !install_when_idle || (away >= IDLE_BEFORE_RESTART && !unsent_draft)
 }
 
 fn consent_matches(consent: Option<&Release>, ready: &Release) -> bool {
@@ -745,7 +891,6 @@ fn install_controls(
     {
         return InstallChoice::Start;
     }
-    if in_place { ui.weak("Temporarily stops servers hosted on this PC"); }
     InstallChoice::None
 }
 
@@ -811,6 +956,66 @@ mod tests {
             installer_sha256: "0".repeat(64), installer_bytes: 123,
             notes: String::new(), handoff: Some("in-place-v2".into()),
         }
+    }
+
+    fn banner_names(controller: &mut Controller, in_call: bool) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0))),
+                ..Default::default()
+            },
+            |ctx| controller.show_banner(ctx, in_call, false, false),
+        );
+        output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.name().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn automatic_restart_waits_for_two_idle_minutes_and_never_drops_a_draft() {
+        let away = IDLE_BEFORE_RESTART;
+        assert!(restart_due(false, Duration::ZERO, true), "a chosen restart is immediate");
+        assert!(!restart_due(true, away - Duration::from_secs(1), false));
+        assert!(!restart_due(true, away, true));
+        assert!(restart_due(true, away, false));
+    }
+
+    #[test]
+    fn a_copy_that_cannot_update_itself_offers_only_the_installer_path() {
+        let mut controller = Controller::inactive(State::Available(Box::new(v2_release())));
+        controller.in_place = false;
+        let names = banner_names(&mut controller, false);
+        assert!(names.iter().any(|n| n == "Download update"));
+        assert!(!names.iter().any(|n| n == "Update and restart" || n == "Restart now"));
+        assert!(!names.iter().any(|n| n.contains("cannot be updated")));
+    }
+
+    #[test]
+    fn an_installed_copy_shows_one_quiet_line_and_later_stops_automatic_updates() {
+        let ctx = egui::Context::default();
+        let mut controller = Controller::inactive(State::Available(Box::new(v2_release())));
+        controller.in_place = true;
+        let names = banner_names(&mut controller, true);
+        assert!(names.iter().any(|n| n == "Relay 0.10.1 is available. It updates after your call."));
+        assert!(!names.iter().any(|n| n == "Download update" || n == "Update and restart"));
+        // During a call Relay neither downloads nor asks to install.
+        controller.automatic_step(&ctx, true, false);
+        assert!(controller.install_consent.is_none() && !controller.install_when_idle);
+        controller.automatic_step(&ctx, false, false);
+        assert!(controller.install_when_idle, "Relay starts its own update when free");
+        controller.postpone();
+        assert!(controller.banner_hidden && controller.auto_postponed);
+        assert!(controller.install_consent.is_none());
+        controller.install_when_idle = false;
+        controller.automatic_step(&ctx, false, false);
+        assert!(!controller.install_when_idle, "Later holds until Relay starts again");
     }
 
     #[cfg(windows)]

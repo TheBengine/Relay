@@ -229,6 +229,12 @@ impl Drop for WaitingInstaller {
     }
 }
 
+/// Whether this running build is the complete installed copy that `release`
+/// can replace without a wizard. Portable or partial copies need the installer.
+pub fn updates_in_place(release: &crate::Release) -> bool {
+    release.handoff.as_deref() == Some("in-place-v2") && installed::current(release).is_ok()
+}
+
 pub fn prepare(
     ready: &PreparedInstaller,
     signals: std::sync::Arc<Signals>,

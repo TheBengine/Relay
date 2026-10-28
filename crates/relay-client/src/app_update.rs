@@ -2422,6 +2422,8 @@ impl eframe::App for RelayApp {
             || self.private_calls.intent.is_some()
             || self.call_switch_pending()
             || self.rtc_request.is_some();
+        self.update_ui
+            .set_unsent_draft(!self.draft.trim().is_empty() || !self.attachments.is_empty());
         if self.update_ui.tick(
             ctx,
             update_call_active,

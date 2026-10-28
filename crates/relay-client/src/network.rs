@@ -129,6 +129,18 @@ pub enum Command {
         user_id: String,
         device_id: String,
     },
+    /// Trust the new security code of a device that waited for review.
+    CryptoAcceptKey {
+        origin: CommandOrigin,
+        user_id: String,
+        device_id: String,
+        fingerprint: String,
+    },
+    /// The user read a key-change notice; trust is unchanged.
+    CryptoDismissNotice {
+        origin: CommandOrigin,
+        device_id: String,
+    },
     FetchUserProfile {
         user_id: String,
         request_id: u64,
@@ -511,16 +523,17 @@ pub fn operation_id() -> String {
 /// explains it next to the kept message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendWait {
-    /// This device is not yet approved into the conversation's group.
+    /// The key manager has not added this device to the conversation yet.
     DeviceApproval,
-    /// The key manager has not finished adding this account's devices.
-    AddingDevices,
-    /// A device left; the key manager must replace the keys.
+    /// A device left or changed its key; the key manager must replace the keys.
     KeyRotation,
     /// Key updates are queued for this conversation.
     KeyUpdates,
-    /// A direct message whose other person has no device verified here yet.
-    PeerVerification,
+    /// A direct message whose other person has no device ready yet.
+    PeerUnavailable,
+    /// A person verified by hand has a new security code or device; the user
+    /// must accept it or verify again before this conversation continues.
+    KeyChangeReview,
 }
 
 pub enum Update {
@@ -2685,6 +2698,8 @@ impl Worker {
             Command::CryptoRefresh
                 | Command::CryptoVerify { .. }
                 | Command::CryptoUnverify { .. }
+                | Command::CryptoAcceptKey { .. }
+                | Command::CryptoDismissNotice { .. }
                 | Command::CryptoResetDevice { .. }
                 | Command::CryptoRevokeOwnDevice { .. }
         ) {

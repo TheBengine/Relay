@@ -515,12 +515,14 @@ impl Incremental {
             return Ok(());
         };
         match step {
-            Step::Directory(devices, roster) => super::encrypted::update_directory_cache(
-                c.crypto.as_mut().unwrap(),
-                devices,
-                roster,
-                false,
-            )?,
+            Step::Directory(devices, roster) => {
+                let crypto = c.crypto.as_mut().unwrap();
+                super::encrypted::update_directory_cache(crypto, devices, roster, false)?;
+                // The same trust on first use as in the open community, so a
+                // parked conversation can follow group updates that add new
+                // people. Notices wait in the protected state until shown.
+                crypto.trust_directory(false)?;
+            }
             Step::Drain => {
                 if consume_batch(
                     c,

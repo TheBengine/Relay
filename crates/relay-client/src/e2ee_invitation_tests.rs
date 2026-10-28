@@ -142,9 +142,10 @@ fn a_valid_proof_approves_the_friends_device_once_and_survives_a_restart() {
     assert!(host.device.is_approved(&friend));
     assert_eq!(host.status.via_invitation, ["friend-device"]);
     assert!(!host.has_active_invitations());
-    // Removing the verification also removes the mark.
+    // Removing the verification also removes the mark; the key stays trusted.
     host.unapprove("friend-device").unwrap();
-    assert!(!host.device.is_approved(&friend));
+    assert!(!host.device.is_verified(&friend));
+    assert!(host.device.is_approved(&friend), "still trusted, as on first use");
     assert!(host.status.via_invitation.is_empty());
 }
 
@@ -422,7 +423,7 @@ fn pending_host_pin_never_waits_past_a_mismatch_or_overrides_manual_verification
     );
     friend.unapprove(&public.identity.device_id).unwrap();
     assert!(!friend.retry_invited_host(start).unwrap());
-    assert!(!friend.device.is_approved(&public));
+    assert!(!friend.device.is_verified(&public));
     friend
         .approve(&public.identity.device_id, &public.fingerprint)
         .unwrap();

@@ -19,5 +19,7 @@ license = "PolyForm-Perimeter-1.0.0"
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 1
+# Eight parallel code generators: about half of a 16-thread PC; thin LTO
+# keeps cross-unit optimisation, so the client is as fast as with one unit.
+codegen-units = 8
 strip = true

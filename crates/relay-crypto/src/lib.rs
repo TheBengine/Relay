@@ -21,6 +21,8 @@ pub const MAX_GROUPS: usize = 128;
 pub const MAX_WIRE_BYTES: usize = 512 * 1024;
 pub const MAX_APPLICATION_BYTES: usize = 32 * 1024;
 pub const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
+/// Trusted device keys kept by one device (verified or trusted on first use).
+pub const MAX_PINS: usize = 256;
 const SUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519;
 const CALL_PROOF_DOMAIN: &[u8] = b"Relay/MLS/call-freshness/v1\0";
 
@@ -95,6 +97,42 @@ struct ApprovedDevice {
     identity: Identity,
     signature_key: Vec<u8>,
     fingerprint: String,
+    /// Trusted automatically the first time it was seen, without a comparison
+    /// of security codes. Missing in older snapshots, which only held
+    /// compared (or invitation-proven) devices.
+    #[serde(default, skip_serializing_if = "is_false")]
+    first_use: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// How this device came to trust another device's signing key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trust {
+    /// Security codes were compared, or an invitation proof checked out.
+    Verified,
+    /// Trusted on first use; nobody compared the code.
+    FirstUse,
+}
+
+/// What trust on first use decided for one listed device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstUse {
+    /// Already trusted with exactly this key (or this device itself).
+    Known,
+    /// Seen for the first time and now trusted.
+    Trusted,
+    /// An automatically trusted device presented a different key; the new key
+    /// replaced the old one. The person should be told.
+    KeyReplaced,
+    /// The person was verified by hand (or this verified device changed its
+    /// key). Nothing is trusted until the user accepts or verifies again.
+    Held,
+    /// Would be trusted, but the listing carries no KeyPackage to take the
+    /// signing key from. It is trusted when it appears, with exactly the
+    /// listed fingerprint, in an authenticated group update.
+    Deferred,
 }
 fn fingerprint(identity: &Identity, signature_key: &[u8]) -> Result<String> {
     let mut hash = Sha256::new();
@@ -152,6 +190,10 @@ pub struct Device {
     groups: BTreeMap<String, GroupState>,
     pending_rotations: BTreeMap<String, PendingRotation>,
     blocked: bool,
+    /// Devices trust on first use accepted from the directory without a
+    /// KeyPackage: (identity, fingerprint). Never saved; the next directory
+    /// read rebuilds it. Only a leaf with a matching fingerprint is adopted.
+    first_use_candidates: BTreeMap<String, (Identity, String)>,
 }
 #[derive(Clone, Debug)]
 pub struct MembershipChange {
@@ -194,11 +236,13 @@ impl Device {
             groups: BTreeMap::new(),
             pending_rotations: BTreeMap::new(),
             blocked: false,
+            first_use_candidates: BTreeMap::new(),
         };
         let own = ApprovedDevice {
             identity: device.identity.clone(),
             signature_key: device.signer.to_public_vec(),
             fingerprint: device.fingerprint()?,
+            first_use: false,
         };
         device.approved.insert(own.identity.device_id.clone(), own);
         Ok(device)
@@ -220,6 +264,247 @@ impl Device {
         self.approved
             .get(device_id)
             .map(|pin| pin.fingerprint.as_str())
+    }
+    /// The trust of exactly this identity and key, if it is trusted at all.
+    pub fn trust(&self, device: &PublicDevice) -> Option<Trust> {
+        self.approved
+            .get(&device.identity.device_id)
+            .filter(|pin| pin.identity == device.identity && pin.fingerprint == device.fingerprint)
+            .map(|pin| {
+                if pin.first_use {
+                    Trust::FirstUse
+                } else {
+                    Trust::Verified
+                }
+            })
+    }
+    /// The trust of whatever key is pinned for this device ID.
+    pub fn pin_trust(&self, device_id: &str) -> Option<Trust> {
+        self.approved.get(device_id).map(|pin| {
+            if pin.first_use {
+                Trust::FirstUse
+            } else {
+                Trust::Verified
+            }
+        })
+    }
+    /// Verified by comparing codes or by an invitation proof, with this key.
+    pub fn is_verified(&self, device: &PublicDevice) -> bool {
+        self.trust(device) == Some(Trust::Verified)
+    }
+    /// True when the user verified any device of this person. Such a person
+    /// never gets a device or key trusted without the user's say. The own
+    /// account is excluded: this device's own pin is not a choice.
+    pub fn person_verified(&self, user_id: &str) -> bool {
+        user_id != self.identity.user_id
+            && self
+                .approved
+                .values()
+                .any(|pin| pin.identity.user_id == user_id && !pin.first_use)
+    }
+    /// True when the listing's KeyPackage is signed by the key its
+    /// fingerprint names, for this community.
+    pub fn listing_is_valid(&self, device: &PublicDevice) -> bool {
+        self.validate_package(device).is_ok()
+    }
+    /// The decision trust on first use would make, without changing anything.
+    pub fn first_use_decision(&self, device: &PublicDevice) -> FirstUse {
+        if device.identity == self.identity || self.trust(device).is_some() {
+            return FirstUse::Known;
+        }
+        let pin = self.approved.get(&device.identity.device_id);
+        let own_account = device.identity.user_id == self.identity.user_id;
+        if !own_account
+            && (self.person_verified(&device.identity.user_id)
+                || pin.is_some_and(|p| !p.first_use))
+        {
+            return FirstUse::Held;
+        }
+        if device.key_package.is_empty() {
+            return if pin.is_some() {
+                // A changed key cannot be taken from a listing without a package.
+                FirstUse::Held
+            } else {
+                FirstUse::Deferred
+            };
+        }
+        if pin.is_some() {
+            FirstUse::KeyReplaced
+        } else {
+            FirstUse::Trusted
+        }
+    }
+    /// Trust on first use for one listed device. A device of a person the user
+    /// verified by hand is never trusted here (`Held`). An invalid listing
+    /// returns an error and changes nothing.
+    pub fn trust_on_first_use(&mut self, device: &PublicDevice) -> Result<FirstUse> {
+        self.guard()?;
+        let decision = self.first_use_decision(device);
+        match decision {
+            FirstUse::Known | FirstUse::Held => {}
+            FirstUse::Deferred => {
+                if device.identity.server_id != self.identity.server_id
+                    || device.fingerprint.len() != 64
+                {
+                    return Err("Encryption: invalid or foreign device listing.".into());
+                }
+                if self.first_use_candidates.len() >= MAX_PINS
+                    && !self
+                        .first_use_candidates
+                        .contains_key(&device.identity.device_id)
+                {
+                    return Err("This device has reached its verification limit.".into());
+                }
+                self.first_use_candidates.insert(
+                    device.identity.device_id.clone(),
+                    (device.identity.clone(), device.fingerprint.clone()),
+                );
+            }
+            FirstUse::Trusted | FirstUse::KeyReplaced => self.pin(device, true)?,
+        }
+        Ok(decision)
+    }
+    /// The user accepted a changed security code with one click (`None`), or
+    /// compared the new code (`Some`). Replaces any earlier pin of the device.
+    pub fn accept_new_key(
+        &mut self,
+        device: &PublicDevice,
+        compared_fingerprint: Option<&str>,
+    ) -> Result<()> {
+        self.guard()?;
+        if device.identity.device_id == self.identity.device_id {
+            return Err("You cannot replace the key of this device.".into());
+        }
+        if compared_fingerprint.is_some_and(|code| code != device.fingerprint) {
+            return Err("The device fingerprint does not match. No key was shared.".into());
+        }
+        self.pin(device, compared_fingerprint.is_none())
+    }
+    fn pin(&mut self, device: &PublicDevice, first_use: bool) -> Result<()> {
+        let package = self.validate_package(device)?;
+        if self.approved.len() >= MAX_PINS
+            && !self.approved.contains_key(&device.identity.device_id)
+        {
+            return Err("This device has reached its verification limit.".into());
+        }
+        self.first_use_candidates.remove(&device.identity.device_id);
+        self.approved.insert(
+            device.identity.device_id.clone(),
+            ApprovedDevice {
+                identity: device.identity.clone(),
+                fingerprint: device.fingerprint.clone(),
+                signature_key: package.leaf_node().signature_key().as_slice().to_vec(),
+                first_use,
+            },
+        );
+        Ok(())
+    }
+    /// Removes the "verified" mark but keeps trusting the same key, as after
+    /// trust on first use. The device stays in its conversations.
+    pub fn unverify(&mut self, device_id: &str) -> Result<()> {
+        self.guard()?;
+        if device_id == self.identity.device_id {
+            return Err("You cannot remove verification of this device.".into());
+        }
+        if let Some(pin) = self.approved.get_mut(device_id) {
+            pin.first_use = true;
+        }
+        Ok(())
+    }
+    /// Number of trusted device keys, verified or not.
+    pub fn pin_count(&self) -> usize {
+        self.approved.len()
+    }
+    /// Forgets automatically trusted devices that are neither listed (`keep`)
+    /// nor members of a conversation here, so the bounded pin store does not
+    /// fill with retired devices. Verified pins are never forgotten.
+    pub fn forget_unused_first_use(&mut self, keep: &HashSet<String>) -> Result<usize> {
+        self.guard()?;
+        let mut members = HashSet::new();
+        for state in self.groups.values() {
+            if let Some(group) = MlsGroup::load(
+                self.provider.storage(),
+                &GroupId::from_slice(state.group_id.as_bytes()),
+            )
+            .map_err(|e| error("load group members", e))?
+            {
+                for member in group.members() {
+                    if let Ok(identity) = Identity::from_credential(&member.credential) {
+                        members.insert(identity.device_id);
+                    }
+                }
+            }
+        }
+        let before = self.approved.len();
+        let own = self.identity.device_id.clone();
+        self.approved.retain(|id, pin| {
+            !pin.first_use || id == &own || keep.contains(id) || members.contains(id)
+        });
+        Ok(before - self.approved.len())
+    }
+    /// Members of a conversation that this device does not trust with their
+    /// current key: no pin, or a pin for a different key. Only the key
+    /// manager acts on this, by removing them.
+    pub fn untrusted_members(&self, scope: &str) -> Result<Vec<String>> {
+        let group = self.load_group_for_commit(scope)?;
+        Ok(group
+            .members()
+            .filter_map(|member| {
+                let identity = Identity::from_credential(&member.credential).ok()?;
+                self.approved_member(&member.credential, &member.signature_key)
+                    .is_err()
+                    .then_some(identity.device_id)
+            })
+            .collect())
+    }
+    /// Trust on first use for a leaf of an authenticated group update.
+    ///
+    /// A device listed without a KeyPackage is adopted only with exactly its
+    /// listed fingerprint. With `vouched` (a device the key manager added, or
+    /// a member of a Welcome other than its sender), an unlisted device of a
+    /// person nobody verified is adopted too: it may have been added and
+    /// revoked while this device was offline, and refusing would stop the
+    /// conversation for good. A verified person's device is never adopted.
+    fn adopt_first_use(
+        &mut self,
+        credential: &Credential,
+        signature_key: &[u8],
+        vouched: bool,
+    ) -> Result<()> {
+        let identity = Identity::from_credential(credential)?;
+        if self.approved.contains_key(&identity.device_id) {
+            return Ok(());
+        }
+        let presented = fingerprint(&identity, signature_key)?;
+        match self.first_use_candidates.get(&identity.device_id) {
+            Some((listed, listed_fingerprint)) => {
+                if *listed != identity || *listed_fingerprint != presented {
+                    return Ok(());
+                }
+            }
+            None => {
+                if !vouched
+                    || identity.server_id != self.identity.server_id
+                    || self.person_verified(&identity.user_id)
+                {
+                    return Ok(());
+                }
+            }
+        }
+        if self.approved.len() >= MAX_PINS {
+            return Err("This device has reached its verification limit.".into());
+        }
+        self.first_use_candidates.remove(&identity.device_id);
+        self.approved.insert(
+            identity.device_id.clone(),
+            ApprovedDevice {
+                fingerprint: presented,
+                identity,
+                signature_key: signature_key.to_vec(),
+                first_use: true,
+            },
+        );
+        Ok(())
     }
     pub fn group_state(&self, scope: &str) -> Option<&GroupState> {
         self.groups.get(scope)
@@ -293,26 +578,19 @@ impl Device {
         if compared_fingerprint != device.fingerprint {
             return Err("The device fingerprint does not match. No key was shared.".into());
         }
-        let package = self.validate_package(device)?;
-        if let Some(pin) = self.approved.get(&device.identity.device_id) {
+        if let Some(pin) = self.approved.get_mut(&device.identity.device_id) {
             if pin.identity != device.identity || pin.fingerprint != device.fingerprint {
                 return Err(
-                    "This device's identity changed. Remove its old verification first.".into(),
+                    "This device's security code changed. Accept or compare the new code instead."
+                        .into(),
                 );
             }
+            // The key was already validated when it was first trusted; an
+            // existing member may be listed without an unused KeyPackage.
+            pin.first_use = false;
+            return Ok(());
         }
-        if self.approved.len() >= 256 && !self.approved.contains_key(&device.identity.device_id) {
-            return Err("This device has reached its verification limit.".into());
-        }
-        self.approved.insert(
-            device.identity.device_id.clone(),
-            ApprovedDevice {
-                identity: device.identity.clone(),
-                fingerprint: device.fingerprint.clone(),
-                signature_key: package.leaf_node().signature_key().as_slice().to_vec(),
-            },
-        );
-        Ok(())
+        self.pin(device, false)
     }
     pub fn unapprove(&mut self, device_id: &str) -> Result<()> {
         self.guard()?;
@@ -773,12 +1051,20 @@ impl Device {
                 "Encryption: the group welcome signer does not match its key manager.".into(),
             );
         }
+        self.adopt_first_use(sender.credential(), sender.signature_key().as_slice(), false)?;
         self.approved_member(sender.credential(), sender.signature_key().as_slice())?;
         let group = staged
             .into_group(&self.provider)
             .map_err(|e| error("join encrypted group", e))?;
         if group.group_id().as_slice() != group_id.as_bytes() || group.ciphersuite() != SUITE {
             return Err("Encryption: group welcome belongs to another conversation.".into());
+        }
+        let leaves: Vec<_> = group
+            .members()
+            .map(|m| (m.credential, m.signature_key))
+            .collect();
+        for (credential, signature_key) in &leaves {
+            self.adopt_first_use(credential, signature_key, true)?;
         }
         self.validate_members(&group)?;
         self.groups.insert(
@@ -916,9 +1202,19 @@ impl Device {
                     return Err("Encryption: unauthorized membership change.".into());
                 }
                 // Validate each added device before merging or deriving the next epoch.
-                for proposal in commit.add_proposals() {
-                    let leaf = proposal.add_proposal().key_package().leaf_node();
-                    self.approved_member(leaf.credential(), leaf.signature_key().as_slice())?;
+                let added: Vec<_> = commit
+                    .add_proposals()
+                    .map(|proposal| {
+                        let leaf = proposal.add_proposal().key_package().leaf_node();
+                        (
+                            leaf.credential().clone(),
+                            leaf.signature_key().as_slice().to_vec(),
+                        )
+                    })
+                    .collect();
+                for (credential, signature_key) in &added {
+                    self.adopt_first_use(credential, signature_key, true)?;
+                    self.approved_member(credential, signature_key)?;
                 }
                 group
                     .merge_staged_commit(&self.provider, *commit)
@@ -1024,7 +1320,7 @@ impl Device {
                     .any(|r| !r.proofs.is_empty())
             || state.identity != *expected
             || state.values.len() > 16384
-            || state.approved.len() > 256
+            || state.approved.len() > MAX_PINS
             || state.groups.len() > MAX_GROUPS
             || state.pending_rotations.len() > MAX_GROUPS
             || state
@@ -1052,6 +1348,7 @@ impl Device {
             groups: state.groups,
             pending_rotations: state.pending_rotations,
             blocked: false,
+            first_use_candidates: BTreeMap::new(),
         };
         let pin = device
             .approved
@@ -1095,6 +1392,7 @@ impl Device {
         self.guard()?;
         let before = self.checkpoint()?;
         let mut next = Self::restore(&before, &self.identity)?;
+        next.first_use_candidates = self.first_use_candidates.clone();
         let result = mutate(&mut next)?;
         let after = match next.checkpoint() {
             Ok(snapshot) => snapshot,
@@ -1134,6 +1432,10 @@ mod checkpoint_tests;
 #[cfg(test)]
 #[path = "message_cost_tests.rs"]
 mod message_cost_tests;
+
+#[cfg(test)]
+#[path = "trust_tests.rs"]
+mod trust_tests;
 
 #[cfg(test)]
 mod tests {

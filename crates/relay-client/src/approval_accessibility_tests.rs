@@ -23,7 +23,9 @@ fn peer() -> CryptoPeerStatus {
         device_id: "device".into(),
         fingerprint: "12ab".repeat(16),
         verified: false,
+        trusted: true,
         changed: false,
+        needs_review: false,
     }
 }
 

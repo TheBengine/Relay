@@ -151,8 +151,9 @@ pub(super) fn run() {
     let _ = encrypted::take_control_delivery_sizes();
     let admission_at = Instant::now();
     // Acknowledge the first production-sized portion and pause the controller.
-    // A welcomed participant must not send while its other verified recipients
-    // are still absent. The controller then resumes from this durable prefix.
+    // With trust on first use a welcomed participant no longer waits for the
+    // key manager to add everyone else: devices not yet added read along from
+    // the epoch that adds them. The controller then resumes from this prefix.
     actors[0]
         .worker
         .crypto()
@@ -172,14 +173,10 @@ pub(super) fn run() {
         .iter()
         .position(|a| a.own().identity.device_id == packages[0].identity.device_id)
         .unwrap();
-    let partial_error = actors[welcomed]
+    actors[welcomed]
         .worker
         .ensure_crypto_conversation(&target)
-        .unwrap_err();
-    assert!(
-        partial_error.contains("finish adding your verified devices"),
-        "{partial_error}"
-    );
+        .unwrap();
     assert_eq!(
         actors[welcomed]
             .worker
@@ -191,20 +188,6 @@ pub(super) fn run() {
             .len(),
         17
     );
-    let origin = actors[welcomed].origin();
-    assert!(actors[welcomed]
-        .worker
-        .handle(Command::SendRich {
-            binding: None,
-            origin,
-            target: target.clone(),
-            content: "must not escape partial admission".into(),
-            attachment_ids: Vec::new(),
-            client_id: "capacity-http-partial-blocked".into(),
-            reply_to_id: None,
-            mentions: Vec::new(),
-        })
-        .is_err());
     assert!(actors[welcomed].raw_messages(&target).is_empty());
     let joined = actors[0]
         .worker

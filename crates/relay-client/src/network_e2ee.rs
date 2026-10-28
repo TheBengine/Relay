@@ -117,6 +117,12 @@ pub(super) fn update_directory_cache(
             key_package,
         };
         if public.user_id == own.user_id {
+            let (verified, trusted, changed, needs_review) = if public.device_id == own.device_id {
+                let same = public.identity == crypto.status.own_fingerprint;
+                (same, same, !same, false)
+            } else {
+                crate::e2ee::peer_trust(&crypto.device, &device)
+            };
             own_incoming.insert(
                 public.device_id.clone(),
                 CryptoPeerStatus {
@@ -124,10 +130,10 @@ pub(super) fn update_directory_cache(
                     name: "Your device".into(),
                     device_id: public.device_id.clone(),
                     fingerprint: public.identity.clone(),
-                    verified: public.device_id == own.device_id
-                        && public.identity == crypto.status.own_fingerprint,
-                    changed: public.device_id == own.device_id
-                        && public.identity != crypto.status.own_fingerprint,
+                    verified,
+                    trusted,
+                    changed,
+                    needs_review,
                 },
             );
         }
@@ -146,7 +152,9 @@ pub(super) fn update_directory_cache(
             device_id: own.device_id.clone(),
             fingerprint: crypto.status.own_fingerprint.clone(),
             verified: true,
+            trusted: true,
             changed: false,
+            needs_review: false,
         });
     if own_incoming.len() > MAX_DIRECTORY_DEVICES {
         return Err("Your device directory exceeds its cache limit.".into());
@@ -180,18 +188,17 @@ pub(super) fn update_directory_cache(
                     }
                 })
                 .unwrap_or_else(|| device.identity.user_id.clone());
-            let verified = crypto.device.is_approved(device);
+            let (verified, trusted, changed, needs_review) =
+                crate::e2ee::peer_trust(&crypto.device, device);
             CryptoPeerStatus {
                 user_id: device.identity.user_id.clone(),
                 name,
                 device_id: device.identity.device_id.clone(),
                 fingerprint: device.fingerprint.clone(),
                 verified,
-                changed: crypto
-                    .device
-                    .expected_fingerprint(&device.identity.device_id)
-                    .is_some()
-                    && !verified,
+                trusted,
+                changed,
+                needs_review,
             }
         })
         .collect();
@@ -199,6 +206,7 @@ pub(super) fn update_directory_cache(
     crypto.directory = next_directory;
     crypto.status.own_devices = own_devices;
     crypto.status.peers = peers;
+    crypto.status.notices = crypto.trust_notices();
     Ok(())
 }
 impl Worker {
@@ -450,7 +458,54 @@ impl Worker {
         devices: &[CryptoDevice],
         roster: &[User],
     ) -> Result<(), String> {
-        update_directory_cache(self.crypto()?, devices, roster, false)
+        update_directory_cache(self.crypto()?, devices, roster, false)?;
+        self.trust_listed_devices(false)
+    }
+
+    /// Trust on first use for the listed devices, and tell the user about key
+    /// changes and new devices on their own account. A person verified by
+    /// hand is never trusted here; their changes wait in Encryption settings.
+    fn trust_listed_devices(&mut self, complete: bool) -> Result<(), String> {
+        let notices = self.crypto()?.trust_directory(complete)?;
+        for notice in notices {
+            let text = match notice.kind {
+                crate::e2ee::TrustNoticeKind::CodeChanged => {
+                    let name = self
+                        .crypto()?
+                        .status
+                        .peers
+                        .iter()
+                        .find(|p| p.user_id == notice.user_id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "Someone".into());
+                    format!("{name}'s security code changed. Messages stay encrypted; compare codes in Encryption settings if you want to be sure.")
+                }
+                crate::e2ee::TrustNoticeKind::NewOwnDevice => "A new device was added to your account. If it wasn't you, revoke it in Encryption settings.".into(),
+            };
+            self.emit(Update::Notice(text));
+        }
+        Ok(())
+    }
+
+    /// The name of the first listed person with a device waiting for review
+    /// among `devices`, if any.
+    fn person_needing_review(&mut self, devices: &[CryptoDevice]) -> Result<Option<String>, String> {
+        let crypto = self.crypto()?;
+        Ok(devices.iter().find_map(|listed| {
+            crypto
+                .status
+                .peers
+                .iter()
+                .find(|p| p.device_id == listed.device_id && p.needs_review)
+                .map(|p| p.name.clone())
+        }))
+    }
+
+    fn review_wait(&mut self, name: &str) -> String {
+        self.send_waiting(
+            SendWait::KeyChangeReview,
+            &format!("{name}'s security code changed. Accept the new code in Encryption settings to keep using this conversation."),
+        )
     }
     fn publish_crypto_status(&self) {
         let status = self
@@ -514,7 +569,9 @@ impl Worker {
                                 device_id: d.device_id,
                                 fingerprint: d.identity,
                                 verified: false,
+                                trusted: false,
                                 changed: false,
+                                needs_review: false,
                             })
                             .collect();
                     }
@@ -701,7 +758,10 @@ impl Worker {
         // A queued action can outlive its UI/account. Reject it before either
         // recording or publishing a problem in the replacement connection.
         let current_origin = match &command {
-            Command::CryptoVerify { origin, .. } | Command::CryptoUnverify { origin, .. } => self
+            Command::CryptoVerify { origin, .. }
+            | Command::CryptoUnverify { origin, .. }
+            | Command::CryptoAcceptKey { origin, .. }
+            | Command::CryptoDismissNotice { origin, .. } => self
                 .connection
                 .as_ref()
                 .is_some_and(|c| origin == &CommandOrigin::from(c)),
@@ -738,6 +798,9 @@ impl Worker {
             Command::CryptoUnverify {
                 user_id, device_id, ..
             } => CryptoProblemSource::DeviceAction(format!("unverify/{user_id}/{device_id}")),
+            Command::CryptoAcceptKey {
+                user_id, device_id, ..
+            } => CryptoProblemSource::DeviceAction(format!("accept/{user_id}/{device_id}")),
             Command::CryptoResetDevice {
                 expected_device_id, ..
             } => CryptoProblemSource::DeviceAction(format!("reset/{expected_device_id}")),
@@ -767,7 +830,10 @@ impl Worker {
 
     fn handle_crypto_command_inner(&mut self, command: Command) -> Result<(), String> {
         match &command {
-            Command::CryptoVerify { origin, .. } | Command::CryptoUnverify { origin, .. } => {
+            Command::CryptoVerify { origin, .. }
+            | Command::CryptoUnverify { origin, .. }
+            | Command::CryptoAcceptKey { origin, .. }
+            | Command::CryptoDismissNotice { origin, .. } => {
                 self.command_connection(origin)?;
             }
             _ => {}
@@ -935,6 +1001,33 @@ impl Worker {
                         )));
                     }
                 }
+                // Everyone else listed is trusted on first use. A newly trusted
+                // device may need a Welcome in the selected conversation.
+                let before = self.crypto()?.device.pin_count();
+                self.trust_listed_devices(true)?;
+                if self.crypto()?.device.pin_count() != before {
+                    self.refresh_pending.store(true, Ordering::Relaxed);
+                }
+            }
+            Command::CryptoAcceptKey {
+                user_id,
+                device_id,
+                fingerprint,
+                ..
+            } => {
+                let public = self
+                    .crypto()?
+                    .directory
+                    .get(&device_id)
+                    .ok_or("Refresh the device list before accepting this security code.")?;
+                if public.identity.user_id != user_id {
+                    return Err("The security code belongs to another account.".into());
+                }
+                self.crypto()?.accept_new_key(&device_id, &fingerprint)?;
+                self.refresh_pending.store(true, Ordering::Relaxed);
+            }
+            Command::CryptoDismissNotice { device_id, .. } => {
+                self.crypto()?.dismiss_notice(&device_id)?;
             }
             Command::CryptoVerify {
                 user_id,
@@ -951,16 +1044,7 @@ impl Worker {
                     return Err("The verification belongs to another account.".into());
                 }
                 self.crypto()?.approve(&device_id, &fingerprint)?;
-                if let Some(peer) = self
-                    .crypto()?
-                    .status
-                    .peers
-                    .iter_mut()
-                    .find(|p| p.device_id == device_id)
-                {
-                    peer.verified = true;
-                    peer.changed = false;
-                }
+                self.refresh_pending.store(true, Ordering::Relaxed);
             }
             Command::CryptoUnverify {
                 user_id, device_id, ..
@@ -973,28 +1057,9 @@ impl Worker {
                 if public.identity.user_id != user_id {
                     return Err("The verification belongs to another account.".into());
                 }
-                if let Some(channel_id) = self
-                    .connection
-                    .as_ref()
-                    .and_then(|c| c.voice_channel.clone())
-                {
-                    self.emit(Update::VoiceEncryptionPaused {
-                        channel_id,
-                        reconnecting: false,
-                        error: "Device verification was removed. The protected call is paused."
-                            .into(),
-                    });
-                }
+                // Only the "Verified" mark goes; the same key stays trusted, so
+                // calls and conversations continue unchanged.
                 self.crypto()?.unapprove(&device_id)?;
-                if let Some(peer) = self
-                    .crypto()?
-                    .status
-                    .peers
-                    .iter_mut()
-                    .find(|p| p.device_id == device_id)
-                {
-                    peer.verified = false;
-                }
             }
             _ => return Err("Invalid encryption operation.".into()),
         }
@@ -1174,8 +1239,17 @@ impl Worker {
                     } else {
                         None
                     };
-                self.crypto()?
-                    .apply_control(&scope, event, &context.server_id, receipt)?;
+                if let Err(error) =
+                    self.crypto()?
+                        .apply_control(&scope, event, &context.server_id, receipt)
+                {
+                    // A member this device must not trust silently (a person
+                    // verified by hand) holds the update until the user decides.
+                    if let Some(name) = self.person_needing_review(&context.devices)? {
+                        return Err(self.review_wait(&name));
+                    }
+                    return Err(error);
+                }
                 last = event.sequence;
             }
             if context.events.is_empty() {
@@ -1188,6 +1262,7 @@ impl Worker {
                 break;
             }
             context = self.crypto_context(target, last)?;
+            self.update_crypto_directory(&context.devices, &context.roster)?;
         }
         self.consume_crypto_mailbox(target, &scope, &mut mailbox)?;
         self.flush_crypto_consumptions()?;
@@ -1204,7 +1279,7 @@ impl Worker {
         } else if context.group_id.is_some() {
             return Err(self.send_waiting(
                 SendWait::DeviceApproval,
-                "Waiting for this conversation's key manager to verify and approve your device.",
+                "Waiting for this conversation's key manager to add this device. It happens automatically while they are online.",
             ));
         } else {
             uuid::Uuid::new_v4().to_string()
@@ -1237,21 +1312,14 @@ impl Worker {
                 Vec::new()
             };
             let allowed_users: Vec<_> = context.roster.iter().map(|u| &u.id).collect();
-            let revoked: Vec<_> = current
-                .iter()
-                .filter(|member| {
-                    self.connection
-                        .as_ref()
-                        .and_then(|c| c.crypto.as_ref())
-                        .is_none_or(|crypto| {
-                            crypto
-                                .device
-                                .expected_fingerprint(&member.device_id)
-                                .is_none()
-                        })
-                })
-                .map(|m| m.device_id.clone())
-                .collect();
+            // Members this device does not trust with their current key: an
+            // unknown device, or a key trust on first use replaced. The key
+            // manager removes them; a replaced key is added again below.
+            let revoked = if group.is_some() {
+                self.crypto()?.device.untrusted_members(&scope)?
+            } else {
+                Vec::new()
+            };
             let remove: Vec<_> = current
                 .iter()
                 .filter(|member| {
@@ -1337,7 +1405,26 @@ impl Worker {
                 context = self.crypto_context(target, cursor)?;
             }
         }
-        if self.crypto()?.device.members(&scope)?.iter().any(|m| {
+        // Sending needs every member trusted with its current key. A member
+        // whose automatically trusted key changed waits for the key manager to
+        // replace it; a person verified by hand waits for the user's decision.
+        let members = match self.crypto()?.device.members(&scope) {
+            Ok(members) => members,
+            Err(error) => {
+                self.pause_call_for_key_change(target);
+                if let Some(name) = self.person_needing_review(&context.devices)? {
+                    return Err(self.review_wait(&name));
+                }
+                if !self.crypto()?.device.untrusted_members(&scope)?.is_empty() {
+                    return Err(self.send_waiting(
+                        SendWait::KeyRotation,
+                        "A device in this conversation has a new security code. Waiting for the conversation's key manager to update its keys.",
+                    ));
+                }
+                return Err(error);
+            }
+        };
+        if members.iter().any(|m| {
             !context
                 .devices
                 .iter()
@@ -1346,38 +1433,26 @@ impl Worker {
             self.pause_call_for_key_change(target);
             return Err(self.send_waiting(
                 SendWait::KeyRotation,
-                "A device left this conversation. Waiting for its verified key manager to rotate keys.",
+                "A device left this conversation. Waiting for its key manager to rotate keys.",
             ));
         }
-        // Other members may observe an acknowledged intermediate Welcome batch.
-        // Their approved recipients with available one-time packages must all
-        // be present before they send. Devices with exhausted stock retain the
-        // existing deferred-admission behavior until they come online to refill.
-        let members = self.crypto()?.device.members(&scope)?;
-        let crypto = self.crypto()?;
-        if context.devices.iter().any(|public| {
-            !public.key_package.is_empty()
-                && crypto.directory.get(&public.device_id).is_some_and(|peer| {
-                    crypto.device.is_approved(peer) && !members.contains(&peer.identity)
-                })
-        }) {
-            self.pause_call_for_key_change(target);
-            return Err(self.send_waiting(
-                SendWait::AddingDevices,
-                "Waiting for this conversation's key manager to finish adding your verified devices. Messages and calls are paused.",
-            ));
-        }
+        // Devices trusted on first use that the key manager has not added yet
+        // do not hold back sending: they read along from the epoch that adds
+        // them, as any later member does. Nothing is shared with them early.
         if let Target::Direct(peer) = target {
-            if !self
-                .crypto()?
-                .device
-                .members(&scope)?
-                .iter()
-                .any(|m| &m.user_id == peer)
-            {
+            if !members.iter().any(|m| &m.user_id == peer) {
+                let peer_devices: Vec<_> = context
+                    .devices
+                    .iter()
+                    .filter(|d| &d.user_id == peer)
+                    .cloned()
+                    .collect();
+                if let Some(name) = self.person_needing_review(&peer_devices)? {
+                    return Err(self.review_wait(&name));
+                }
                 return Err(self.send_waiting(
-                    SendWait::PeerVerification,
-                    "Verify the other person's device before sending a private message.",
+                    SendWait::PeerUnavailable,
+                    "The other person has no device ready for encrypted messages yet. Relay sets it up when they open Relay.",
                 ));
             }
         }

@@ -5,8 +5,10 @@
 //! here reads error text. A wait is bound to the connection (`CommandOrigin`:
 //! address, server and account) and the conversation it was reported for. A
 //! later result for that same conversation and connection replaces it: a
-//! delivered message, a real failure or a rate limit. The draft, the send rules
-//! and the trust model are unchanged: nothing is sent, approved or copied here.
+//! delivered message, a real failure or a rate limit. The draft and the send
+//! rules are unchanged. Devices are trusted on first use by the worker, so
+//! normal use shows nothing here. In a direct message, a changed security code
+//! of the other person is shown; only the user's click there accepts it.
 use super::*;
 use crate::network::{CommandOrigin, SendWait};
 
@@ -73,37 +75,43 @@ impl ConversationReadiness {
 }
 
 /// One short explanation and the next step. Only a direct message names a
-/// person: there the other person is the only one who can confirm this device.
+/// person: there the other person's Relay is the one that adds this device.
 /// In channels the worker does not report who the key manager is.
 pub(super) fn wait_text(wait: SendWait, peer: Option<&str>) -> (String, String) {
     let (headline, next): (&str, &str) = match (wait, peer) {
-        (SendWait::PeerVerification, Some(name)) => {
+        (SendWait::KeyChangeReview, Some(name)) => {
             return (
-                format!("Verify {name} to send private messages."),
-                format!("Compare your security codes with {name} in person, on a call or in another chat you trust. {name} also needs to verify you. Your message is kept; send it again afterwards."),
+                format!("{name}'s security code changed."),
+                format!("You verified {name} before, so Relay waits for you. Accept the new code, or compare it with {name} first. Your message is kept."),
+            )
+        }
+        (SendWait::PeerUnavailable, Some(name)) => {
+            return (
+                format!("{name}'s Relay isn't ready for encrypted messages yet."),
+                format!("It is set up automatically the next time {name} opens Relay. Your message is kept; send it again afterwards."),
             )
         }
         (SendWait::DeviceApproval, Some(name)) => {
             return (
-                format!("{name} needs to verify your device first."),
-                format!("Ask {name} to open Encryption and verify you, and verify {name} too. Your message is kept; send it again afterwards."),
+                format!("Setting up encryption with {name}."),
+                format!("{name}'s Relay adds this device automatically while it is online. Your message is kept; send it again in a moment."),
             )
         }
-        (SendWait::PeerVerification, None) => (
-            "Verify the other person to send private messages.",
-            "Compare your security codes in person, on a call or in another chat you trust. They also need to verify you. Your message is kept; send it again afterwards.",
+        (SendWait::KeyChangeReview, None) => (
+            "Someone's security code changed.",
+            "You verified this person before, so Relay waits for you. Accept the new code in Encryption, or compare it with them first. Your message is kept.",
+        ),
+        (SendWait::PeerUnavailable, None) => (
+            "The other person's Relay isn't ready for encrypted messages yet.",
+            "It is set up automatically the next time they open Relay. Your message is kept; send it again afterwards.",
         ),
         (SendWait::DeviceApproval, None) => (
-            "Your device is waiting to be confirmed for this conversation.",
-            "Ask the person who manages its keys to confirm your device in Encryption. Your message is kept; send it again afterwards.",
-        ),
-        (SendWait::AddingDevices, _) => (
-            "This conversation is still adding your confirmed devices.",
-            "The person who manages its keys may need to be online. Your message is kept; send it again in a moment.",
+            "Setting up encryption for this device.",
+            "The person who manages this conversation's keys adds it automatically while they are online. Your message is kept; send it again in a moment.",
         ),
         (SendWait::KeyRotation, _) => (
-            "A device left this conversation, so its keys are being replaced.",
-            "The person who manages its keys needs to be online to finish. Your message is kept; send it again afterwards.",
+            "This conversation's keys are being replaced.",
+            "A device left or got a new security code. The person who manages its keys finishes this while they are online. Your message is kept.",
         ),
         (SendWait::KeyUpdates, _) => (
             "This conversation has key updates waiting.",
@@ -116,19 +124,23 @@ pub(super) fn wait_text(wait: SendWait, peer: Option<&str>) -> (String, String) 
 /// The failed row's short reason while its conversation is waiting.
 pub(super) fn failed_label(wait: SendWait) -> &'static str {
     match wait {
-        SendWait::DeviceApproval | SendWait::PeerVerification => "Not sent · device verification needed",
-        SendWait::AddingDevices | SendWait::KeyRotation | SendWait::KeyUpdates => {
+        SendWait::KeyChangeReview => "Not sent · a security code changed",
+        SendWait::DeviceApproval | SendWait::PeerUnavailable => {
+            "Not sent yet · setting up encryption"
+        }
+        SendWait::KeyRotation | SendWait::KeyUpdates => {
             "Not sent yet · encryption keys are updating"
         }
     }
 }
 
-/// Draws the banner and returns true when its button was clicked. In a direct
-/// message the button opens that person's devices on the Encryption page.
+/// Draws the banner and returns true when its button was clicked. The button
+/// opens Encryption settings (in a direct message, at that person).
 pub(super) fn readiness_banner(ui: &mut egui::Ui, wait: SendWait, peer: Option<&str>) -> bool {
     let (headline, next) = wait_text(wait, peer);
     let action = match (wait, peer) {
-        (SendWait::PeerVerification | SendWait::DeviceApproval, Some(name)) => format!("Verify {name}"),
+        (SendWait::KeyChangeReview, Some(name)) => format!("Review {name}'s code"),
+        (SendWait::KeyChangeReview, None) => "Review security codes".to_owned(),
         _ => "Open Encryption".to_owned(),
     };
     let mut open = false;
@@ -146,6 +158,57 @@ pub(super) fn readiness_banner(ui: &mut egui::Ui, wait: SendWait, peer: Option<&
         });
     ui.add_space(8.0);
     open
+}
+
+/// What the person chose in a direct message's key-change notice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KeyChangeChoice {
+    Accept,
+    Compare,
+    Dismiss,
+}
+
+/// A direct message's notice that the other person's security code changed.
+/// `review` means they were verified here, so nothing new is trusted until
+/// the user accepts. Otherwise messaging already continues; the notice only
+/// informs and can be dismissed.
+pub(super) fn key_change_banner(
+    ui: &mut egui::Ui,
+    name: &str,
+    review: bool,
+) -> Option<KeyChangeChoice> {
+    let headline = format!("{name}'s security code changed.");
+    let next = if review {
+        format!("You verified {name} before, so Relay waits for you before trusting the new code. Accept it, or compare codes with {name} first.")
+    } else {
+        format!("This happens when {name} reinstalls Relay or uses a new device. Messages stay end-to-end encrypted. Compare codes with {name} if you want to be sure.")
+    };
+    let mut choice = None;
+    egui::Frame::none()
+        .fill(c_panel())
+        .stroke(Stroke::new(1.0_f32, if review { c_bad() } else { c_line() }))
+        .rounding(8.0)
+        .inner_margin(Margin::symmetric(12.0, 10.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(RichText::new(headline).strong()).wrap(true));
+            ui.add(egui::Label::new(RichText::new(next).color(c_muted())).wrap(true));
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if review {
+                    if ui.add(primary("Accept new code")).clicked() {
+                        choice = Some(KeyChangeChoice::Accept);
+                    }
+                } else if ui.add(secondary("OK")).clicked() {
+                    choice = Some(KeyChangeChoice::Dismiss);
+                }
+                if ui.add(secondary("Compare codes")).clicked() {
+                    choice = Some(KeyChangeChoice::Compare);
+                }
+            });
+        });
+    ui.add_space(8.0);
+    choice
 }
 
 impl RelayApp {
@@ -185,26 +248,61 @@ impl RelayApp {
         Some((id.clone(), name))
     }
 
-    /// Hook, above the composer of the open conversation. A direct message to
-    /// someone with no device verified here explains that before the first
-    /// send fails; nothing is verified or approved by showing it.
+    fn open_encryption_for(&mut self, user_id: Option<&str>) {
+        if let Some(id) = user_id {
+            self.encryption_ui.review_person(id);
+        }
+        self.settings_tab = SettingsTab::Encryption;
+        self.settings_open = true;
+        self.send(Command::CryptoRefresh);
+    }
+
+    /// Hook, above the composer of the open conversation. Normal use shows
+    /// nothing: new people and devices are trusted on first use. A wait the
+    /// worker reported is explained; in a direct message a changed security
+    /// code of the other person is shown until it is accepted or dismissed.
     pub(super) fn composer_readiness(&mut self, ui: &mut egui::Ui) {
         let peer = self.direct_peer();
-        let wait = self.current_wait().or_else(|| {
-            peer.as_ref()
-                .filter(|(id, _)| self.encryption_ui.person_unverified(id))
-                .map(|_| SendWait::PeerVerification)
-        });
-        let Some(wait) = wait else {
+        if let Some((id, name)) = &peer {
+            let review = self.encryption_ui.devices_needing_review(id);
+            let notices = self.encryption_ui.notices_for(id);
+            if !review.is_empty() || !notices.is_empty() {
+                match key_change_banner(ui, name, !review.is_empty()) {
+                    Some(KeyChangeChoice::Accept) => {
+                        if let Some(origin) = self.command_origin() {
+                            for device in review.iter() {
+                                self.send(Command::CryptoAcceptKey {
+                                    origin: origin.clone(),
+                                    user_id: device.user_id.clone(),
+                                    device_id: device.device_id.clone(),
+                                    fingerprint: device.fingerprint.clone(),
+                                });
+                            }
+                        }
+                    }
+                    Some(KeyChangeChoice::Dismiss) => {
+                        if let Some(origin) = self.command_origin() {
+                            for notice in notices {
+                                self.send(Command::CryptoDismissNotice {
+                                    origin: origin.clone(),
+                                    device_id: notice.device_id,
+                                });
+                            }
+                        }
+                    }
+                    Some(KeyChangeChoice::Compare) => self.open_encryption_for(Some(id)),
+                    None => {}
+                }
+                if !review.is_empty() {
+                    return;
+                }
+            }
+        }
+        let Some(wait) = self.current_wait() else {
             return;
         };
         if readiness_banner(ui, wait, peer.as_ref().map(|(_, name)| name.as_str())) {
-            if let Some((id, _)) = &peer {
-                self.encryption_ui.review_person(id);
-            }
-            self.settings_tab = SettingsTab::Encryption;
-            self.settings_open = true;
-            self.send(Command::CryptoRefresh);
+            self.open_encryption_for(peer.as_ref().map(|(id, _)| id.as_str()));
         }
     }
 }
@@ -253,11 +351,11 @@ mod tests {
         let mut readiness = ConversationReadiness::default();
         let here = key("server-a", "maria", general());
         let elsewhere = key("server-a", "maria", Target::Channel("random".into()));
-        readiness.waiting(here.clone(), SendWait::AddingDevices);
+        readiness.waiting(here.clone(), SendWait::PeerUnavailable);
         readiness.waiting(elsewhere.clone(), SendWait::KeyRotation);
         // A delivered message in another conversation is unrelated.
         readiness.settled(&elsewhere);
-        assert_eq!(readiness.current(&here), Some(SendWait::AddingDevices));
+        assert_eq!(readiness.current(&here), Some(SendWait::PeerUnavailable));
         // A newer state for the same conversation replaces the older one.
         readiness.waiting(here.clone(), SendWait::KeyUpdates);
         assert_eq!(readiness.current(&here), Some(SendWait::KeyUpdates));
@@ -325,17 +423,24 @@ mod tests {
     }
 
     #[test]
-    fn a_direct_message_names_the_one_person_who_can_confirm() {
-        let (headline, next) = wait_text(SendWait::PeerVerification, Some("sebron"));
-        assert_eq!(headline, "Verify sebron to send private messages.");
-        assert!(next.contains("sebron also needs to verify you") && next.contains("Your message is kept"));
-        let (headline, next) = wait_text(SendWait::DeviceApproval, Some("spect1e"));
-        assert_eq!(headline, "spect1e needs to verify your device first.");
-        assert!(next.contains("Ask spect1e to open Encryption"));
+    fn a_direct_message_never_asks_for_a_manual_check_in_normal_use() {
+        // Waiting for the other side is automatic; no text asks to verify.
+        for wait in [SendWait::PeerUnavailable, SendWait::DeviceApproval] {
+            let (headline, next) = wait_text(wait, Some("sebron"));
+            assert!(headline.contains("sebron"), "{wait:?}");
+            assert!(!headline.to_lowercase().contains("verif"), "{wait:?}: {headline}");
+            assert!(!next.to_lowercase().contains("verif"), "{wait:?}: {next}");
+            assert!(next.contains("automatically") && next.contains("Your message is kept"));
+        }
+        // Only a person verified before with a changed code waits for a decision.
+        let (headline, next) = wait_text(SendWait::KeyChangeReview, Some("spect1e"));
+        assert_eq!(headline, "spect1e's security code changed.");
+        assert!(next.contains("Accept the new code"));
         // Channels never guess at a key manager's name.
         let (headline, _) = wait_text(SendWait::DeviceApproval, None);
         assert!(!headline.contains("spect1e"));
-        assert_eq!(failed_label(SendWait::PeerVerification), "Not sent · device verification needed");
+        assert_eq!(failed_label(SendWait::KeyChangeReview), "Not sent · a security code changed");
+        assert_eq!(failed_label(SendWait::PeerUnavailable), "Not sent yet · setting up encryption");
         assert_eq!(failed_label(SendWait::KeyUpdates), "Not sent yet · encryption keys are updating");
     }
 
@@ -392,10 +497,10 @@ mod tests {
             UI_FONT_SCALE.with(|scale| scale.set(text));
             for wait in [
                 SendWait::DeviceApproval,
-                SendWait::AddingDevices,
                 SendWait::KeyRotation,
                 SendWait::KeyUpdates,
-                SendWait::PeerVerification,
+                SendWait::PeerUnavailable,
+                SendWait::KeyChangeReview,
             ] {
                 let ctx = egui::Context::default();
                 configure(&ctx);

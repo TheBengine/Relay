@@ -25,6 +25,7 @@ fn invitation(host: &mut CryptoWorker, request_id: u64) -> (String, InviteProof)
         .expect("a host with encryption keys issues a verifiable invitation")
 }
 
+/// Verified, not merely trusted on first use: the invitation is what verifies.
 fn trusts(worker: &CryptoWorker, peer: &relay_crypto::PublicDevice) -> bool {
     worker
         .worker
@@ -35,7 +36,7 @@ fn trusts(worker: &CryptoWorker, peer: &relay_crypto::PublicDevice) -> bool {
         .as_ref()
         .unwrap()
         .device
-        .is_approved(peer)
+        .is_verified(peer)
 }
 
 fn files_under(root: &Path, out: &mut Vec<PathBuf>) {
