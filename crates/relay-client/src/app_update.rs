@@ -83,8 +83,11 @@ impl RelayApp {
         if let Some(media) = &self.media {
             self.mic_test = media.is_microphone_test_active();
         }
-        if let Some(inventory) = self.inventory_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        if let Some(mut inventory) = self.inventory_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            let cameras = std::mem::take(&mut inventory.cameras);
+            inventory.cameras = std::mem::take(&mut self.inventory.cameras);
             self.inventory = inventory;
+            self.apply_cameras(cameras);
             self.inventory_rx = None;
             self.inventory_loaded = true;
         }
@@ -2400,6 +2403,7 @@ impl eframe::App for RelayApp {
         self.updates(ctx);
         self.replica_copy_tick();
         self.device_follow_tick();
+        self.camera_follow_tick();
         self.handover_tick();
         self.lan_pairing_tick();
         self.game_activity_tick(ctx);

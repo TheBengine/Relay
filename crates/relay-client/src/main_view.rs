@@ -275,6 +275,24 @@ impl RelayApp {
                                     }
                                 }
                             }
+                            // Discord puts the call button in every DM header.
+                            if let Some(Target::Direct(peer)) = self.current.clone() {
+                                let friend = self.bootstrap.as_ref().is_some_and(|b| {
+                                    b.social.friends.contains(&peer) && !b.social.blocked.contains(&peer)
+                                });
+                                let in_call = self.voice_channel.is_some() || self.joining_voice.is_some();
+                                if friend
+                                    && ui
+                                        .add_enabled_ui(!in_call, |ui| {
+                                            icon_button(ui, Icon::Phone, false, "Start voice call")
+                                        })
+                                        .inner
+                                        .on_disabled_hover_text("Leave your current call first")
+                                        .clicked()
+                                {
+                                    self.start_friend_call(&peer);
+                                }
+                            }
                             if !matches!(self.current, Some(Target::Direct(_)))
                                 && icon_button(
                                     ui,

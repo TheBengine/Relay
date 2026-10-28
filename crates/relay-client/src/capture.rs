@@ -519,7 +519,7 @@ impl CaptureSession {
                 use nokhwa::{
                     pixel_format::RgbFormat,
                     utils::{
-                        ApiBackend, CameraFormat, FrameFormat, RequestedFormat, RequestedFormatType,
+                        ApiBackend, FrameFormat, RequestedFormat, RequestedFormatType,
                     },
                 };
                 let options = options.normalized();
@@ -529,37 +529,92 @@ impl CaptureSession {
                     .into_iter()
                     .find(|camera| format!("camera:{}", camera.index()) == source.id)
                     .ok_or("The selected camera is no longer available")?;
-                let (width, height) = options.quality.dimensions();
                 let formats = [
                     FrameFormat::MJPEG,
                     FrameFormat::YUYV,
                     FrameFormat::NV12,
                     FrameFormat::RAWRGB,
                 ];
-                let request = RequestedFormat::with_formats(
-                    RequestedFormatType::Closest(CameraFormat::new_from(
-                        width,
-                        height,
-                        FrameFormat::MJPEG,
-                        options.fps,
-                    )),
-                    &formats,
-                );
-                let mut camera = nokhwa::Camera::with_backend(info.index().clone(), request, ApiBackend::MediaFoundation)
-                    .map_err(|e| format!("Open camera: {e}. Check camera access and whether another app is using it."))?;
-                // Query the real device modes before choosing a supported resolution/FPS.
-                if let Ok(available) = camera.compatible_camera_formats() {
-                    if let Some(selected) = choose_camera_format(&available, options) {
-                        let supported = [selected.format()];
-                        camera
-                            .set_camera_requset(RequestedFormat::with_formats(
-                                RequestedFormatType::Exact(selected),
-                                &supported,
-                            ))
-                            .map_err(|e| format!("Set supported camera mode: {e}"))?;
+                // nokhwa's Closest matches only the requested pixel format and
+                // looks up frame rates at the requested size, not the closest
+                // one; the preview's 854×480 exists on no camera, so it always
+                // failed with "Failed to fulfill requested format". Open with
+                // any readable mode, then choose the real mode below.
+                let requests = [
+                    RequestedFormat::with_formats(RequestedFormatType::None, &formats),
+                    RequestedFormat::with_formats(RequestedFormatType::AbsoluteHighestFrameRate, &formats),
+                    RequestedFormat::with_formats(RequestedFormatType::AbsoluteHighestResolution, &formats),
+                ];
+                let mut last_error = String::new();
+                let mut opened = None;
+                for request in requests {
+                    if stop.load(Ordering::Acquire) {
+                        return Err("Camera request cancelled".into());
+                    }
+                    match nokhwa::Camera::with_backend(info.index().clone(), request, ApiBackend::MediaFoundation) {
+                        Ok(camera) => {
+                            opened = Some(camera);
+                            break;
+                        }
+                        Err(error) => {
+                            last_error = error.to_string();
+                            // Busy or blocked does not get better with another format.
+                            if camera_problem(&last_error) != CameraProblem::Format {
+                                break;
+                            }
+                        }
                     }
                 }
-                let actual = camera.camera_format();
+                let mut camera = opened.ok_or_else(|| camera_error_message(&last_error))?;
+                // The device's real modes, best first. A mode that is listed
+                // but will not stream falls back to the next one.
+                let plan = camera
+                    .compatible_camera_formats()
+                    .map(|available| camera_format_plan(&available, options))
+                    .unwrap_or_default();
+                let mut streaming = None;
+                let mut stream_error = String::new();
+                for mode in plan.iter().take(6) {
+                    if stop.load(Ordering::Acquire) {
+                        return Err("Camera request cancelled".into());
+                    }
+                    let supported = [mode.format()];
+                    if camera
+                        .set_camera_requset(RequestedFormat::with_formats(
+                            RequestedFormatType::Exact(*mode),
+                            &supported,
+                        ))
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    match camera.open_stream() {
+                        Ok(()) => {
+                            streaming = Some(*mode);
+                            break;
+                        }
+                        Err(error) => {
+                            stream_error = error.to_string();
+                            let _ = camera.stop_stream();
+                            if camera_problem(&stream_error) != CameraProblem::Format {
+                                return Err(camera_error_message(&stream_error));
+                            }
+                        }
+                    }
+                }
+                if streaming.is_none() {
+                    if stop.load(Ordering::Acquire) {
+                        return Err("Camera request cancelled".into());
+                    }
+                    // The mode chosen while opening, when no listed mode started.
+                    camera.open_stream().map_err(|error| {
+                        let error = error.to_string();
+                        camera_error_message(if stream_error.is_empty() { &error } else { &stream_error })
+                    })?;
+                }
+                // nokhwa reports 1 fps after an exact mode change; the mode
+                // that started is what the camera delivers.
+                let actual = streaming.unwrap_or_else(|| camera.camera_format());
                 let format = format!(
                     "{}×{} · {} fps · {}",
                     actual.width(),
@@ -570,9 +625,6 @@ impl CaptureSession {
                 if stop.load(Ordering::Acquire) {
                     return Err("Camera request cancelled".into());
                 }
-                camera
-                    .open_stream()
-                    .map_err(|e| format!("Start camera: {e}"))?;
                 Ok((
                     move || {
                         let buffer = camera.frame().map_err(|e| format!("Read camera: {e}"))?;
@@ -829,6 +881,101 @@ fn choose_camera_format(
                 },
             )
         })
+}
+
+/// Every usable mode, best first: closest frame rate, then closest size, MJPEG
+/// before uncompressed formats. `choose_camera_format` is the first of these.
+#[cfg(windows)]
+#[cfg_attr(not(any(test, feature = "native-rtc")), allow(dead_code))]
+fn camera_format_plan(
+    formats: &[nokhwa::utils::CameraFormat],
+    options: CaptureOptions,
+) -> Vec<nokhwa::utils::CameraFormat> {
+    let mut remaining = formats.to_vec();
+    let mut plan = Vec::new();
+    while let Some(best) = choose_camera_format(&remaining, options) {
+        plan.push(best);
+        remaining.retain(|format| *format != best);
+    }
+    plan
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CameraProblem {
+    /// Windows privacy settings block camera access for desktop apps.
+    Blocked,
+    /// Another app holds the camera.
+    InUse,
+    /// The camera was unplugged or disabled.
+    Gone,
+    /// Nothing matched this mode; another format may work.
+    Format,
+}
+
+/// Classifies Media Foundation errors by their HRESULTs and messages.
+pub(crate) fn camera_problem(raw: &str) -> CameraProblem {
+    let text = raw.to_ascii_lowercase();
+    let any = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+    if any(&["0x80070005", "access is denied", "access denied", "e_accessdenied"]) {
+        CameraProblem::Blocked
+    } else if any(&[
+        "0xc00d3704", // MF_E_HW_MFT_FAILED_START_STREAMING
+        "0xc00d3ea3", // MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED
+        "0x800700aa", // ERROR_BUSY
+        "lack of hardware resources",
+        "preempted",
+        "in use",
+        "being used",
+    ]) {
+        CameraProblem::InUse
+    } else if any(&[
+        "0xc00d3ea2", // MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED
+        "0x80070491",
+        "0x8007048f", // ERROR_DEVICE_NOT_CONNECTED
+        "no longer available",
+        "invalidated",
+        "not connected",
+    ]) {
+        CameraProblem::Gone
+    } else {
+        CameraProblem::Format
+    }
+}
+
+/// What the person can do about a camera that will not open.
+pub(crate) fn camera_error_message(raw: &str) -> String {
+    match camera_problem(raw) {
+        CameraProblem::Blocked => "Windows is blocking camera access. Open Windows Settings › Privacy & security › Camera, turn on \"Let desktop apps access your camera\", then try again.".into(),
+        CameraProblem::InUse => "Another app is using this camera. Close it there (for example Teams, Zoom, OBS or a browser tab), then try again.".into(),
+        CameraProblem::Gone => "The camera was unplugged or turned off. Plug it back in or choose another camera.".into(),
+        CameraProblem::Format if raw.to_ascii_lowercase().contains("fulfill") => "This camera offers no picture format Relay can read. Try another camera or update its driver.".into(),
+        CameraProblem::Format => format!("The camera did not start ({raw}). Try again, or choose another camera."),
+    }
+}
+
+/// Keeps the person's camera across a refreshed list, whose ids follow the
+/// device order: the same name wins over the same position. With nothing
+/// chosen yet, the first camera is chosen, as Discord does.
+pub(crate) fn follow_camera_selection(
+    selected: &mut Option<String>,
+    before: &[CaptureSource],
+    after: &[CaptureSource],
+) {
+    let name = selected
+        .as_ref()
+        .and_then(|id| before.iter().find(|source| &source.id == id))
+        .map(|source| source.name.clone());
+    *selected = match name {
+        Some(name) => after
+            .iter()
+            .find(|source| source.name == name)
+            .map(|source| source.id.clone()),
+        None => selected
+            .as_ref()
+            .filter(|id| after.iter().any(|source| &source.id == *id))
+            .cloned(),
+    }
+    .or_else(|| after.first().map(|source| source.id.clone()));
 }
 
 #[cfg_attr(not(any(test, feature = "native-rtc")), allow(dead_code))]
@@ -1412,6 +1559,84 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(session.worker.is_none());
     }
+    #[cfg(windows)]
+    #[test]
+    fn a_camera_without_mjpeg_opens_in_its_own_format_with_fallbacks() {
+        use nokhwa::utils::{CameraFormat, FrameFormat};
+        // Many webcams and virtual cameras offer only NV12 or YUY2.
+        let modes = [
+            CameraFormat::new_from(1920, 1080, FrameFormat::NV12, 30),
+            CameraFormat::new_from(1280, 720, FrameFormat::NV12, 30),
+            CameraFormat::new_from(640, 480, FrameFormat::YUYV, 30),
+            CameraFormat::new_from(1280, 720, FrameFormat::GRAY, 30),
+        ];
+        let plan = camera_format_plan(&modes, CaptureOptions::default());
+        assert_eq!(plan.len(), 3, "an unreadable format is never tried: {plan:?}");
+        assert_eq!(plan[0], modes[1], "the requested size first");
+        assert!(plan.contains(&modes[0]) && plan.contains(&modes[2]), "the others are fallbacks");
+        assert!(camera_format_plan(&modes[3..], CaptureOptions::default()).is_empty());
+    }
+
+    #[cfg(all(windows, feature = "native-rtc"))]
+    #[test]
+    #[ignore = "opens the first real camera on this PC"]
+    fn the_first_real_camera_previews_at_the_size_no_camera_offers() {
+        let source = enumerate_cameras().unwrap().into_iter().next().expect("a camera");
+        let (tx, frames) = std::sync::mpsc::sync_channel(1);
+        let options = CaptureOptions {
+            quality: CaptureQuality::P480,
+            fps: 15,
+            application_audio: false,
+            ..Default::default()
+        };
+        let session = CaptureSession::start_camera_raw(tx, 0, source.clone(), options).unwrap();
+        let frame = frames.recv_timeout(std::time::Duration::from_secs(15));
+        let error = session.take_error();
+        println!("Camera {}: frame {:?}, error {error:?}, mode {:?}", source.name, frame.as_ref().map(|f| (f.width, f.height)), session.diagnostics().device_format);
+        assert!(error.is_none() && frame.is_ok());
+    }
+
+    #[test]
+    fn camera_errors_say_what_the_person_can_do() {
+        let blocked = "Could not initialize MediaFoundation: Failed to open: Access is denied. (0x80070005)";
+        assert_eq!(camera_problem(blocked), CameraProblem::Blocked);
+        assert!(camera_error_message(blocked).contains("Privacy & security › Camera"));
+        let busy = "Failed to open stream: Hardware MFT failed to start streaming due to lack of hardware resources. (0xC00D3704)";
+        assert_eq!(camera_problem(busy), CameraProblem::InUse);
+        assert!(camera_error_message(busy).contains("Another app is using this camera"));
+        assert_eq!(camera_problem("The video recording device is preempted by another immersive application. (0xC00D3EA3)"), CameraProblem::InUse);
+        assert_eq!(camera_problem("The video recording device is no longer present. (0xC00D3EA2)"), CameraProblem::Gone);
+        let format = "Could not initialize MediaFoundation: Failed to fulfill requested format";
+        assert_eq!(camera_problem(format), CameraProblem::Format);
+        assert!(camera_error_message(format).contains("no picture format"));
+    }
+
+    #[test]
+    fn the_chosen_camera_follows_its_name_when_the_list_changes() {
+        let camera = |index: usize, name: &str| CaptureSource {
+            id: format!("camera:{index}"),
+            name: name.into(),
+            kind: SourceKind::Camera,
+            width: 0,
+            height: 0,
+        };
+        let before = [camera(0, "Laptop"), camera(1, "Logitech C920")];
+        // A new camera plugged in first shifts the indices.
+        let after = [camera(0, "Elgato"), camera(1, "Laptop"), camera(2, "Logitech C920")];
+        let mut selected = Some("camera:1".to_owned());
+        follow_camera_selection(&mut selected, &before, &after);
+        assert_eq!(selected.as_deref(), Some("camera:2"), "still the Logitech");
+        // The chosen camera unplugged: the first one, like Windows' default.
+        let unplugged = [camera(0, "Elgato"), camera(1, "Laptop")];
+        follow_camera_selection(&mut selected, &after, &unplugged);
+        assert_eq!(selected.as_deref(), Some("camera:0"));
+        let mut none = None;
+        follow_camera_selection(&mut none, &[], &unplugged);
+        assert_eq!(none.as_deref(), Some("camera:0"), "a first camera is chosen");
+        follow_camera_selection(&mut none, &unplugged, &[]);
+        assert_eq!(none, None);
+    }
+
     #[cfg(windows)]
     #[test]
     fn camera_mode_selection_uses_real_formats_and_requested_fps() {

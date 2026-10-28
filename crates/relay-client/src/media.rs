@@ -90,6 +90,8 @@ struct AudioControls {
     adaptive_jitter: AtomicBool,
     transmission: AtomicU32,
     suppression: AtomicBool,
+    noise_model: AtomicU32,
+    noise_strength: AtomicU32,
     low_latency_device: AtomicBool,
     input_timing: Mutex<Option<DeviceTiming>>,
     output_timing: Mutex<Option<DeviceTiming>>,
@@ -103,6 +105,10 @@ struct AudioControls {
     echo_reference: EchoReference,
     ptt_pressed: AtomicBool,
     ptt_key: AtomicI32,
+    attack_ms: AtomicU32,
+    release_ms: AtomicU32,
+    /// What the voice-activation gate measured, for the Settings bar.
+    gate_meter: crate::voice_gate::GateMeter,
     /// Capture RMS before gain and processing, for "no sound from the microphone".
     capture_rms: AtomicU32,
     /// The app follows Windows device changes; an unplugged device then
@@ -173,6 +179,8 @@ impl AudioControls {
             adaptive_jitter: AtomicBool::new(settings.adaptive_jitter),
             transmission: AtomicU32::new(settings.transmission as u32),
             suppression: AtomicBool::new(settings.noise_suppression),
+            noise_model: AtomicU32::new(settings.noise_model as u32),
+            noise_strength: AtomicU32::new(settings.noise_strength as u32),
             low_latency_device: AtomicBool::new(settings.low_latency_device),
             input_timing: Mutex::new(None),
             output_timing: Mutex::new(None),
@@ -186,6 +194,9 @@ impl AudioControls {
             echo_reference: EchoReference::default(),
             ptt_pressed: AtomicBool::new(false),
             ptt_key: AtomicI32::new(0),
+            attack_ms: AtomicU32::new(settings.activation_attack_ms),
+            release_ms: AtomicU32::new(settings.activation_release_ms),
+            gate_meter: Default::default(),
             capture_rms: AtomicU32::new(0),
             follow_devices: AtomicBool::new(false),
             device_lost: AtomicBool::new(false),
@@ -241,6 +252,8 @@ impl AudioControls {
             || self.preserve_speech_start.load(Ordering::Relaxed) != settings.preserve_speech_start
             || self.transmission.load(Ordering::Relaxed) != settings.transmission as u32
             || self.suppression.load(Ordering::Relaxed) != settings.noise_suppression
+            || self.noise_model.load(Ordering::Relaxed) != settings.noise_model as u32
+            || self.noise_strength.load(Ordering::Relaxed) != settings.noise_strength as u32
             || self.whisper_enabled.load(Ordering::Relaxed) != settings.whisper_enabled
             || self.tcp_enabled.load(Ordering::Relaxed) != settings.tcp_fallback_enabled
             || self.direct_enabled.load(Ordering::Relaxed)
@@ -263,6 +276,11 @@ impl AudioControls {
             .store(settings.automatic_microphone_volume, Ordering::Relaxed);
         self.hold_ms
             .store(settings.activation_hold_ms, Ordering::Relaxed);
+        // Gate ramps change no privacy boundary; they apply on the next block.
+        self.attack_ms
+            .store(settings.activation_attack_ms, Ordering::Relaxed);
+        self.release_ms
+            .store(settings.activation_release_ms, Ordering::Relaxed);
         self.preserve_speech_start
             .store(settings.preserve_speech_start, Ordering::Relaxed);
         self.bitrate_kbps
@@ -305,6 +323,10 @@ impl AudioControls {
             .store(settings.transmission as u32, Ordering::Relaxed);
         self.suppression
             .store(settings.noise_suppression, Ordering::Relaxed);
+        self.noise_model
+            .store(settings.noise_model as u32, Ordering::Relaxed);
+        self.noise_strength
+            .store(settings.noise_strength as u32, Ordering::Relaxed);
         #[cfg(feature = "native-rtc")]
         {
             self.echo_enabled
@@ -1216,6 +1238,36 @@ impl MediaEngine {
             period(&preview.controls.output_timing),
             preview.controls.ptt_pressed.load(Ordering::Acquire),
         ))
+    }
+    /// What the voice-activation gate measured since the previous read: from
+    /// the running preview, else from the call's own capture.
+    pub(crate) fn voice_gate_meter(&self) -> Option<crate::voice_gate::GateReading> {
+        if let Some(preview) = self.preview.as_ref().filter(|_| self.is_microphone_test_active()) {
+            return Some(preview.controls.gate_meter.take());
+        }
+        self.is_active().then(|| self.shared.controls.gate_meter.take())
+    }
+    /// Gate threshold, sensitivity mode and ramps of an unsaved draft, heard in
+    /// the running call on the next block. None of them is a privacy boundary,
+    /// so no history is discarded; Reset or closing Settings writes them back.
+    pub(crate) fn preview_gate(&self, settings: &AudioSettings) {
+        let settings = settings.clone().normalized();
+        let controls = &self.shared.controls;
+        controls
+            .threshold
+            .store(settings.activation_threshold.to_bits(), Ordering::Relaxed);
+        controls
+            .automatic_sensitivity
+            .store(settings.automatic_sensitivity(), Ordering::Relaxed);
+        controls
+            .hold_ms
+            .store(settings.activation_hold_ms, Ordering::Relaxed);
+        controls
+            .attack_ms
+            .store(settings.activation_attack_ms, Ordering::Relaxed);
+        controls
+            .release_ms
+            .store(settings.activation_release_ms, Ordering::Relaxed);
     }
     pub fn stop_microphone_test(&mut self) {
         self.preview.take();
@@ -3125,8 +3177,16 @@ where
             }
             #[cfg(feature = "native-rtc")]
             if controls.echo_enabled.load(Ordering::Acquire) {
+                // In Listen to Myself the voice is the person's own microphone.
+                // As a reference it would make the canceller remove their live
+                // voice, so the monitor rises and falls; only other sounds count.
+                let reference = if controls.local_preview {
+                    application.map(|sample| sample * volume + tone)
+                } else {
+                    rendered
+                };
                 echo_resampler.feed_bounded(
-                    (rendered[0] + rendered[1]) * 0.5,
+                    (reference[0] + reference[1]) * 0.5,
                     &mut echo_samples,
                     960,
                 );
@@ -3200,22 +3260,37 @@ fn capture_processing_samples(packet_samples: usize, controls: &AudioControls) -
     }
 }
 
+/// Automatic volume holds the speech gain at most this long after the last
+/// speech block, while the level still sounds like speech.
+const AGC_HOLD_SAMPLES: u32 = 300 * 48;
+/// Automatic volume learns only from blocks above -60 dBFS.
+const AGC_LEARN_FLOOR: f32 = 0.001;
+/// Below this fraction of the far end's level, a block with an echo path is
+/// treated as the canceller's residue (-34 dB).
+#[cfg(feature = "native-rtc")]
+const ECHO_RESIDUE_RATIO: f32 = 0.02;
+
 struct MicrophoneProcessor {
     denoiser: Option<Box<DenoiseState<'static>>>,
     #[cfg(feature = "native-rtc")]
     voice_detector: Option<crate::audio_activity::VoiceDetector>,
     first_denoised: bool,
-    hangover_samples: u32,
+    clicks: crate::click_suppression::ClickSuppressor,
+    gate: crate::voice_gate::NoiseGate,
     noise_floor: f32,
     noise_minimum: f32,
     noise_samples: usize,
     automatic_gain: f32,
     speech_output_gain: f32,
     speech_power: f32,
+    /// Samples the speech gain is still held for after the last speech block.
+    speech_hold: u32,
     #[cfg(feature = "native-rtc")]
     echo: Option<EchoCanceller>,
     #[cfg(feature = "native-rtc")]
     echo_error: Option<String>,
+    #[cfg(feature = "native-rtc")]
+    echo_outcome: crate::audio_echo::EchoOutcome,
     #[cfg(feature = "native-rtc")]
     privacy_closed: bool,
 }
@@ -3226,17 +3301,21 @@ impl MicrophoneProcessor {
             #[cfg(feature = "native-rtc")]
             voice_detector: None,
             first_denoised: true,
-            hangover_samples: 0,
+            clicks: crate::click_suppression::ClickSuppressor::new(),
+            gate: crate::voice_gate::NoiseGate::new(),
             noise_floor: 0.0005,
             noise_minimum: f32::INFINITY,
             noise_samples: 0,
             automatic_gain: 1.0,
             speech_output_gain: 1.0,
             speech_power: 0.0,
+            speech_hold: 0,
             #[cfg(feature = "native-rtc")]
             echo: None,
             #[cfg(feature = "native-rtc")]
             echo_error: None,
+            #[cfg(feature = "native-rtc")]
+            echo_outcome: Default::default(),
             #[cfg(feature = "native-rtc")]
             privacy_closed: false,
         }
@@ -3259,10 +3338,12 @@ impl MicrophoneProcessor {
                 self.voice_detector = None;
             }
             self.first_denoised = true;
-            self.hangover_samples = 0;
+            self.clicks = crate::click_suppression::ClickSuppressor::new();
+            self.gate = crate::voice_gate::NoiseGate::new();
             self.automatic_gain = 1.0;
             self.speech_output_gain = 1.0;
             self.speech_power = 0.0;
+            self.speech_hold = 0;
             #[cfg(feature = "native-rtc")]
             if !self.privacy_closed {
                 if let Some(echo) = self.echo.as_mut() {
@@ -3280,14 +3361,16 @@ impl MicrophoneProcessor {
                 let echo = self
                     .echo
                     .get_or_insert_with(|| EchoCanceller::new(controls.echo_reference.clone()));
-                if let Err(error) =
-                    echo.process(input, controls.echo_delay_ms.load(Ordering::Relaxed))
-                {
-                    self.echo_error = Some(error);
-                    return false;
+                match echo.process(input, controls.echo_delay_ms.load(Ordering::Relaxed)) {
+                    Ok(outcome) => self.echo_outcome = outcome,
+                    Err(error) => {
+                        self.echo_error = Some(error);
+                        return false;
+                    }
                 }
             } else {
                 self.echo = None;
+                self.echo_outcome = Default::default();
             }
         }
         let mut gain = f32::from_bits(controls.gain.load(Ordering::Relaxed));
@@ -3310,6 +3393,11 @@ impl MicrophoneProcessor {
         #[cfg(not(feature = "native-rtc"))]
         let detected: Option<bool> = None;
         if controls.suppression.load(Ordering::Relaxed) {
+            let enhanced = controls.noise_model.load(Ordering::Relaxed)
+                == crate::audio_settings::NoiseModel::Enhanced as u32;
+            let strength = crate::click_suppression::NoiseStrength::from_u32(
+                controls.noise_strength.load(Ordering::Relaxed),
+            );
             if self.denoiser.is_none() {
                 self.denoiser = Some(DenoiseState::new());
                 self.first_denoised = true;
@@ -3331,7 +3419,7 @@ impl MicrophoneProcessor {
                 for (to, from) in source.iter_mut().zip(chunk.iter()) {
                     *to = (*from * 32768.0).clamp(-32768.0, 32767.0);
                 }
-                state.process_frame(&mut output, &source);
+                let voice = state.process_frame(&mut output, &source);
                 if self.first_denoised {
                     output.fill(0.0);
                     self.first_denoised = false;
@@ -3342,6 +3430,10 @@ impl MicrophoneProcessor {
                     } else {
                         0.0
                     };
+                }
+                // Before speech detection, so a click cannot open the gate.
+                if enhanced {
+                    self.clicks.process(chunk, voice, strength);
                 }
                 #[cfg(feature = "native-rtc")]
                 if let Some(detector) = self.voice_detector.as_mut() {
@@ -3358,6 +3450,7 @@ impl MicrophoneProcessor {
             }
         } else {
             self.denoiser = None;
+            self.clicks = crate::click_suppression::ClickSuppressor::new();
             #[cfg(feature = "native-rtc")]
             {
                 self.voice_detector = None;
@@ -3366,12 +3459,29 @@ impl MicrophoneProcessor {
         // Detect before automatic volume adjustment: amplification must not turn
         // background noise into speech. The manual threshold keeps its meaning.
         let rms = (input.iter().map(|v| v * v).sum::<f32>() / input.len() as f32).sqrt();
+        // With an echo path, a block far below the far end's level is what is
+        // left of its echo: never boost it, nor let it open the gate.
+        #[cfg(feature = "native-rtc")]
+        let echo_like = self.echo_outcome.cancelling
+            && rms < self.echo_outcome.far_rms * ECHO_RESIDUE_RATIO;
+        #[cfg(not(feature = "native-rtc"))]
+        let echo_like = false;
+        // While the far end talks through an echo path, or before Relay knows
+        // there is none, its echo could pass for speech: automatic volume
+        // keeps what it learned from the person.
+        #[cfg(feature = "native-rtc")]
+        let far_talking = self.echo_outcome.path != crate::audio_echo::PathState::Absent
+            && self.echo_outcome.far_rms > 0.003;
+        #[cfg(not(feature = "native-rtc"))]
+        let far_talking = false;
+        let detected = detected.map(|speech| speech && !echo_like);
         if controls.automatic_microphone_volume.load(Ordering::Relaxed) {
             let peak = input
                 .iter()
                 .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
-            let speech = detected.unwrap_or(rms >= 0.0015);
-            if speech {
+            let speech = detected.unwrap_or(rms >= 0.0015) && !echo_like;
+            // A detector that fires on microphone hiss must not teach a huge gain.
+            if speech && !far_talking && rms >= AGC_LEARN_FLOOR {
                 // Learn from speech, retaining its level across normal pauses.
                 // Explicit privacy boundaries and disabling AGC still reset it.
                 // Track a speech envelope rather than flattening each 10 ms
@@ -3401,16 +3511,27 @@ impl MicrophoneProcessor {
                     self.automatic_gain += (desired - self.automatic_gain) * blend;
                 }
             }
-            // A remembered speech level must not amplify background noise.
-            let gain = if speech { self.automatic_gain } else { 1.0 };
+            if speech {
+                self.speech_hold = AGC_HOLD_SAMPLES;
+            } else {
+                self.speech_hold = self.speech_hold.saturating_sub(input.len() as u32);
+            }
+            // A missed detection mid-word keeps the speech gain for up to 300 ms
+            // while the level still sounds like speech (within 20 dB of it), so
+            // the voice never jumps between the speech gain and unity. A real
+            // pause is far quieter: it returns to unity at once, because a
+            // remembered level must not amplify background noise.
+            let held = !speech
+                && self.speech_hold > 0
+                && rms >= self.speech_power.sqrt() * 0.1;
             let ceiling = 0.95 / peak.max(0.0001);
+            let gain = if speech || held { self.automatic_gain } else { 1.0 };
             let gain = gain.min(ceiling);
             // Interpolate speech gain inside this existing PCM block so a
             // continuous waveform does not acquire a step every packet. A
-            // newly loud frame still takes the safe gain immediately. Quiet
-            // pauses keep unity gain and retain only the speech-level scalar.
-            let from = if speech && self.speech_output_gain <= ceiling {
-                self.speech_output_gain
+            // newly loud frame still takes the safe gain immediately.
+            let from = if speech || held {
+                self.speech_output_gain.min(ceiling)
             } else {
                 gain
             };
@@ -3419,30 +3540,35 @@ impl MicrophoneProcessor {
                 let level = from + step * (index + 1) as f32;
                 *sample = (*sample * level).clamp(-0.95, 0.95);
             }
-            if speech {
+            if speech || held {
                 self.speech_output_gain = gain;
             }
         } else {
             self.automatic_gain = 1.0;
             self.speech_output_gain = 1.0;
             self.speech_power = 0.0;
+            self.speech_hold = 0;
         }
+        let automatic = controls.automatic_sensitivity.load(Ordering::Relaxed);
         if mode == TransmissionMode::PushToTalk as u32 {
-            self.hangover_samples = 0;
-            return controls.ptt_pressed.load(Ordering::Acquire)
+            self.gate = crate::voice_gate::NoiseGate::new();
+            let held = controls.ptt_pressed.load(Ordering::Acquire)
                 || (controls.whisper_enabled.load(Ordering::Acquire)
                     && controls.whisper_pressed.load(Ordering::Acquire));
+            controls.gate_meter.record(rms, 0.0, held, false);
+            return held;
         }
         if mode != TransmissionMode::VoiceActivation as u32 {
-            self.hangover_samples = 0;
+            self.gate = crate::voice_gate::NoiseGate::new();
+            controls.gate_meter.record(rms, 0.0, true, false);
             return true;
         }
-        let threshold = if controls.automatic_sensitivity.load(Ordering::Relaxed) {
+        let threshold = if automatic {
             // A bounded one-second minimum follows the quiet parts between words.
             // No extra audio frame is buffered, and speech cannot raise the gate
             // beyond 0.006 RMS (the former factory threshold was 0.02).
             let current = (self.noise_floor * 3.0).clamp(0.0015, 0.006);
-            if rms < current && self.hangover_samples == 0 {
+            if rms < current && !self.gate.is_open() {
                 self.noise_minimum = self.noise_minimum.min(rms);
                 self.noise_samples += input.len();
                 if self.noise_samples >= AUDIO_SAMPLE_RATE as usize {
@@ -3455,20 +3581,27 @@ impl MicrophoneProcessor {
         } else {
             f32::from_bits(controls.threshold.load(Ordering::Relaxed))
         };
-        let speech = if controls.automatic_sensitivity.load(Ordering::Relaxed) {
-            detected.unwrap_or(rms >= threshold)
+        let decision = if automatic {
+            detected
+        } else if echo_like {
+            Some(false)
         } else {
-            rms >= threshold
+            None
         };
-        if speech {
-            self.hangover_samples = controls.hold_ms.load(Ordering::Relaxed).saturating_mul(48);
-            true
-        } else if self.hangover_samples > 0 {
-            self.hangover_samples = self.hangover_samples.saturating_sub(input.len() as u32);
-            true
-        } else {
-            false
-        }
+        let speech = self.gate.detect(rms, threshold, decision);
+        let timing = crate::voice_gate::GateTiming {
+            attack_ms: controls.attack_ms.load(Ordering::Relaxed),
+            hold_ms: controls.hold_ms.load(Ordering::Relaxed),
+            release_ms: controls.release_ms.load(Ordering::Relaxed),
+        };
+        // A call prepends the retained speech start and fades that in instead.
+        let staged_start =
+            controls.preserve_speech_start.load(Ordering::Relaxed) && !controls.local_preview;
+        let audible = self.gate.apply(input, speech, timing, staged_start);
+        controls
+            .gate_meter
+            .record(rms, threshold, audible, automatic);
+        audible
     }
 }
 
@@ -4483,6 +4616,7 @@ fn voice_worker(mut w: VoiceWorker) {
                     packet_samples,
                     retain_start,
                     transmit && allowed,
+                    w.controls.attack_ms.load(Ordering::Relaxed) as usize * 48,
                     &mut send_pcm,
                 );
                 if let Some((frame_timestamp, input)) = staged {
@@ -6731,8 +6865,288 @@ mod tests {
             automatic_sensitivity: Some(false),
             automatic_microphone_volume: false,
             microphone_gain: 1.0,
+            // The former hard gate: these tests count whole open blocks.
+            activation_release_ms: 0,
             ..Default::default()
         })
+    }
+    /// The capture chain over a synthetic call: the far end is rendered (and
+    /// becomes the echo reference) 10 ms before its echo, delayed by
+    /// `echo_delay` samples and low-passed, reaches the microphone with the
+    /// near-end talker. Returns what would be transmitted per sample.
+    #[cfg(feature = "native-rtc")]
+    pub(super) fn run_capture_chain(
+        settings: &AudioSettings,
+        near: &[f32],
+        far: &[f32],
+        echo_delay: usize,
+        echo_gain: f32,
+    ) -> Vec<f32> {
+        let controls = AudioControls::new(settings);
+        let mut processor = MicrophoneProcessor::new();
+        let mut path = 0.0f32;
+        // A real microphone always has a little self-noise (about -70 dBFS).
+        let mut noise = 0x2468_ace1u32;
+        let mut sent = Vec::with_capacity(near.len());
+        for (index, chunk) in near.chunks_exact(480).enumerate() {
+            let start = index * 480;
+            let mut reference = [0.0f32; 480];
+            reference.copy_from_slice(&far[start..start + 480]);
+            controls.echo_reference.rendered(&reference);
+            let mut block = [0.0f32; 480];
+            for (offset, sample) in block.iter_mut().enumerate() {
+                let at = start + offset;
+                let echo = if at >= echo_delay { far[at - echo_delay] } else { 0.0 };
+                path += (echo - path) * 0.5;
+                noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let hiss = ((noise >> 8) as f32 / 16_777_215.0 - 0.5) * 0.001;
+                *sample = chunk[offset] + path * echo_gain + hiss;
+            }
+            let audible = processor.process(&mut block, &controls);
+            assert!(processor.echo_error.is_none());
+            sent.extend_from_slice(if audible { &block } else { &[0.0; 480] });
+        }
+        sent
+    }
+
+    #[cfg(feature = "native-rtc")]
+    #[test]
+    #[ignore = "diagnostic: prints each stage of the capture chain"]
+    fn diagnose_capture_chain_stages_with_echo() {
+        use crate::voice_test_signals::{db, rms, talker, RATE};
+        let (far, mut near) = match std::env::var_os("VOICE_TEST_WAV") {
+            Some(path) => {
+                std::env::set_var("RELAY_SYNTHETIC_SPEECH_WAV", path);
+                let speech = owned_synthetic_speech();
+                let len = (9.0 * RATE) as usize;
+                let take = |from: usize, level: f32| -> Vec<f32> { (0..len).map(|i| speech[(from + i) % speech.len()] * level).collect() };
+                (take(0, 1.0), take(speech.len() / 2, 0.6))
+            }
+            None => (talker(9.0, (190.0, 230.0), 7, 0.5), talker(9.0, (105.0, 135.0), 3, 0.3)),
+        };
+        let near_from = (2.5 * RATE) as usize;
+        near[..near_from].fill(0.0);
+        for gain in [0.0f32, 0.1, 0.25, 0.5] {
+        for (label, ns, agc, aec) in [("aec only", false, false, true), ("all", true, true, true)] {
+            let settings = AudioSettings { transmission: TransmissionMode::Continuous, echo_cancellation: aec, noise_suppression: ns, automatic_microphone_volume: agc, microphone_gain: 1.0, ..Default::default() };
+            let alone = run_capture_chain(&settings, &near, &vec![0.0; near.len()], 2_400, 0.0);
+            let with_echo = run_capture_chain(&settings, &near, &far, 2_400, gain);
+            let echo_in: Vec<f32> = (RATE as usize..near_from).map(|n| far[n - 2_400] * gain.max(1e-6)).collect();
+            let erle = db(rms(&echo_in)) - db(rms(&with_echo[RATE as usize..near_from]));
+            let late = db(rms(&echo_in[..])) - db(rms(&with_echo[(1.8*RATE) as usize..near_from]));
+            let mut ratios: Vec<f32> = alone[near_from..].chunks_exact(960).zip(with_echo[near_from..].chunks_exact(960)).filter(|(a, _)| db(rms(a)) > -40.0).map(|(a, b)| db(rms(b)) - db(rms(a))).collect();
+            ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let chopped = ratios.iter().filter(|r| **r < -6.0).count() as f32 / ratios.len() as f32;
+            println!("echo x{gain} {label}: erle {erle:.1} dB (late {late:.1}), chopped {:.0} %, median {:+.1}, p10 {:+.1}", chopped*100.0, ratios[ratios.len()/2], ratios[ratios.len()/10]);
+        }
+        }
+    }
+
+    #[cfg(feature = "native-rtc")]
+    #[test]
+    fn call_echo_cancellation_removes_echo_without_chopping_double_talk() {
+        use crate::voice_test_signals::{db, rms, talker, RATE};
+        let seconds = 9.0;
+        let far = talker(seconds, (190.0, 230.0), 7, 0.5);
+        let mut near = talker(seconds, (105.0, 135.0), 3, 0.3);
+        let near_from = (2.5 * RATE) as usize;
+        near[..near_from].fill(0.0);
+        let silent = vec![0.0; near.len()];
+        for (device, echo_gain) in [("headphones", 0.0f32), ("speakers", 0.25)] {
+            for (label, transmission) in [
+                ("continuous", TransmissionMode::Continuous),
+                ("voice activation", TransmissionMode::VoiceActivation),
+            ] {
+                let settings = AudioSettings {
+                    transmission,
+                    echo_cancellation: true,
+                    ..Default::default()
+                };
+                let alone = run_capture_chain(&settings, &near, &silent, 2_400, 0.0);
+                let with_echo = run_capture_chain(&settings, &near, &far, 2_400, echo_gain);
+                // Far end only, once the echo path had 2 s to be heard: what of
+                // its echo the others would hear.
+                let from = (2.0 * RATE) as usize;
+                let echo_in: Vec<f32> = (from..near_from).map(|n| far[n - 2_400] * echo_gain).collect();
+                let erle = db(rms(&echo_in)) - db(rms(&with_echo[from..near_from]));
+                // Double talk: 20 ms windows where the near end alone is audible.
+                let mut ratios: Vec<f32> = alone[near_from..]
+                    .chunks_exact(960)
+                    .zip(with_echo[near_from..].chunks_exact(960))
+                    .filter(|(a, _)| db(rms(a)) > -40.0)
+                    .map(|(a, b)| db(rms(b)) - db(rms(a)))
+                    .collect();
+                ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let chopped = ratios.iter().filter(|r| **r < -6.0).count() as f32 / ratios.len() as f32;
+                let median = ratios[ratios.len() / 2];
+                println!("Call chain, {device}, {label}, AEC on: echo reduced {erle:.1} dB; double talk: {:.0} % of {} speech windows more than 6 dB quieter than without far end, median {median:+.1} dB, 10th percentile {:+.1} dB", chopped * 100.0, ratios.len(), ratios[ratios.len() / 10]);
+                assert!(median > -4.5, "{device}/{label}: near end attenuated by {median:.1} dB");
+                if echo_gain == 0.0 {
+                    assert!(chopped <= 0.05, "{device}/{label}: voice chopped in {:.0} % of windows", chopped * 100.0);
+                } else {
+                    // Recorded speech leaves far less (see the diagnostic above).
+                    assert!(erle >= 18.0, "{device}/{label}: echo must drop by at least 18 dB, got {erle:.1}");
+                    // AEC3 still softens syllables while both talk over loud speakers:
+                    // about 16 % with recorded speech (diagnose_capture_chain_stages_with_echo
+                    // with VOICE_TEST_WAV), more with these steady synthetic vowels.
+                    assert!(chopped <= 0.5, "{device}/{label}: voice chopped in {:.0} % of windows", chopped * 100.0);
+                }
+            }
+        }
+    }
+
+    /// Speech, keyboard clicks and a fan through the real capture chain for
+    /// every noise suppression choice: clicks left in pauses, what happens to
+    /// speech, the processing time per 10 ms block and the added delay.
+    #[cfg(feature = "native-rtc")]
+    fn noise_suppression_report() -> Vec<(String, f32, f32, f32, f32)> {
+        use crate::audio_settings::NoiseModel;
+        use crate::click_suppression::NoiseStrength;
+        use crate::voice_test_signals::{clicks, db, rms, talker};
+        let seconds = 8.0;
+        let speech = match std::env::var_os("VOICE_TEST_WAV") {
+            Some(path) => {
+                std::env::set_var("RELAY_SYNTHETIC_SPEECH_WAV", path);
+                let recorded = owned_synthetic_speech();
+                let peak = recorded.iter().fold(0.0f32, |p, s| p.max(s.abs()));
+                (0..(seconds * 48_000.0) as usize).map(|i| recorded[i % recorded.len()] * 0.3 / peak).collect()
+            }
+            None => talker(seconds, (105.0, 135.0), 13, 0.3),
+        };
+        let (keys, onsets) = clicks(seconds, 2.5, 0.25, 21);
+        let mut fan = vec![0.0f32; speech.len()];
+        let mut state = 0x1357_9bdfu32;
+        let mut low = 0.0f32;
+        for sample in &mut fan {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            low += (((state >> 8) as f32 / 16_777_215.0 - 0.5) - low) * 0.05;
+            *sample = low * 0.06;
+        }
+        let clean: Vec<f32> = speech.iter().zip(&fan).map(|(s, f)| s + f).collect();
+        let noisy: Vec<f32> = clean.iter().zip(&keys).map(|(c, k)| c + k).collect();
+        let silent = vec![0.0; speech.len()];
+        let pauses: Vec<usize> = onsets
+            .iter()
+            .copied()
+            .filter(|&at| at > 4_800 && at + 2_400 < speech.len() && rms(&speech[at - 960..at + 1_920]) < 0.002)
+            .collect();
+        let near_click = |at: usize| onsets.iter().any(|&o| o + 1_920 > at && o < at + 960 + 1_920);
+        let mut rows = Vec::new();
+        let mut reference: Option<Vec<f32>> = None;
+        for (label, model, strength) in [
+            ("Standard (RNNoise)", NoiseModel::Standard, NoiseStrength::Normal),
+            ("Enhanced Low", NoiseModel::Enhanced, NoiseStrength::Low),
+            ("Enhanced Normal", NoiseModel::Enhanced, NoiseStrength::Normal),
+            ("Enhanced High", NoiseModel::Enhanced, NoiseStrength::High),
+        ] {
+            let settings = AudioSettings {
+                transmission: TransmissionMode::Continuous,
+                automatic_microphone_volume: false,
+                microphone_gain: 1.0,
+                noise_model: model,
+                noise_strength: strength,
+                ..Default::default()
+            };
+            let started = Instant::now();
+            let out = run_capture_chain(&settings, &noisy, &silent, 0, 0.0);
+            let per_block_ms = started.elapsed().as_secs_f32() * 1000.0 / (noisy.len() / 480) as f32;
+            let clean_out = run_capture_chain(&settings, &clean, &silent, 0, 0.0);
+            let residue: f32 = pauses.iter().map(|&at| out[at..at + 1_440].iter().map(|s| s * s).sum::<f32>()).sum();
+            let click_db = 10.0 * (residue.max(1e-12)).log10();
+            // Speech level against Standard's output of the same clean input.
+            let base = reference.get_or_insert_with(|| clean_out.clone()).clone();
+            let mut changes: Vec<f32> = (0..speech.len() / 960)
+                .filter(|w| rms(&speech[w * 960..w * 960 + 960]) > 0.02 && !near_click(w * 960))
+                .map(|w| db(rms(&out[w * 960..w * 960 + 960])) - db(rms(&base[w * 960..w * 960 + 960])))
+                .collect();
+            changes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let speech_db = changes[changes.len() / 2];
+            // Added delay: the lag with the strongest match to the clean input.
+            let lag = (0..1_440usize)
+                .max_by(|a, b| {
+                    let score = |lag: usize| (48_000..240_000).map(|n| clean[n] * clean_out[n + lag]).sum::<f32>();
+                    score(*a).partial_cmp(&score(*b)).unwrap()
+                })
+                .unwrap();
+            rows.push((label.to_owned(), click_db, speech_db, per_block_ms, lag as f32 / 48.0));
+        }
+        rows
+    }
+
+    #[cfg(feature = "native-rtc")]
+    #[test]
+    fn enhanced_noise_suppression_removes_the_clicks_rnnoise_lets_through() {
+        let rows = noise_suppression_report();
+        // Recorded speech (VOICE_TEST_WAV) lets RNNoise recognise the voice as
+        // it would in a call; the steady synthetic vowels confuse it more.
+        let recorded = std::env::var_os("VOICE_TEST_WAV").is_some();
+        let wanted = if recorded { [8.0f32, 20.0, 25.0] } else { [6.0, 8.0, 12.0] };
+        let speech_floor = if recorded { -1.5 } else { -4.0 };
+        println!("Noise suppression bench source: {}", if recorded { "recorded speech" } else { "synthetic talker" });
+        for (label, click_db, speech_db, per_block_ms, delay_ms) in &rows {
+            println!("Noise suppression bench, {label}: clicks between words {click_db:.1} dB energy, speech {speech_db:+.1} dB vs Standard, {per_block_ms:.3} ms CPU per 10 ms block, delay {delay_ms:.2} ms");
+        }
+        let standard = rows[0].1;
+        for (index, wanted) in [(1usize, wanted[0]), (2, wanted[1]), (3, wanted[2])] {
+            let (label, click_db, speech_db, per_block_ms, delay_ms) = &rows[index];
+            assert!(standard - click_db >= wanted, "{label}: clicks only {:.1} dB below Standard", standard - click_db);
+            assert!(*speech_db > speech_floor, "{label}: speech {speech_db:.1} dB");
+            // Real time with a wide margin even in an unoptimised test build.
+            assert!(*per_block_ms < 5.0, "{label}: {per_block_ms:.2} ms per 10 ms block");
+            assert!(*delay_ms <= rows[0].4 + 1.0, "{label}: adds delay: {delay_ms:.2} ms");
+        }
+    }
+
+    #[test]
+    fn voice_gate_ramps_with_hysteresis_and_meters_the_level_it_compares() {
+        let controls = AudioControls::new(&AudioSettings {
+            packet_ms: 10,
+            transmission: TransmissionMode::VoiceActivation,
+            noise_suppression: false,
+            automatic_sensitivity: Some(false),
+            automatic_microphone_volume: false,
+            microphone_gain: 1.0,
+            activation_threshold: 0.02,
+            activation_attack_ms: 5,
+            activation_hold_ms: 20,
+            activation_release_ms: 40,
+            preserve_speech_start: false,
+            ..Default::default()
+        });
+        let mut processor = MicrophoneProcessor::new();
+        let mut quiet = [0.01; 480];
+        assert!(!processor.process(&mut quiet, &controls));
+        assert!(quiet.iter().all(|s| *s == 0.01), "closed audio is never altered");
+        let reading = controls.gate_meter.take();
+        assert!((reading.level - 0.01).abs() < 1e-6 && reading.threshold == 0.02 && !reading.open);
+        let mut speech = [0.05; 480];
+        assert!(processor.process(&mut speech, &controls));
+        assert!(speech[0] < 0.001 && (speech[239] - 0.05).abs() < 1e-6, "5 ms attack instead of a click");
+        let reading = controls.gate_meter.take();
+        assert!((reading.level - 0.05).abs() < 1e-6 && reading.open, "the bar shows what the gate measured");
+        // 0.012 is below the 0.02 threshold but within the 6 dB hysteresis: still speech.
+        for _ in 0..5 {
+            let mut hovering = [0.012; 480];
+            assert!(processor.process(&mut hovering, &controls));
+            assert!(hovering.iter().all(|s| *s == 0.012), "no pumping while hovering");
+        }
+        // Below the close level: 20 ms hold, then a 40 ms fade, then closed.
+        let mut previous = 0.009;
+        let mut open_blocks = 0;
+        for _ in 0..10 {
+            let mut fading = [0.009; 480];
+            if processor.process(&mut fading, &controls) {
+                open_blocks += 1;
+                assert!(fading[0] <= previous + 1e-6, "no step up between blocks");
+                previous = fading[479];
+            }
+        }
+        assert_eq!((open_blocks, previous), (2 + 4, 0.0));
+        controls.release_ms.store(0, Ordering::Relaxed);
+        controls.attack_ms.store(0, Ordering::Relaxed);
+        let mut speech = [0.05; 480];
+        assert!(processor.process(&mut speech, &controls));
+        assert_eq!(speech[0], 0.05, "live edits apply on the next block");
     }
     #[test]
     fn microphone_gain_gate_hangover_and_ptt_change_actual_transmission() {
@@ -6774,6 +7188,7 @@ mod tests {
             microphone_gain: 1.0,
             noise_suppression: false,
             automatic_microphone_volume: false,
+            activation_release_ms: 0,
             ..Default::default()
         };
         let controls = AudioControls::new(&settings);
@@ -6921,6 +7336,33 @@ mod tests {
             reports.iter().all(|(_, step)| *step < 0.0001),
             "automatic level changes must not create block-edge discontinuities: {reports:?}"
         );
+    }
+    #[test]
+    fn automatic_volume_does_not_pump_when_detection_drops_out_mid_word() {
+        let controls = AudioControls::new(&AudioSettings {
+            microphone_gain: 1.0,
+            noise_suppression: false,
+            transmission: TransmissionMode::Continuous,
+            ..Default::default()
+        });
+        let mut processor = MicrophoneProcessor::new();
+        for _ in 0..100 {
+            processor.process(&mut [0.005; 480], &controls);
+        }
+        let learned = processor.speech_output_gain;
+        assert!(learned > 4.0, "quiet speech is boosted: {learned}");
+        // A weaker 10 ms inside the word falls under the speech detector but is
+        // still speech-like: the gain must hold instead of dropping to unity.
+        let mut dip = [0.0012; 480];
+        processor.process(&mut dip, &controls);
+        assert!((dip[479] / 0.0012 - learned).abs() < 0.01 * learned, "held: {}", dip[479] / 0.0012);
+        let mut word = [0.005; 480];
+        processor.process(&mut word, &controls);
+        assert!((word[0] / 0.005 - learned).abs() < 0.01 * learned, "no jump back up");
+        // A real pause is quiet: it returns to unity immediately.
+        let mut pause = [0.0001; 480];
+        processor.process(&mut pause, &controls);
+        assert!(pause.iter().all(|s| (*s - 0.0001).abs() < 1e-7));
     }
     #[test]
     fn quiet_microphone_level_survives_a_normal_pause_without_boosting_background() {
@@ -8768,6 +9210,7 @@ mod tests {
             let controls = AudioControls::new(&AudioSettings {
                 noise_suppression: false,
                 activation_hold_ms: 100,
+                activation_release_ms: 0,
                 ..Default::default()
             });
             assert_eq!(capture_processing_samples(samples, &controls), samples);

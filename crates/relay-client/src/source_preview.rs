@@ -74,18 +74,44 @@ impl SourcePreview {
         }
         None
     }
+    /// A 16:9 stage across the available width, as in Discord's video
+    /// settings; the picture is letterboxed, never cropped or stretched.
     pub fn show(&self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("Local preview · Visible only to you").size(font_size(12.0)));
+        let width = ui.available_width().max(160.0);
+        let height = (width * 9.0 / 16.0).min(420.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 8.0, egui::Color32::from_gray(12));
         if let Some(texture) = &self.texture {
             let size = texture.size_vec2();
-            let scale = (ui.available_width() / size.x).min(200.0 / size.y).min(1.0);
-            ui.add(egui::Image::new((texture.id(), size * scale)).rounding(8.0));
+            let scale = (rect.width() / size.x).min(rect.height() / size.y);
+            let picture = egui::Rect::from_center_size(rect.center(), size * scale);
+            egui::Image::new((texture.id(), size * scale))
+                .rounding(8.0)
+                .paint_at(ui, picture);
         } else {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Opening the selected source…");
-            });
+            let spinner = egui::Rect::from_center_size(rect.center() - egui::vec2(0.0, 14.0), egui::vec2(24.0, 24.0));
+            ui.put(spinner, egui::Spinner::new());
+            painter.text(
+                rect.center() + egui::vec2(0.0, 18.0),
+                egui::Align2::CENTER_CENTER,
+                if self.camera { "Starting your camera…" } else { "Opening the selected source…" },
+                egui::FontId::proportional(font_size(13.0)),
+                egui::Color32::from_gray(210),
+            );
         }
+        // Who can see this, on a dark pill so it reads over any picture.
+        let galley = painter.layout_no_wrap(
+            "Preview · only you can see this".into(),
+            egui::FontId::proportional(font_size(12.0)),
+            egui::Color32::WHITE,
+        );
+        let pill = egui::Rect::from_min_size(
+            rect.left_bottom() + egui::vec2(10.0, -10.0 - galley.size().y - 8.0),
+            galley.size() + egui::vec2(16.0, 8.0),
+        );
+        painter.rect_filled(pill, 6.0, egui::Color32::from_black_alpha(170));
+        painter.galley(pill.min + egui::vec2(8.0, 4.0), galley, egui::Color32::WHITE);
     }
     /// Cancel first, then release native handles off the UI thread before reuse.
     pub fn stop(mut self, ctx: egui::Context) -> Receiver<()> {

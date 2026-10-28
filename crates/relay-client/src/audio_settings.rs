@@ -11,6 +11,17 @@ pub enum TransmissionMode {
     PushToTalk = 2,
 }
 
+/// Enhanced adds WebRTC noise suppression, click removal and voice isolation
+/// around RNNoise; Standard is RNNoise alone, as before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u32)]
+pub enum NoiseModel {
+    #[default]
+    Enhanced = 0,
+    Standard = 1,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatencyMode {
     Adaptive,
@@ -98,6 +109,10 @@ pub struct AudioSettings {
     pub automatic_sensitivity: Option<bool>,
     pub automatic_microphone_volume: bool,
     pub activation_hold_ms: u32,
+    /// Voice-activation fade-in when the gate opens (0 = instant).
+    pub activation_attack_ms: u32,
+    /// Voice-activation fade-out after the hold time (0 = hard cut).
+    pub activation_release_ms: u32,
     /// Retain 10 ms (one whole packet minimum) before the Voice Activity gate opens.
     pub preserve_speech_start: bool,
     pub bitrate_kbps: u32,
@@ -132,6 +147,10 @@ pub struct AudioSettings {
     #[serde(default)]
     pub adaptive_jitter: bool,
     pub noise_suppression: bool,
+    /// Which suppressor runs while noise suppression is on.
+    pub noise_model: NoiseModel,
+    /// Strength of Enhanced suppression.
+    pub noise_strength: crate::click_suppression::NoiseStrength,
     /// Experimental native AEC. The reference is only Relay's actual speaker output.
     pub echo_cancellation: bool,
     pub echo_delay_ms: u32,
@@ -152,6 +171,8 @@ impl Default for AudioSettings {
             automatic_sensitivity: None,
             automatic_microphone_volume: true,
             activation_hold_ms: 200,
+            activation_attack_ms: 5,
+            activation_release_ms: 80,
             preserve_speech_start: true,
             bitrate_kbps: 96,
             recover_packet_loss: false,
@@ -173,6 +194,8 @@ impl Default for AudioSettings {
             jitter_ms: 10,
             adaptive_jitter: true,
             noise_suppression: true,
+            noise_model: NoiseModel::Enhanced,
+            noise_strength: crate::click_suppression::NoiseStrength::Normal,
             echo_cancellation: false,
             echo_delay_ms: 40,
             sounds_enabled: true,
@@ -382,6 +405,12 @@ impl AudioSettings {
         self.sound_volume = bounded(self.sound_volume, defaults.sound_volume, 0.0, 1.0);
         self.event_sounds.normalize();
         self.activation_hold_ms = self.activation_hold_ms.min(1000);
+        self.activation_attack_ms = self
+            .activation_attack_ms
+            .min(crate::voice_gate::MAX_ATTACK_MS);
+        self.activation_release_ms = self
+            .activation_release_ms
+            .min(crate::voice_gate::MAX_RELEASE_MS);
         self.bitrate_kbps = self.bitrate_kbps.clamp(16, 128);
         if !matches!(self.packet_ms, 5 | 10 | 20) {
             self.packet_ms = defaults.packet_ms;
@@ -447,6 +476,30 @@ impl AudioCue {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn older_profiles_get_enhanced_noise_suppression_and_can_choose_rnnoise() {
+        let old: super::AudioSettings = serde_json::from_str(r#"{"noise_suppression":true}"#).unwrap();
+        assert_eq!(old.noise_model, super::NoiseModel::Enhanced);
+        assert_eq!(old.noise_strength, crate::click_suppression::NoiseStrength::Normal);
+        let chosen: super::AudioSettings = serde_json::from_str(r#"{"noise_model":"standard","noise_strength":"high"}"#).unwrap();
+        assert_eq!((chosen.noise_model, chosen.noise_strength), (super::NoiseModel::Standard, crate::click_suppression::NoiseStrength::High));
+        let text = serde_json::to_string(&chosen).unwrap();
+        assert!(text.contains(r#""noise_model":"standard""#) && text.contains(r#""noise_strength":"high""#));
+    }
+
+    #[test]
+    fn gate_ramps_are_bounded_and_older_profiles_get_soft_defaults() {
+        let old: super::AudioSettings = serde_json::from_str(r#"{"activation_hold_ms":300}"#).unwrap();
+        assert_eq!((old.activation_attack_ms, old.activation_hold_ms, old.activation_release_ms), (5, 300, 80));
+        let wild = super::AudioSettings {
+            activation_attack_ms: u32::MAX,
+            activation_release_ms: u32::MAX,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!((wild.activation_attack_ms, wild.activation_release_ms), (50, 500));
+    }
+
     #[test]
     fn zero_volume_recovery_preserves_call_policy_and_unsaved_device_choices() {
         let applied = super::AudioSettings {

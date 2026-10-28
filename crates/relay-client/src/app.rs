@@ -187,6 +187,7 @@ palette_color!(c_muted, muted);
 palette_color!(c_accent, accent);
 palette_color!(c_bad, bad);
 palette_color!(c_good, good);
+palette_color!(c_hover, hover);
 
 fn font_size(base: f32) -> f32 {
     UI_FONT_SCALE.with(|scale| base * scale.get())
@@ -910,8 +911,15 @@ pub struct RelayApp {
     mic_test: bool,
     /// Level advice for the running "Listen to Myself" preview.
     mic_meter: Option<crate::self_listen::LevelAnalyzer>,
+    /// Smoothed level for the Input Sensitivity bar.
+    gate_display: crate::voice_gate::GateDisplay,
     /// Windows audio endpoint notifications; None when registration failed.
     device_watch: Option<crate::device_watch::DeviceWatch>,
+    /// Windows camera arrival/removal; None when registration failed.
+    camera_watch: Option<crate::camera_watch::CameraWatch>,
+    cameras_rx: Option<Receiver<Result<Vec<CaptureSource>, String>>>,
+    /// Voice & Video was open last frame: entering it lists the cameras again.
+    cameras_page_seen: bool,
     /// Changes waiting for a fresh audio device list.
     device_change: crate::device_follow::Change,
     audio_devices_rx: Option<Receiver<Result<AudioDevices, String>>>,
@@ -1406,10 +1414,17 @@ impl RelayApp {
             sound_settings,
             mic_test: false,
             mic_meter: None,
+            gate_display: Default::default(),
             device_watch: {
                 let ctx = cc.egui_ctx.clone();
                 crate::device_watch::DeviceWatch::start(std::sync::Arc::new(move || ctx.request_repaint())).ok()
             },
+            camera_watch: {
+                let ctx = cc.egui_ctx.clone();
+                crate::camera_watch::CameraWatch::start(std::sync::Arc::new(move || ctx.request_repaint())).ok()
+            },
+            cameras_rx: None,
+            cameras_page_seen: false,
             // Check the saved devices once at startup: one may be missing already.
             device_change: crate::device_follow::Change { devices: true, ..Default::default() },
             audio_devices_rx: None,
@@ -2826,6 +2841,51 @@ impl RelayApp {
             let _ = tx.send(inventory);
             ctx.request_repaint();
         });
+    }
+
+    /// Lists the cameras again in the background; audio devices are untouched.
+    pub(super) fn refresh_cameras(&mut self) {
+        if self.cameras_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.cameras_rx = Some(rx);
+        let ctx = self.capture_ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::capture::enumerate_cameras());
+            ctx.request_repaint();
+        });
+    }
+
+    /// A new camera list keeps the chosen camera by name and stops a preview
+    /// of a camera that is gone.
+    pub(super) fn apply_cameras(&mut self, cameras: Vec<CaptureSource>) {
+        let before = std::mem::replace(&mut self.inventory.cameras, cameras);
+        let chosen = self.camera_source.clone();
+        crate::capture::follow_camera_selection(&mut self.camera_source, &before, &self.inventory.cameras);
+        let moved = chosen.is_some() && self.camera_source != chosen;
+        #[cfg(feature = "native-rtc")]
+        let moved = moved
+            || self.source_preview.as_ref().is_some_and(|preview| {
+                preview.camera && !self.inventory.cameras.iter().any(|source| source.id == preview.source_id)
+            });
+        if moved {
+            self.stop_source_preview();
+        }
+    }
+
+    /// Follows cameras plugged in or removed, like `device_follow_tick` for audio.
+    pub(super) fn camera_follow_tick(&mut self) {
+        if self.camera_watch.as_ref().is_some_and(|watch| watch.take()) {
+            self.refresh_cameras();
+        }
+        if let Some(result) = self.cameras_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.cameras_rx = None;
+            match result {
+                Ok(cameras) => self.apply_cameras(cameras),
+                Err(error) => self.inventory.warnings.push(error),
+            }
+        }
     }
 
     fn apply_audio_settings(&mut self) {
@@ -4249,6 +4309,8 @@ enum Icon {
     Screen,
     Calendar,
     Megaphone,
+    /// Start a call: the handset tipped up, unlike the flat hang-up handset.
+    Phone,
 }
 fn message_toolbar_position(row: Rect, clip: Rect, width: f32) -> Pos2 {
     let left = clip.left() + 2.0;
@@ -4568,6 +4630,32 @@ fn draw_icon(p: &egui::Painter, r: Rect, shape: Icon, color: Color32) {
                 vec![point(0.36, 0.4), point(0.5, 0.26), point(0.64, 0.4)],
                 s,
             ));
+        }
+        Icon::Phone => {
+            // The hang-up handset turned 135°, the usual "call" glyph.
+            let center = point(0.5, 0.5);
+            let turn = |p: Pos2| {
+                let (sin, cos) = (135f32.to_radians().sin(), 135f32.to_radians().cos());
+                let d = p - center;
+                // Rotated, the handset spans less width: draw it a third larger.
+                center + Vec2::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos) * 1.3
+            };
+            let tp = |x: f32, y: f32| turn(point(x, y + 0.08));
+            p.add(egui::Shape::line(
+                [(0.12, 0.55), (0.22, 0.43), (0.36, 0.36), (0.5, 0.33), (0.64, 0.36), (0.78, 0.43), (0.88, 0.55)]
+                    .iter()
+                    .map(|(x, y)| tp(*x, *y))
+                    .collect(),
+                Stroke::new(w * 0.13, color),
+            ));
+            for flip in [false, true] {
+                let ear = |x: f32, y: f32| tp(if flip { 1.0 - x } else { x }, y);
+                p.add(egui::Shape::convex_polygon(
+                    vec![ear(0.08, 0.5), ear(0.2, 0.42), ear(0.28, 0.49), ear(0.28, 0.64), ear(0.11, 0.71), ear(0.07, 0.66)],
+                    color,
+                    Stroke::NONE,
+                ));
+            }
         }
         Icon::HangUp => {
             // A horizontal handset with downward earpieces, shared by both call controls.

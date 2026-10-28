@@ -173,7 +173,7 @@ pub(super) fn render(ui: &mut egui::Ui, content: &str, spoilers_revealed: bool) 
             .inner_margin(egui::Margin::same(10.0))
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width().min(420.0));
-                ui.label(egui::RichText::new(card.provider).small().color(c_accent()));
+                ui.label(egui::RichText::new(card.provider).small().color(c_muted()));
                 ui.add(egui::Label::new(egui::RichText::new(card.title).strong()).wrap(true));
                 ui.add(
                     egui::Label::new(egui::RichText::new(card.display).small().color(c_muted()))

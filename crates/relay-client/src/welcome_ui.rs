@@ -1059,19 +1059,37 @@ fn host_checklist_card(
 ) -> Option<HostClick> {
     let mut click = None;
     if compact {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Next step").strong());
-            if !steps.invited {
-                if ui.add(primary("Invite a friend")).clicked() { click = Some(HostClick::Invite); }
-            } else if !steps.said_hello {
-                if let Some(name) = hello {
-                    if ui.add(secondary(&format!("Say hello in #{name}"))).clicked() { click = Some(HostClick::Hello); }
-                }
-            } else if !steps.tried_voice && voice {
-                if ui.add(primary("Join voice together")).clicked() { click = Some(HostClick::Voice); }
-            }
-            if ui.small_button("Dismiss").clicked() { click = Some(HostClick::Dismiss); }
-        });
+        // Discord's notice bar: one sentence, one action, a close button.
+        egui::Frame::none()
+            .fill(c_panel())
+            .rounding(6.0)
+            .inner_margin(Margin::symmetric(12.0, 6.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let line = if !steps.invited {
+                        "Your server is ready. Invite a friend to start talking."
+                    } else if !steps.said_hello {
+                        "Your friend is here. Say hello."
+                    } else {
+                        "Try voice together: it takes one click."
+                    };
+                    ui.label(RichText::new(line).color(c_text()));
+                    if !steps.invited {
+                        if ui.add(primary("Invite a friend")).clicked() { click = Some(HostClick::Invite); }
+                    } else if !steps.said_hello {
+                        if let Some(name) = hello {
+                            if ui.add(secondary(&format!("Say hello in #{name}"))).clicked() { click = Some(HostClick::Hello); }
+                        }
+                    } else if !steps.tried_voice && voice && ui.add(primary("Join voice together")).clicked() {
+                        click = Some(HostClick::Voice);
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button_sized(ui, 24.0, Icon::Close, false, "Dismiss").clicked() {
+                            click = Some(HostClick::Dismiss);
+                        }
+                    });
+                });
+            });
         ui.add_space(6.0);
         return click;
     }

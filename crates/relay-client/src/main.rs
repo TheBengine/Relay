@@ -129,6 +129,11 @@ mod voice_connection;
 mod voice_jitter;
 mod voice_limiter;
 mod voice_output;
+mod voice_gate;
+mod camera_watch;
+mod click_suppression;
+#[cfg(test)]
+mod voice_test_signals;
 mod voice_preroll;
 mod voice_recovery;
 mod voice_tunnel;

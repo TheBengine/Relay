@@ -1342,13 +1342,14 @@ impl RelayApp {
         let Some(b) = self.bootstrap.clone() else {
             return;
         };
-        for (label, page) in [
-            ("Friends", SettingsTab::Friends),
-            ("Inbox", SettingsTab::Mentions),
+        for (label, page, shape) in [
+            ("Friends", SettingsTab::Friends, Icon::Users),
+            ("Inbox", SettingsTab::Mentions, Icon::Inbox),
         ] {
-            if crate::settings_ui::nav_item(
+            if icon_nav_row(
                 ui,
                 ("home-nav", page as u8),
+                shape,
                 label,
                 self.home_page == Some(page),
             )
@@ -1358,10 +1359,13 @@ impl RelayApp {
             }
         }
         ui.add_space(12.0);
+        // The same header as a server's channel categories.
         ui.horizontal(|ui| {
+            ui.add_space(14.0);
             ui.label(
                 RichText::new("DIRECT MESSAGES")
                     .size(font_size(TEXT_CAPTION))
+                    .family(egui::FontFamily::Name("Relay Semibold".into()))
                     .strong()
                     .color(c_muted()),
             );

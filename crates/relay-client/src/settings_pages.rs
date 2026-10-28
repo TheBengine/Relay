@@ -196,8 +196,13 @@ impl RelayApp {
 
     pub(super) fn close_settings(&mut self) {
         self.settings_open = false;
+        self.cameras_page_seen = false;
         self.stop_source_preview();
         self.stop_settings_mic_test();
+        // An unsaved gate draft was heard live in the call; the call keeps the saved one.
+        if let Some(media) = &self.media {
+            media.preview_gate(&self.audio_applied);
+        }
         self.defer_preferences();
     }
 
@@ -235,12 +240,14 @@ impl RelayApp {
 
     pub(super) fn settings_view(&mut self, ctx: &egui::Context) {
         let audio_before = self.prefs.audio.clone();
-        if self.settings_tab == SettingsTab::VoiceVideo
-            && !self.inventory_loaded
-            && self.inventory_rx.is_none()
-        {
+        let on_voice_video = self.settings_tab == SettingsTab::VoiceVideo;
+        if on_voice_video && !self.inventory_loaded && self.inventory_rx.is_none() {
             self.refresh_devices();
+        } else if on_voice_video && !self.cameras_page_seen {
+            // Opening the page shows cameras plugged in since the last list.
+            self.refresh_cameras();
         }
+        self.cameras_page_seen = on_voice_video;
         let before = (
             self.compact,
             self.ui_scale,
@@ -486,7 +493,9 @@ impl RelayApp {
                         }
                         let capture_bottom =
                             self.settings_scroll_bottom && self.capture_path.is_some();
-                        if self.settings_tab == SettingsTab::VoiceVideo {
+                        if self.settings_tab == SettingsTab::VoiceVideo
+                            && self.voice_video_tab == VoiceVideoTab::Voice
+                        {
                             // Pinned under the page (above Save Changes) so it stays in
                             // view while settings scroll, without pushing the title down.
                             egui::TopBottomPanel::bottom("settings-voice-delay-counter")
@@ -924,10 +933,245 @@ impl RelayApp {
             .show(ui, |ui| {
                 controls::description(ui, "Input device and Input Volume decide how loud you are. Aim for the green zone when you speak normally; the bar should never reach the right edge.");
                 controls::description(ui, "Automatic microphone volume evens out your level and keeps Relay's gain from clipping. It cannot fix a microphone that is already too loud in Windows.");
-                controls::description(ui, "Noise suppression removes steady background noise such as fans and keyboards, and adds 10 ms. Echo cancellation removes Relay's own speaker sound from your microphone; with headphones you rarely need it.");
-                controls::description(ui, "Input Mode: with voice activation, your speech must cross the marker on the meter before others hear you. With push-to-talk, you are heard only while the key is held.");
+                controls::description(ui, "Enhanced noise suppression removes background noise and keyboard and mouse clicks, and adds 10 ms. Echo cancellation removes Relay's own speaker sound from your microphone; with headphones you rarely need it.");
+                controls::description(ui, "Input Mode: with voice activation, your speech must cross the marker on the Input Sensitivity bar below before others hear you. With push-to-talk, you are heard only while the key is held.");
                 controls::description(ui, "Output device and Output Volume decide where and how loud you hear others. Receive latency and audio per packet change call delay, not this local test.");
             });
+    }
+
+    /// Discord-style Input Sensitivity: the live level the gate measures, with
+    /// the threshold drawn and dragged on that same dB scale.
+    fn input_sensitivity_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::self_listen::{db, meter_fraction, METER_FLOOR_DB};
+        use crate::voice_gate::CLOSE_RATIO;
+        controls::nav_group(ui, "INPUT SENSITIVITY");
+        let mut automatic = self.prefs.audio.automatic_sensitivity();
+        if controls::switch_row(
+            ui,
+            "automatic-input-sensitivity",
+            "Automatically determine input sensitivity",
+            "Recommended. Relay follows the quiet between your words and opens for speech.",
+            &mut automatic,
+        )
+        .changed()
+        {
+            self.prefs.audio.automatic_sensitivity = Some(automatic);
+        }
+        let now = Instant::now();
+        let reading = self.media.as_ref().and_then(MediaEngine::voice_gate_meter);
+        let (level, live) = match reading {
+            Some(reading) => self.gate_display.update(reading, now),
+            None => (0.0, false),
+        };
+        let threshold = if automatic {
+            reading.map(|r| r.threshold).filter(|t| *t > 0.0)
+        } else {
+            Some(self.prefs.audio.activation_threshold)
+        };
+        let width = ui.available_width().max(160.0);
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(width, 28.0),
+            if automatic {
+                egui::Sense::hover()
+            } else {
+                egui::Sense::click_and_drag()
+            },
+        );
+        let x = |level_db: f32| rect.left() + rect.width() * meter_fraction(level_db);
+        if !automatic {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                let picked = METER_FLOOR_DB + fraction * -METER_FLOOR_DB;
+                self.prefs.audio.activation_threshold = 10f32.powf(picked / 20.0).clamp(0.001, 0.5);
+            }
+        }
+        let close_offset_db = 20.0 * CLOSE_RATIO.log10();
+        let painter = ui.painter_at(rect);
+        let track = rect.shrink2(egui::vec2(0.0, 8.0));
+        painter.rect_filled(track, 6.0, c_card());
+        let level_db = db(level);
+        let open_db = threshold.map(db);
+        let above = open_db.is_some_and(|t| level_db >= t);
+        let fill = egui::Rect::from_min_max(track.min, egui::pos2(x(level_db), track.bottom()));
+        painter.rect_filled(
+            fill,
+            6.0,
+            if above {
+                c_good()
+            } else {
+                c_muted().gamma_multiply(0.8)
+            },
+        );
+        if let Some(open_db) = open_db {
+            let tx = x(open_db);
+            // The band where an already open gate stays open (hysteresis).
+            painter.rect_filled(
+                egui::Rect::from_x_y_ranges(x(open_db + close_offset_db)..=tx, track.y_range()),
+                0.0,
+                c_text().gamma_multiply(0.08),
+            );
+            let stroke = egui::Stroke::new(2.0_f32, if automatic { c_muted() } else { c_text() });
+            painter.line_segment(
+                [egui::pos2(tx, rect.top() + 2.0), egui::pos2(tx, rect.bottom() - 2.0)],
+                stroke,
+            );
+            if !automatic {
+                painter.circle_filled(egui::pos2(tx, rect.center().y), 7.0, c_text());
+                painter.circle_stroke(
+                    egui::pos2(tx, rect.center().y),
+                    7.0,
+                    egui::Stroke::new(1.0_f32, c_line()),
+                );
+            }
+        }
+        painter.rect_stroke(track, 6.0, egui::Stroke::new(1.0_f32, c_line()));
+        let response = if automatic {
+            response.on_hover_text("Automatic sensitivity moves this marker by itself.")
+        } else {
+            response.on_hover_text("Drag the marker. Speech louder than the marker is sent.")
+        };
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Slider,
+                open_db.map_or("Input sensitivity: automatic".to_owned(), |t| {
+                    format!("Input sensitivity {t:.0} dB")
+                }),
+            )
+        });
+        ui.horizontal_wrapped(|ui| {
+            let level_text = if !live {
+                "not measured".to_owned()
+            } else if level_db <= METER_FLOOR_DB {
+                "silent".to_owned()
+            } else {
+                format!("{level_db:.0} dB")
+            };
+            ui.label(RichText::new(format!("Level: {level_text}")).color(c_muted()));
+            if let Some(open_db) = open_db {
+                ui.label(
+                    RichText::new(format!(
+                        "· opens at {open_db:.0} dB, closes at {:.0} dB",
+                        open_db + close_offset_db
+                    ))
+                    .color(c_muted()),
+                );
+            } else {
+                ui.label(RichText::new("· the marker appears once Relay hears you").color(c_muted()));
+            }
+            if live {
+                let (text, color) = if self.muted {
+                    ("· muted", c_bad())
+                } else if reading.is_some_and(|r| r.open) {
+                    ("· transmitting", c_good())
+                } else {
+                    ("· not transmitting", c_muted())
+                };
+                ui.label(RichText::new(text).color(color));
+            }
+        });
+        if live {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        } else {
+            controls::description(
+                ui,
+                if self.voice_channel.is_some() {
+                    "Your level appears here while the call's microphone is open."
+                } else {
+                    "Click Listen to Myself above to see your level live while you move the marker."
+                },
+            );
+        }
+        if !automatic {
+            let mut threshold_db = db(self.prefs.audio.activation_threshold);
+            ui.spacing_mut().slider_width = (ui.available_width() - 140.0).max(40.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut threshold_db, -60.0..=-6.0)
+                        .step_by(1.0)
+                        .suffix(" dB")
+                        .text("Threshold"),
+                )
+                .changed()
+            {
+                self.prefs.audio.activation_threshold = 10f32.powf(threshold_db / 20.0).clamp(0.001, 0.5);
+            }
+        }
+        egui::CollapsingHeader::new("Gate timing")
+            .id_source("voice-gate-timing")
+            .show(ui, |ui| {
+                ui.spacing_mut().slider_width = (ui.available_width() - 160.0).max(40.0);
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.prefs.audio.activation_attack_ms,
+                        0..=crate::voice_gate::MAX_ATTACK_MS,
+                    )
+                    .suffix(" ms")
+                    .text("Attack"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.prefs.audio.activation_hold_ms, 0..=1000)
+                        .step_by(10.0)
+                        .suffix(" ms")
+                        .text("Hold"),
+                );
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.prefs.audio.activation_release_ms,
+                        0..=crate::voice_gate::MAX_RELEASE_MS,
+                    )
+                    .step_by(5.0)
+                    .suffix(" ms")
+                    .text("Release"),
+                );
+                controls::description(ui, "Attack fades your voice in when the gate opens. Hold keeps it open through short pauses. Release fades it out instead of cutting it off. You hear changes immediately.");
+            });
+        // Heard live in a running call; Save Changes keeps it, Reset or closing restores.
+        if self.voice_channel.is_some() {
+            if let Some(media) = &self.media {
+                media.preview_gate(&self.prefs.audio);
+            }
+        }
+    }
+
+    /// Discord-style choice: Enhanced (clicks too), Standard (RNNoise) or None.
+    fn noise_suppression_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::audio_settings::NoiseModel;
+        use crate::click_suppression::NoiseStrength;
+        controls::nav_group(ui, "NOISE SUPPRESSION");
+        let audio = &mut self.prefs.audio;
+        let mut choice = match (audio.noise_suppression, audio.noise_model) {
+            (false, _) => None,
+            (true, model) => Some(model),
+        };
+        for (option, label, body) in [
+            (Some(NoiseModel::Enhanced), "Enhanced (recommended)", "Removes background noise and keyboard and mouse clicks. Runs on this PC and adds 10 ms."),
+            (Some(NoiseModel::Standard), "Standard", "RNNoise alone: steady noise such as fans. Choose it if Enhanced ever cuts into your voice."),
+            (None, "None", "Your microphone exactly as it sounds."),
+        ] {
+            controls::radio_value(ui, ("noise-model", label), &mut choice, option, label, body);
+        }
+        audio.noise_suppression = choice.is_some();
+        if let Some(model) = choice {
+            audio.noise_model = model;
+        }
+        if choice == Some(NoiseModel::Enhanced) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Strength").color(c_muted()));
+                for strength in [NoiseStrength::Low, NoiseStrength::Normal, NoiseStrength::High] {
+                    if ui
+                        .selectable_label(audio.noise_strength == strength, strength.label())
+                        .clicked()
+                    {
+                        audio.noise_strength = strength;
+                    }
+                }
+            });
+            controls::description(ui, match audio.noise_strength {
+                NoiseStrength::Low => "Low: clicks between your words are softened; your voice is never touched.",
+                NoiseStrength::Normal => "Normal: clicks between words are removed and softened while you talk; noise that is not voice is lowered.",
+                NoiseStrength::High => "High: as quiet as possible while you game or type. Quiet word endings can sound a little thinner.",
+            });
+        }
     }
 
     fn voice_page(&mut self, ui: &mut egui::Ui) {
@@ -1002,6 +1246,71 @@ impl RelayApp {
         bluetooth_hint(ui, &self.inventory.audio, &self.prefs.audio);
         self.microphone_preview_ui(ui);
         controls::divider(ui);
+        controls::section_heading(
+            ui,
+            "Input Mode",
+            "Choose how your microphone is transmitted.",
+        );
+        for mode in [
+            TransmissionMode::VoiceActivation,
+            TransmissionMode::PushToTalk,
+            TransmissionMode::Continuous,
+        ] {
+            controls::radio_value(
+                ui,
+                ("input-mode", mode as u32),
+                &mut self.prefs.audio.transmission,
+                mode,
+                transmission_label(mode),
+                match mode {
+                    TransmissionMode::VoiceActivation => {
+                        "Automatically transmit while you are speaking."
+                    }
+                    TransmissionMode::PushToTalk => "Only transmit while your shortcut is held.",
+                    TransmissionMode::Continuous => {
+                        "Keep transmitting until you mute your microphone."
+                    }
+                },
+            );
+        }
+        if self.prefs.audio.transmission == TransmissionMode::PushToTalk {
+            self.ptt_control(ui);
+        }
+        if self.prefs.audio.transmission == TransmissionMode::VoiceActivation {
+            self.input_sensitivity_ui(ui);
+        }
+        controls::divider(ui);
+        controls::section_heading(
+            ui,
+            "Voice Processing",
+            "Clean up background noise and speaker echo.",
+        );
+        self.noise_suppression_ui(ui);
+        #[cfg(feature = "native-rtc")]
+        controls::switch_row(
+            ui,
+            "echo-cancellation",
+            "Echo Cancellation",
+            "Remove your speakers' sound from your microphone. Relay switches it on by itself once it hears your speakers in the microphone; with headphones your voice is left untouched.",
+            &mut self.prefs.audio.echo_cancellation,
+        );
+        controls::switch_row(
+            ui,
+            "automatic-microphone-volume",
+            "Keep microphone volume even",
+            "Boost quieter speech automatically and limit loud peaks.",
+            &mut self.prefs.audio.automatic_microphone_volume,
+        );
+        controls::switch_row(
+            ui,
+            "preserve-speech-start",
+            "Keep the beginning of words",
+            "Voice Activity includes the preceding 10 ms so quiet word beginnings are not cut off (20 ms with 20 ms packets). Adds that much speech delay; never records a push-to-talk lead-in.",
+            &mut self.prefs.audio.preserve_speech_start,
+        );
+        controls::divider(ui);
+        // Discord keeps network and codec choices under Advanced, after the voice basics.
+        controls::nav_group(ui, "ADVANCED");
         controls::section_heading(
             ui,
             "Receive Latency",
@@ -1086,99 +1395,6 @@ impl RelayApp {
         if self.prefs.audio.recover_packet_loss && self.prefs.audio.packet_samples() < 480 {
             controls::description(ui, "Recovery is inactive with 2.5 or 5 ms packets. Choose 10 or 20 ms packets to use it.");
         }
-        controls::divider(ui);
-        controls::section_heading(
-            ui,
-            "Input Mode",
-            "Choose how your microphone is transmitted.",
-        );
-        for mode in [
-            TransmissionMode::VoiceActivation,
-            TransmissionMode::PushToTalk,
-            TransmissionMode::Continuous,
-        ] {
-            controls::radio_value(
-                ui,
-                ("input-mode", mode as u32),
-                &mut self.prefs.audio.transmission,
-                mode,
-                transmission_label(mode),
-                match mode {
-                    TransmissionMode::VoiceActivation => {
-                        "Automatically transmit while you are speaking."
-                    }
-                    TransmissionMode::PushToTalk => "Only transmit while your shortcut is held.",
-                    TransmissionMode::Continuous => {
-                        "Keep transmitting until you mute your microphone."
-                    }
-                },
-            );
-        }
-        if self.prefs.audio.transmission == TransmissionMode::PushToTalk {
-            self.ptt_control(ui);
-        }
-        if self.prefs.audio.transmission == TransmissionMode::VoiceActivation {
-            let mut automatic = self.prefs.audio.automatic_sensitivity();
-            if ui
-                .checkbox(&mut automatic, "Automatic input sensitivity (recommended)")
-                .changed()
-            {
-                self.prefs.audio.automatic_sensitivity = Some(automatic);
-            }
-            if automatic {
-                controls::description(
-                    ui,
-                    "Picks up quieter voices and adjusts to the quiet parts between words.",
-                );
-            } else {
-                controls::section_heading(
-                    ui,
-                    "Input Sensitivity",
-                    "Lower the threshold to pick up a quieter voice.",
-                );
-                ui.spacing_mut().slider_width = (ui.available_width() - 140.0).max(40.0);
-                ui.add(
-                    egui::Slider::new(&mut self.prefs.audio.activation_threshold, 0.001..=0.2)
-                        .logarithmic(true)
-                        .suffix(" RMS"),
-                );
-            }
-        }
-        controls::divider(ui);
-        controls::section_heading(
-            ui,
-            "Voice Processing",
-            "Clean up background noise and speaker echo.",
-        );
-        controls::switch_row(
-            ui,
-            "preserve-speech-start",
-            "Keep the beginning of words",
-            "Voice Activity includes the preceding 10 ms so quiet word beginnings are not cut off (20 ms with 20 ms packets). Adds that much speech delay; never records a push-to-talk lead-in.",
-            &mut self.prefs.audio.preserve_speech_start,
-        );
-        controls::switch_row(
-            ui,
-            "automatic-microphone-volume",
-            "Keep microphone volume even",
-            "Boost quieter speech automatically and limit loud peaks.",
-            &mut self.prefs.audio.automatic_microphone_volume,
-        );
-        controls::switch_row(
-            ui,
-            "noise-suppression",
-            "Noise Suppression",
-            "Reduce steady background noise with RNNoise.",
-            &mut self.prefs.audio.noise_suppression,
-        );
-        #[cfg(feature = "native-rtc")]
-        controls::switch_row(
-            ui,
-            "echo-cancellation",
-            "Echo Cancellation",
-            "Reduce speaker audio reaching your microphone. Experimental; off by default.",
-            &mut self.prefs.audio.echo_cancellation,
-        );
         controls::divider(ui);
         controls::nav_group(ui, "GAMING FEATURES");
         ui.checkbox(
@@ -1305,44 +1521,56 @@ impl RelayApp {
         if previous_source != self.camera_source {
             self.stop_source_preview();
         }
-        egui::Frame::none()
-            .fill(c_rail())
-            .rounding(8.0)
-            .inner_margin(Margin::same(20.0))
-            .show(ui, |ui| {
-                #[cfg(feature = "native-rtc")]
-                if let Some(preview) = self
-                    .source_preview
-                    .as_ref()
-                    .filter(|preview| preview.camera)
-                {
-                    preview.show(ui);
-                    return;
-                }
-                ui.vertical_centered(|ui| {
-                    ui.add_space(24.0);
-                    ui.label(
-                        RichText::new("Camera Preview")
-                            .size(font_size(18.0))
-                            .color(c_muted()),
-                    );
-                    controls::description(ui, "Your camera opens only when you choose Test Video.");
-                    ui.add_space(24.0);
+        #[cfg(feature = "native-rtc")]
+        let active = self
+            .source_preview
+            .as_ref()
+            .is_some_and(|preview| preview.camera);
+        #[cfg(not(feature = "native-rtc"))]
+        let active = false;
+        let mut toggle = false;
+        #[cfg(feature = "native-rtc")]
+        if let Some(preview) = self.source_preview.as_ref().filter(|preview| preview.camera) {
+            preview.show(ui);
+        }
+        if !active {
+            // Discord's empty stage: the button to try the camera sits inside it.
+            let width = ui.available_width();
+            egui::Frame::none()
+                .fill(c_rail())
+                .rounding(8.0)
+                .show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(width, (width * 9.0 / 16.0).min(300.0)));
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(((width * 9.0 / 16.0).min(300.0) - 110.0).max(12.0) / 2.0);
+                        ui.label(RichText::new(if self.inventory.cameras.is_empty() {
+                            "No camera found"
+                        } else {
+                            "Check your camera"
+                        })
+                        .size(font_size(18.0))
+                        .color(c_text()));
+                        controls::description(ui, if self.inventory.cameras.is_empty() {
+                            "Plug in a camera; Relay finds it by itself."
+                        } else {
+                            "Your camera turns on only while you test it here or share it in a call."
+                        });
+                        ui.add_space(8.0);
+                        if cfg!(feature = "native-rtc")
+                            && ui
+                                .add_enabled(self.camera_source.is_some(), primary("Test Video"))
+                                .clicked()
+                        {
+                            toggle = true;
+                        }
+                    });
                 });
-            });
+        } else if ui.add(secondary("Stop Video")).clicked() {
+            toggle = true;
+        }
         #[cfg(feature = "native-rtc")]
         {
-            let active = self
-                .source_preview
-                .as_ref()
-                .is_some_and(|preview| preview.camera);
-            if ui
-                .add_enabled(
-                    active || self.camera_source.is_some(),
-                    primary(if active { "Stop Preview" } else { "Test Video" }),
-                )
-                .clicked()
-            {
+            if toggle {
                 if active {
                     self.stop_source_preview();
                 } else if let Some(source) = self

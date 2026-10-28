@@ -975,7 +975,7 @@ impl RelayApp {
                                         color: if span.style.spoiler && !spoilers_revealed {
                                             c_muted()
                                         } else if span.link.is_some() {
-                                            c_accent()
+                                            ui.visuals().hyperlink_color
                                         } else if span.style.small || span.style.quote {
                                             c_muted()
                                         } else {
@@ -995,7 +995,7 @@ impl RelayApp {
                                             Stroke::new(
                                                 1.0_f32,
                                                 if span.link.is_some() {
-                                                    c_accent()
+                                                    ui.visuals().hyperlink_color
                                                 } else {
                                                     c_text()
                                                 },

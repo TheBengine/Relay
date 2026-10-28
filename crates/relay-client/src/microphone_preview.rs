@@ -294,6 +294,53 @@ mod tests {
         )
     }
 
+
+    /// A steady voiced sound: 100 Hz with falling harmonics, one period per 10 ms.
+    fn voiced(clock: usize, amplitude: f32) -> f32 {
+        let phase = (clock % 480) as f32 / 480.0;
+        (1..=12)
+            .map(|k| (std::f32::consts::TAU * phase * k as f32).sin() / k as f32)
+            .sum::<f32>()
+            * amplitude
+            / 3.0
+    }
+
+    #[cfg(feature = "native-rtc")]
+    #[test]
+    fn listen_to_myself_with_echo_cancellation_keeps_a_steady_voice_on_headphones() {
+        // Headphones: the speaker never reaches the microphone. The only loop is
+        // Relay's own monitor, which must not become the echo reference.
+        for echo in [false, true] {
+        let mut settings = settings();
+        settings.echo_cancellation = echo;
+        let mut monitor = monitor(&settings);
+        let mut render = render(&monitor);
+        let mut clock = 0;
+        let mut output = [0.0f32; 480];
+        let mut levels = Vec::new();
+        for _ in 0..600 {
+            let block: Vec<f32> = (0..480).map(|i| voiced(clock + i, 0.1)).collect();
+            clock += 480;
+            monitor.capture.lock().unwrap().extend(block);
+            monitor.taps.take();
+            monitor.step();
+            // What the processing produced for this block (the monitored voice).
+            levels.push(monitor.taps.take().rms);
+            render(&mut output);
+        }
+        let settled = &levels[200..];
+        let (low, high) = settled
+            .chunks(5)
+            .map(|w| w.iter().sum::<f32>() / w.len() as f32)
+            .fold((f32::MAX, 0.0f32), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let input_rms = (0..48_000).map(|i| voiced(i, 0.1).powi(2)).sum::<f32>().sqrt() / 48_000f32.sqrt();
+        println!("Listen to Myself, echo {echo}, headphones: 50 ms output RMS {low:.4}..{high:.4}, input {input_rms:.4}");
+        if !echo { continue; }
+        assert!(low > input_rms * 0.7, "the monitored voice must not be cancelled or pumped: low {low:.4}");
+        assert!(high / low < 1.4, "no rise and fall: {low:.4}..{high:.4}");
+        }
+    }
+
     #[test]
     fn microphone_preview_uses_capture_processing_and_output_volume_locally() {
         let mut settings = settings();

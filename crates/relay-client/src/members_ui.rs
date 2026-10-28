@@ -76,15 +76,24 @@ impl RelayApp {
         egui::ScrollArea::vertical()
             .id_source("member-list")
             .show(ui, |ui| {
-                for admin in [true, false] {
-                    let count = b
-                        .members
+                // Discord: the owner first, then everyone online, then offline.
+                let online = |id: &str| {
+                    b.presence
                         .iter()
-                        .filter(|m| {
-                            (m.role == "admin") == admin
-                                && group_members.as_ref().is_none_or(|ids| ids.contains(&m.id))
-                        })
-                        .count();
+                        .find(|p| p.user_id == id)
+                        .is_some_and(|p| p.status != "offline")
+                        || id == b.user.id
+                };
+                let in_group = |group: usize, m: &relay_protocol::User| {
+                    group_members.as_ref().is_none_or(|ids| ids.contains(&m.id))
+                        && match group {
+                            0 => m.role == "admin" && online(&m.id),
+                            1 => m.role != "admin" && online(&m.id),
+                            _ => !online(&m.id),
+                        }
+                };
+                for group in 0..3 {
+                    let count = b.members.iter().filter(|m| in_group(group, m)).count();
                     if count == 0 {
                         continue;
                     }
@@ -92,7 +101,7 @@ impl RelayApp {
                     ui.label(
                         RichText::new(format!(
                             "{} — {count}",
-                            if admin { "SERVER OWNER" } else { "MEMBERS" }
+                            ["SERVER OWNER", "ONLINE", "OFFLINE"][group]
                         ))
                         .size(font_size(TEXT_CAPTION))
                         .family(egui::FontFamily::Name("Relay Semibold".into()))
@@ -100,10 +109,7 @@ impl RelayApp {
                         .color(c_muted()),
                     );
                     ui.add_space(6.0);
-                    for user in b.members.iter().filter(|m| {
-                        (m.role == "admin") == admin
-                            && group_members.as_ref().is_none_or(|ids| ids.contains(&m.id))
-                    }) {
+                    for user in b.members.iter().filter(|m| in_group(group, m)) {
                         let texture = self.avatar_texture(user);
                         let response = user_row(ui, user, false, 0, 0, false, texture.as_ref());
                         match &group_channel {

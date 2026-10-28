@@ -99,7 +99,13 @@ impl AppearanceSettings {
         visuals.extreme_bg_color = colors.rail;
         visuals.faint_bg_color = colors.hover_message;
         visuals.code_bg_color = colors.card;
-        visuals.hyperlink_color = colors.accent;
+        // Discord's link blue: 7:1 on the dark backgrounds, where the accent
+        // itself is under 4.5:1 as text.
+        visuals.hyperlink_color = if colors.dark_mode {
+            Color32::from_rgb(0, 168, 252)
+        } else {
+            Color32::from_rgb(0, 98, 204)
+        };
         visuals.error_fg_color = colors.bad;
         visuals.window_stroke = Stroke::new(1.0_f32, colors.line);
         visuals.window_rounding = Rounding::same(15.0);

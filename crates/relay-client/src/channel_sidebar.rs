@@ -97,9 +97,11 @@ impl RelayApp {
                     .frame(egui::Frame::none().inner_margin(Margin::symmetric(16.0, 9.0)))
                     .show_inside(ui, |ui| {
                         ui.horizontal(|ui| {
-                            let heading = ui.add_sized(
-                                [ui.available_width() - 40.0, 30.0],
-                                egui::Label::new(
+                            // Left-aligned like Discord; add_sized would centre the label.
+                            let heading = ui.allocate_ui_with_layout(
+                                Vec2::new(ui.available_width() - 40.0, 30.0),
+                                Layout::left_to_right(Align::Center),
+                                |ui| ui.add(egui::Label::new(
                                     RichText::new(if self.selected_nav {
                                         &b.server_name
                                     } else {
@@ -110,8 +112,9 @@ impl RelayApp {
                                     .strong(),
                                 )
                                 .truncate(true)
-                                .sense(Sense::click()),
-                            );
+                                .sense(Sense::click())),
+                            )
+                            .inner;
                             if self.selected_nav && heading.clicked() {
                                 self.server_menu = !self.server_menu;
                             }
@@ -297,51 +300,68 @@ impl RelayApp {
                                     }
                                 });
                             });
-                            if self.source_active(false) || self.source_starting(false) {
-                                ui.horizontal(|ui| {
-                                    dot(ui, c_good(), 3.0);
-                                    ui.label(
-                                        RichText::new(if self.source_starting(false) {
-                                            "Opening source…"
-                                        } else {
-                                            "Sharing screen"
-                                        })
-                                        .size(font_size(TEXT_CAPTION))
-                                        .color(c_good()),
+                            // Discord's row under "Voice Connected": camera and screen
+                            // share are always one click away, lit while they run.
+                            ui.add_space(4.0);
+                            let ready = self.voice_ready();
+                            let mut toggle = None;
+                            ui.columns(2, |columns| {
+                                for (column, camera) in columns.iter_mut().zip([true, false]) {
+                                    let starting = self.source_starting(camera);
+                                    let active = self.source_active(camera) || starting;
+                                    let label = match (camera, active) {
+                                        (true, false) => "Turn on camera",
+                                        (true, true) if starting => "Opening camera…",
+                                        (true, true) => "Turn off camera",
+                                        (false, false) => "Share your screen",
+                                        (false, true) if starting => "Opening source…",
+                                        (false, true) => "Stop sharing",
+                                    };
+                                    let enabled = ready || active;
+                                    let (rect, response) = column.allocate_exact_size(
+                                        Vec2::new(column.available_width(), 32.0),
+                                        if enabled { Sense::click() } else { Sense::hover() },
                                     );
-                                    if ui
-                                        .small_button("Stop")
-                                        .on_hover_text(
-                                            "Stop sharing your screen, from any conversation",
-                                        )
-                                        .clicked()
-                                    {
-                                        self.stop_capture(false);
+                                    let fill = if active {
+                                        c_good()
+                                    } else if response.hovered() && enabled {
+                                        c_text().gamma_multiply(0.18)
+                                    } else {
+                                        c_hover()
+                                    };
+                                    column.painter().rect_filled(rect, 6.0, fill);
+                                    if response.has_focus() {
+                                        column.painter().rect_stroke(rect, 6.0, Stroke::new(2.0_f32, c_accent()));
                                     }
-                                });
-                            }
-                            if self.source_active(true) || self.source_starting(true) {
-                                ui.horizontal(|ui| {
-                                    dot(ui, c_good(), 3.0);
-                                    ui.label(
-                                        RichText::new(if self.source_starting(true) {
-                                            "Opening camera…"
+                                    draw_icon(
+                                        column.painter(),
+                                        egui::Rect::from_center_size(rect.center(), Vec2::splat(18.0)),
+                                        if camera { Icon::Camera } else { Icon::Screen },
+                                        if active {
+                                            Color32::WHITE
+                                        } else if enabled {
+                                            c_text()
                                         } else {
-                                            "Camera on"
-                                        })
-                                        .size(font_size(TEXT_CAPTION))
-                                        .color(c_good()),
+                                            c_muted()
+                                        },
                                     );
-                                    if ui
-                                        .small_button("Stop")
-                                        .on_hover_text(
-                                            "Turn your camera off, from any conversation",
-                                        )
-                                        .clicked()
-                                    {
-                                        self.stop_capture(true);
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::labeled(egui::WidgetType::Button, label)
+                                    });
+                                    let response = if enabled {
+                                        response.on_hover_text(label)
+                                    } else {
+                                        response.on_hover_text("Available once voice is connected")
+                                    };
+                                    if enabled && response.clicked() {
+                                        toggle = Some(camera);
                                     }
-                                });
+                                }
+                            });
+                            match toggle {
+                                Some(true) => self.camera_toggle(),
+                                Some(false) => self.screen_toggle(),
+                                None => {}
                             }
                             ui.add_space(6.0);
                             ui.separator();
@@ -418,9 +438,7 @@ impl RelayApp {
                                     );
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         if b.has_permission(PERMISSION_CHANNELS)
-                                            && ui
-                                                .small_button("+")
-                                                .on_hover_text("Create channel")
+                                            && icon_button_sized(ui, 22.0, Icon::Plus, false, "Create channel")
                                                 .clicked()
                                         {
                                             self.channel_kind =
