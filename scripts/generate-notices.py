@@ -180,6 +180,15 @@ def main():
                   "Source: https://github.com/danielmiessler/SecLists/tree/913b327317496d062bcc7cace524aaad8a693be2\n"
                   "Used only for offline new-password checks; see assets/security/common-passwords.provenance.json.\n\n"
                   + (package / 'assets/security/LICENSE-SecLists.txt').read_text(encoding='utf-8'))
+    # The DPDFNet models are embedded in relay.exe (Studio noise suppression);
+    # they are not a Cargo dependency, so their Apache-2.0 text is added here.
+    models = package / 'vendor/models/dpdfnet'
+    blocks.append("\n" + "=" * 72 + "\nDPDFNet speech enhancement models (dpdfnet8_48khz_hr, dpdfnet2_48khz_hr)\n"
+                  "License: Apache-2.0\nPublished by Ceva (Ceva-IP); upstream supplies no separate copyright notice.\n"
+                  "Source: https://huggingface.co/Ceva-IP/DPDFNet (revision dd6818d00f50c836fed43a6243ebe49116de5964), "
+                  "https://github.com/ceva-ip/DPDFNet\n"
+                  "Embedded unmodified in relay.exe for Studio noise suppression; see vendor/models/dpdfnet/README.md.\n\n"
+                  "--- LICENSE ---\n" + (models / 'LICENSE').read_text(encoding='utf-8'))
     # Stable CRLF output matches the existing Windows notice artifact.
     content = '\n'.join(line.rstrip() for line in '\n'.join(blocks).splitlines()).rstrip() + '\n'
     args.output.write_bytes(content.replace('\n', '\r\n').encode('utf-8'))

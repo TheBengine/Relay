@@ -97,6 +97,7 @@ mod message_format;
 mod native_invitation_wake;
 mod native_render_probe;
 mod network;
+mod dpdfnet;
 mod noise_suppressor;
 mod notifications;
 mod online_gifs;

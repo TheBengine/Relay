@@ -2303,6 +2303,10 @@ fn concurrent_distinct_revision_markers_do_not_observe_older_writes() {
                 uuid::Uuid::new_v4()
             );
             let url = format!("https://{}.relay-test.invalid", uuid::Uuid::new_v4());
+            // This test is about Windows' own vault; both entries go when the
+            // thread ends, also if it panics.
+            let _marker = protected::test_vault::RealVaultEntry::marker(&binding);
+            let _session = crate::credential_vault::real_vault_session_for_test(&url);
             let session = relay_protocol::Session {
                 token: "owned-concurrent-vault-fixture".into(),
                 user: relay_protocol::User {
@@ -2346,12 +2350,29 @@ fn concurrent_distinct_revision_markers_do_not_observe_older_writes() {
     );
 }
 
+/// Tests never leave a checkpoint marker in Windows Credential Manager:
+/// without a `RealVaultEntry` it stays in this process's memory.
+#[test]
+fn checkpoint_markers_stay_out_of_the_windows_vault_in_tests() {
+    let pair = Pair::new();
+    let binding = pair.alice.as_ref().unwrap().binding();
+    let revision = protected::head(&binding).unwrap().unwrap();
+    assert!(revision > 0);
+    {
+        let _real = protected::test_vault::RealVaultEntry::marker(&binding);
+        assert_eq!(protected::head(&binding).unwrap(), None, "the marker reached the Windows vault");
+    }
+    assert_eq!(protected::head(&binding).unwrap(), Some(revision));
+}
+
 #[test]
 fn revision_marker_rejects_equal_or_older_writes() {
     let binding = format!(
         "Relay/crypto/v1/{}/marker-counter-fixture",
         uuid::Uuid::new_v4()
     );
+    // Checked against Windows' own vault; the entry goes when the test ends.
+    let _real = protected::test_vault::RealVaultEntry::marker(&binding);
     protected::set_head(&binding, 7, "marker-fixture-device").unwrap();
     assert!(protected::check_identity(&binding, "marker-fixture-device").is_ok());
     assert!(protected::check_identity(&binding, "retired-fixture-device").is_err());

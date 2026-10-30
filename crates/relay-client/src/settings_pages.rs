@@ -1133,7 +1133,8 @@ impl RelayApp {
         }
     }
 
-    /// Discord-style choice: Enhanced (clicks too), Standard (RNNoise) or None.
+    /// Discord-style choice: Enhanced (clicks too), Standard (RNNoise), Studio
+    /// (DPDFNet: music and other voices too, 60 ms) or None.
     fn noise_suppression_ui(&mut self, ui: &mut egui::Ui) {
         use crate::audio_settings::NoiseModel;
         use crate::click_suppression::NoiseStrength;
@@ -1146,6 +1147,7 @@ impl RelayApp {
         for (option, label, body) in [
             (Some(NoiseModel::Enhanced), "Enhanced (recommended)", "Removes background noise and keyboard and mouse clicks. Runs on this PC and adds 10 ms."),
             (Some(NoiseModel::Standard), "Standard", "RNNoise alone: steady noise such as fans. Choose it if Enhanced ever cuts into your voice."),
+            (Some(NoiseModel::Studio), "Studio", "Also removes music, other people talking and fans, and leaves your voice as it is. Others hear you about 50 ms later than with Enhanced, and it uses more of this PC's processor."),
             (None, "None", "Your microphone exactly as it sounds."),
         ] {
             controls::radio_value(ui, ("noise-model", label), &mut choice, option, label, body);

@@ -11,8 +11,9 @@ pub enum TransmissionMode {
     PushToTalk = 2,
 }
 
-/// Enhanced adds WebRTC noise suppression, click removal and voice isolation
-/// around RNNoise; Standard is RNNoise alone, as before.
+/// Enhanced adds click removal and voice isolation to RNNoise; Standard is
+/// RNNoise alone, as before; Studio is DPDFNet, which also removes music and
+/// other voices at 60 ms (`docs/audio-studio-level-20261030.md`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u32)]
@@ -20,6 +21,26 @@ pub enum NoiseModel {
     #[default]
     Enhanced = 0,
     Standard = 1,
+    Studio = 2,
+}
+
+impl NoiseModel {
+    pub(crate) fn from_u32(value: u32) -> Self {
+        match value {
+            1 => Self::Standard,
+            2 => Self::Studio,
+            _ => Self::Enhanced,
+        }
+    }
+
+    /// How late the suppressor's output follows its input.
+    pub(crate) fn suppression_ms(self) -> u32 {
+        let samples = match self {
+            Self::Enhanced | Self::Standard => nnnoiseless::DenoiseState::FRAME_SIZE,
+            Self::Studio => crate::dpdfnet::DELAY_SAMPLES,
+        };
+        samples as u32 * 1000 / relay_protocol::AUDIO_SAMPLE_RATE
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -366,10 +387,11 @@ impl AudioSettings {
             } else {
                 settings.packet_duration_ms()
             },
-            // RNNoise's overlap/add synthesis retains one 480-sample block.
+            // RNNoise's overlap/add synthesis retains one 480-sample block;
+            // DPDFNet looks four blocks ahead, adds its own overlap/add, and
+            // its thread hands each block back one block later.
             suppression_ms: if settings.noise_suppression {
-                (nnnoiseless::DenoiseState::FRAME_SIZE as u32 * 1000)
-                    / relay_protocol::AUDIO_SAMPLE_RATE
+                settings.noise_model.suppression_ms()
             } else {
                 0
             },
@@ -528,6 +550,39 @@ mod tests {
         assert_eq!((chosen.noise_model, chosen.noise_strength), (super::NoiseModel::Standard, crate::click_suppression::NoiseStrength::High));
         let text = serde_json::to_string(&chosen).unwrap();
         assert!(text.contains(r#""noise_model":"standard""#) && text.contains(r#""noise_strength":"high""#));
+    }
+
+    #[test]
+    fn studio_is_a_third_noise_model_and_older_files_still_load() {
+        use super::{AudioSettings, NoiseModel};
+        // Files written before Studio existed: every value they can hold.
+        for (text, model) in [
+            (r#"{}"#, NoiseModel::Enhanced),
+            (r#"{"noise_suppression":true}"#, NoiseModel::Enhanced),
+            (r#"{"noise_model":"enhanced","noise_strength":"low"}"#, NoiseModel::Enhanced),
+            (r#"{"noise_model":"standard"}"#, NoiseModel::Standard),
+        ] {
+            let old: AudioSettings = serde_json::from_str(text).unwrap();
+            assert_eq!(old.noise_model, model, "{text}");
+        }
+        assert_eq!(AudioSettings::default().noise_model, NoiseModel::Enhanced);
+        let studio: AudioSettings = serde_json::from_str(r#"{"noise_model":"studio"}"#).unwrap();
+        assert_eq!(studio.noise_model, NoiseModel::Studio);
+        assert!(serde_json::to_string(&studio).unwrap().contains(r#""noise_model":"studio""#));
+        for model in [NoiseModel::Enhanced, NoiseModel::Standard, NoiseModel::Studio] {
+            assert_eq!(NoiseModel::from_u32(model as u32), model);
+        }
+        // Studio: 40 ms of look-ahead and 10 ms of hand-off to its thread on
+        // top of the 10 ms the others have.
+        let budget = |model| {
+            AudioSettings { noise_model: model, ..Default::default() }
+                .voice_delay_budget()
+                .suppression_ms
+        };
+        assert_eq!(
+            (budget(NoiseModel::Enhanced), budget(NoiseModel::Standard), budget(NoiseModel::Studio)),
+            (10, 10, 60)
+        );
     }
 
     #[test]

@@ -476,6 +476,17 @@ pub(crate) fn forget_central_session(issuer: &str, client_id: &str) -> Result<()
     }
 }
 
+/// Opts this URL's remembered login into the real Windows vault for one test
+/// (tests otherwise keep it in memory); the entry is deleted on drop.
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn real_vault_session_for_test(
+    url: &str,
+) -> crate::e2ee::protected::test_vault::RealVaultEntry {
+    crate::e2ee::protected::test_vault::RealVaultEntry::new(
+        session_target(url, profile().as_deref()).unwrap(),
+    )
+}
+
 #[cfg(target_os = "windows")]
 fn profile() -> Option<std::ffi::OsString> {
     // A normal profile moved to a chosen folder keeps its saved-login names.
@@ -494,8 +505,15 @@ mod native {
     fn wide(target: &str) -> Vec<u16> {
         target.encode_utf16().chain(Some(0)).collect()
     }
+    #[cfg(test)]
+    use crate::e2ee::protected::test_vault;
     pub(super) fn save(target: &str, user: &str, mut bytes: Vec<u8>) -> Result<(), String> {
         let result = crate::e2ee::protected::with_credential_lock(|| {
+            #[cfg(test)]
+            if test_vault::in_memory(target) {
+                return test_vault::write(target, &bytes)
+                    .map_err(|()| "Windows could not save the remembered login.".to_string());
+            }
             let mut target = wide(target);
             let mut username: Vec<_> = user.encode_utf16().chain(Some(0)).collect();
             let credential = CREDENTIALW {
@@ -515,6 +533,15 @@ mod native {
     }
     pub(super) fn load(target: &str) -> Result<Option<Vec<u8>>, String> {
         crate::e2ee::protected::with_credential_lock(|| {
+            #[cfg(test)]
+            if test_vault::in_memory(target) {
+                return match test_vault::read(target) {
+                    Some(bytes) if bytes.len() > 4096 => {
+                        Err("The remembered login is invalid.".to_string())
+                    }
+                    found => Ok(found),
+                };
+            }
             let target = wide(target);
             let mut credential = std::ptr::null_mut();
             let result = unsafe {
@@ -550,6 +577,11 @@ mod native {
     }
     pub(super) fn forget(target: &str) -> Result<(), String> {
         crate::e2ee::protected::with_credential_lock(|| {
+            #[cfg(test)]
+            if test_vault::in_memory(target) {
+                test_vault::delete(target);
+                return Ok(());
+            }
             let target = wide(target);
             match unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, 0) } {
                 Ok(()) => Ok(()),
@@ -755,6 +787,28 @@ mod tests {
         value["version"] = serde_json::json!(2);
         assert!(decode_replica(&own, &serde_json::to_vec(&value).unwrap()).is_err());
     }
+    /// Tests never leave a remembered login in Windows Credential Manager:
+    /// without a `RealVaultEntry` it stays in this process's memory.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn remembered_logins_stay_out_of_the_windows_vault_in_tests() {
+        let url = format!("https://{}.relay-test.invalid", uuid::Uuid::new_v4());
+        let session = Session {
+            token: "synthetic-memory-fixture".into(),
+            user: relay_protocol::User {
+                id: "fixture-user".into(),
+                ..Default::default()
+            },
+        };
+        save(&url, "6f6087b7-a4a8-4dba-b4c5-58bf76b59d6b", &session).unwrap();
+        assert_eq!(load(&url).unwrap().unwrap().session.token, session.token);
+        {
+            let _real = real_vault_session_for_test(&url);
+            assert!(load(&url).unwrap().is_none(), "the login reached the Windows vault");
+        }
+        forget(&url).unwrap();
+        assert!(load(&url).unwrap().is_none());
+    }
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "writes and removes only a uniquely named synthetic Relay test credential in the OS vault"]
@@ -768,6 +822,7 @@ mod tests {
             },
         };
         let pin = "6f6087b7-a4a8-4dba-b4c5-58bf76b59d6b";
+        let _real = real_vault_session_for_test(&url);
         save(&url, pin, &session).unwrap();
         let found = load(&url).unwrap().unwrap();
         assert_eq!(found.session.token, session.token);

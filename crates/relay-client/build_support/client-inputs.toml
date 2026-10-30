@@ -6,6 +6,10 @@ workspace_files = [
   ".cargo/config.toml",
   "scripts/prepare-webrtc.ps1",
   "vendor/relay-frame-crypto/frame_crypto_transformer.cc",
+  "vendor/models/dpdfnet/LICENSE",
+  "vendor/models/dpdfnet/README.md",
+  "vendor/models/dpdfnet/dpdfnet2_48khz_hr.onnx",
+  "vendor/models/dpdfnet/dpdfnet8_48khz_hr.onnx",
 ]
 
 [packages."crates/relay-client"]

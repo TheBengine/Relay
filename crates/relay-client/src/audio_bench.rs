@@ -21,7 +21,8 @@ pub const RATE: usize = 48_000;
 pub const BLOCK: usize = 480;
 /// Length of every corpus item.
 pub const SECONDS: f32 = 10.0;
-/// Longest delay the bench looks for: 30 ms.
+/// Longest delay the bench looks for in a chain that declares none: 30 ms.
+/// A chain that declares a delay is searched around it instead, however long.
 pub const MAX_DELAY_SAMPLES: usize = 1_440;
 
 // ---------------------------------------------------------------- chains
@@ -111,24 +112,21 @@ impl SendChain for CurrentChain {
 /// A chain the bench can build afresh for every corpus item.
 pub struct ChainSpec {
     pub name: &'static str,
-    pub make: fn() -> Box<dyn SendChain>,
+    pub make: Box<dyn Fn() -> Box<dyn SendChain>>,
+}
+
+impl ChainSpec {
+    pub fn new(name: &'static str, make: impl Fn() -> Box<dyn SendChain> + 'static) -> Self {
+        Self { name, make: Box::new(make) }
+    }
 }
 
 /// Every chain the bench measures, in table order. Add candidates here.
 pub fn chains() -> Vec<ChainSpec> {
     vec![
-        ChainSpec {
-            name: "none",
-            make: || Box::new(Passthrough),
-        },
-        ChainSpec {
-            name: "rnnoise",
-            make: || Box::new(CurrentChain::rnnoise()),
-        },
-        ChainSpec {
-            name: "rnnoise+enhanced",
-            make: || Box::new(CurrentChain::rnnoise_enhanced()),
-        },
+        ChainSpec::new("none", || Box::new(Passthrough)),
+        ChainSpec::new("rnnoise", || Box::new(CurrentChain::rnnoise())),
+        ChainSpec::new("rnnoise+enhanced", || Box::new(CurrentChain::rnnoise_enhanced())),
     ]
     .into_iter()
     .chain(crate::noise_suppressor::bench::chains())
@@ -447,13 +445,19 @@ impl CorpusItem {
     }
 }
 
-/// The seven bench rows, synthesized deterministically (fixed seeds), all
-/// 10 s of 48 kHz mono. See `bench-corpus/README.md`.
+/// The eleven bench rows, synthesized deterministically (fixed seeds), all
+/// 10 s of 48 kHz mono (or the length of `VOICE_TEST_WAV`). See
+/// `bench-corpus/README.md`.
 pub fn corpus() -> Vec<CorpusItem> {
-    let len = samples_for(SECONDS);
     // The talker and seed of `enhanced_noise_suppression_removes_the_clicks_rnnoise_lets_through`.
-    let speech = talker(SECONDS, (105.0, 135.0), 13, 0.3);
-    let fan_noise = {
+    let synthetic = talker(SECONDS, (105.0, 135.0), 13, 0.3);
+    // A recorded voice replaces it, at its own length (every row follows).
+    let speech = match std::env::var_os("VOICE_TEST_WAV") {
+        Some(path) => recorded_talker(Path::new(&path), active_power(&synthetic)),
+        None => synthetic,
+    };
+    let len = speech.len();
+    let fan_noise: Vec<f32> = {
         let fan = fan(len, 41);
         let mouse = mouse_train(len, (0.6, 1.1), 42);
         fan.iter().zip(&mouse).map(|(f, m)| f + m * 8.0).collect()
@@ -466,8 +470,13 @@ pub fn corpus() -> Vec<CorpusItem> {
         mix("keyboard_between_words", &speech, keyboard(&speech, false, 21).0, 10.0),
         mix("keyboard_during_speech", &speech, keyboard(&speech, true, 22).0, 10.0),
         mix("mouse_clicks", &speech, mouse_train(len, (0.23, 0.27), 31), 15.0),
-        mix("fan_plus_mouse", &speech, fan_noise, 5.0),
+        mix("fan_plus_mouse", &speech, fan_noise.clone(), 5.0),
+        // The same fan and mouse, quieter: a fan further from the microphone.
+        mix("fan_plus_mouse_15", &speech, fan_noise.clone(), 15.0),
+        mix("fan_plus_mouse_10", &speech, fan_noise, 10.0),
         mix("music_bed", &speech, music_bed(len, 51), 5.0),
+        // The same music, quieter: background music in a real room.
+        mix("music_bed_12", &speech, music_bed(len, 51), 12.0),
         mix("second_talker", &speech, second_talker(len), 0.0),
         CorpusItem {
             name: "silence_floor",
@@ -475,7 +484,45 @@ pub fn corpus() -> Vec<CorpusItem> {
             noise: laptop.iter().map(|s| s * floor_level / laptop_rms).collect(),
             snr_db: f32::NAN,
         },
+        // No noise at all: does the chain leave a voice alone?
+        CorpusItem {
+            name: "clean_voice",
+            noise: vec![0.0; len],
+            clean: speech,
+            snr_db: f32::NAN,
+        },
     ]
+}
+
+/// A recorded 48 kHz mono 16-bit WAV, cut to whole blocks and scaled to
+/// `active` so that the gain, gate and SNR figures start from the same speech
+/// level as the synthetic talker. Its pauses must already be digital silence
+/// (see `docs/audio-deepfilter-decision-20261029.md`), as the talker's are:
+/// the keyboard row and the pause metrics look for them.
+fn recorded_talker(path: &Path, active: f64) -> Vec<f32> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("VOICE_TEST_WAV {}: {e}", path.display()));
+    let field = |at: usize, width: usize| bytes[at..at + width].iter().rev().fold(0usize, |v, b| v << 8 | *b as usize);
+    assert!(&bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE", "VOICE_TEST_WAV must be a WAV file");
+    let (mut at, mut format, mut samples) = (12, None, None);
+    while at + 8 <= bytes.len() {
+        let size = field(at + 4, 4);
+        match &bytes[at..at + 4] {
+            b"fmt " => format = Some((field(at + 8, 2), field(at + 10, 2), field(at + 12, 4), field(at + 22, 2))),
+            b"data" => samples = Some(&bytes[at + 8..(at + 8 + size).min(bytes.len())]),
+            _ => {}
+        }
+        at += 8 + size + size % 2;
+    }
+    assert_eq!(format, Some((1, 1, RATE, 16)), "VOICE_TEST_WAV must be 48 kHz mono 16-bit PCM");
+    let mut speech: Vec<f32> = samples
+        .expect("VOICE_TEST_WAV has no data chunk")
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32_768.0)
+        .collect();
+    speech.truncate(speech.len() / BLOCK * BLOCK);
+    let scale = (active / active_power(&speech)).sqrt() as f32;
+    speech.iter_mut().for_each(|s| *s *= scale);
+    speech
 }
 
 fn samples_for(seconds: f32) -> usize {
@@ -747,7 +794,7 @@ fn music_bed(len: usize, seed: u32) -> Vec<f32> {
 /// A second person in the room: the synthetic talker with a different voice,
 /// generated at double speed and stretched to half speed (and half pitch).
 fn second_talker(len: usize) -> Vec<f32> {
-    let fast = talker(SECONDS / 2.0, (260.0, 340.0), 77, 0.3);
+    let fast = talker(len as f32 / RATE as f32 / 2.0, (260.0, 340.0), 77, 0.3);
     (0..len)
         .map(|index| {
             let position = index as f32 * 0.5;
@@ -782,6 +829,7 @@ struct ChainReport {
     declared_delay_ms: f32,
     measured_delay_ms: f32,
     cpu_ms_per_block_mean: f32,
+    cpu_ms_per_block_p50: f32,
     cpu_ms_per_block_p99: f32,
     cpu_ms_per_block_max: f32,
     rows: Vec<RowReport>,
@@ -812,7 +860,12 @@ pub(crate) fn output_directory() -> PathBuf {
         .join("audio-bench")
 }
 
-fn write_wav(path: &Path, samples: &[f32]) -> std::io::Result<()> {
+/// A chain name as part of a file name (`replay:x` -> `replay_x`).
+pub(crate) fn file_stem(chain: &str) -> String {
+    chain.replace(|c: char| r#"<>:"/\|?*"#.contains(c), "_")
+}
+
+pub(crate) fn write_wav(path: &Path, samples: &[f32]) -> std::io::Result<()> {
     let data = (samples.len() * 2) as u32;
     let mut bytes = Vec::with_capacity(44 + data as usize);
     bytes.extend_from_slice(b"RIFF");
@@ -838,6 +891,12 @@ const USAGE: &str = "audio-bench [--chain NAME]... [--write-wav]
 Runs the noise corpus through each send chain and prints a Markdown table.
   --chain NAME   only this chain (repeatable); default: all
   --write-wav    also write the corpus and every chain's output as WAV
+  --input-16bit  feed every chain the 16-bit samples the corpus WAVs hold,
+                 as an outside tool behind a replay chain was fed
+Environment:
+  VOICE_TEST_WAV=<48 kHz mono 16-bit WAV>  a recorded talker for every row
+  RELAY_REPLAY_DIR=<folder>  one chain `replay:<label>` per subfolder <label>
+                 (see noise_suppressor::bench::Replay)
 Results: target/audio-bench/<chain>.json";
 
 /// Entry point of the `audio-bench` binary. Returns the process exit code.
@@ -849,6 +908,7 @@ pub fn run_cli() -> i32 {
     }
     let mut wanted = Vec::new();
     let mut write_wavs = false;
+    let mut input_16bit = false;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -860,6 +920,7 @@ pub fn run_cli() -> i32 {
                 }
             },
             "--write-wav" => write_wavs = true,
+            "--input-16bit" => input_16bit = true,
             other => {
                 eprintln!("Unknown argument {other}\n{USAGE}");
                 return 2;
@@ -883,6 +944,17 @@ pub fn run_cli() -> i32 {
     }
     let corpus = corpus();
     let noisy: Vec<Vec<f32>> = corpus.iter().map(CorpusItem::noisy).collect();
+    // What each chain is fed: the corpus, or the corpus as `write_wav` stores
+    // it. Metrics always compare with the exact clean speech.
+    let as_fed = |samples: &[f32]| -> Vec<f32> {
+        if input_16bit {
+            samples.iter().map(|v| (v.clamp(-1.0, 1.0) * 32767.0).round() / 32768.0).collect()
+        } else {
+            samples.to_vec()
+        }
+    };
+    let fed_noisy: Vec<Vec<f32>> = noisy.iter().map(|v| as_fed(v)).collect();
+    let fed_clean: Vec<Vec<f32>> = corpus.iter().map(|item| as_fed(&item.clean)).collect();
     if write_wavs {
         for (item, noisy) in corpus.iter().zip(&noisy) {
             for (suffix, samples) in [("clean", &item.clean), ("noise", &item.noise), ("noisy", noisy)] {
@@ -908,7 +980,7 @@ pub fn run_cli() -> i32 {
         let reference = &corpus[0].clean;
         let mut chain = (spec.make)();
         assert_eq!(chain.name(), spec.name, "chain list and chain disagree");
-        let declared = run_chain(&mut *chain, reference);
+        let declared = run_chain(&mut *chain, &fed_clean[0]);
         let declared_samples = chain.algorithmic_delay_samples();
         let measured = if declared_samples == 0 {
             measure_delay_samples(reference, &declared.output, MAX_DELAY_SAMPLES)
@@ -917,18 +989,18 @@ pub fn run_cli() -> i32 {
                 reference,
                 &declared.output,
                 declared_samples.saturating_sub(DELAY_SEARCH_SAMPLES),
-                (declared_samples + DELAY_SEARCH_SAMPLES).min(MAX_DELAY_SAMPLES),
+                declared_samples + DELAY_SEARCH_SAMPLES,
             )
         };
         let mut rows = Vec::new();
         let mut all_blocks = Vec::new();
-        for (item, noisy) in corpus.iter().zip(&noisy) {
-            let processed = run_chain(&mut *(spec.make)(), noisy);
-            let processed_clean = run_chain(&mut *(spec.make)(), &item.clean);
+        for (index, (item, noisy)) in corpus.iter().zip(&noisy).enumerate() {
+            let processed = run_chain(&mut *(spec.make)(), &fed_noisy[index]);
+            let processed_clean = run_chain(&mut *(spec.make)(), &fed_clean[index]);
             let m = metrics(&item.clean, noisy, &processed.output, measured);
             let leak = speech_noise_leak_db(&item.clean, noisy, &processed.output, &processed_clean.output, measured);
             if write_wavs {
-                let path = wav_directory.join(format!("{}.{}.wav", item.name, spec.name));
+                let path = wav_directory.join(format!("{}.{}.wav", item.name, file_stem(spec.name)));
                 if let Err(error) = write_wav(&path, &processed.output) {
                     eprintln!("Cannot write {}: {error}", path.display());
                     return 1;
@@ -948,6 +1020,7 @@ pub fn run_cli() -> i32 {
         }
         let mean = all_blocks.iter().sum::<f32>() / all_blocks.len().max(1) as f32;
         let max = all_blocks.iter().fold(0.0f32, |m, v| m.max(*v));
+        let p50 = percentile(&mut all_blocks, 0.5);
         let p99 = percentile(&mut all_blocks, 0.99);
         let report = ChainReport {
             chain: spec.name,
@@ -957,11 +1030,12 @@ pub fn run_cli() -> i32 {
             declared_delay_ms: declared.delay_ms,
             measured_delay_ms: measured as f32 * 1000.0 / RATE as f32,
             cpu_ms_per_block_mean: mean,
+            cpu_ms_per_block_p50: p50,
             cpu_ms_per_block_p99: p99,
             cpu_ms_per_block_max: max,
             rows,
         };
-        let path = directory.join(format!("{}.json", spec.name));
+        let path = directory.join(format!("{}.json", file_stem(spec.name)));
         let json = serde_json::to_string_pretty(&report).expect("bench report serializes");
         if let Err(error) = std::fs::write(&path, json) {
             eprintln!("Cannot write {}: {error}", path.display());
@@ -995,15 +1069,16 @@ fn print_tables(reports: &[ChainReport]) {
             );
         }
     }
-    println!("\n| chain | declared delay (ms) | measured delay (ms) | CPU mean (ms / 10 ms block) | CPU p99 | CPU max |");
-    println!("| --- | ---: | ---: | ---: | ---: | ---: |");
+    println!("\n| chain | declared delay (ms) | measured delay (ms) | CPU mean (ms / 10 ms block) | CPU p50 | CPU p99 | CPU max |");
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
     for report in reports {
         println!(
-            "| {} | {:.2} | {:.2} | {:.3} | {:.3} | {:.3} |",
+            "| {} | {:.2} | {:.2} | {:.3} | {:.3} | {:.3} | {:.3} |",
             report.chain,
             report.declared_delay_ms,
             report.measured_delay_ms,
             report.cpu_ms_per_block_mean,
+            report.cpu_ms_per_block_p50,
             report.cpu_ms_per_block_p99,
             report.cpu_ms_per_block_max,
         );
@@ -1077,9 +1152,13 @@ mod tests {
                 "keyboard_during_speech",
                 "mouse_clicks",
                 "fan_plus_mouse",
+                "fan_plus_mouse_15",
+                "fan_plus_mouse_10",
                 "music_bed",
+                "music_bed_12",
                 "second_talker",
-                "silence_floor"
+                "silence_floor",
+                "clean_voice"
             ]
         );
         for (a, b) in first.iter().zip(&second) {
@@ -1088,7 +1167,8 @@ mod tests {
             assert_eq!(bits(&a.noise), bits(&b.noise), "{}", a.name);
             assert_eq!(a.clean.len(), a.noise.len(), "{}", a.name);
             assert!((8 * RATE..=15 * RATE).contains(&a.clean.len()), "{}", a.name);
-            assert!(a.noise.iter().all(|s| s.is_finite()) && rms(&a.noise) > 0.0, "{}", a.name);
+            let silent = a.name == "clean_voice";
+            assert!(a.noise.iter().all(|s| s.is_finite()) && (rms(&a.noise) > 0.0) != silent, "{}", a.name);
             let peak = a.noisy().iter().fold(0.0f32, |p, s| p.max(s.abs()));
             assert!(peak < 1.0, "{} clips: {peak}", a.name);
             if a.snr_db.is_finite() {
@@ -1096,6 +1176,38 @@ mod tests {
                 assert!((snr as f32 - a.snr_db).abs() < 0.01, "{}: {snr}", a.name);
             }
         }
+    }
+
+    #[test]
+    fn music_bed_12_is_the_same_music_7_db_quieter_and_clean_voice_is_the_voice_alone() {
+        let corpus = corpus();
+        let row = |name: &str| corpus.iter().find(|item| item.name == name).unwrap();
+        // The quieter fan rows: the same fan and mouse, 10 and 5 dB down.
+        for (name, down) in [("fan_plus_mouse_15", 10.0f32), ("fan_plus_mouse_10", 5.0)] {
+            let ratio = 10f32.powf(-down / 20.0);
+            for (a, b) in row("fan_plus_mouse").noise.iter().zip(&row(name).noise) {
+                assert!((a * ratio - b).abs() <= 1e-6, "{name}: {a} {b}");
+            }
+        }
+        let (loud, quiet) = (row("music_bed"), row("music_bed_12"));
+        let ratio = 10f32.powf(-7.0 / 20.0);
+        assert_eq!(loud.clean, quiet.clean);
+        for (a, b) in loud.noise.iter().zip(&quiet.noise) {
+            assert!((a * ratio - b).abs() <= 1e-6, "{a} {b}");
+        }
+        let clean = row("clean_voice");
+        assert_eq!(clean.clean, loud.clean);
+        assert!(clean.snr_db.is_nan() && clean.noisy() == clean.clean);
+        // Metrics against itself: perfect, and no leak to measure.
+        let m = metrics(&clean.clean, &clean.clean, &clean.clean, 0);
+        assert!(m.lsd_db < 0.1 && m.speech_attenuation_db.abs() < 0.01, "{m:?}");
+        assert!(speech_noise_leak_db(&clean.clean, &clean.clean, &clean.clean, &clean.clean, 0).is_nan());
+    }
+
+    #[test]
+    fn chain_names_become_file_names() {
+        assert_eq!(file_stem("replay:dpdfnet8-lim24"), "replay_dpdfnet8-lim24");
+        assert_eq!(file_stem("rnnoise+enhanced"), "rnnoise+enhanced");
     }
 
     #[test]

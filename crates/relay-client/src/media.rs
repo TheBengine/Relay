@@ -163,6 +163,7 @@ impl AudioControls {
     }
 
     pub(crate) fn new(settings: &AudioSettings) -> Self {
+        prepare_noise_model(settings);
         Self {
             local_preview: false,
             call_tones: Arc::new(Mutex::new(VecDeque::new())),
@@ -328,6 +329,7 @@ impl AudioControls {
             .store(settings.transmission as u32, Ordering::Relaxed);
         self.suppression
             .store(settings.noise_suppression, Ordering::Relaxed);
+        prepare_noise_model(settings);
         self.noise_model
             .store(settings.noise_model as u32, Ordering::Relaxed);
         self.noise_strength
@@ -3271,6 +3273,14 @@ fn capture_processing_samples(packet_samples: usize, controls: &AudioControls) -
     }
 }
 
+/// Studio's model takes up to a second to build: start it as soon as the
+/// setting is chosen, so a call does not begin on the stand-in.
+fn prepare_noise_model(settings: &AudioSettings) {
+    if settings.noise_suppression && settings.noise_model == crate::audio_settings::NoiseModel::Studio {
+        crate::dpdfnet::prepare();
+    }
+}
+
 /// Automatic volume holds the speech gain at most this long after the last
 /// speech block, while the level still sounds like speech.
 const AGC_HOLD_SAMPLES: u32 = 300 * 48;
@@ -3422,14 +3432,18 @@ impl MicrophoneProcessor {
         #[cfg(not(feature = "native-rtc"))]
         let detected: Option<bool> = None;
         if controls.suppression.load(Ordering::Relaxed) {
-            let enhanced = controls.noise_model.load(Ordering::Relaxed)
-                == crate::audio_settings::NoiseModel::Enhanced as u32;
+            let model = crate::audio_settings::NoiseModel::from_u32(
+                controls.noise_model.load(Ordering::Relaxed),
+            );
+            // Enhanced always, Studio when its suppressor gives a voice
+            // probability; Standard never.
+            let clicks = model != crate::audio_settings::NoiseModel::Standard;
             let strength = crate::click_suppression::NoiseStrength::from_u32(
                 controls.noise_strength.load(Ordering::Relaxed),
             );
             let kind = self
                 .forced_suppressor
-                .unwrap_or_else(|| crate::noise_suppressor::for_setting(enhanced, strength));
+                .unwrap_or_else(|| crate::noise_suppressor::for_setting(model, strength));
             if self.denoiser.is_none() || self.denoiser_kind != Some(kind) {
                 self.denoiser = Some(crate::noise_suppressor::make(kind));
                 self.denoiser_kind = Some(kind);
@@ -3451,7 +3465,7 @@ impl MicrophoneProcessor {
                 suppressor.process(block);
                 // Before speech detection, so a click cannot open the gate.
                 // Click suppression needs a voice probability to spare speech.
-                if let (true, Some(voice)) = (enhanced, suppressor.voice_probability()) {
+                if let (true, Some(voice)) = (clicks, suppressor.voice_probability()) {
                     self.clicks.process(chunk, voice, strength);
                 }
                 #[cfg(feature = "native-rtc")]
@@ -5693,6 +5707,20 @@ mod tests {
         assert_eq!(budget.suppression, shown.suppression_ms as f32);
         assert_eq!(Some(budget.encoder_lookahead), shown.codec_ms);
         assert_eq!(budget.speech_start, shown.speech_start_ms);
+    }
+
+    /// Studio (DPDFNet) counts its 60 ms honestly (model 50, hand-off to its
+    /// thread 10): 50 ms more than Enhanced on every packet.
+    #[test]
+    fn send_delay_budget_counts_studio_at_60_ms() {
+        let enhanced = send_delay_budget_ms(&AudioSettings::default());
+        let studio = send_delay_budget_ms(&AudioSettings {
+            noise_model: crate::audio_settings::NoiseModel::Studio,
+            ..Default::default()
+        });
+        assert_eq!(studio.suppression, 60.0);
+        assert_eq!(studio.total() - enhanced.total(), 50.0);
+        assert_eq!((studio.total(), studio.first_packet_total()), (72.5, 82.5));
     }
 
     #[test]

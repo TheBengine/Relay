@@ -2099,11 +2099,14 @@ pub(crate) mod protected {
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
     }
-    fn vault_target(binding: &str) -> Vec<u16> {
-        wide(&format!(
+    fn target_name(binding: &str) -> String {
+        format!(
             "Relay/crypto-revision/{:x}",
             Sha256::digest(binding.as_bytes())
-        ))
+        )
+    }
+    fn vault_target(binding: &str) -> Vec<u16> {
+        wide(&target_name(binding))
     }
     struct VaultHandle {
         handle: HANDLE,
@@ -2363,6 +2366,12 @@ pub(crate) mod protected {
         })
     }
     fn marker_unlocked(binding: &str) -> Result<Option<RevisionMarker>, String> {
+        #[cfg(test)]
+        if test_vault::in_memory(&target_name(binding)) {
+            return test_vault::read(&target_name(binding))
+                .map(|bytes| decode_marker(&bytes))
+                .transpose();
+        }
         let target = vault_target(binding);
         let mut credential = std::ptr::null_mut();
         if let Err(error) = unsafe {
@@ -2401,20 +2410,11 @@ pub(crate) mod protected {
             if marker_unlocked(binding)?.is_some_and(|previous| previous.revision >= revision) {
                 return Err("The protected checkpoint counter must advance; another actor may have used these keys.".into());
             }
-            let mut target = vault_target(binding);
             let mut bytes = [0u8; 48];
             bytes[..8].copy_from_slice(MARKER_MAGIC);
             bytes[8..16].copy_from_slice(&revision.to_le_bytes());
             bytes[16..].copy_from_slice(&device_hash);
-            let credential = CREDENTIALW {
-                Type: CRED_TYPE_GENERIC,
-                TargetName: PWSTR(target.as_mut_ptr()),
-                CredentialBlobSize: bytes.len() as u32,
-                CredentialBlob: bytes.as_mut_ptr(),
-                Persist: CRED_PERSIST_LOCAL_MACHINE,
-                ..Default::default()
-            };
-            unsafe { CredWriteW(&credential, 0) }.map_err(|_| {
+            write_marker(binding, &mut bytes).map_err(|()| {
                 "Windows could not save the device checkpoint marker; encryption is paused."
                     .to_string()
             })?;
@@ -2432,21 +2432,28 @@ pub(crate) mod protected {
             Ok(())
         })
     }
+    /// Call with the credential lock held.
+    fn write_marker(binding: &str, bytes: &mut [u8]) -> Result<(), ()> {
+        #[cfg(test)]
+        if test_vault::in_memory(&target_name(binding)) {
+            return test_vault::write(&target_name(binding), bytes);
+        }
+        let mut target = vault_target(binding);
+        let credential = CREDENTIALW {
+            Type: CRED_TYPE_GENERIC,
+            TargetName: PWSTR(target.as_mut_ptr()),
+            CredentialBlobSize: bytes.len() as u32,
+            CredentialBlob: bytes.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            ..Default::default()
+        };
+        unsafe { CredWriteW(&credential, 0) }.map_err(|_| ())
+    }
     #[cfg(test)]
     pub(super) fn legacy_head_for_test(binding: &str, revision: u64) -> Result<(), String> {
         with_credential_lock(|| {
-            let mut target = vault_target(binding);
-            let mut bytes = revision.to_le_bytes();
-            let credential = CREDENTIALW {
-                Type: CRED_TYPE_GENERIC,
-                TargetName: PWSTR(target.as_mut_ptr()),
-                CredentialBlobSize: bytes.len() as u32,
-                CredentialBlob: bytes.as_mut_ptr(),
-                Persist: CRED_PERSIST_LOCAL_MACHINE,
-                ..Default::default()
-            };
-            unsafe { CredWriteW(&credential, 0) }
-                .map_err(|_| "Windows could not write the synthetic legacy marker.".into())
+            write_marker(binding, &mut revision.to_le_bytes())
+                .map_err(|()| "Windows could not write the synthetic legacy marker.".into())
         })
     }
     fn transform(bytes: &[u8], binding: &str, decrypt: bool) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -2547,10 +2554,74 @@ pub(crate) mod protected {
     #[cfg(test)]
     pub fn remove_head(binding: &str) {
         let _ = with_credential_lock(|| {
+            if test_vault::in_memory(&target_name(binding)) {
+                test_vault::delete(&target_name(binding));
+                return Ok(());
+            }
             let target = vault_target(binding);
             let _ = unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, 0) };
             Ok(())
         });
+    }
+
+    /// Tests keep credentials in this process's memory instead of Windows
+    /// Credential Manager, so a test run leaves nothing there. A test that
+    /// checks the real vault opts one target in with a `RealVaultEntry`, which
+    /// deletes that entry when it is dropped, also when the test panics.
+    #[cfg(test)]
+    pub(crate) mod test_vault {
+        use super::*;
+        use std::collections::{HashMap, HashSet};
+        use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+
+        /// The most Windows keeps in one credential (CRED_MAX_CREDENTIAL_BLOB_SIZE).
+        const MAX_BLOB: usize = 5 * 512;
+        static STORED: LazyLock<Mutex<HashMap<String, Vec<u8>>>> = LazyLock::new(Default::default);
+        static REAL: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+        fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+            mutex.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+        /// True unless a test opted this target into the real vault.
+        pub(crate) fn in_memory(target: &str) -> bool {
+            !lock(&REAL).contains(target)
+        }
+        pub(crate) fn read(target: &str) -> Option<Vec<u8>> {
+            lock(&STORED).get(target).cloned()
+        }
+        pub(crate) fn write(target: &str, bytes: &[u8]) -> Result<(), ()> {
+            if bytes.len() > MAX_BLOB {
+                return Err(());
+            }
+            lock(&STORED).insert(target.into(), bytes.to_vec());
+            Ok(())
+        }
+        pub(crate) fn delete(target: &str) {
+            lock(&STORED).remove(target);
+        }
+
+        /// One target a test reads and writes in the real Windows vault.
+        pub(crate) struct RealVaultEntry {
+            target: String,
+        }
+        impl RealVaultEntry {
+            pub(crate) fn new(target: String) -> Self {
+                assert!(target.starts_with("Relay/"), "{target}");
+                assert!(lock(&REAL).insert(target.clone()), "{target} is already in use");
+                Self { target }
+            }
+            pub(crate) fn marker(binding: &str) -> Self {
+                Self::new(target_name(binding))
+            }
+        }
+        impl Drop for RealVaultEntry {
+            fn drop(&mut self) {
+                // Deleting needs no lock: it never reads what it removes.
+                let target = wide(&self.target);
+                let _ = unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, 0) };
+                lock(&REAL).remove(&self.target);
+            }
+        }
     }
 
     #[cfg(test)]

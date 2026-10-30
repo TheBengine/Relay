@@ -50,23 +50,40 @@ pub(crate) enum SuppressorKind {
     RnNoiseThenWebRtcNs(NsLevel),
     /// WebRTC NS first, then RNNoise.
     WebRtcNsThenRnNoise(NsLevel),
+    /// DPDFNet (Studio): removes music and other voices, 60 ms.
+    DpdfNet(crate::dpdfnet::StudioKind),
 }
 
+/// Studio gives click suppression no voice probability: measured on the
+/// bench, see `docs/audio-studio-level-20261030.md`.
+pub(crate) const STUDIO_CLICKS: bool = false;
+
 /// The suppressor for the noise settings: RNNoise for Standard and for
-/// every Enhanced strength. The measured alternatives (WebRTC NS in front of
-/// RNNoise, DeepFilterNet) each lost somewhere the current chain holds; see
+/// every Enhanced strength, DPDFNet (dpdfnet8, with the overrun guard) for
+/// Studio. The measured alternatives to RNNoise (WebRTC NS in front of it,
+/// DeepFilterNet) each lost somewhere the current chain holds; see
 /// docs/audio-suppressor-comparison-20261028.md before changing this.
 pub(crate) fn for_setting(
-    _enhanced: bool,
+    model: crate::audio_settings::NoiseModel,
     _strength: crate::click_suppression::NoiseStrength,
 ) -> SuppressorKind {
-    SuppressorKind::RnNoise
+    match model {
+        crate::audio_settings::NoiseModel::Enhanced | crate::audio_settings::NoiseModel::Standard => {
+            SuppressorKind::RnNoise
+        }
+        crate::audio_settings::NoiseModel::Studio => SuppressorKind::DpdfNet(crate::dpdfnet::StudioKind {
+            variant: crate::dpdfnet::Variant::Eight,
+            probability: STUDIO_CLICKS,
+            guarded: true,
+        }),
+    }
 }
 
 pub(crate) fn make(kind: SuppressorKind) -> Box<dyn Suppressor> {
     match kind {
         SuppressorKind::Off => Box::new(Off),
         SuppressorKind::RnNoise => Box::new(RnNoise::new()),
+        SuppressorKind::DpdfNet(kind) => Box::new(crate::dpdfnet::Studio::new(kind)),
         #[cfg(feature = "native-rtc")]
         SuppressorKind::WebRtcNs(level) => Box::new(WebRtcNs::new(level)),
         #[cfg(feature = "native-rtc")]
@@ -265,10 +282,13 @@ impl Suppressor for Chain {
 #[cfg(any(test, feature = "audio-bench"))]
 pub(crate) mod bench {
     use super::{make, NsLevel, SuppressorKind, BLOCK};
+    use crate::dpdfnet::{StudioKind, Variant};
     use crate::audio_bench::{ChainSpec, SendChain};
     use crate::audio_settings::{AudioSettings, NoiseModel};
     use crate::click_suppression::NoiseStrength;
     use crate::media::{AudioControls, MicrophoneProcessor};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, OnceLock};
 
     pub struct Candidate {
         name: &'static str,
@@ -309,26 +329,36 @@ pub(crate) mod bench {
         }
     }
 
-    /// A suppressor that cannot be linked into the client (DeepFilterNet:
-    /// its `tract` pins `time` below what the client needs), run beforehand
-    /// by an outside tool on the corpus WAVs that `--write-wav` writes. This
-    /// chain plays that tool's output for whichever corpus signal it is fed
-    /// and runs the rest of the app's chain (automatic volume, gate) on it.
-    /// The directory holds `<row>.noisy.out.wav`, `<row>.clean.out.wav` and
-    /// `delay.txt`, and is named by the environment variable `variable`.
+    /// A suppressor that cannot be linked into the client (DeepFilterNet,
+    /// DPDFNet), run beforehand by an outside tool on the corpus WAVs that
+    /// `--write-wav` writes. This chain plays that tool's output for
+    /// whichever corpus signal it is fed and runs the rest of the app's chain
+    /// (automatic volume, gate) on it. The directory holds
+    /// `<row>.noisy.out.wav` and `<row>.clean.out.wav` (16-bit, the length of
+    /// the input, not shifted back) and `delay.txt` (the tool's delay in
+    /// samples). An optional `then.txt` reading `rnnoise+enhanced` also runs
+    /// RNNoise with Enhanced click suppression at Normal after it.
     pub struct Replay {
         name: &'static str,
         controls: AudioControls,
         processor: MicrophoneProcessor,
-        pairs: &'static [(Vec<f32>, Vec<f32>)],
+        recording: Arc<Recording>,
         alive: Vec<usize>,
         at: usize,
         delay: usize,
     }
 
-    type Recording = (Vec<(Vec<f32>, Vec<f32>)>, usize);
+    pub struct Recording {
+        /// (input the tool was given, what it returned)
+        pairs: Vec<(Vec<f32>, Vec<f32>)>,
+        delay: usize,
+        then_rnnoise: bool,
+    }
 
-    fn read_wav(path: &std::path::Path) -> Vec<f32> {
+    /// Loaded on first use, then shared by every chain built from it.
+    type Shared = Arc<OnceLock<Arc<Recording>>>;
+
+    fn read_wav(path: &Path) -> Vec<f32> {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let mut at = 12;
         while &bytes[at..at + 4] != b"data" {
@@ -341,38 +371,49 @@ pub(crate) mod bench {
             .collect()
     }
 
-    fn load(variable: &str) -> Recording {
-        let output = std::path::PathBuf::from(std::env::var_os(variable).expect("replay directory"));
-        let input = crate::audio_bench::output_directory().join("wav");
+    /// `output`: the tool's directory; `input`: the corpus WAVs it was given.
+    fn load(output: &Path, input: &Path) -> Recording {
         let mut pairs = Vec::new();
-        for entry in std::fs::read_dir(&output).expect("replay directory") {
-            let name = entry.expect("entry").file_name().to_string_lossy().into_owned();
+        let mut names: Vec<String> = std::fs::read_dir(output)
+            .unwrap_or_else(|e| panic!("replay directory {}: {e}", output.display()))
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        for name in names {
             if let Some(stem) = name.strip_suffix(".out.wav") {
                 pairs.push((read_wav(&input.join(format!("{stem}.wav"))), read_wav(&output.join(&name))));
             }
         }
+        assert!(!pairs.is_empty(), "{}: no <row>.<clean|noisy>.out.wav", output.display());
         let delay = std::fs::read_to_string(output.join("delay.txt"))
-            .expect("delay.txt")
+            .unwrap_or_else(|e| panic!("{}: delay.txt: {e}", output.display()))
             .trim()
             .parse()
             .expect("delay in samples");
-        (pairs, delay)
+        let then_rnnoise = match std::fs::read_to_string(output.join("then.txt")) {
+            Ok(text) if text.trim() == "rnnoise+enhanced" => true,
+            Ok(text) => panic!("{}: then.txt must read rnnoise+enhanced, not {text:?}", output.display()),
+            Err(_) => false,
+        };
+        Recording { pairs, delay, then_rnnoise }
     }
 
     impl Replay {
-        pub fn new(name: &'static str, recording: &'static Recording) -> Self {
+        pub fn new(name: &'static str, recording: Arc<Recording>) -> Self {
+            let then_rnnoise = recording.then_rnnoise;
             let settings = AudioSettings {
-                noise_model: NoiseModel::Standard,
+                noise_model: if then_rnnoise { NoiseModel::Enhanced } else { NoiseModel::Standard },
                 ..Default::default()
             };
+            let kind = if then_rnnoise { SuppressorKind::RnNoise } else { SuppressorKind::Off };
             Self {
                 name,
                 controls: AudioControls::new(&settings),
-                processor: MicrophoneProcessor::with_suppressor(SuppressorKind::Off),
-                pairs: &recording.0,
-                alive: (0..recording.0.len()).collect(),
+                processor: MicrophoneProcessor::with_suppressor(kind),
+                alive: (0..recording.pairs.len()).collect(),
                 at: 0,
-                delay: recording.1,
+                delay: recording.delay + make(kind).delay_samples(),
+                recording,
             }
         }
     }
@@ -383,7 +424,7 @@ pub(crate) mod bench {
         }
         fn process_block(&mut self, block: &mut [f32; BLOCK]) {
             // The WAVs are 16-bit: match within two steps of quantization.
-            let (at, pairs) = (self.at, self.pairs);
+            let (at, pairs) = (self.at, &self.recording.pairs);
             self.alive.retain(|&index| {
                 let input = &pairs[index].0;
                 block.iter().enumerate().all(|(n, sample)| {
@@ -392,7 +433,7 @@ pub(crate) mod bench {
             });
             let &index = self.alive.first().expect("no replayed recording matches this input");
             for (n, sample) in block.iter_mut().enumerate() {
-                *sample = self.pairs[index].1.get(at + n).copied().unwrap_or(0.0);
+                *sample = pairs[index].1.get(at + n).copied().unwrap_or(0.0);
             }
             self.at += BLOCK;
             if !self.processor.process(block, &self.controls) {
@@ -404,15 +445,42 @@ pub(crate) mod bench {
         }
     }
 
-    static DFN: std::sync::OnceLock<Recording> = std::sync::OnceLock::new();
-    static DFN_LL: std::sync::OnceLock<Recording> = std::sync::OnceLock::new();
+    fn replay_chain(name: &'static str, output: PathBuf, input: PathBuf) -> ChainSpec {
+        let shared: Shared = Arc::default();
+        ChainSpec::new(name, move || {
+            let recording = shared.get_or_init(|| Arc::new(load(&output, &input))).clone();
+            Box::new(Replay::new(name, recording))
+        })
+    }
+
+    /// One chain `replay:<label>` for every subfolder `<label>` of `root`
+    /// (`RELAY_REPLAY_DIR`), each laid out as `Replay` describes; `input`
+    /// holds the corpus WAVs the tool was given.
+    pub fn replay_chains(root: &Path, input: &Path) -> Vec<ChainSpec> {
+        let mut labels: Vec<PathBuf> = std::fs::read_dir(root)
+            .unwrap_or_else(|e| panic!("RELAY_REPLAY_DIR {}: {e}", root.display()))
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.is_dir())
+            .collect();
+        labels.sort();
+        labels
+            .into_iter()
+            .map(|dir| {
+                let label = dir.file_name().expect("label").to_string_lossy();
+                // Chain names are 'static; the bench builds them once per run.
+                let name: &'static str = Box::leak(format!("replay:{label}").into_boxed_str());
+                replay_chain(name, dir, input.to_path_buf())
+            })
+            .collect()
+    }
+
+    fn studio(variant: Variant, probability: bool) -> SuppressorKind {
+        SuppressorKind::DpdfNet(StudioKind { variant, probability, guarded: false })
+    }
 
     macro_rules! candidate {
         ($name:literal, $kind:expr, $clicks:expr) => {
-            ChainSpec {
-                name: $name,
-                make: || Box::new(Candidate::new($name, $kind, $clicks)),
-            }
+            ChainSpec::new($name, || Box::new(Candidate::new($name, $kind, $clicks)))
         };
     }
 
@@ -429,18 +497,37 @@ pub(crate) mod bench {
             candidate!("webrtc-ns-high-then-rnnoise+enhanced", WebRtcNsThenRnNoise(NsLevel::High), Some(Normal)),
             candidate!("webrtc-ns-veryhigh-then-rnnoise+enhanced", WebRtcNsThenRnNoise(NsLevel::VeryHigh), Some(Normal)),
             candidate!("webrtc-ns-veryhigh-then-rnnoise+enhanced-high", WebRtcNsThenRnNoise(NsLevel::VeryHigh), Some(High)),
+            // Studio, in process: the app's code with the guard off, so a
+            // busy bench machine cannot swap the model mid-row.
+            candidate!("dpdfnet8", studio(Variant::Eight, false), None),
+            candidate!("dpdfnet2", studio(Variant::Two, false), None),
+            // Click suppression fed the model's output-to-input energy ratio.
+            candidate!("dpdfnet8+ratio-clicks", studio(Variant::Eight, true), Some(Normal)),
+            candidate!("dpdfnet2+ratio-clicks", studio(Variant::Two, true), Some(Normal)),
         ];
-        if std::env::var_os("RELAY_REPLAY_DFN").is_some() {
-            chains.push(ChainSpec {
-                name: "deepfilternet (replayed)",
-                make: || Box::new(Replay::new("deepfilternet (replayed)", DFN.get_or_init(|| load("RELAY_REPLAY_DFN")))),
-            });
+        // Worker E's DeepFilterNet routes (docs/audio-deepfilter-decision-20261029.md),
+        // kept for its reruns; RELAY_REPLAY_DIR does the same for any tool.
+        let input = crate::audio_bench::output_directory().join("wav");
+        let path = |variable: &str| std::env::var_os(variable).map(PathBuf::from);
+        if let Some(dir) = path("RELAY_REPLAY_DFN") {
+            chains.push(replay_chain("deepfilternet (replayed)", dir, input.clone()));
         }
-        if std::env::var_os("RELAY_REPLAY_DFN_LL").is_some() {
-            chains.push(ChainSpec {
-                name: "deepfilternet-ll (replayed)",
-                make: || Box::new(Replay::new("deepfilternet-ll (replayed)", DFN_LL.get_or_init(|| load("RELAY_REPLAY_DFN_LL")))),
-            });
+        if let Some(dir) = path("RELAY_REPLAY_DFN_LL") {
+            chains.push(replay_chain("deepfilternet-ll (replayed)", dir.clone(), input.clone()));
+            // The same output through RNNoise with click suppression.
+            let shared: Shared = Arc::default();
+            let input = input.clone();
+            chains.push(ChainSpec::new("deepfilternet-ll-then-rnnoise+enhanced (replayed)", move || {
+                let recording = shared.get_or_init(|| {
+                    let mut recording = load(&dir, &input);
+                    recording.then_rnnoise = true;
+                    Arc::new(recording)
+                });
+                Box::new(Replay::new("deepfilternet-ll-then-rnnoise+enhanced (replayed)", recording.clone()))
+            }));
+        }
+        if let Some(root) = path("RELAY_REPLAY_DIR") {
+            chains.extend(replay_chains(&root, &input));
         }
         chains
     }
@@ -481,12 +568,21 @@ mod tests {
     }
 
     #[test]
-    fn every_setting_keeps_rnnoise() {
+    fn enhanced_and_standard_keep_rnnoise_and_studio_runs_guarded_dpdfnet8() {
+        use crate::audio_settings::NoiseModel;
         use crate::click_suppression::NoiseStrength::{High, Low, Normal};
-        for enhanced in [false, true] {
-            for strength in [Low, Normal, High] {
-                assert_eq!(for_setting(enhanced, strength), SuppressorKind::RnNoise);
+        for strength in [Low, Normal, High] {
+            for model in [NoiseModel::Enhanced, NoiseModel::Standard] {
+                assert_eq!(for_setting(model, strength), SuppressorKind::RnNoise);
             }
+            assert_eq!(
+                for_setting(NoiseModel::Studio, strength),
+                SuppressorKind::DpdfNet(crate::dpdfnet::StudioKind {
+                    variant: crate::dpdfnet::Variant::Eight,
+                    probability: STUDIO_CLICKS,
+                    guarded: true,
+                })
+            );
         }
     }
 
@@ -537,5 +633,46 @@ mod tests {
                 suppressor.delay_samples()
             );
         }
+    }
+
+    /// RELAY_REPLAY_DIR: every label folder becomes a chain that plays the
+    /// tool's output back for the matching input, at the tool's declared
+    /// delay (plus RNNoise's when `then.txt` asks for it), even past the 30 ms
+    /// the bench searches without a declared delay.
+    #[test]
+    fn replay_dir_plays_each_label_back_at_its_delay() {
+        use crate::audio_bench::{measure_delay_between, run_chain, write_wav};
+        let root = std::env::temp_dir().join(format!("relay-replay-test-{}", std::process::id()));
+        let (input_dir, replay) = (root.join("wav"), root.join("replay"));
+        let speech = talker(2.0, (105.0, 135.0), 13, 0.3);
+        let late = 2_400;
+        let mut delayed = vec![0.0f32; late];
+        delayed.extend_from_slice(&speech[..speech.len() - late]);
+        std::fs::create_dir_all(&input_dir).unwrap();
+        for kind in ["clean", "noisy"] {
+            write_wav(&input_dir.join(format!("row.{kind}.wav")), &speech).unwrap();
+        }
+        for (label, then) in [("late", false), ("late-then-clicks", true)] {
+            let dir = replay.join(label);
+            std::fs::create_dir_all(&dir).unwrap();
+            for kind in ["clean", "noisy"] {
+                write_wav(&dir.join(format!("row.{kind}.out.wav")), &delayed).unwrap();
+            }
+            std::fs::write(dir.join("delay.txt"), format!("{late}\n")).unwrap();
+            if then {
+                std::fs::write(dir.join("then.txt"), "rnnoise+enhanced\n").unwrap();
+            }
+        }
+        let chains = bench::replay_chains(&replay, &input_dir);
+        let names: Vec<&str> = chains.iter().map(|spec| spec.name).collect();
+        assert_eq!(names, ["replay:late", "replay:late-then-clicks"]);
+        for (spec, declared) in chains.iter().zip([late, late + BLOCK]) {
+            let mut chain = (spec.make)();
+            assert_eq!((chain.name(), chain.algorithmic_delay_samples()), (spec.name, declared));
+            let output = run_chain(&mut *chain, &speech).output;
+            let measured = measure_delay_between(&speech, &output, declared - 96, declared + 96);
+            assert!(measured.abs_diff(declared) <= 24, "{}: declared {declared}, measured {measured}", spec.name);
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
