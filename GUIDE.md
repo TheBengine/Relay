@@ -6,9 +6,9 @@
 
 | Package | Best for |
 | --- | --- |
-| [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261029.1/Relay-Setup.exe) | Recommended: install or update Relay like a normal Windows app. |
-| [Relay-Portable.zip](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261029.1/Relay-Portable.zip) | Extract the whole folder and open `Relay.exe`. Keep the files together. |
-| [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261029.1/SHA256SUMS.txt) | Check that downloaded files match the release. |
+| [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261030.1/Relay-Setup.exe) | Recommended: install or update Relay like a normal Windows app. |
+| [Relay-Portable.zip](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261030.1/Relay-Portable.zip) | Extract the whole folder and open `Relay.exe`. Keep the files together. |
+| [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261030.1/SHA256SUMS.txt) | Check that downloaded files match the release. |
 
 This is an **unsigned preview**. Real audio hardware, extended streaming and calls between different homes still need practical acceptance. Local synthetic media tests do not establish that these work on every PC or network.
 
