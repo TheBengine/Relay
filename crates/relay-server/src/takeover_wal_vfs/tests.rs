@@ -1256,3 +1256,86 @@ fn automatic_passive_checkpoints_continue_while_the_owned_hook_stays_installed()
     let first = recorded[0].generation;
     assert!(recorded.iter().all(|r| r.generation == first));
 }
+
+
+/// An underlying writer with SQLite's Unix length limit, also usable on Windows.
+#[repr(C)]
+struct BoundedWriter {
+    base: ffi::sqlite3_file,
+    writes: Vec<(i64, Vec<u8>)>,
+    fail_at: Option<usize>,
+    attempts: usize,
+}
+unsafe extern "C" fn bounded_write(
+    file: *mut ffi::sqlite3_file,
+    data: *const c_void,
+    amount: c_int,
+    offset: i64,
+) -> c_int {
+    let writer = &mut *(file as *mut BoundedWriter);
+    let attempt = writer.attempts;
+    writer.attempts += 1;
+    // SQLite's Unix release build masks larger lengths; refuse them here so the
+    // regression also catches the problem with the Windows underlying VFS.
+    if amount <= 0 || amount > 0x1ffff {
+        return ffi::SQLITE_FULL;
+    }
+    if writer.fail_at == Some(attempt) {
+        return ffi::SQLITE_IOERR_WRITE;
+    }
+    writer.writes.push((
+        offset,
+        std::slice::from_raw_parts(data as *const u8, amount as usize).to_vec(),
+    ));
+    ffi::SQLITE_OK
+}
+
+#[test]
+fn large_underlying_writes_keep_every_byte_and_offset_within_sqlites_unix_limit() {
+    // Null optional callbacks are valid; r_write uses only xWrite.
+    let methods = ffi::sqlite3_io_methods {
+        iVersion: 1,
+        xWrite: Some(bounded_write),
+        ..unsafe { std::mem::zeroed() }
+    };
+    let data: Vec<u8> = (0..(2 * 1024 * 1024 + 37))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let mut writer = BoundedWriter {
+        base: ffi::sqlite3_file { pMethods: &methods },
+        writes: Vec::new(),
+        attempts: 0,
+        fail_at: None,
+    };
+    assert_eq!(unsafe { r_write(&mut writer.base, &data, 91) }, ffi::SQLITE_OK);
+    let mut complete = Vec::new();
+    for (offset, bytes) in &writer.writes {
+        assert_eq!(*offset, 91 + complete.len() as i64);
+        assert!(!bytes.is_empty() && bytes.len() <= 0x1ffff);
+        complete.extend_from_slice(bytes);
+    }
+    assert_eq!(complete, data);
+}
+
+#[test]
+fn a_failed_underlying_write_stops_before_any_later_slice() {
+    let methods = ffi::sqlite3_io_methods {
+        iVersion: 1,
+        xWrite: Some(bounded_write),
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut writer = BoundedWriter {
+        base: ffi::sqlite3_file { pMethods: &methods },
+        writes: Vec::new(),
+        attempts: 0,
+        fail_at: Some(2),
+    };
+    assert_eq!(
+        unsafe { r_write(&mut writer.base, &vec![7; 2 * 1024 * 1024], 19) },
+        ffi::SQLITE_IOERR_WRITE
+    );
+    assert_eq!(writer.attempts, 3);
+    assert_eq!(writer.writes.len(), 2);
+    assert_eq!(writer.writes[0].0, 19);
+    assert_eq!(writer.writes[1].0, 19 + writer.writes[0].1.len() as i64);
+}

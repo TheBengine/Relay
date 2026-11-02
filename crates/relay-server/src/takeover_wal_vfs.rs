@@ -148,7 +148,9 @@ const FRAME_HEADER: usize = 24;
 const WAL_VERSION: u32 = 3_007_000;
 const WAL_MAGIC: u32 = 0x377f_0682;
 /// Largest single write forwarded to the real WAL file.
-const FLUSH_SLICE: usize = 1 << 20;
+// SQLite 3.50.2 Unix seekAndWriteFd masks lengths with 0x1ffff. Keep every
+// underlying write below that limit (64 KiB is also its largest page size).
+const FLUSH_SLICE: usize = 64 << 10;
 
 /// A fixed, content-free reason; never a path, page or payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
