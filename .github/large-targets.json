@@ -6,6 +6,12 @@
       "path": "updates/beta/targets/windows-x64/beta/Relay-0.10.0-20261102172456-Setup.exe",
       "sha256": "054402f6a108bbb4b7c550b7bcf439c6bb79a223e7056319225090c6790d778c",
       "bytes": 149122227
+    },
+    {
+      "tag": "v0.10.0-preview.20261102.5",
+      "path": "updates/beta/targets/windows-x64/beta/Relay-0.10.0-20261102203858-Setup.exe",
+      "sha256": "f460fcfc62c9659bbae02e188cbc48908e7cc18bebd16aac409254c067e9f891",
+      "bytes": 149257197
     }
   ]
 }
