@@ -1,6 +1,8 @@
 use super::*;
 use crate::network::{avatar_attachment_id, ProfileAvatarChange};
 use crate::settings_ui as controls;
+#[path = "profile_presets.rs"]
+mod presets;
 
 #[path = "dialog_header_ui.rs"]
 pub(super) mod dialog_header_ui;
@@ -108,6 +110,7 @@ enum SelfMenuPage {
 pub(super) struct ProfileUi {
     editor: Option<Editor>,
     section: ProfileSection,
+    gallery: presets::Gallery,
     pub(super) menu_anchor: Option<Rect>,
     menu_page: SelfMenuPage,
     capture_menu: Option<SelfMenuPage>,
@@ -668,6 +671,7 @@ impl RelayApp {
             .as_ref()
             .is_some_and(|b| b.capabilities.iter().any(|c| c == "profiles-v2"));
         let effects = self.has_chat_capability("profiles-v3");
+        let expanded_effects = self.has_chat_capability("profiles-v4");
         let reduced_motion = self.prefs.reduced_motion;
         let scope = format!("{}|{}", self.login.url, user.id);
         if !self
@@ -682,8 +686,10 @@ impl RelayApp {
         let assets = self.has_chat_capability("assets-v1");
         let mut crop_avatar = false;
         let mut crop_banner = false;
+        let mut preset_banner = None;
         let mut remove_banner = false;
         let banner_texture = self.asset_texture("profile_banner", &user.id);
+        let gallery = &mut self.profile_ui.gallery;
         let editor = self.profile_ui.editor.as_mut().unwrap();
         let pending = editor.pending.is_some();
         let mut section = self.profile_ui.section;
@@ -718,7 +724,15 @@ impl RelayApp {
                         controls::description(ui, "Leave empty to use your username.");
                     }
                     if section == ProfileSection::Avatar {
-                        controls::nav_group(ui, "AVATAR");
+                        controls::nav_group(ui, "CHOOSE AN AVATAR");
+                        if let Some((texture, bytes)) = gallery.avatars(ui) {
+                            editor.draft.avatar = ProfileAvatarChange::Prepared(bytes);
+                            editor.preview = Some(texture);
+                            editor.preview_rx = None;
+                        }
+                        controls::description(ui, "Pick a character, or upload your own. Save Changes to apply your choice.");
+                        ui.add_space(16.0);
+                        controls::nav_group(ui, "YOUR OWN IMAGE");
                         ui.horizontal_wrapped(|ui| {
                             if ui
                                 .add_enabled(
@@ -771,7 +785,11 @@ impl RelayApp {
                             );
                         }
                         if assets {
-                            controls::nav_group(ui, "PROFILE BANNER");
+                            controls::nav_group(ui, "CHOOSE A BANNER");
+                            preset_banner = gallery.banners(ui);
+                            controls::description(ui, "Choose a design to preview and crop it. Save Image applies the banner separately from your profile text and colors.");
+                            ui.add_space(16.0);
+                            controls::nav_group(ui, "YOUR OWN IMAGE");
                             ui.horizontal_wrapped(|ui| {
                                 if ui.add(secondary("Change Banner")).clicked() {
                                     crop_banner = true;
@@ -800,13 +818,7 @@ impl RelayApp {
                     if extended && section == ProfileSection::Colors {
                         controls::nav_group(ui, "PROFILE COLORS");
                         ui.horizontal_wrapped(|ui| {
-                            for (label, accent, banner) in [
-                                ("Relay", 0x5865f2, 0x232428),
-                                ("Ocean", 0x4ab5db, 0x20425a),
-                                ("Forest", 0x57c59a, 0x193c32),
-                                ("Sunset", 0xf7a971, 0x58364e),
-                                ("Lavender", 0xb59bff, 0x47336d),
-                            ] {
+                            for &(label, accent, banner) in presets::THEMES {
                                 let selected = editor.draft.appearance.accent == accent
                                     && editor.draft.appearance.banner == banner;
                                 let button = ui.add(
@@ -838,7 +850,7 @@ impl RelayApp {
                     if effects && section == ProfileSection::Effects {
                         controls::nav_group(ui, "PROFILE EFFECT");
                         ui.horizontal_wrapped(|ui| {
-                            for effect in ["none", "glow", "sparkle", "wave"] {
+                            for &effect in available_effects(expanded_effects) {
                                 let selected =
                                     editor.draft.appearance.effect.as_deref().unwrap_or("none")
                                         == effect;
@@ -855,10 +867,10 @@ impl RelayApp {
                                 }
                             }
                         });
-                        controls::description(
-                            ui,
-                            "Free local effects. Reduced Motion keeps the preview still.",
-                        );
+                        controls::description(ui, "Preview your choice on the profile card. Reduced Motion keeps effects still.");
+                        if !expanded_effects {
+                            controls::description(ui, "More effects are available after this server is updated.");
+                        }
                     }
                     if section == ProfileSection::Identity {
                         controls::nav_group(ui, "ABOUT ME");
@@ -967,6 +979,9 @@ impl RelayApp {
         }
         if crop_banner {
             self.choose_crop_image("profile_banner", &user.id);
+        }
+        if let Some(index) = preset_banner {
+            self.preview_profile_banner(presets::banner(index, 1200), &user.id);
         }
         if remove_banner {
             self.admin_request(
@@ -1402,11 +1417,21 @@ fn paint_status(ui: &egui::Ui, center: Pos2, status: &str, background: Color32) 
     }
 }
 
+fn available_effects(expanded: bool) -> &'static [&'static str] {
+    if expanded { relay_protocol::PROFILE_EFFECTS } else { &relay_protocol::PROFILE_EFFECTS[..4] }
+}
+
 fn effect_name(effect: &str) -> &str {
     match effect {
         "glow" => "Soft Glow",
         "sparkle" => "Sparkles",
         "wave" => "Waves",
+        "aurora" => "Aurora",
+        "confetti" => "Confetti",
+        "orbit" => "Orbit",
+        "rain" => "Rain",
+        "hearts" => "Hearts",
+        "fireflies" => "Fireflies",
         _ => "None",
     }
 }
@@ -1476,6 +1501,45 @@ fn paint_profile_effect(
                 ));
             }
         }
+        "aurora" => {
+            for band in 0..6 {
+                let points = (0..33).map(|step| {
+                    let x = step as f32 / 32.0;
+                    egui::pos2(rect.left()+x*rect.width(), rect.top()+rect.height()*(0.4+band as f32*0.04+0.2*(x*5.0+time*0.3+band as f32*0.2).sin()))
+                }).collect();
+                painter.add(egui::Shape::line(points, Stroke::new(7.0_f32, color.linear_multiply(0.13))));
+            }
+        }
+        "orbit" => {
+            let center=rect.center();
+            let radius=rect.height()*0.34;
+            painter.circle_stroke(center,radius,Stroke::new(1.0_f32,color.linear_multiply(0.4)));
+            for index in 0..4 {
+                let angle=time*0.35+index as f32*std::f32::consts::FRAC_PI_2;
+                painter.circle_filled(center+Vec2::angled(angle)*radius,3.0,color);
+            }
+        }
+        "rain" | "confetti" | "hearts" | "fireflies" => {
+            for index in 0..18 {
+                let phase=index as f32;
+                let x=(phase*0.618+0.018*(time*0.4+phase).sin()).rem_euclid(1.0);
+                let y=(phase*0.383+time*if effect=="rain" {0.13} else {-0.035}).rem_euclid(1.0);
+                let point=egui::pos2(rect.left()+x*rect.width(),rect.top()+y*rect.height());
+                match effect {
+                    "rain" => { painter.line_segment([point,point+Vec2::new(-2.0,9.0)],Stroke::new(1.0_f32,Color32::WHITE.linear_multiply(0.4))); }
+                    "confetti" => { painter.rect_filled(Rect::from_center_size(point,Vec2::new(3.0,6.0)),1.0,if index%2==0 { color } else { Color32::WHITE.linear_multiply(0.65) }); }
+                    "hearts" => {
+                        let points=vec![point+Vec2::new(-4.0,-1.0),point+Vec2::new(-2.0,-3.0),point,point+Vec2::new(2.0,-3.0),point+Vec2::new(4.0,-1.0),point+Vec2::new(0.0,4.0),point+Vec2::new(-4.0,-1.0)];
+                        painter.add(egui::Shape::line(points,Stroke::new(1.2_f32,color.linear_multiply(0.75))));
+                    }
+                    _ => {
+                        let pulse=0.5+0.5*(time*0.8+phase).sin();
+                        painter.circle_filled(point,5.0,color.linear_multiply(0.08+pulse*0.08));
+                        painter.circle_filled(point,1.5,color.linear_multiply(0.4+pulse*0.5));
+                    }
+                }
+            }
+        }
         _ => return,
     }
     if !reduced_motion {
@@ -1486,6 +1550,27 @@ fn paint_profile_effect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn effect_catalog_respects_old_servers_and_reduced_motion() {
+        assert_eq!(available_effects(false), &["none", "glow", "sparkle", "wave"]);
+        for &effect in available_effects(true) {
+            let ctx=egui::Context::default();
+            let appearance=ProfileAppearance { effect: Some(effect.into()), ..Default::default() };
+            assert!(appearance.valid());
+            let draw=|time| ctx.run(egui::RawInput { time: Some(time), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let rect=Rect::from_min_size(Pos2::new(20.0,20.0),Vec2::new(260.0,84.0));
+                    paint_profile_effect(ui,rect,&appearance,true);
+                });
+            });
+            let _=draw(0.0);
+            let a=draw(1.0);
+            let b=draw(9.0);
+            assert_eq!(format!("{:?}",a.shapes),format!("{:?}",b.shapes),"motion in {effect}");
+            assert!(b.shapes.len()<100,"unbounded effect geometry");
+        }
+    }
+
     fn menu_frame(
         ctx: &egui::Context,
         events: Vec<egui::Event>,

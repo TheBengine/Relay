@@ -108,6 +108,7 @@ pub(super) fn chosen(options: &crate::capture::CaptureOptions) -> relay_protocol
         fps: options.fps,
         bitrate_kbps: match options.bitrate {
             VideoBitrate::Auto => None,
+            VideoBitrate::Mbps1 => Some(1_000),
             VideoBitrate::Mbps2 => Some(2_000),
             VideoBitrate::Mbps4 => Some(4_000),
             VideoBitrate::Mbps8 => Some(8_000),

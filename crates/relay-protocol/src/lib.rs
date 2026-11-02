@@ -72,6 +72,9 @@ impl Default for ProfileAppearance {
         }
     }
 }
+/// Ordered catalog: the first four IDs are supported by profiles-v3 servers.
+pub const PROFILE_EFFECTS: &[&str] = &["none", "glow", "sparkle", "wave", "aurora", "confetti", "orbit", "rain", "hearts", "fireflies"];
+
 impl ProfileAppearance {
     pub fn valid(&self) -> bool {
         self.pronouns.chars().count() <= 32
@@ -80,7 +83,7 @@ impl ProfileAppearance {
             && self
                 .effect
                 .as_deref()
-                .is_none_or(|effect| matches!(effect, "none" | "glow" | "sparkle" | "wave"))
+                .is_none_or(|effect| PROFILE_EFFECTS.contains(&effect))
             && !self.pronouns.chars().any(|c| {
                 c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
             })

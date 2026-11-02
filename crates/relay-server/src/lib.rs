@@ -1944,6 +1944,7 @@ async fn bootstrap(
                 "discord-channel-status-v1".into(),
                 "welcome-v1".into(),
                 "profiles-v3".into(),
+            "profiles-v4".into(),
                 "custom-roles-v1".into(),
                 "voice-text-v1".into(),
                 "social-v1".into(),

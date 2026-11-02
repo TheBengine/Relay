@@ -376,6 +376,24 @@ fn capture_options_ui(
     high_fps: bool,
 ) -> bool {
     let mut changed = false;
+    if high_fps {
+        use crate::capture::BandwidthPreset;
+        ui.label(RichText::new("Bandwidth mode").strong());
+        ui.horizontal_wrapped(|ui| {
+            for (preset, label, help) in [
+                (BandwidthPreset::Automatic, "Automatic", "Up to the source resolution (4K), 60 fps. Uses available capacity when useful, and lowers quality when the connection is busy."),
+                (BandwidthPreset::Balanced, "Balanced", "Up to 1080p, 30 fps. Automatic quality with a smaller upload budget."),
+                (BandwidthPreset::Saver, "Save data", "Up to 480p, 24 fps and 1 Mbps video. Can reduce quality further when needed."),
+            ] {
+                if ui.selectable_label(preset.matches(*options), label).on_hover_text(help).clicked() {
+                    preset.apply(options);
+                    changed=true;
+                }
+            }
+        });
+        ui.label(RichText::new("Quality drops when the connection is busy and recovers when it is stable. Limits below are ceilings, not constant data use. Changes apply to your next stream.").size(font_size(TEXT_BODY)).color(c_muted()));
+        ui.add_space(8.0);
+    }
     ui.horizontal_wrapped(|ui| {
         ui.label(
             RichText::new("Quality")
@@ -467,6 +485,7 @@ fn capture_options_ui(
             egui::ComboBox::from_id_source((id, "bitrate"))
                 .selected_text(match options.bitrate {
                     VideoBitrate::Auto => "Automatic · Match quality",
+                    VideoBitrate::Mbps1 => "1 Mbps",
                     VideoBitrate::Mbps2 => "2 Mbps",
                     VideoBitrate::Mbps4 => "4 Mbps",
                     VideoBitrate::Mbps8 => "8 Mbps",
@@ -477,6 +496,7 @@ fn capture_options_ui(
                 .show_ui(ui, |ui| {
                     for (bitrate, label) in [
                         (VideoBitrate::Auto, "Automatic · Match quality"),
+                        (VideoBitrate::Mbps1, "1 Mbps - Lowest data use"),
                         (VideoBitrate::Mbps2, "2 Mbps · Save bandwidth"),
                         (VideoBitrate::Mbps4, "4 Mbps"),
                         (VideoBitrate::Mbps8, "8 Mbps"),
@@ -497,7 +517,7 @@ fn capture_options_ui(
                 "Automatically adjust video quality",
             )
             .changed();
-        ui.label(RichText::new("Adjusts output when RTC reports bandwidth or encoder pressure. Your chosen quality and frame rate stay the upper limit.").size(font_size(TEXT_BODY)).color(c_muted()));
+        ui.label(RichText::new("Lowers quality when upload capacity or encoding is limited, then gradually restores it. Your chosen quality, frame rate and bandwidth limit stay the upper limits.").size(font_size(TEXT_BODY)).color(c_muted()));
     }
     if changed {
         ui.ctx().memory_mut(|memory| memory.close_popup());

@@ -348,6 +348,18 @@ impl RelayApp {
         self.gif_picker = true;
     }
 
+    pub(super) fn preview_profile_banner(&mut self, image: image::RgbaImage, name: &str) {
+        let Some(scope) = self.conversation_scope() else { return; };
+        // Same scoped preview/save path as an uploaded banner; choosing a preset sends nothing.
+        let (_tx, loaded) = mpsc::sync_channel(1);
+        let texture = self.capture_ctx.load_texture("built-in-banner", egui::ColorImage::from_rgba_unmultiplied(
+            [image.width() as usize, image.height() as usize], image.as_raw()), egui::TextureOptions::LINEAR);
+        self.admin_ui.image_picker = Some(ImagePicker {
+            scope, kind: "profile_banner".into(), name: name.into(), loaded,
+            bytes: vec![], image: Some(image), texture: Some(texture), zoom: 1.0, x: 0.5, y: 0.5,
+        });
+    }
+
     pub(super) fn choose_crop_image(&mut self, kind: &str, name: &str) {
         let Some(scope) = self.conversation_scope() else {
             return;

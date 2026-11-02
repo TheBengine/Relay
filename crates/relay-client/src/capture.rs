@@ -71,6 +71,7 @@ impl CaptureQuality {
 pub enum VideoBitrate {
     #[default]
     Auto,
+    Mbps1,
     Mbps2,
     Mbps4,
     Mbps8,
@@ -117,12 +118,36 @@ pub struct CaptureOptions {
     pub codec: VideoCodecPreference,
     #[serde(default)]
     pub application_audio: bool,
-    #[serde(default)]
+    #[serde(default = "default_adaptive_video")]
     pub adaptive_video: bool,
     #[serde(default)]
     pub bitrate: VideoBitrate,
     #[serde(default)]
     pub priority: VideoPriority,
+}
+
+fn default_adaptive_video() -> bool { true }
+
+/// Convenience choices reuse the stored quality/rate fields; other capture choices survive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BandwidthPreset { Automatic, Balanced, Saver }
+impl BandwidthPreset {
+    pub fn apply(self, options: &mut CaptureOptions) {
+        let (quality, fps, bitrate) = match self {
+            Self::Automatic => (CaptureQuality::Source, 60, VideoBitrate::Auto),
+            Self::Balanced => (CaptureQuality::P1080, 30, VideoBitrate::Auto),
+            Self::Saver => (CaptureQuality::P480, 24, VideoBitrate::Mbps1),
+        };
+        options.quality=quality;
+        options.fps=fps;
+        options.bitrate=bitrate;
+        options.adaptive_video=true;
+    }
+    pub fn matches(self, options: CaptureOptions) -> bool {
+        let mut expected=options;
+        self.apply(&mut expected);
+        options==expected
+    }
 }
 
 impl Default for CaptureOptions {
@@ -161,6 +186,7 @@ impl CaptureOptions {
     pub fn target_bitrate_for(self, width: u32, height: u32, fps: u32) -> u32 {
         let manual = match self.bitrate {
             VideoBitrate::Auto => None,
+            VideoBitrate::Mbps1 => Some(1_000_000),
             VideoBitrate::Mbps2 => Some(2_000_000),
             VideoBitrate::Mbps4 => Some(4_000_000),
             VideoBitrate::Mbps8 => Some(8_000_000),
@@ -1337,6 +1363,9 @@ mod tests {
         let old: CaptureOptions =
             serde_json::from_str(r#"{"quality":"P1080","fps":30,"jpeg_quality":70}"#).unwrap();
         assert_eq!(old.bitrate, VideoBitrate::Auto);
+        assert!(old.adaptive_video);
+        let explicit: CaptureOptions=serde_json::from_str(r#"{"quality":"P720","fps":30,"jpeg_quality":70,"adaptive_video":false}"#).unwrap();
+        assert!(!explicit.adaptive_video);
         for quality in [
             CaptureQuality::P1440,
             CaptureQuality::P2160,
@@ -1353,6 +1382,24 @@ mod tests {
                     .unwrap(),
                 options
             );
+        }
+    }
+
+    #[test]
+    fn bandwidth_presets_preserve_audio_codec_and_priority_and_roundtrip() {
+        for preset in [BandwidthPreset::Automatic, BandwidthPreset::Balanced, BandwidthPreset::Saver] {
+            let mut options=CaptureOptions { application_audio: true, codec: VideoCodecPreference::Software,
+                priority: VideoPriority::Motion, adaptive_video: false, ..Default::default() };
+            preset.apply(&mut options);
+            assert!(preset.matches(options));
+            assert!(options.application_audio);
+            assert_eq!(options.codec, VideoCodecPreference::Software);
+            assert_eq!(options.priority, VideoPriority::Motion);
+            assert_eq!(serde_json::from_str::<CaptureOptions>(&serde_json::to_string(&options).unwrap()).unwrap(),options);
+            assert!(options.adaptive_video);
+            if preset==BandwidthPreset::Saver { assert_eq!(options.target_bitrate(),1_000_000); }
+            options.adaptive_video=false;
+            assert!(!preset.matches(options));
         }
     }
 
@@ -1387,6 +1434,7 @@ mod tests {
             32_000_000
         );
         for (bitrate, expected) in [
+            (VideoBitrate::Mbps1, 1_000_000),
             (VideoBitrate::Mbps2, 2_000_000),
             (VideoBitrate::Mbps4, 4_000_000),
             (VideoBitrate::Mbps8, 8_000_000),

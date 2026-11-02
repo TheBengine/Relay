@@ -10,7 +10,9 @@ async fn local_profile_effects_are_validated_preserved_for_old_clients_and_persi
     let state = AppState::open(temp.path(), "Effects", 0).unwrap();
     let app = router(state.clone());
     let admin = signup(&app, "Admin", "").await;
-    for effect in ["glow", "sparkle", "wave", "none"] {
+    let (_, bootstrap) = request(&app, "GET", "/api/bootstrap", Some(&admin.token), serde_json::Value::Null).await;
+    assert!(bootstrap["capabilities"].as_array().unwrap().iter().any(|c| c == "profiles-v4"));
+    for &effect in relay_protocol::PROFILE_EFFECTS {
         let (status, user) = request(
             &app,
             "PUT",
@@ -28,7 +30,7 @@ async fn local_profile_effects_are_validated_preserved_for_old_clients_and_persi
         "PUT",
         "/api/profile",
         Some(&admin.token),
-        serde_json::json!({"display_name":"Alex","bio":"","appearance":{"effect":"sparkle"}}),
+        serde_json::json!({"display_name":"Alex","bio":"","appearance":{"effect":"aurora"}}),
     )
     .await;
     let (_, legacy)=request(&app,"PUT","/api/profile",Some(&admin.token),serde_json::json!({"display_name":"Alex","bio":"Older client","appearance":{"pronouns":"they/them","accent":0x5865f2,"banner":0x245a83}})).await;
