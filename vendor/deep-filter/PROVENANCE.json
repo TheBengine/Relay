@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/Rikorose/DeepFilterNet",
+  "commit": "d375b2d8309e0935d165700c91da9de862a99c31",
+  "changes": [
+    "Runtime-only dependency manifest; tract 0.23.9 and ndarray 0.17 APIs",
+    "Mutable feature tensors are owned Tensor values, removing mutation through shared TValue storage",
+    "Inference math and trained weights unchanged"
+  ]
+}

@@ -3,6 +3,57 @@
 # root are discovered automatically. No workspace/Git/output parent is watched.
 schema = 1
 workspace_files = [
+  "vendor/models/deepfilter/DeepFilterNet3_ll_onnx.tar.gz",
+  "vendor/models/deepfilter/DeepFilterNet3_onnx.tar.gz",
+  "vendor/models/deepfilter/LICENSE-APACHE",
+  "vendor/models/deepfilter/LICENSE-MIT",
+  "vendor/models/deepfilter/provenance.json",
+  "vendor/models/gtcrn/LICENSE",
+  "vendor/models/gtcrn/gtcrn.onnx",
+  "vendor/models/gtcrn/provenance.json",
+  "vendor/rnnoise-native/COPYING",
+  "vendor/rnnoise-native/Makefile.am",
+  "vendor/rnnoise-native/README",
+  "vendor/rnnoise-native/include/rnnoise.h",
+  "vendor/rnnoise-native/model_version",
+  "vendor/rnnoise-native/provenance.json",
+  "vendor/rnnoise-native/src/_kiss_fft_guts.h",
+  "vendor/rnnoise-native/src/arch.h",
+  "vendor/rnnoise-native/src/celt_lpc.c",
+  "vendor/rnnoise-native/src/celt_lpc.h",
+  "vendor/rnnoise-native/src/common.h",
+  "vendor/rnnoise-native/src/cpu_support.h",
+  "vendor/rnnoise-native/src/denoise.c",
+  "vendor/rnnoise-native/src/denoise.h",
+  "vendor/rnnoise-native/src/dump_features.c",
+  "vendor/rnnoise-native/src/dump_rnnoise_tables.c",
+  "vendor/rnnoise-native/src/kiss_fft.c",
+  "vendor/rnnoise-native/src/kiss_fft.h",
+  "vendor/rnnoise-native/src/nnet.c",
+  "vendor/rnnoise-native/src/nnet.h",
+  "vendor/rnnoise-native/src/nnet_arch.h",
+  "vendor/rnnoise-native/src/nnet_default.c",
+  "vendor/rnnoise-native/src/opus_types.h",
+  "vendor/rnnoise-native/src/parse_lpcnet_weights.c",
+  "vendor/rnnoise-native/src/pitch.c",
+  "vendor/rnnoise-native/src/pitch.h",
+  "vendor/rnnoise-native/src/rnn.c",
+  "vendor/rnnoise-native/src/rnn.h",
+  "vendor/rnnoise-native/src/rnnoise_data.c",
+  "vendor/rnnoise-native/src/rnnoise_data.h",
+  "vendor/rnnoise-native/src/rnnoise_tables.c",
+  "vendor/rnnoise-native/src/vec.h",
+  "vendor/rnnoise-native/src/vec_avx.h",
+  "vendor/rnnoise-native/src/vec_neon.h",
+  "vendor/rnnoise-native/src/write_weights.c",
+  "vendor/rnnoise-native/src/x86/dnn_x86.h",
+  "vendor/rnnoise-native/src/x86/nnet_avx2.c",
+  "vendor/rnnoise-native/src/x86/nnet_sse4_1.c",
+  "vendor/rnnoise-native/src/x86/x86_arch_macros.h",
+  "vendor/rnnoise-native/src/x86/x86_dnn_map.c",
+  "vendor/rnnoise-native/src/x86/x86cpu.c",
+  "vendor/rnnoise-native/src/x86/x86cpu.h",
+
   ".cargo/config.toml",
   "scripts/prepare-webrtc.ps1",
   "vendor/relay-frame-crypto/frame_crypto_transformer.cc",
@@ -55,3 +106,11 @@ directories = ["src"]
 [packages."vendor/livekit-0.9.3"]
 directories = ["src", "examples", "tests", "specs"]
 files = ["build.rs"]
+
+[packages."crates/relay-audio-models"]
+directories = ["src"]
+files = ["build.rs"]
+
+[packages."vendor/deep-filter"]
+directories = ["src"]
+files = ["LICENSE-MIT", "LICENSE-APACHE", "PROVENANCE.json"]

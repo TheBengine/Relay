@@ -94,7 +94,10 @@ impl Session {
                 while !monitor.stop.load(Ordering::Acquire) {
                     poll_push_to_talk(&monitor.controls);
                     if !monitor.step() {
-                        thread::sleep(Duration::from_micros(2500));
+                        // Capture already signals this event when samples arrive.
+                        // Keep a bounded wait for PTT polling, without delaying
+                        // ready PCM or changing the Enhanced processing blocks.
+                        monitor.controls.wake.wait(Duration::from_micros(2500));
                     }
                 }
                 monitor.clear();
@@ -303,6 +306,26 @@ mod tests {
             .sum::<f32>()
             * amplitude
             / 3.0
+    }
+
+    #[test]
+    fn capture_wake_preserves_enhanced_processed_samples() {
+        let mut settings = settings();
+        settings.noise_suppression = true;
+        settings.noise_model = crate::audio_settings::NoiseModel::Enhanced;
+        let mut previous = monitor(&settings);
+        let mut notified = monitor(&settings);
+        for frame in 0..100 {
+            let input: Vec<f32> = (0..480).map(|n| voiced(frame * 480 + n, 0.3)).collect();
+            previous.capture.lock().unwrap().extend(input.iter().copied());
+            notified.capture.lock().unwrap().extend(input);
+            notified.controls.wake.notify();
+            notified.controls.wake.wait(Duration::from_millis(100));
+            assert_eq!(previous.step(), notified.step());
+            let a: Vec<_> = previous.playback.lock().unwrap().drain(..).collect();
+            let b: Vec<_> = notified.playback.lock().unwrap().drain(..).collect();
+            assert_eq!(a, b, "wake scheduling must not alter Enhanced PCM");
+        }
     }
 
     #[cfg(feature = "native-rtc")]

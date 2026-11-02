@@ -95,6 +95,9 @@ pub(super) struct State {
     pub(super) account_cleanup_error: Option<String>,
     pub(super) friends_requested: bool,
     pub(super) friends_error: Option<String>,
+    /// The Friends view actually visited in this run, scoped to its account.
+    /// A persisted last conversation alone does not open a DM on first entry.
+    pub(super) friends_view: Option<(String, Option<Target>)>,
     friends_resume: Option<(String, Instant)>,
     cancelled_navigation: std::collections::HashSet<String>,
     navigation_restore: Option<String>,
@@ -115,6 +118,7 @@ impl Default for State {
             account_cleanup_error: None,
             friends_requested: false,
             friends_error: None,
+            friends_view: None,
             friends_resume: None,
             cancelled_navigation: Default::default(),
             navigation_restore: None,
@@ -123,6 +127,17 @@ impl Default for State {
 }
 
 impl State {
+    pub(super) fn remembered_friends_target(&self, scope: &str, bootstrap: &Bootstrap) -> Option<Target> {
+        self.friends_view.as_ref()
+            .filter(|(saved_scope, _)| saved_scope == scope)
+            .and_then(|(_, target)| target.clone())
+            .filter(|target| target_available(target, bootstrap)
+                && match target {
+                    Target::Direct(peer) => crate::direct_targets::actionable(bootstrap, peer),
+                    Target::Channel(_) => true,
+                })
+    }
+
     fn cancel_navigation(&mut self, destination: Option<&str>) {
         self.navigation_restore = destination.map(str::to_owned);
         if let Some(auto) = self.auto.take() {
@@ -862,12 +877,24 @@ impl RelayApp {
             .is_some_and(|b| b.capabilities.iter().any(|c| c == "people-v1"))
     }
 
+    pub(super) fn remember_people_view(&mut self) {
+        if self.in_people() {
+            if let Some(scope) = self.conversation_scope() {
+                let target = (self.home_page.is_none() && !self.selected_nav)
+                    .then(|| self.current.clone()).flatten();
+                self.account_start.friends_view = Some((scope, target));
+            }
+        }
+    }
+
     pub(super) fn open_people(&mut self) {
         if self.central_account.account.is_none() { self.account_start.home = true; return; }
         if self.voice_channel.is_some() || self.joining_voice.is_some() {
             self.notice = Some(("Finish your current call before opening Friends.".into(), Instant::now()));
             return;
         }
+        let keep_conversation = self.in_people() && self.home_page.is_none()
+            && !self.selected_nav && self.current.is_some();
         self.cancel_friends_navigation(None);
         self.account_start.entered = true;
         self.account_start.friends_requested = true;
@@ -886,7 +913,7 @@ impl RelayApp {
         if self.in_people() && self.login.url == url && !sign_in_required {
             self.account_start.home = false;
             self.selected_nav = false;
-            self.home_page = Some(SettingsTab::Friends);
+            self.home_page = if keep_conversation { None } else { Some(SettingsTab::Friends) };
             self.admin_ui.friend_all_servers = false;
             return;
         }

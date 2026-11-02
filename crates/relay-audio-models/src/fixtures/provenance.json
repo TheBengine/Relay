@@ -1,0 +1,11 @@
+{
+  "input": "Synthetic chirp, generated locally; no microphone recording",
+  "deepfilter": "Original DeepFilterNet d375b2d8309e0935d165700c91da9de862a99c31 with tract 0.21.4; DfTract::new exactly once (already initializes); default mono parameters. Float32 output.",
+  "gtcrn": "ONNX Runtime CPU with upstream sqrt-Hann STFT and independent NumPy reference; see generate_gtcrn_reference.py",
+  "sha256": {
+    "deepfilter3-ll.f32": "ec0348ddd1358f6419b9691ac5cc3c0b1984b60fa4ed276ce331b70247b9351d",
+    "deepfilter3.f32": "680cc507b60cfdd840e9030b05926570f5af31c54626865c1bbb4c543f8b746a",
+    "gtcrn.f32": "bae0a23cdbacf962de31461addbaba74fab18da98faa4e0e4a9af972eb88a520",
+    "input.pcm16": "bdc440b2a133f0f66acd0fdb4502b79cad05f5cfb76948dc080222d28f768bfb"
+  }
+}

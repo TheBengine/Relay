@@ -1,0 +1,12 @@
+[package]
+name = "relay-audio-models"
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Perimeter-1.0.0"
+[dependencies]
+deep_filter = { package = "relay-deepfilter", path = "../../vendor/deep-filter" }
+tract-onnx = { version = "=0.23.9", default-features = false }
+realfft = "3.5"
+ndarray = "0.17"
+[build-dependencies]
+cc = "1"

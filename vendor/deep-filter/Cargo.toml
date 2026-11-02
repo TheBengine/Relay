@@ -1,0 +1,39 @@
+[package]
+name = "relay-deepfilter"
+version = "0.5.7"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+[lib]
+name = "df"
+[features]
+default = ["tract", "transforms", "logging"]
+tract = []
+transforms = []
+logging = []
+timings = []
+dataset = []
+capi = []
+wasm = []
+nightly-features = []
+wav-utils = []
+default-model = []
+default-model-ll = []
+[dependencies]
+itertools = "0.12"
+num-complex = "0.4"
+rustfft = "6.4"
+realfft = "3.5"
+ndarray = "0.17"
+rubato = "0.14"
+thiserror = "1"
+anyhow = "1"
+log = { version = "0.4", features = ["std"] }
+crossbeam-channel = "0.5"
+rust-ini = "0.21"
+flate2 = "1"
+tar = "0.4"
+tract-core = "=0.23.9"
+tract-onnx = { version = "=0.23.9", default-features = false }
+tract-hir = "=0.23.9"
+tract-pulse = "=0.23.9"
+[workspace]

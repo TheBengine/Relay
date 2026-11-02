@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/relay-protocol", "crates/relay-server", "crates/relay-client", "crates/relay-crypto", "crates/relay-updater"]
-exclude = ["vendor/audiopus_sys", "vendor/webrtc-sys-build", "vendor/libwebrtc-0.3.50", "vendor/webrtc-sys-0.3.47", "vendor/livekit-0.9.3", "vendor/serenity-0.12.5"]
+members = ["crates/relay-protocol", "crates/relay-server", "crates/relay-client", "crates/relay-crypto", "crates/relay-updater", "crates/relay-audio-models"]
+exclude = ["vendor/deep-filter", "vendor/audiopus_sys", "vendor/webrtc-sys-build", "vendor/libwebrtc-0.3.50", "vendor/webrtc-sys-0.3.47", "vendor/livekit-0.9.3", "vendor/serenity-0.12.5"]
 
 [patch.crates-io]
 serenity = { path = "vendor/serenity-0.12.5" }

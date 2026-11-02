@@ -1,0 +1,16 @@
+[
+  {
+    "file": "gtcrn.onnx",
+    "source": "https://api.github.com/repos/Xiaobin-Rong/gtcrn/git/blobs/613bd97557556a296f578af0a0993da191bbf8d4",
+    "git_blob": "613bd97557556a296f578af0a0993da191bbf8d4",
+    "sha256": "f648b02f2d7ff96ebcb0eec2219688a08ed12fe7e3d50f248605a90eba8cad17",
+    "bytes": 352084
+  },
+  {
+    "file": "LICENSE",
+    "source": "https://api.github.com/repos/Xiaobin-Rong/gtcrn/git/blobs/39f9700cbb8e4e8a26de5f7cb6fafd12ac62d246",
+    "git_blob": "39f9700cbb8e4e8a26de5f7cb6fafd12ac62d246",
+    "sha256": "c467165e5860b4a7494ef4a6e2788e4115d95b5b8989bb5f86287089adddf794",
+    "bytes": 1069
+  }
+]

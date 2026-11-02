@@ -17,6 +17,8 @@ pub struct SavedCommunity {
     pub username: String,
     #[serde(default)]
     pub last_target: Option<Target>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) icon: Option<crate::server_icon_cache::SavedIcon>,
     /// How to reach a community which was joined without an account-free address.
     /// Holds a secret; kept with the other preferences and never printed.
     #[serde(default, skip_serializing_if = "Option::is_none")]

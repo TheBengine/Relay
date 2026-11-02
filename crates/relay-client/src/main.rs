@@ -12,6 +12,7 @@ mod accessible_input;
 mod qa_automation;
 mod file_pick;
 mod audio_wake;
+mod audio_model_lab;
 mod build_metadata;
 #[cfg(windows)]
 mod windows_audio;
@@ -37,6 +38,7 @@ mod audio_settings;
 mod audio_gain;
 mod silero_vad;
 mod self_listen;
+mod server_icon_cache;
 mod voice_priority;
 mod delay_estimate;
 mod device_follow;

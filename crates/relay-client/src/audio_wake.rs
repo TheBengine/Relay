@@ -31,6 +31,28 @@ impl Wake {
             self.condition.notify_one();
         }
     }
+    /// A local audio worker has no socket, but uses the same retained capture
+    /// signal. A notification before the wait must not be lost.
+    pub(crate) fn wait(&self, timeout: Duration) {
+        #[cfg(windows)]
+        if let Some(event) = &self.event {
+            let milliseconds = timeout
+                .as_millis()
+                .saturating_add(u128::from(
+                    !timeout.subsec_nanos().is_multiple_of(1_000_000),
+                ))
+                .min(u128::from(u32::MAX - 1)) as u32;
+            unsafe {
+                let result =
+                    windows::Win32::System::Threading::WaitForSingleObject(event.0, milliseconds);
+                if result != windows::Win32::Foundation::WAIT_FAILED {
+                    return;
+                }
+            }
+        }
+        self.wait_portable(timeout);
+    }
+
     fn wait_portable(&self, timeout: Duration) {
         if let Ok(mut pending) = self.pending.lock() {
             if !*pending {
@@ -249,6 +271,40 @@ mod tests {
         thread,
         time::Instant,
     };
+    #[test]
+    fn local_monitor_retains_a_signal_and_then_times_out() {
+        for wake in [Wake::new(), Wake::default()] {
+            wake.notify();
+            let start = Instant::now();
+            wake.wait(Duration::from_secs(1));
+            assert!(start.elapsed() < Duration::from_millis(250));
+            let start = Instant::now();
+            wake.wait(Duration::from_millis(12));
+            assert!(
+                start.elapsed() >= Duration::from_millis(10),
+                "signal must be consumed"
+            );
+            assert!(start.elapsed() < Duration::from_secs(1));
+        }
+    }
+    #[test]
+    fn local_monitor_wait_is_interrupted_by_capture_or_stop() {
+        for wake in [Wake::new(), Wake::default()] {
+            let wake = Arc::new(wake);
+            let worker_wake = wake.clone();
+            let (ready, receiver) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                ready.send(()).unwrap();
+                worker_wake.wait(Duration::from_secs(2));
+            });
+            receiver.recv().unwrap();
+            thread::sleep(Duration::from_millis(10));
+            let start = Instant::now();
+            wake.notify();
+            worker.join().unwrap();
+            assert!(start.elapsed() < Duration::from_millis(500));
+        }
+    }
     #[test]
     fn capture_signal_before_wait_is_retained_and_consumed() {
         // Exercise the condition-variable fallback independently of Win32 events.

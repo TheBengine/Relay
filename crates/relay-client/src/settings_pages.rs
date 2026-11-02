@@ -3,6 +3,47 @@ use super::*;
 use crate::audio_settings::LatencyMode;
 use crate::settings_ui as controls;
 
+// Keep every live state on the same three rows: changing meter values must
+// never reflow the settings beneath them.
+fn sensitivity_readout(ui: &mut egui::Ui, level_db: f32, open_db: Option<f32>,
+    live: bool, muted: bool, transmitting: bool) {
+    use crate::self_listen::METER_FLOOR_DB;
+    let close_offset_db = 20.0 * crate::voice_gate::CLOSE_RATIO.log10();
+    ui.vertical(|ui| {
+        let level_text = if !live {
+            "not measured".to_owned()
+        } else if level_db <= METER_FLOOR_DB {
+            "silent".to_owned()
+        } else {
+            format!("{level_db:.0} dB")
+        };
+        ui.add(egui::Label::new(RichText::new(format!("Level: {level_text}")).color(c_muted())).truncate(true));
+        if let Some(open_db) = open_db {
+            ui.add(egui::Label::new(
+                RichText::new(format!(
+                    "Opens at {open_db:.0} dB · closes at {:.0} dB",
+                    open_db + close_offset_db
+                ))
+                .color(c_muted()),
+            ).truncate(true));
+        } else {
+            ui.add(egui::Label::new(RichText::new("Waiting for the automatic threshold").color(c_muted())).truncate(true));
+        }
+        if live {
+            let (text, color) = if muted {
+                ("· muted", c_bad())
+            } else if transmitting {
+                ("· transmitting", c_good())
+            } else {
+                ("· not transmitting", c_muted())
+            };
+            ui.add(egui::Label::new(RichText::new(text).color(color)).truncate(true));
+        } else {
+            ui.add(egui::Label::new(RichText::new("· microphone not active").color(c_muted())).truncate(true));
+        }
+    });
+}
+
 fn voice_delay_counter(
     ui: &mut egui::Ui,
     audio: &AudioSettings,
@@ -927,7 +968,13 @@ impl RelayApp {
         };
         let prefix = if reading.advice.is_problem() { "⚠ " } else { "" };
         ui.add(egui::Label::new(RichText::new(format!("{prefix}{}", reading.advice.text(key))).color(color)).wrap(true));
-        controls::description(ui, &listen::loop_latency(&self.prefs.audio, input_period, output_period).label());
+        let mut latency = listen::loop_latency(&self.prefs.audio, input_period, output_period);
+        if self.prefs.audio.noise_suppression && self.prefs.audio.noise_model.comparison().is_some() {
+            let packet = self.prefs.audio.packet_samples();
+            let batch = self.media.as_ref().map_or(packet, |media| media.model_comparison_batch(packet));
+            latency.ms += (self.prefs.audio.noise_model.suppression_ms_for(batch) - self.prefs.audio.noise_model.suppression_ms_for(packet)) as f32;
+        }
+        controls::description(ui, &latency.label());
         egui::CollapsingHeader::new("Which settings matter?")
             .id_source("listen-to-myself-guide")
             .show(ui, |ui| {
@@ -935,7 +982,7 @@ impl RelayApp {
                 controls::description(ui, "Automatic microphone volume evens out your level and keeps Relay's gain from clipping. It cannot fix a microphone that is already too loud in Windows.");
                 controls::description(ui, "Enhanced noise suppression removes background noise and keyboard and mouse clicks, and adds 10 ms. Echo cancellation removes Relay's own speaker sound from your microphone; with headphones you rarely need it.");
                 controls::description(ui, "Input Mode: with voice activation, your speech must cross the marker on the Input Sensitivity bar below before others hear you. With push-to-talk, you are heard only while the key is held.");
-                controls::description(ui, "Output device and Output Volume decide where and how loud you hear others. Receive latency and audio per packet change call delay, not this local test.");
+                controls::description(ui, "Output device and Output Volume decide where and how loud you hear others. Receive latency changes call delay. Audio per packet can also change the buffering used by experimental models in this test.");
             });
     }
 
@@ -1038,54 +1085,21 @@ impl RelayApp {
                 }),
             )
         });
-        ui.horizontal_wrapped(|ui| {
-            let level_text = if !live {
-                "not measured".to_owned()
-            } else if level_db <= METER_FLOOR_DB {
-                "silent".to_owned()
-            } else {
-                format!("{level_db:.0} dB")
-            };
-            ui.label(RichText::new(format!("Level: {level_text}")).color(c_muted()));
-            if let Some(open_db) = open_db {
-                ui.label(
-                    RichText::new(format!(
-                        "· opens at {open_db:.0} dB, closes at {:.0} dB",
-                        open_db + close_offset_db
-                    ))
-                    .color(c_muted()),
-                );
-            } else {
-                ui.label(RichText::new("· the marker appears once Relay hears you").color(c_muted()));
-            }
-            if live {
-                let (text, color) = if self.muted {
-                    ("· muted", c_bad())
-                } else if reading.is_some_and(|r| r.open) {
-                    ("· transmitting", c_good())
-                } else {
-                    ("· not transmitting", c_muted())
-                };
-                ui.label(RichText::new(text).color(color));
-            }
-        });
+        sensitivity_readout(ui, level_db, open_db, live, self.muted, reading.is_some_and(|r| r.open));
         if live {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
-        } else {
-            controls::description(
-                ui,
-                if self.voice_channel.is_some() {
-                    "Your level appears here while the call's microphone is open."
-                } else {
-                    "Click Listen to Myself above to see your level live while you move the marker."
-                },
-            );
         }
-        if !automatic {
-            let mut threshold_db = db(self.prefs.audio.activation_threshold);
+        controls::description(ui, "Use Listen to Myself or a call to see your microphone level.");
+        ui.scope(|ui| {
+            let mut threshold_db = if automatic {
+                open_db.unwrap_or_else(|| db(self.prefs.audio.activation_threshold))
+            } else {
+                db(self.prefs.audio.activation_threshold)
+            };
             ui.spacing_mut().slider_width = (ui.available_width() - 140.0).max(40.0);
             if ui
-                .add(
+                .add_enabled(
+                    !automatic,
                     egui::Slider::new(&mut threshold_db, -60.0..=-6.0)
                         .step_by(1.0)
                         .suffix(" dB")
@@ -1095,7 +1109,7 @@ impl RelayApp {
             {
                 self.prefs.audio.activation_threshold = 10f32.powf(threshold_db / 20.0).clamp(0.001, 0.5);
             }
-        }
+        });
         egui::CollapsingHeader::new("Gate timing")
             .id_source("voice-gate-timing")
             .show(ui, |ui| {
@@ -1139,18 +1153,45 @@ impl RelayApp {
         use crate::audio_settings::NoiseModel;
         use crate::click_suppression::NoiseStrength;
         controls::nav_group(ui, "NOISE SUPPRESSION");
+        let batch = self.media.as_ref().map_or(self.prefs.audio.packet_samples(), |media| media.model_comparison_batch(self.prefs.audio.packet_samples()));
         let audio = &mut self.prefs.audio;
         let mut choice = match (audio.noise_suppression, audio.noise_model) {
             (false, _) => None,
             (true, model) => Some(model),
         };
         for (option, label, body) in [
-            (Some(NoiseModel::Enhanced), "Enhanced (recommended)", "Removes background noise and keyboard and mouse clicks. Runs on this PC and adds 10 ms."),
-            (Some(NoiseModel::Standard), "Standard", "RNNoise alone: steady noise such as fans. Choose it if Enhanced ever cuts into your voice."),
-            (Some(NoiseModel::Studio), "Studio", "Also removes music, other people talking and fans, and leaves your voice as it is. Others hear you about 50 ms later than with Enhanced, and it uses more of this PC's processor."),
-            (None, "None", "Your microphone exactly as it sounds."),
+            (Some(NoiseModel::RECOMMENDED), "Enhanced (recommended)", NoiseModel::RECOMMENDED.description()),
+            (None, "None", "No noise filter. Other microphone settings still apply."),
         ] {
             controls::radio_value(ui, ("noise-model", label), &mut choice, option, label, body);
+        }
+        egui::CollapsingHeader::new("Compare voice models")
+            .default_open(choice.is_some_and(|model| model != NoiseModel::RECOMMENDED))
+            .show(ui, |ui| {
+                controls::description(ui, "Use Listen to Myself above to compare. Changes are heard live; Save Changes keeps your choice for calls. Enhanced remains the recommended default.");
+                egui::ComboBox::from_id_source("voice-model-comparison")
+                    .width(ui.available_width().min(320.0))
+                    .selected_text(choice.map_or("None", NoiseModel::label))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut choice, None, "None · No noise filter");
+                        for model in NoiseModel::ALL {
+                            #[cfg(not(feature = "native-rtc"))]
+                            if matches!(model, NoiseModel::WebRtc | NoiseModel::RnNoiseThenWebRtc | NoiseModel::WebRtcThenRnNoise) { continue; }
+                            ui.selectable_value(&mut choice, Some(model), format!("{} · ~{} ms", model.label(), model.suppression_ms_for(batch)));
+                        }
+                    });
+                if let Some(model) = choice {
+                    controls::description(ui, model.description());
+                    controls::description(ui, &format!("Estimated added filter delay: {} ms. Includes model buffering and worker handoff; your audio devices add more delay.", model.suppression_ms_for(batch)));
+                }
+                controls::description(ui, "Automatic volume (Relay / Sonora), speech detection (Silero) and receive buffering are separate controls. Keep them the same for a fair model comparison.");
+            });
+        if let Some(model) = choice {
+            controls::description(ui, &format!("Selected: {} · ~{} ms filter delay", model.label(), model.suppression_ms_for(batch)));
+            if self.mic_test {
+                let status = self.media.as_ref().map_or(crate::audio_model_lab::Status::Idle, MediaEngine::noise_model_status);
+                controls::description(ui, status.label());
+            }
         }
         audio.noise_suppression = choice.is_some();
         if let Some(model) = choice {
@@ -2296,6 +2337,37 @@ fn unavailable_choice_saved(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_sensitivity_readings_never_moves_the_next_control() {
+        let context = egui::Context::default();
+        configure(&context);
+        for width in [280.0, 360.0, 700.0] {
+            let mut baseline = None;
+            for (level, threshold, live, muted, transmitting) in [
+                (-80.0, None, false, false, false),
+                (-80.0, Some(-60.0), true, false, false),
+                (-9.0, Some(-20.0), true, false, true),
+                (-35.0, Some(-6.0), true, true, false),
+            ] {
+                let _ = context.run(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 420.0))),
+                    ..Default::default()
+                }, |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        sensitivity_readout(ui, level, threshold, live, muted, transmitting);
+                        let next = ui.button("Next setting").rect;
+                        assert!(context.screen_rect().contains_rect(next));
+                        if let Some(top) = baseline {
+                            assert_eq!(next.top(), top, "live meter changed the layout height");
+                        } else {
+                            baseline = Some(next.top());
+                        }
+                    });
+                });
+            }
+        }
+    }
 
     #[test]
     fn bluetooth_hint_renders_for_a_selected_or_default_wireless_device() {

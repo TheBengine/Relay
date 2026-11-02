@@ -74,6 +74,7 @@ opus = "0.3.0"
 nnnoiseless = { version = "0.5.2", default-features = false }
 # Opt-in automatic microphone volume; only AGC2 is enabled in its pipeline.
 sonora = "=0.2.0"
+relay-audio-models = { path = "../relay-audio-models" }
 # Studio noise suppression: DPDFNet (Ceva, Apache-2.0, vendor/models/dpdfnet)
 # runs as an ONNX graph in tract, one STFT frame per 10 ms block.
 tract-onnx = { version = "=0.23.9", default-features = false }

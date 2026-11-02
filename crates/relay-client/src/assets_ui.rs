@@ -495,6 +495,58 @@ impl RelayApp {
         }
         None
     }
+
+    pub(super) fn saved_server_icon(
+        &mut self,
+        ctx: &egui::Context,
+        community: &SavedCommunity,
+    ) -> Option<egui::TextureHandle> {
+        let active = community.url == self.login.url && self.bootstrap.as_ref()
+            .is_some_and(|b| b.server_id == community.server_id);
+        let mut saved = community.icon.clone();
+        if active {
+            let revision = self.bootstrap.as_ref()?.assets.iter()
+                .find(|a| a.kind == "server_icon" && a.name == "community")
+                .map(crate::network::asset_attachment_id);
+            if saved.as_ref().is_some_and(|icon| Some(&icon.revision) != revision.as_ref()) {
+                if let Some(entry) = self.prefs.communities.iter_mut().find(|c| c.url == community.url) {
+                    entry.icon = None;
+                }
+                saved = None;
+                self.server_icons.remove(&community.url);
+                self.defer_preferences();
+            }
+            revision.as_ref()?;
+            if saved.is_none() {
+                // The authenticated asset worker fetches only the active server.
+                // Its result also saves a thumbnail for inactive rail entries.
+                return self.asset_texture("server_icon", "community");
+            }
+        }
+        let saved = saved?;
+        let key = format!("{}:{}", community.server_id, saved.revision);
+        if let Some((revision, texture)) = self.server_icons.get(&community.url) {
+            if revision == &key { return Some(texture.clone()); }
+        }
+        let Some(image) = saved.image(&community.server_id) else {
+            if active {
+                if let Some(entry) = self.prefs.communities.iter_mut().find(|c| c.url == community.url) {
+                    entry.icon = None;
+                }
+                self.server_icons.remove(&community.url);
+                // Recover through the authenticated worker, even if a previous
+                // texture exists but its persisted thumbnail is invalid.
+                self.admin_ui.asset_cache.remove(&saved.revision);
+                self.defer_preferences();
+                return self.asset_texture("server_icon", "community");
+            }
+            return None;
+        };
+        self.server_icons.retain(|url, _| self.prefs.communities.iter().any(|c| c.url == *url));
+        let texture = ctx.load_texture(format!("server-icon:{key}"), image, egui::TextureOptions::LINEAR);
+        self.server_icons.insert(community.url.clone(), (key, texture.clone()));
+        Some(texture)
+    }
     pub(super) fn inline_community_emoji(
         &mut self,
         content: &str,
@@ -541,6 +593,18 @@ impl RelayApp {
         if frame.image.size[0] > 1200 || frame.image.size[1] > 480 {
             self.admin_ui.asset_failed.insert(key);
             return;
+        }
+        if let Some(bootstrap) = self.bootstrap.as_ref().filter(|b| b.assets.iter().any(|asset|
+            asset.kind == "server_icon" && asset.name == "community"
+                && crate::network::asset_attachment_id(asset) == key)) {
+            if let Some(icon) = crate::server_icon_cache::SavedIcon::new(&bootstrap.server_id, &key, &frame.image) {
+                if let Some(saved) = self.prefs.communities.iter_mut()
+                    .find(|c| c.url == self.login.url && c.server_id == bootstrap.server_id) {
+                    saved.icon = Some(icon);
+                    self.server_icons.remove(&self.login.url);
+                    self.defer_preferences();
+                }
+            }
         }
         while self.admin_ui.asset_cache.len() >= 32 {
             let old = self

@@ -2,6 +2,33 @@
 use super::*;
 
 #[test]
+fn friends_restores_only_a_visited_and_still_allowed_conversation_in_this_account() {
+    let mut bootstrap = Bootstrap::default();
+    bootstrap.user.id = "me".into();
+    bootstrap.capabilities.push("people-v1".into());
+    bootstrap.members.push(User { id: "friend".into(), ..Default::default() });
+    bootstrap.social.friends.push("friend".into());
+    bootstrap.channels.push(relay_protocol::Channel { id: "group".into(), ..Default::default() });
+    let mut state = State::default();
+    assert_eq!(state.remembered_friends_target("account", &bootstrap), None);
+    for target in [Target::Direct("friend".into()), Target::Channel("group".into())] {
+        state.friends_view = Some(("account".into(), Some(target.clone())));
+        assert_eq!(state.remembered_friends_target("account", &bootstrap), Some(target));
+        assert_eq!(state.remembered_friends_target("other-account", &bootstrap), None);
+    }
+    bootstrap.channels.clear();
+    assert_eq!(state.remembered_friends_target("account", &bootstrap), None);
+    state.friends_view = Some(("account".into(), Some(Target::Direct("friend".into()))));
+    bootstrap.social.blocked.push("friend".into());
+    assert_eq!(state.remembered_friends_target("account", &bootstrap), None);
+    bootstrap.social.blocked.clear();
+    bootstrap.social.friends.clear();
+    assert_eq!(state.remembered_friends_target("account", &bootstrap), None);
+    state.friends_view = Some(("account".into(), None));
+    assert_eq!(state.remembered_friends_target("account", &bootstrap), None);
+}
+
+#[test]
 fn verified_account_routes_to_shell_without_a_friends_session_but_keeps_security_gates() {
     assert!(signed_shell_allowed(true, false, false, false));
     for gates in [(false, false, false, false), (true, true, false, false),

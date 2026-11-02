@@ -112,14 +112,10 @@ impl RelayApp {
                                     FontId::proportional(font_size(17.0)),
                                     c_text(),
                                 );
-                                if community.url == self.login.url {
-                                    if let Some(texture) =
-                                        self.asset_texture("server_icon", "community")
-                                    {
-                                        egui::Image::new((texture.id(), rect.size()))
-                                            .rounding(if current { 16.0 } else { 24.0 })
-                                            .paint_at(ui, rect);
-                                    }
+                                if let Some(texture) = self.saved_server_icon(ctx, &community) {
+                                    egui::Image::new((texture.id(), rect.size()))
+                                        .rounding(if current { 16.0 } else { 24.0 })
+                                        .paint_at(ui, rect);
                                 }
                                 if unread > 0 {
                                     unread_badge(

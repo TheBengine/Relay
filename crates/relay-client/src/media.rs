@@ -103,6 +103,9 @@ pub(crate) struct AudioControls {
     transmission: AtomicU32,
     suppression: AtomicBool,
     noise_model: AtomicU32,
+    model_service: std::sync::OnceLock<Arc<crate::audio_model_lab::Service>>,
+    model_status: AtomicU32,
+    model_capture_batch: AtomicUsize,
     noise_strength: AtomicU32,
     low_latency_device: AtomicBool,
     input_timing: Mutex<Option<DeviceTiming>>,
@@ -197,6 +200,9 @@ impl AudioControls {
             transmission: AtomicU32::new(settings.transmission as u32),
             suppression: AtomicBool::new(settings.noise_suppression),
             noise_model: AtomicU32::new(settings.noise_model as u32),
+            model_service: std::sync::OnceLock::new(),
+            model_status: AtomicU32::new(crate::audio_model_lab::Status::Idle as u32),
+            model_capture_batch: AtomicUsize::new(480),
             noise_strength: AtomicU32::new(settings.noise_strength as u32),
             low_latency_device: AtomicBool::new(settings.low_latency_device),
             input_timing: Mutex::new(None),
@@ -251,6 +257,10 @@ impl AudioControls {
     }
     /// A running local preview: only a transmission-mode change is a privacy
     /// boundary there, so dragging gain or threshold never restarts RNNoise.
+    fn model_handoff_samples(&self) -> usize {
+        (self.packet_samples.load(Ordering::Relaxed) as usize)
+            .max(self.model_capture_batch.load(Ordering::Relaxed)).div_ceil(480).clamp(1, 20) * 480
+    }
     fn apply_preview(&self, settings: &AudioSettings) {
         self.apply_with(settings, true);
     }
@@ -258,11 +268,16 @@ impl AudioControls {
         let mode_changed = self.transmission.load(Ordering::Relaxed) != settings.transmission as u32;
         let volume_model_changed = self.automatic_volume_model.load(Ordering::Relaxed)
             != settings.automatic_volume_model as u32;
+        let noise_changed = self.suppression.load(Ordering::Relaxed) != settings.noise_suppression
+            || self.noise_model.load(Ordering::Relaxed) != settings.noise_model as u32;
+        let model_packet_changed = settings.noise_model.comparison().is_some()
+            && self.packet_samples.load(Ordering::Relaxed) != settings.packet_samples() as u32;
         // Changing playback/receive settings must not reset VAD, RNNoise, gain
         // tracking or Opus history halfway through the local person's sentence.
         let capture_changed = self.gain.load(Ordering::Relaxed)
             != settings.microphone_gain.to_bits()
             || volume_model_changed
+            || model_packet_changed
             || self.threshold.load(Ordering::Relaxed) != settings.activation_threshold.to_bits()
             || self.automatic_sensitivity.load(Ordering::Relaxed)
                 != settings.automatic_sensitivity()
@@ -360,7 +375,10 @@ impl AudioControls {
             self.echo_delay_ms
                 .store(settings.echo_delay_ms, Ordering::Relaxed);
         }
-        let capture_changed = if preview { mode_changed || volume_model_changed } else { capture_changed };
+        let capture_changed = if preview { mode_changed || volume_model_changed || noise_changed || model_packet_changed } else { capture_changed };
+        if noise_changed || model_packet_changed {
+            self.model_status.store(crate::audio_model_lab::Status::Idle as u32, Ordering::Release);
+        }
         // Publish after the changed capture policy, so an acquired generation
         // includes those stores before accepting queued microphone/tunnel audio.
         if capture_changed {
@@ -1286,6 +1304,17 @@ impl MediaEngine {
         } else {
             crate::silero_vad::Reading::Idle
         }
+    }
+    pub(crate) fn model_comparison_batch(&self, packet_samples: usize) -> usize {
+        self.preview.as_ref().filter(|_| self.is_microphone_test_active())
+            .map_or(packet_samples, |preview| packet_samples.max(preview.controls.model_capture_batch.load(Ordering::Relaxed)))
+    }
+    pub(crate) fn noise_model_status(&self) -> crate::audio_model_lab::Status {
+        use crate::audio_model_lab::Status;
+        if let Some(preview) = self.preview.as_ref().filter(|_| self.is_microphone_test_active()) {
+            return Status::from_u32(preview.controls.model_status.load(Ordering::Acquire));
+        }
+        Status::Idle
     }
     /// Gate threshold, sensitivity mode and ramps of an unsaved draft, heard in
     /// the running call on the next block. None of them is a privacy boundary,
@@ -2772,6 +2801,8 @@ where
         let mut dropped_samples = 0usize;
         // Preserve a complete larger hardware callback after fallback.
         let capture_limit = capture_sample_limit(data.len() / channels, sample_rate);
+        let batch = ((data.len() / channels) * AUDIO_SAMPLE_RATE as usize).div_ceil(sample_rate as usize);
+        controls.model_capture_batch.fetch_max(batch, Ordering::Relaxed);
         for frame in data.chunks_exact(channels) {
             let mono = frame
                 .iter()
@@ -3337,6 +3368,7 @@ pub(crate) struct MicrophoneProcessor {
     denoiser: Option<Box<dyn crate::noise_suppressor::Suppressor>>,
     /// Which suppressor `denoiser` is, to rebuild it when the setting changes.
     denoiser_kind: Option<crate::noise_suppressor::SuppressorKind>,
+    denoiser_handoff: usize,
     /// Fixed suppressor regardless of the noise model setting (audio bench).
     forced_suppressor: Option<crate::noise_suppressor::SuppressorKind>,
     #[cfg(feature = "native-rtc")]
@@ -3367,6 +3399,7 @@ impl MicrophoneProcessor {
         Self {
             denoiser: None,
             denoiser_kind: None,
+            denoiser_handoff: 0,
             forced_suppressor: None,
             #[cfg(feature = "native-rtc")]
             voice_detector: None,
@@ -3412,6 +3445,7 @@ impl MicrophoneProcessor {
         {
             // Discard denoiser history while the talk key is up, so earlier private speech
             // cannot emerge from its lookahead when the key is next pressed.
+            controls.model_status.store(crate::audio_model_lab::Status::Idle as u32, Ordering::Release);
             self.denoiser = None;
             self.denoiser_kind = None;
             #[cfg(feature = "native-rtc")]
@@ -3481,16 +3515,25 @@ impl MicrophoneProcessor {
             );
             // Enhanced always, Studio when its suppressor gives a voice
             // probability; Standard never.
-            let clicks = model != crate::audio_settings::NoiseModel::Standard;
+            let clicks = matches!(model, crate::audio_settings::NoiseModel::Enhanced | crate::audio_settings::NoiseModel::Studio);
             let strength = crate::click_suppression::NoiseStrength::from_u32(
                 controls.noise_strength.load(Ordering::Relaxed),
             );
             let kind = self
                 .forced_suppressor
                 .unwrap_or_else(|| crate::noise_suppressor::for_setting(model, strength));
-            if self.denoiser.is_none() || self.denoiser_kind != Some(kind) {
-                self.denoiser = Some(crate::noise_suppressor::make(kind));
+            let handoff = controls.model_handoff_samples();
+            let handoff_changed = matches!(kind, crate::noise_suppressor::SuppressorKind::Comparison(_)) && self.denoiser_handoff != handoff;
+            if self.denoiser.is_none() || self.denoiser_kind != Some(kind) || handoff_changed {
+                self.denoiser = Some(match kind {
+                    crate::noise_suppressor::SuppressorKind::Comparison(model) => {
+                        let service = controls.model_service.get_or_init(crate::audio_model_lab::Service::new).clone();
+                        Box::new(crate::audio_model_lab::Comparison::new(service, model, handoff))
+                    }
+                    _ => crate::noise_suppressor::make(kind),
+                });
                 self.denoiser_kind = Some(kind);
+                self.denoiser_handoff = handoff;
             }
             #[cfg(feature = "native-rtc")]
             {
@@ -3507,6 +3550,7 @@ impl MicrophoneProcessor {
                 let block: &mut [f32; crate::noise_suppressor::BLOCK] =
                     chunk.try_into().expect("chunks_exact yields whole blocks");
                 suppressor.process(block);
+                controls.model_status.store(suppressor.status() as u32, Ordering::Release);
                 // Before speech detection, so a click cannot open the gate.
                 // Click suppression needs a voice probability to spare speech.
                 if let (true, Some(voice)) = (clicks, suppressor.voice_probability()) {
@@ -3526,6 +3570,7 @@ impl MicrophoneProcessor {
                 }
             }
         } else {
+            controls.model_status.store(crate::audio_model_lab::Status::Idle as u32, Ordering::Release);
             self.denoiser = None;
             self.denoiser_kind = None;
             self.clicks = crate::click_suppression::ClickSuppressor::new();
@@ -5525,7 +5570,9 @@ pub(crate) fn send_delay_budget_for_capture(
         capture_period,
         resample,
         aec: 0.0,
-        suppression: shown.suppression_ms as f32,
+        suppression: if settings.noise_suppression && settings.noise_model.comparison().is_some() {
+            settings.noise_model.suppression_ms_for(settings.packet_samples().max(period)) as f32
+        } else { shown.suppression_ms as f32 },
         clicks: 0.0,
         gate_attack: 0.0,
         encoder_lookahead: shown.codec_ms.unwrap_or(0.0),
@@ -5720,6 +5767,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn comparison_handoff_tracks_real_capture_callbacks_through_200ms() {
+        for batch in [480, 960, 1920, 9600] {
+            let state = capture_test_state();
+            let config = cpal::StreamConfig { channels: 1, sample_rate: cpal::SampleRate(48_000), buffer_size: cpal::BufferSize::Default };
+            let mut callback = input_callback::<f32>(&config, state.clone());
+            callback(&vec![0.25; batch]);
+            assert_eq!(state.controls.model_handoff_samples(), batch);
+            let settings = AudioSettings { noise_model: crate::audio_settings::NoiseModel::DeepFilter3, ..Default::default() };
+            assert_eq!(send_delay_budget_for_capture(&settings, 48_000, batch as f32 / 48.0).suppression,
+                settings.noise_model.suppression_ms_for(batch) as f32);
+        }
+    }
     #[test]
     fn capture_at_48khz_completes_each_10ms_block_in_the_callback_that_delivers_it() {
         // A 10 ms device period delivers exactly one processing block. Holding

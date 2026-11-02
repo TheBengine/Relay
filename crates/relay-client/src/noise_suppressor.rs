@@ -23,6 +23,7 @@ pub(crate) trait Suppressor: Send {
     /// suppressor estimates one. Click suppression needs it to tell a click
     /// from a consonant.
     fn voice_probability(&self) -> Option<f32>;
+    fn status(&self) -> crate::audio_model_lab::Status { crate::audio_model_lab::Status::Active }
 }
 
 /// WebRTC noise suppression strength: the most it takes off steady noise.
@@ -52,6 +53,7 @@ pub(crate) enum SuppressorKind {
     WebRtcNsThenRnNoise(NsLevel),
     /// DPDFNet (Studio): removes music and other voices, 60 ms.
     DpdfNet(crate::dpdfnet::StudioKind),
+    Comparison(crate::audio_model_lab::Model),
 }
 
 /// Studio gives click suppression no voice probability: measured on the
@@ -67,6 +69,7 @@ pub(crate) fn for_setting(
     model: crate::audio_settings::NoiseModel,
     _strength: crate::click_suppression::NoiseStrength,
 ) -> SuppressorKind {
+    if let Some(model) = model.comparison() { return SuppressorKind::Comparison(model); }
     match model {
         crate::audio_settings::NoiseModel::Enhanced | crate::audio_settings::NoiseModel::Standard => {
             SuppressorKind::RnNoise
@@ -76,6 +79,10 @@ pub(crate) fn for_setting(
             probability: STUDIO_CLICKS,
             guarded: true,
         }),
+        crate::audio_settings::NoiseModel::WebRtc => SuppressorKind::WebRtcNs(NsLevel::High),
+        crate::audio_settings::NoiseModel::RnNoiseThenWebRtc => SuppressorKind::RnNoiseThenWebRtcNs(NsLevel::High),
+        crate::audio_settings::NoiseModel::WebRtcThenRnNoise => SuppressorKind::WebRtcNsThenRnNoise(NsLevel::High),
+        _ => unreachable!("comparison models handled above"),
     }
 }
 
@@ -84,6 +91,7 @@ pub(crate) fn make(kind: SuppressorKind) -> Box<dyn Suppressor> {
         SuppressorKind::Off => Box::new(Off),
         SuppressorKind::RnNoise => Box::new(RnNoise::new()),
         SuppressorKind::DpdfNet(kind) => Box::new(crate::dpdfnet::Studio::new(kind)),
+        SuppressorKind::Comparison(model) => Box::new(crate::audio_model_lab::Comparison::new(crate::audio_model_lab::Service::new(), model, BLOCK)),
         #[cfg(feature = "native-rtc")]
         SuppressorKind::WebRtcNs(level) => Box::new(WebRtcNs::new(level)),
         #[cfg(feature = "native-rtc")]
@@ -98,10 +106,21 @@ pub(crate) fn make(kind: SuppressorKind) -> Box<dyn Suppressor> {
             first: Box::new(WebRtcNs::new(level)),
             second: Box::new(RnNoise::new()),
         }),
-        // A kind this build lacks falls back to RNNoise.
-        #[allow(unreachable_patterns)]
-        _ => Box::new(RnNoise::new()),
+        // A saved native-only choice is unavailable in a portable build.
+        #[cfg(not(feature = "native-rtc"))]
+        _ => Box::new(Unavailable),
     }
+}
+
+#[cfg(not(feature = "native-rtc"))]
+struct Unavailable;
+#[cfg(not(feature = "native-rtc"))]
+impl Suppressor for Unavailable {
+    fn process(&mut self, block: &mut [f32; BLOCK]) { block.fill(0.0); }
+    fn delay_samples(&self) -> usize { 0 }
+    fn name(&self) -> &'static str { "unavailable" }
+    fn voice_probability(&self) -> Option<f32> { None }
+    fn status(&self) -> crate::audio_model_lab::Status { crate::audio_model_lab::Status::Unavailable }
 }
 
 // ------------------------------------------------------------------- off
@@ -205,6 +224,7 @@ impl WebRtcNs {
 impl Suppressor for WebRtcNs {
     fn process(&mut self, block: &mut [f32; BLOCK]) {
         if self.failed {
+            block.fill(0.0);
             return;
         }
         let mut frame = [0i16; BLOCK];
@@ -231,6 +251,7 @@ impl Suppressor for WebRtcNs {
             // A module that failed once is not trusted again: pass the
             // microphone through rather than send garbage.
             self.failed = true;
+            block.fill(0.0);
             return;
         }
         for (to, from) in block.iter_mut().zip(frame) {
@@ -242,6 +263,9 @@ impl Suppressor for WebRtcNs {
     }
     fn name(&self) -> &'static str {
         "webrtc-ns"
+    }
+    fn status(&self) -> crate::audio_model_lab::Status {
+        if self.failed { crate::audio_model_lab::Status::Unavailable } else { crate::audio_model_lab::Status::Active }
     }
     fn voice_probability(&self) -> Option<f32> {
         None
@@ -259,6 +283,10 @@ struct Chain {
 }
 
 impl Suppressor for Chain {
+    fn status(&self) -> crate::audio_model_lab::Status {
+        let first = self.first.status();
+        if first != crate::audio_model_lab::Status::Active { first } else { self.second.status() }
+    }
     fn process(&mut self, block: &mut [f32; BLOCK]) {
         self.first.process(block);
         self.second.process(block);

@@ -32,6 +32,15 @@ pub enum NoiseModel {
     Enhanced = 0,
     Standard = 1,
     Studio = 2,
+    WebRtc = 3,
+    RnNoiseThenWebRtc = 4,
+    WebRtcThenRnNoise = 5,
+    DeepFilter3 = 6,
+    DeepFilter3LowLatency = 7,
+    Gtcrn = 8,
+    RnNoiseNew = 9,
+    DpdfNet8 = 10,
+    DpdfNet2 = 11,
 }
 
 impl NoiseModel {
@@ -39,17 +48,84 @@ impl NoiseModel {
         match value {
             1 => Self::Standard,
             2 => Self::Studio,
+            3 => Self::WebRtc,
+            4 => Self::RnNoiseThenWebRtc,
+            5 => Self::WebRtcThenRnNoise,
+            6 => Self::DeepFilter3,
+            7 => Self::DeepFilter3LowLatency,
+            8 => Self::Gtcrn,
+            9 => Self::RnNoiseNew,
+            10 => Self::DpdfNet8,
+            11 => Self::DpdfNet2,
             _ => Self::Enhanced,
         }
     }
 
-    /// How late the suppressor's output follows its input.
-    pub(crate) fn suppression_ms(self) -> u32 {
+    pub(crate) fn suppression_ms_for(self, packet_samples: usize) -> u32 {
+        if let Some(model) = self.comparison() {
+            let handoff = packet_samples.div_ceil(480).clamp(1, 20) * 480;
+            return ((model.delay_samples() + handoff) as u32).div_ceil(48);
+        }
         let samples = match self {
             Self::Enhanced | Self::Standard => nnnoiseless::DenoiseState::FRAME_SIZE,
             Self::Studio => crate::dpdfnet::DELAY_SAMPLES,
+            Self::WebRtc => 335,
+            Self::RnNoiseThenWebRtc | Self::WebRtcThenRnNoise => 815,
+            _ => unreachable!("comparison models handled above"),
         };
-        samples as u32 * 1000 / relay_protocol::AUDIO_SAMPLE_RATE
+        (samples as u32).div_ceil(48)
+    }
+
+    pub(crate) const RECOMMENDED: Self = Self::Enhanced;
+    pub(crate) const ALL: [Self; 12] = [Self::Enhanced, Self::Standard, Self::Studio,
+        Self::WebRtc, Self::RnNoiseThenWebRtc, Self::WebRtcThenRnNoise,
+        Self::DeepFilter3, Self::DeepFilter3LowLatency, Self::Gtcrn, Self::RnNoiseNew,
+        Self::DpdfNet8, Self::DpdfNet2];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Enhanced => "Enhanced · Recommended",
+            Self::Standard => "RNNoise · Standard",
+            Self::Studio => "Studio · Automatic",
+            Self::WebRtc => "WebRTC noise suppression",
+            Self::RnNoiseThenWebRtc => "RNNoise → WebRTC",
+            Self::WebRtcThenRnNoise => "WebRTC → RNNoise",
+            Self::DeepFilter3 => "DeepFilterNet 3",
+            Self::DeepFilter3LowLatency => "DeepFilterNet 3 · Low latency",
+            Self::Gtcrn => "GTCRN · 16 kHz",
+            Self::RnNoiseNew => "RNNoise · Newer model",
+            Self::DpdfNet8 => "DPDFNet 8 · Exact model",
+            Self::DpdfNet2 => "DPDFNet 2 · Exact model",
+        }
+    }
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::Enhanced => "The current recommended sound: RNNoise with Relay's click removal and voice isolation.",
+            Self::Standard => "RNNoise alone, without Relay's extra click removal.",
+            Self::Studio => "Automatically switches between DPDFNet 8, DPDFNet 2 and RNNoise if this PC cannot keep up. Use an exact model below for comparisons.",
+            Self::WebRtc => "WebRTC's high-strength noise filter, without extra gain or echo processing.",
+            Self::RnNoiseThenWebRtc => "RNNoise first, then WebRTC's high-strength noise filter.",
+            Self::WebRtcThenRnNoise => "WebRTC's high-strength noise filter first, then RNNoise.",
+            Self::DeepFilter3 => "DeepFilterNet 3 with its original settings. Compare voice clarity and background music.",
+            Self::DeepFilter3LowLatency => "DeepFilterNet 3's separate low-latency model, with its original settings.",
+            Self::Gtcrn => "A lightweight 16 kHz model. The comparison includes sample-rate conversion; high frequencies are reduced.",
+            Self::RnNoiseNew => "The newer native RNNoise model, separate from the RNNoise used in Enhanced.",
+            Self::DpdfNet8 => "The full Studio model, kept fixed so you can hear exactly this model.",
+            Self::DpdfNet2 => "The smaller Studio model, kept fixed so you can compare its sound and speed.",
+        }
+    }
+    pub(crate) fn comparison(self) -> Option<crate::audio_model_lab::Model> {
+        use crate::audio_model_lab::Model;
+        use relay_audio_models::Model as External;
+        Some(match self {
+            Self::DeepFilter3 => Model::External(External::DeepFilter3),
+            Self::DeepFilter3LowLatency => Model::External(External::DeepFilter3LowLatency),
+            Self::Gtcrn => Model::External(External::Gtcrn),
+            Self::RnNoiseNew => Model::External(External::RnNoiseNew),
+            Self::DpdfNet8 => Model::Dpdf(crate::dpdfnet::Variant::Eight),
+            Self::DpdfNet2 => Model::Dpdf(crate::dpdfnet::Variant::Two),
+            _ => return None,
+        })
     }
 }
 
@@ -408,7 +484,7 @@ impl AudioSettings {
             // DPDFNet looks four blocks ahead, adds its own overlap/add, and
             // its thread hands each block back one block later.
             suppression_ms: if settings.noise_suppression {
-                settings.noise_model.suppression_ms()
+                settings.noise_model.suppression_ms_for(settings.packet_samples())
             } else {
                 0
             },
@@ -1091,6 +1167,26 @@ mod tests {
                     lookahead as f32 / 48.0
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_comparison_tests {
+    use super::*;
+    #[test]
+    fn model_catalog_preserves_saved_settings_and_accounts_for_worker_handoff() {
+        assert_eq!(NoiseModel::RECOMMENDED, NoiseModel::default());
+        assert_eq!(NoiseModel::Enhanced as u32, 0);
+        assert_eq!(NoiseModel::Standard as u32, 1);
+        assert_eq!(NoiseModel::Studio as u32, 2);
+        for model in NoiseModel::ALL {
+            assert_eq!(NoiseModel::from_u32(model as u32), model);
+            let json = serde_json::to_string(&model).unwrap();
+            assert_eq!(serde_json::from_str::<NoiseModel>(&json).unwrap(), model);
+            let a = model.suppression_ms_for(480);
+            let b = model.suppression_ms_for(960);
+            assert_eq!(b - a, if model.comparison().is_some() { 10 } else { 0 });
         }
     }
 }

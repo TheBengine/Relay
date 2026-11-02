@@ -493,11 +493,15 @@ impl RelayApp {
                     if let Err(error) = self.remember_current_local() {
                         self.notice = Some((error, Instant::now()));
                     }
-                    if let Some(target) = target.filter(|_| !preserve_friends_shell) {
-                        self.selected_nav = !matches!(target, Target::Direct(_));
+                    let target = if preserve_friends_shell && self.in_people() {
+                        self.account_start.remembered_friends_target(&scope, self.bootstrap.as_ref().unwrap())
+                    } else {
+                        target.filter(|_| !preserve_friends_shell)
+                    };
+                    if let Some(target) = target {
                         self.select(target);
                     }
-                    if preserve_friends_shell || (self.in_people() && self.current.is_none()) {
+                    if (preserve_friends_shell || self.in_people()) && self.current.is_none() {
                         self.selected_nav = false;
                         self.home_page = Some(SettingsTab::Friends);
                         self.admin_ui.friend_all_servers = false;

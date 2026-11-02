@@ -829,6 +829,7 @@ pub struct RelayApp {
     admin_requests: HashMap<u64, String>,
     admin_data: HashMap<String, serde_json::Value>,
     admin_ui: admin_ui::ServerUi,
+    server_icons: HashMap<String, (String, egui::TextureHandle)>,
     profile_ui: profile_ui::ProfileUi,
     encryption_ui: encryption_ui::EncryptionUi,
     message_protection: encryption_ui::ProtectionCache,
@@ -1315,6 +1316,7 @@ impl RelayApp {
             admin_requests: HashMap::new(),
             admin_data: HashMap::new(),
             admin_ui: admin_ui::ServerUi::default(),
+            server_icons: HashMap::new(),
             profile_ui: profile_ui::ProfileUi::default(),
             encryption_ui: encryption_ui::EncryptionUi::default(),
             message_protection: encryption_ui::ProtectionCache::default(),
@@ -1713,7 +1715,9 @@ impl RelayApp {
 
     fn select_at(&mut self, target: Target, unread: bool) {
         self.home_page = None;
-        self.selected_nav = matches!(&target, Target::Channel(_));
+        // Friends group conversations are protocol channels, but belong in
+        // Direct Messages rather than the community channel sidebar.
+        self.selected_nav = !self.in_people() && matches!(&target, Target::Channel(_));
         if !unread && self.current.as_ref() == Some(&target) {
             return;
         }
@@ -2240,6 +2244,7 @@ impl RelayApp {
     }
 
     fn switch_community(&mut self, url: String) {
+        self.remember_people_view();
         self.cancel_friends_navigation(Some(&url));
         self.cancel_background_people_answer();
         self.server_actions.cancel_if_other(&url);
