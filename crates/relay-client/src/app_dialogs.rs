@@ -332,7 +332,8 @@ impl RelayApp {
             .default_width(500.0);
         // The shared header (title, Close, Escape) stays above the scrolling body.
         if host_setup_ui::show_with_header(ctx, window, "Transfers", |ui| {
-            if self.uploads.is_empty() {
+            let update_visible = self.update_ui.show_transfer(ui);
+            if self.uploads.is_empty() && !update_visible {
                 ui.label("All transfers have finished.");
             }
             let ids: Vec<_> = self.uploads.keys().cloned().collect();

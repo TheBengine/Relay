@@ -376,6 +376,9 @@ pub(crate) struct CentralSession {
     pub subject: String,
     pub nonce: String,
     pub refresh_token: String,
+    /// Informational only; old credentials remain readable and are never trusted as identity.
+    #[serde(default)]
+    pub short_lived: bool,
 }
 impl Drop for CentralSession {
     fn drop(&mut self) {
@@ -484,6 +487,22 @@ pub(crate) fn real_vault_session_for_test(
 ) -> crate::e2ee::protected::test_vault::RealVaultEntry {
     crate::e2ee::protected::test_vault::RealVaultEntry::new(
         session_target(url, profile().as_deref()).unwrap(),
+    )
+}
+
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn real_central_session_for_test(
+    issuer: &str,
+    client_id: &str,
+    isolated_profile: &std::ffi::OsStr,
+) -> crate::e2ee::protected::test_vault::RealVaultEntry {
+    let url = url::Url::parse(issuer).unwrap();
+    assert_eq!(url.scheme(), "http");
+    assert_eq!(url.host_str(), Some("127.0.0.1"));
+    assert!(url.port().is_some());
+    assert!(std::path::Path::new(isolated_profile).is_absolute());
+    crate::e2ee::protected::test_vault::RealVaultEntry::new(
+        central_target(issuer, client_id, Some(isolated_profile)),
     )
 }
 
@@ -860,9 +879,13 @@ mod central_session_tests {
             subject: "owned-subject".into(),
             nonce: "owned-nonce".into(),
             refresh_token: "owned-refresh".into(),
+            short_lived: false,
         };
         let raw = serde_json::to_vec(&saved).unwrap();
         assert!(decode_central(issuer, "relay-desktop", &raw).is_ok());
+        let mut legacy = serde_json::to_value(&saved).unwrap();
+        legacy.as_object_mut().unwrap().remove("short_lived");
+        assert!(!decode_central(issuer, "relay-desktop", &serde_json::to_vec(&legacy).unwrap()).unwrap().short_lived);
         assert!(decode_central(issuer, "another-client", &raw).is_err());
         assert!(decode_central("https://other.example/realm", "relay-desktop", &raw).is_err());
     }

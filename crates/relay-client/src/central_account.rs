@@ -260,6 +260,11 @@ enum Callback {
 /// grant ends when the account service's browser session does (30 minutes
 /// idle or 10 hours by default), so a saved sign-in rarely outlived a restart.
 const OFFLINE_SCOPE: &str = "offline_access";
+const SHORT_LOGIN_WARNING: &str = "This sign-in is short-lived. Relay may ask you to sign in again after closing. Renew your saved login in Account settings to request a long-lived sign-in.";
+
+fn short_lived_login(tokens: &CoreTokenResponse, fallback: bool) -> bool {
+    tokens.scopes().map_or(fallback, |scopes| !scopes.iter().any(|scope| scope.as_str() == OFFLINE_SCOPE))
+}
 const INVALID_SCOPE: &str = "The account service does not allow a long-lived sign-in for Relay.";
 
 fn parse_callback(
@@ -432,15 +437,29 @@ fn checked_account(
     provider: &Provider,
     refreshing: bool,
 ) -> Result<Account> {
+    checked_account_at(tokens, verifier, nonce, provider, refreshing, chrono::Utc::now())
+}
+
+// A response retained during key discovery is checked at its receipt time to
+// authenticate a rotated refresh credential. UI delivery still checks real time.
+fn checked_account_at(
+    tokens: &CoreTokenResponse,
+    verifier: &CoreIdTokenVerifier<'_>,
+    nonce: &Nonce,
+    provider: &Provider,
+    refreshing: bool,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Account> {
     let invalid = "The account service returned an invalid identity. Sign in again.";
     let verifier = verifier
         .clone()
+        .set_time_fn(move || received_at)
         .set_allowed_algs([
             CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
             CoreJwsSigningAlgorithm::EdDsa,
         ])
-        .set_issue_time_verifier_fn(|issued| {
-            if issued > chrono::Utc::now() + chrono::Duration::seconds(60) {
+        .set_issue_time_verifier_fn(move |issued| {
+            if issued > received_at + chrono::Duration::seconds(60) {
                 Err("Identity issued in the future.".into())
             } else {
                 Ok(())
@@ -752,10 +771,13 @@ fn run_flow_persistent(
         subject: original.subject.clone(),
         nonce: nonce.secret().clone(),
         refresh_token: token.secret().clone(),
+        short_lived: short_lived_login(&tokens, !offline),
     });
     if let (Some(persistence), Some(saved)) = (&persistence, &saved) {
         if let Err(warning) = persistence.update(saved.clone(), &cancel) {
             let _ = events.try_send(Event::Warning(Some(warning)));
+        } else if saved.short_lived && persistence.state.lock().is_ok_and(|s| s.enabled) {
+            let _ = events.try_send(Event::Warning(Some(SHORT_LOGIN_WARNING)));
         }
     }
     if saved.is_none() {
@@ -964,8 +986,8 @@ fn resume_flow(
 }
 
 fn refresh_session(
-    client: AccountClient,
-    http: Transport,
+    mut client: AccountClient,
+    mut http: Transport,
     cancel: Arc<AtomicBool>,
     events: &mpsc::SyncSender<Event>,
     mut saved: SavedSession,
@@ -973,7 +995,6 @@ fn refresh_session(
     persistence: Option<Arc<Persistence>>,
 ) -> Result<()> {
     let nonce = Nonce::new(saved.nonce.clone());
-    let verifier = client.id_token_verifier();
     let mut attempt = 0;
     loop {
         if cancel.load(Ordering::Acquire) {
@@ -1013,8 +1034,36 @@ fn refresh_session(
                 continue;
             }
         };
-        let next = match checked_account(&refreshed, &verifier, &nonce, &http.provider, true) {
-            Ok(next) if next.subject == saved.subject && next.expires_at > now + 30 => next,
+        let received_at = chrono::Utc::now();
+        let mut identity = checked_account_at(&refreshed, &client.id_token_verifier(), &nonce, &http.provider, true, received_at);
+        if identity.is_err() {
+            // Discovery keys belong to the worker's start time. A provider can
+            // rotate them while Relay is open. Retry this SAME signed response
+            // with fresh trusted metadata before rejecting the remembered login.
+            // A temporary discovery outage must neither delete the credential
+            // nor exchange an already-rotated refresh token a second time.
+            let mut discovery_attempt = 0;
+            loop {
+                if cancel.load(Ordering::Acquire) { return Ok(()); }
+                match account_client(&http.provider, &cancel) {
+                    Ok((fresh_client, fresh_http)) => {
+                        identity = checked_account_at(&refreshed, &fresh_client.id_token_verifier(), &nonce, &fresh_http.provider, true, received_at);
+                        client = fresh_client;
+                        http = fresh_http;
+                        break;
+                    }
+                    Err(_) => {
+                        if discovery_attempt == 0 {
+                            let _ = events.try_send(Event::Warning(Some(RETRY_WARNING)));
+                        }
+                        if !retry_pause(&cancel, discovery_attempt) { return Ok(()); }
+                        discovery_attempt = discovery_attempt.saturating_add(1);
+                    }
+                }
+            }
+        }
+        let next = match identity {
+            Ok(next) if next.subject == saved.subject && next.expires_at > received_at.timestamp().max(0) as u64 + 30 => next,
             _ => {
                 if let Some(persistence) = &persistence {
                     persistence.reject(&cancel)?;
@@ -1030,19 +1079,32 @@ fn refresh_session(
             saved.refresh_token.zeroize();
             saved.refresh_token = rotated.secret().clone();
         }
+        saved.short_lived = short_lived_login(&refreshed, saved.short_lived);
         let warning = persistence
             .as_ref()
-            .and_then(|p| p.update(saved.clone(), &cancel).err());
+            .and_then(|p| p.update(saved.clone(), &cancel).err()
+                .or_else(|| (saved.short_lived && p.state.lock().is_ok_and(|s| s.enabled)).then_some(SHORT_LOGIN_WARNING)));
         if warning.is_some() || attempt > 0 || persistence.is_some() {
             let _ = events.try_send(Event::Warning(warning));
         }
         if cancel.load(Ordering::Acquire) {
             return Ok(());
         }
+        if !account_ready_now(&next) {
+            // Metadata recovery can outlive this ID token. Its verified refresh
+            // rotation is now saved; obtain a fresh identity before showing it.
+            account = None;
+            attempt = 0;
+            continue;
+        }
         deliver_account(events, &cancel, next.clone())?;
         account = Some(next);
         attempt = 0;
     }
+}
+
+fn account_ready_now(account: &Account) -> bool {
+    account.expires_at > (chrono::Utc::now().timestamp().max(0) as u64).saturating_add(30)
 }
 
 pub struct Controller {
@@ -1111,6 +1173,10 @@ impl Controller {
     }
     pub fn resuming(&self) -> bool {
         self.resuming
+    }
+    pub fn short_lived_login(&self) -> bool {
+        self.persistence.state.lock().is_ok_and(|state| state.enabled
+            && state.current.as_ref().is_some_and(|saved| saved.short_lived))
     }
     /// A different signed global identity must not inherit old community sessions.
     pub fn take_account_change(&mut self) -> bool {

@@ -261,6 +261,9 @@ impl RelayApp {
                     self.sign_out_relay();
                 }
             });
+            if self.central_account.short_lived_login() && ui.button("Renew saved login").clicked() {
+                self.central_account.start_remembered(ui.ctx().clone(), self.prefs.stay_signed_in);
+            }
         } else if self.central_account.waiting() {
             ui.label(if self.central_account.browser_ready() {
                 "Continue in your browser. Relay will show your account here when sign-in finishes."

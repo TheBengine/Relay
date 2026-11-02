@@ -170,9 +170,10 @@ impl RelayApp {
                             .inner_margin(Margin::same(8.0)),
                     )
                     .show_inside(ui, |ui| {
-                        if !self.uploads.is_empty() {
+                        let transfer_count = self.uploads.len() + usize::from(self.update_ui.has_transfer());
+                        if transfer_count > 0 {
                             if ui
-                                .add(secondary(&format!("Transfers · {}", self.uploads.len())))
+                                .add(secondary(&format!("Transfers · {transfer_count}")))
                                 .clicked()
                             {
                                 self.transfers_open = true;

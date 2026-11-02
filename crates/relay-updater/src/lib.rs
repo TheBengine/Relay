@@ -26,6 +26,21 @@ use tough::{Repository, RepositoryLoader, TargetName, Transport};
 use transport::{HttpTransport, RootRecorder};
 
 pub type Result<T> = std::result::Result<T, String>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadPhase {
+    Preparing,
+    Downloading,
+    Verifying,
+}
+
+/// Counts received bytes against the publisher's signed size. Completion is
+/// reported only through PreparedInstaller, after all verification succeeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DownloadProgress {
+    pub phase: DownloadPhase,
+    pub received: u64,
+    pub total: u64,
+}
 pub const APP_ID: &str = "3bed570c-afb7-4f36-8a88-8c6f1772d6af";
 const MAX_METADATA: u64 = 2 * 1024 * 1024;
 const MAX_RELEASE: u64 = 16 * 1024;
@@ -280,6 +295,14 @@ impl Engine {
         let transport = HttpTransport::new(&self.publisher)?;
         self.download_with(approved, transport).await
     }
+    pub async fn download_with_progress(
+        &self,
+        approved: &Release,
+        progress: impl FnMut(DownloadProgress),
+    ) -> Result<PreparedInstaller> {
+        let transport = HttpTransport::new(&self.publisher)?;
+        self.download_reporting(approved, transport, progress).await
+    }
     async fn load<T: Transport + Clone + 'static>(
         &self,
         store: &Store,
@@ -402,6 +425,15 @@ impl Engine {
         approved: &Release,
         transport: T,
     ) -> Result<PreparedInstaller> {
+        self.download_reporting(approved, transport, |_| {}).await
+    }
+    async fn download_reporting<T: Transport + Clone + 'static>(
+        &self,
+        approved: &Release,
+        transport: T,
+        mut progress: impl FnMut(DownloadProgress),
+    ) -> Result<PreparedInstaller> {
+        progress(DownloadProgress { phase: DownloadPhase::Preparing, received: 0, total: approved.installer_bytes });
         let store = Store::open(&self.directory, &self.publisher.identity)?;
         let (repository, candidate) = self.load(&store, transport).await?;
         let release = tokio::time::timeout(
@@ -435,6 +467,7 @@ impl Engine {
         ));
         storage::guard(&destination)?;
         if destination.exists() {
+            progress(DownloadProgress { phase: DownloadPhase::Verifying, received: release.installer_bytes, total: release.installer_bytes });
             let ready = PreparedInstaller {
                 path: destination,
                 release,
@@ -445,6 +478,7 @@ impl Engine {
             return Ok(ready);
         }
         let mut temporary = cache.stage(&release)?;
+        progress(DownloadProgress { phase: DownloadPhase::Downloading, received: 0, total: release.installer_bytes });
         let operation = async {
             let stream = repository
                 .read_target(&target)
@@ -465,6 +499,7 @@ impl Engine {
                     .write_all(&chunk)
                     .map_err(|e| e.to_string())?;
                 storage::checkpoint("download-partial");
+                progress(DownloadProgress { phase: DownloadPhase::Downloading, received: count, total: release.installer_bytes });
             }
             if count != release.installer_bytes {
                 return Err("The installer download was incomplete.".into());
@@ -480,6 +515,7 @@ impl Engine {
         tokio::time::timeout(Duration::from_secs(120), operation)
             .await
             .map_err(|_| "The installer download timed out.")??;
+        progress(DownloadProgress { phase: DownloadPhase::Verifying, received: release.installer_bytes, total: release.installer_bytes });
         let (count, hash) = storage::file_digest(temporary.path(), MAX_INSTALLER)?;
         if count != release.installer_bytes || hash != release.installer_sha256 {
             return Err("The installer could not be verified.".into());

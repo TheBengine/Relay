@@ -1,5 +1,14 @@
 # Verificerede opdateringer – motor, status, genstart og installerhandoff
 
+## Downloadfremdrift — 2. november 2026
+
+Opdateringer vises i Transfers, også uden andre overførsler, samt i banneret
+og opdateringsindstillingerne. Procent og MB kommer fra faktisk modtagne bytes
+og udgiverens signerede størrelse. Filkontrol vises som en særskilt fase;
+100 % hentet er ikke i sig selv tilladelse til installation. Efter ti sekunder
+uden nye data viser downloadfasen, at den venter. Annullering og fejl forbliver
+synlige, mens de eksisterende tidsgrænser og sikkerhedskontroller er bevaret.
+
 ## Aktuel implementering — bootstrap .7 klargøres
 
 Kilden indeholder nu en rigtig TUF-udgiverrod og beta-adresserne

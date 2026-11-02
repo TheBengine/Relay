@@ -370,6 +370,10 @@ struct Authorization {
     fail_refreshes: usize,
     reject_refresh: bool,
     offline_supported: bool,
+    rotate_signing_on_refresh: bool,
+    fail_rotated_key_reads: usize,
+    key_reads: usize,
+    short_first_refresh: bool,
 }
 
 struct Fixture {
@@ -396,6 +400,8 @@ impl Fixture {
         let worker = thread::spawn(move || {
             let signing = key(17);
             let public = signing.as_verification_key();
+            let rotated_signing = key(18);
+            let rotated_public = rotated_signing.as_verification_key();
             while !quit.load(Ordering::Acquire) {
                 let mut stream = match listener.accept() {
                     Ok((s, _)) => s,
@@ -446,7 +452,15 @@ impl Fixture {
                         metadata
                     }
                 } else if path.ends_with("/keys") {
-                    json!({"keys":[public]})
+                    let mut state = shared.lock().unwrap();
+                    state.key_reads += 1;
+                    if state.rotate_signing_on_refresh && state.refreshes > 0 {
+                        if state.fail_rotated_key_reads > 0 {
+                            state.fail_rotated_key_reads -= 1;
+                            status = "503 Service Unavailable";
+                            json!({"error":"temporarily_unavailable"})
+                        } else { json!({"keys":[rotated_public]}) }
+                    } else { json!({"keys":[public]}) }
                 } else if path.ends_with("/token") {
                     let params: HashMap<_, _> = url::form_urlencoded::parse(&data[header_end..])
                         .into_owned()
@@ -489,9 +503,9 @@ impl Fixture {
                                 &state.nonce,
                                 "stable-subject-a",
                                 "alice_shared",
-                                if state.refreshes == 0 { 31 } else { 300 },
+                                if state.refreshes == 0 || (state.refreshes == 1 && state.short_first_refresh) { 31 } else { 300 },
                             ),
-                            &signing,
+                            if state.rotate_signing_on_refresh && state.refreshes > 0 { &rotated_signing } else { &signing },
                         );
                         if params["grant_type"] == "refresh_token" && state.rotate {
                             let rotated = format!("owned-rotated-refresh-{}", state.refreshes);
@@ -899,6 +913,7 @@ fn saved_fixture(fixture: &Fixture) -> SavedSession {
         subject: "stable-subject-a".into(),
         nonce: "owned-remembered-nonce".into(),
         refresh_token: "own-fixture-refresh-token".into(),
+        short_lived: false,
     }
 }
 fn remembered_controller(provider: Provider, store: Arc<MemorySessionStore>) -> Controller {
@@ -1000,6 +1015,87 @@ fn temporary_refresh_failure_keeps_saved_signin_and_retries_without_browser() {
 }
 
 #[test]
+fn signing_key_rotation_rechecks_same_response_and_keeps_login_during_discovery_outage() {
+    let _guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
+    for (unavailable, near_expiry) in [(false, false), (true, false), (true, true)] {
+        wait_account_workers();
+        let fixture = Fixture::new();
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.rotate = true;
+            state.rotate_signing_on_refresh = true;
+            state.fail_rotated_key_reads = usize::from(unavailable) + usize::from(near_expiry);
+            state.short_first_refresh = near_expiry;
+        }
+        let store = Arc::new(MemorySessionStore::default());
+        *store.saved.lock().unwrap() = Some(saved_fixture(&fixture));
+        let mut controller = remembered_controller(fixture.provider.clone(), store.clone());
+        assert!(controller.resume(egui::Context::default(), true));
+        if unavailable {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while controller.warning.is_none() {
+                assert!(controller.poll().is_none());
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(store.saved.lock().unwrap().is_some());
+            assert!(controller.resuming());
+        }
+        restored_account(&mut controller);
+        assert!(controller.warning.is_none());
+        let exchanges = 1 + usize::from(near_expiry);
+        assert_eq!(store.saved.lock().unwrap().as_ref().unwrap().refresh_token, format!("owned-rotated-refresh-{exchanges}"));
+        assert!(account_ready_now(controller.account.as_ref().unwrap()));
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.refreshes, exchanges, "Only renew again if the retained identity aged during recovery");
+        assert_eq!(state.key_reads, 2 + usize::from(unavailable) + usize::from(near_expiry));
+        assert_eq!(state.exchanges, 0, "No browser sign-in");
+    }
+}
+
+#[test]
+fn an_identity_that_expires_during_key_recovery_can_only_authenticate_rotation_not_open_the_app() {
+    let provider = provider("https://accounts.example.test/realm");
+    let signing = key(18);
+    let verifier = CoreIdTokenVerifier::new_public_client(ClientId::new(provider.client_id.clone()),
+        IssuerUrl::new(provider.issuer.to_string()).unwrap(), JsonWebKeySet::new(vec![signing.as_verification_key()]));
+    let received_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+    let nonce = Nonce::new("owned-nonce".into());
+    let signed = claims(&provider, nonce.secret(), "owned-subject", "alice_shared", -1)
+        .set_issue_time(received_at - chrono::Duration::seconds(1));
+    let tokens = serde_json::from_value(token_json(signed, &signing)).unwrap();
+    assert!(checked_account(&tokens, &verifier, &nonce, &provider, true).is_err());
+    let verified = checked_account_at(&tokens, &verifier, &nonce, &provider, true, received_at).unwrap();
+    assert!(!account_ready_now(&verified));
+    assert!(checked_account_at(&tokens, &verifier, &Nonce::new("wrong".into()), &provider, true, received_at).is_err());
+}
+
+#[test]
+fn short_lived_grants_remain_usable_and_warn_across_restart() {
+    let _guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
+    wait_account_workers();
+    let fixture = Fixture::new();
+    let store = Arc::new(MemorySessionStore::default());
+    let mut saved = saved_fixture(&fixture);
+    saved.short_lived = true;
+    *store.saved.lock().unwrap() = Some(saved);
+    let mut controller = remembered_controller(fixture.provider.clone(), store.clone());
+    assert!(controller.resume(egui::Context::default(), true));
+    restored_account(&mut controller);
+    assert_eq!(controller.warning, Some(SHORT_LOGIN_WARNING));
+    assert!(controller.short_lived_login());
+    assert!(store.saved.lock().unwrap().is_some());
+    let tokens: CoreTokenResponse = serde_json::from_value(token_json(claims(&fixture.provider, "nonce", "subject", "alice_shared", 300), &key(17))).unwrap();
+    assert!(short_lived_login(&tokens, true));
+    assert!(!short_lived_login(&tokens, false));
+    let mut value = serde_json::to_value(&tokens).unwrap();
+    value["scope"] = json!("openid profile");
+    assert!(short_lived_login(&serde_json::from_value(value.clone()).unwrap(), false));
+    value["scope"] = json!("openid profile offline_access");
+    assert!(!short_lived_login(&serde_json::from_value(value).unwrap(), true));
+}
+
+#[test]
 fn revoked_refresh_requires_signin_and_forgets_only_that_central_session() {
     let _guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
     wait_account_workers();
@@ -1079,11 +1175,14 @@ fn vault_save_failure_keeps_ram_session_and_is_a_warning() {
 
 #[test]
 #[cfg(windows)]
-fn windows_vault_owned_refresh_survives_two_silent_controller_restarts() {
+fn windows_vault_owned_refresh_survives_two_process_restarts() {
     let _guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
     wait_account_workers();
     let fixture = Fixture::new();
     fixture.state.lock().unwrap().rotate = true;
+    let profile = std::env::var_os("RELAY_PROFILE_DIR").expect("Explicit isolated test profile");
+    let _vault = crate::credential_vault::real_central_session_for_test(
+        fixture.provider.issuer.as_str(), &fixture.provider.client_id, &profile);
     // Unique owned loopback issuer/purpose target: never reads a real account.
     struct Cleanup(VaultStore);
     impl Drop for Cleanup {
@@ -1099,21 +1198,41 @@ fn windows_vault_owned_refresh_survives_two_silent_controller_restarts() {
         .update(saved_fixture(&fixture), &AtomicBool::new(false))
         .unwrap();
     drop(initial);
-    let mut first = Controller::owned(fixture.provider.clone());
-    assert!(first.resume(egui::Context::default(), true));
-    restored_account(&mut first);
-    drop(first);
-    wait_account_workers();
-    let mut second = Controller::owned(fixture.provider.clone());
-    assert!(second.resume(egui::Context::default(), true));
-    restored_account(&mut second);
+    for generation in [1, 2] {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "central_account::tests::owned_vault_restart_child", "--ignored", "--test-threads=1"])
+            .env("RELAY_OWN_VAULT_RESTART_ISSUER", fixture.provider.issuer.as_str())
+            .env("RELAY_OWN_VAULT_RESTART_GENERATION", generation.to_string())
+            .output().unwrap();
+        assert!(result.status.success(), "Owned child failed: {} {}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+    }
     assert_eq!(fixture.state.lock().unwrap().refreshes, 2);
     assert_eq!(fixture.state.lock().unwrap().exchanges, 0);
-    second.forget().unwrap();
+    VaultStore(Some(fixture.provider.clone())).forget().unwrap();
     assert!(VaultStore(Some(fixture.provider.clone()))
         .load()
         .unwrap()
         .is_none());
+}
+
+#[test]
+#[cfg(windows)]
+#[ignore = "spawned only by the owned Windows-vault restart test"]
+fn owned_vault_restart_child() {
+    let issuer = std::env::var("RELAY_OWN_VAULT_RESTART_ISSUER").expect("Owned parent fixture required");
+    let generation: u32 = std::env::var("RELAY_OWN_VAULT_RESTART_GENERATION").unwrap().parse().unwrap();
+    assert!(matches!(generation, 1 | 2));
+    let provider = provider(&issuer);
+    let profile = std::env::var_os("RELAY_PROFILE_DIR").expect("Explicit isolated test profile");
+    let vault = crate::credential_vault::real_central_session_for_test(&issuer, &provider.client_id, &profile);
+    let mut controller = Controller::owned(provider.clone());
+    assert!(controller.resume(egui::Context::default(), true));
+    restored_account(&mut controller);
+    assert_eq!(VaultStore(Some(provider)).load().unwrap().unwrap().refresh_token, format!("owned-rotated-refresh-{generation}"));
+    drop(controller);
+    // The parent owns cleanup. Leave only this synthetic fixture credential
+    // for the next process; no personal provider or normal profile is used.
+    std::mem::forget(vault);
 }
 
 #[test]

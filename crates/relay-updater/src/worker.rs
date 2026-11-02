@@ -1,8 +1,9 @@
-use super::{Check, Engine, PreparedInstaller, Release, Result};
+use super::{Check, DownloadProgress, Engine, PreparedInstaller, Release, Result};
 use std::{
     future::Future,
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 #[derive(Debug)]
@@ -28,10 +29,12 @@ struct Job {
 }
 
 /// A single cancellable operation. No runtime, timer, socket or thread exists
-/// while idle; the UI is notified only when a job has produced its final result.
+/// while idle. Download progress uses one replaceable snapshot, with bounded
+/// repaint notifications rather than an unbounded queue of network chunks.
 pub struct Worker {
     engine: Arc<Engine>,
     job: Option<Job>,
+    progress: Arc<Mutex<Option<(DownloadProgress, Instant)>>>,
 }
 
 impl Worker {
@@ -39,6 +42,7 @@ impl Worker {
         Self {
             engine: Arc::new(engine),
             job: None,
+            progress: Arc::new(Mutex::new(None)),
         }
     }
     pub fn running(&self) -> bool {
@@ -56,18 +60,36 @@ impl Worker {
     pub fn download(
         &mut self,
         approved: Release,
-        notify: impl FnOnce() + Send + 'static,
+        notify: impl Fn() + Send + Sync + 'static,
     ) -> Result<()> {
         let engine = self.engine.clone();
+        let snapshot = self.progress.clone();
+        let notify = Arc::new(notify);
+        let progress_notify = notify.clone();
         self.start(
             move || async move {
+                let mut last_notice: Option<(super::DownloadPhase, Instant)> = None;
                 engine
-                    .download(&approved)
+                    .download_with_progress(&approved, move |progress| {
+                        let now = Instant::now();
+                        if let Ok(mut slot) = snapshot.lock() {
+                            *slot = Some((progress, now));
+                        }
+                        if last_notice.is_none_or(|(phase, at)| phase != progress.phase
+                            || now.duration_since(at) >= Duration::from_millis(150)) {
+                            last_notice = Some((progress.phase, now));
+                            progress_notify();
+                        }
+                    })
                     .await
                     .map(|ready| Outcome::Downloaded(Box::new(ready)))
             },
-            notify,
+            move || notify(),
         )
+    }
+
+    pub fn download_progress(&self) -> Option<(DownloadProgress, Duration)> {
+        self.progress.lock().ok()?.map(|(progress, at)| (progress, at.elapsed()))
     }
 
     pub fn cancel(&mut self) {
@@ -123,6 +145,9 @@ impl Worker {
     {
         if self.job.is_some() {
             return Err("An update operation is already running.".into());
+        }
+        if let Ok(mut progress) = self.progress.lock() {
+            *progress = None;
         }
         let (sender, receiver) = mpsc::channel();
         let (cancel, cancelled) = tokio::sync::oneshot::channel();

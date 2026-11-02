@@ -528,17 +528,18 @@ impl Controller {
                 }
             }
             State::Downloading | State::Cancelling => {
-                ui.spinner();
                 let version = self
                     .download_release
                     .as_ref()
                     .map(|release| release.version.clone())
                     .unwrap_or_default();
-                ui.label(if matches!(self.state, State::Downloading) {
-                    format!("Downloading Relay {version}…")
+                if matches!(self.state, State::Downloading) {
+                    ui.label(format!("Relay {version} update"));
+                    self.show_download_progress(ui, 260.0);
                 } else {
-                    "Cancelling download…".into()
-                });
+                    ui.spinner();
+                    ui.label("Cancelling download…");
+                }
                 if matches!(self.state, State::Downloading) && ui.small_button("Cancel").clicked() {
                     self.auto_postponed = true;
                     self.cancel_download();
@@ -639,6 +640,49 @@ impl Controller {
     }
 
     /// The app reports an unsent message so an automatic restart never drops it.
+    fn show_download_progress(&self, ui: &mut egui::Ui, width: f32) {
+        let snapshot = self.worker.as_ref().and_then(Worker::download_progress);
+        let (fraction, label) = download_progress_label(snapshot);
+        ui.add(egui::ProgressBar::new(fraction).desired_width(width).text(label));
+        // Keep a stalled connection visibly distinct from verification. This
+        // timer exists only while a download is displayed; it starts no IO.
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
+
+    pub(super) fn has_transfer(&self) -> bool {
+        matches!(self.state, State::Downloading | State::Cancelling | State::Ready(_))
+            || (matches!(self.state, State::Failed) && self.last_available.is_some())
+    }
+
+    /// The same update operation appears beside ordinary file downloads.
+    pub(super) fn show_transfer(&mut self, ui: &mut egui::Ui) -> bool {
+        if !self.has_transfer() {
+            return false;
+        }
+        ui.strong("Relay update");
+        match &self.state {
+            State::Downloading => {
+                self.show_download_progress(ui, ui.available_width().min(460.0));
+                if ui.small_button("Cancel download").clicked() {
+                    self.auto_postponed = true;
+                    self.cancel_download();
+                }
+            }
+            State::Cancelling => { ui.label("Cancelling download…"); }
+            State::Ready(_) => {
+                ui.label(if self.preparing_install() {
+                    "Preparing installation…"
+                } else {
+                    "Download verified. Ready to install."
+                });
+            }
+            State::Failed => { ui.label("Update failed. Open Settings → Advanced → Updates to try again."); }
+            _ => {}
+        }
+        ui.separator();
+        true
+    }
+
     pub fn set_unsent_draft(&mut self, unsent: bool) {
         self.unsent_draft = unsent;
     }
@@ -746,6 +790,9 @@ impl Controller {
             State::Failed => "Couldn't check or verify the update. Try again in a moment.",
         };
         ui.label(message);
+        if matches!(self.state, State::Downloading) {
+            self.show_download_progress(ui, ui.available_width().min(400.0));
+        }
         if matches!(self.state, State::Disabled | State::Unavailable) {
             ui.hyperlink_to("View releases", RELEASES_URL);
         }
@@ -894,6 +941,30 @@ fn install_controls(
     InstallChoice::None
 }
 
+fn download_progress_label(
+    snapshot: Option<(relay_updater::DownloadProgress, Duration)>,
+) -> (f32, String) {
+    use relay_updater::DownloadPhase;
+    let Some((progress, quiet)) = snapshot else {
+        return (0.0, "Preparing download…".into());
+    };
+    let fraction = if progress.total == 0 { 0.0 } else {
+        (progress.received as f64 / progress.total as f64).clamp(0.0, 1.0) as f32
+    };
+    let label = match progress.phase {
+        DownloadPhase::Preparing => "Checking update information…".into(),
+        DownloadPhase::Verifying => "Checking downloaded file…".into(),
+        DownloadPhase::Downloading => {
+            let counts = format!("{:.0}% · {:.1} / {:.1} MB", (fraction * 100.0).floor(),
+                progress.received as f64 / 1_000_000.0, progress.total as f64 / 1_000_000.0);
+            if quiet >= Duration::from_secs(10) {
+                format!("{counts} · Waiting for data…")
+            } else { counts }
+        }
+    };
+    (fraction, label)
+}
+
 fn update_button(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Response {
     let response = ui.add_enabled(enabled, egui::Button::new(label));
     // egui 0.27 does not publish a disabled Button's state to AccessKit.
@@ -947,6 +1018,43 @@ fn show_folder(_path: &std::path::Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfers_include_update_and_keep_cancellation_visible_until_worker_finishes() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut controller = Controller::inactive(State::Downloading);
+        controller.download_release = Some(Box::new(v2_release()));
+        assert!(controller.has_transfer());
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { assert!(controller.show_transfer(ui)); });
+        });
+        let names: Vec<_> = output.platform_output.accesskit_update.unwrap().nodes
+            .into_iter().filter_map(|(_, n)| n.name().map(str::to_owned)).collect();
+        assert!(names.iter().any(|n| n == "Relay update"));
+        assert!(names.iter().any(|n| n == "Cancel download"));
+        controller.cancel_download();
+        assert!(controller.has_transfer());
+        controller.apply(Ok(Outcome::Cancelled));
+        assert!(!controller.has_transfer());
+        assert!(matches!(controller.state, State::Available(_)));
+        controller.last_available = Some(v2_release().sequence);
+        controller.failed();
+        assert!(controller.has_transfer(), "A failed download must remain visible");
+    }
+
+    #[test]
+    fn download_progress_distinguishes_transfer_stall_and_verification() {
+        use relay_updater::{DownloadPhase, DownloadProgress};
+        let progress = DownloadProgress { phase: DownloadPhase::Downloading, received: 25_000_000, total: 100_000_000 };
+        let (fraction, label) = download_progress_label(Some((progress, Duration::ZERO)));
+        assert_eq!(fraction, 0.25);
+        assert_eq!(label, "25% · 25.0 / 100.0 MB");
+        assert!(download_progress_label(Some((progress, Duration::from_secs(10)))).1.contains("Waiting for data"));
+        let verifying = DownloadProgress { phase: DownloadPhase::Verifying, received: progress.total, ..progress };
+        assert_eq!(download_progress_label(Some((verifying, Duration::ZERO))), (1.0, "Checking downloaded file…".into()));
+        assert_eq!(download_progress_label(None).0, 0.0);
+    }
 
     fn v2_release() -> Release {
         Release {

@@ -24,3 +24,15 @@ cannot be recovered after closing the app. An upgrade therefore needs one
 interactive sign-in; previously unsaved server/Friends sessions also need one
 fresh approval. Later launches resume the protected saved sessions. A revoked
 or expired refresh grant still requires sign-in again.
+
+The November 2 login update rechecks refreshed identities against newly fetched
+provider signing keys before rejecting a saved login. A temporary key-discovery
+outage keeps the credential and retries the same response. Identity, nonce and
+issuer checks still apply; a permanently invalid identity remains rejected.
+
+When a provider grants only a short-lived login, Relay keeps a warning with
+that saved session and offers **Renew saved login** in Account settings. Existing
+credentials remain readable. Old ordinary grants cannot become offline grants
+through refresh alone: an explicit new sign-in must request the long-lived scope.
+The Windows credential check exercises two separate client test processes,
+using only an isolated profile and a synthetic loopback identity service.

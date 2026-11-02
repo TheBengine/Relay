@@ -249,6 +249,38 @@ pub(crate) fn handoff_fixture_bytes(
 }
 
 #[tokio::test]
+async fn download_progress_counts_signed_bytes_then_verifies_including_cached_restart() {
+    let root = directory();
+    let fixture = Fixture::new();
+    let engine = fixture.engine(root.path());
+    let mut events = Vec::new();
+    let ready = engine.download_reporting(&fixture.release, fixture.memory.clone(), |p| events.push(p)).await.unwrap();
+    ready.revalidate().unwrap();
+    assert_eq!(events.first().unwrap().phase, DownloadPhase::Preparing);
+    assert_eq!(events.last().unwrap().phase, DownloadPhase::Verifying);
+    let received: Vec<_> = events.iter().filter(|p| p.phase == DownloadPhase::Downloading).map(|p| p.received).collect();
+    assert_eq!(received.first(), Some(&0));
+    assert_eq!(received.last(), Some(&fixture.release.installer_bytes));
+    assert!(received.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(events.iter().all(|p| p.total == fixture.release.installer_bytes && p.received <= p.total));
+    events.clear();
+    engine.download_reporting(&fixture.release, fixture.memory.clone(), |p| events.push(p)).await.unwrap();
+    assert_eq!(events.iter().map(|p| p.phase).collect::<Vec<_>>(), vec![DownloadPhase::Preparing, DownloadPhase::Verifying]);
+}
+
+#[tokio::test]
+async fn interrupted_download_progress_never_reports_verification() {
+    let root = directory();
+    let fixture = Fixture::new();
+    let mut memory = fixture.memory.clone();
+    memory.broken = Some(format!("/targets/{}", fixture.release.installer_target));
+    let mut events = Vec::new();
+    assert!(fixture.engine(root.path()).download_reporting(&fixture.release, memory, |p| events.push(p)).await.is_err());
+    assert!(!events.iter().any(|p| p.phase == DownloadPhase::Verifying));
+    assert!(events.iter().any(|p| p.phase == DownloadPhase::Downloading));
+}
+
+#[tokio::test]
 async fn legacy_signed_release_stages_but_does_not_gain_execution_permission() {
     let root = directory();
     let mut fixture = Fixture::new();
