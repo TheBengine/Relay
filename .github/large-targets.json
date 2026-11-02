@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "targets": [
+    {
+      "tag": "v0.10.0-preview.20261102.4",
+      "path": "updates/beta/targets/windows-x64/beta/Relay-0.10.0-20261102172456-Setup.exe",
+      "sha256": "054402f6a108bbb4b7c550b7bcf439c6bb79a223e7056319225090c6790d778c",
+      "bytes": 149122227
+    }
+  ]
+}
