@@ -2804,7 +2804,7 @@ impl Worker {
                     || private_service
                     || crate::iroh_route::is_iroh(&url)
                 {
-                    let summary = check_server(&self.http, &url)?;
+                    let summary = check_server_for_login(&self.http, &url)?;
                     summary.validate(expected_server_id.as_deref())?;
                     crate::embedded_network::bind_identity(&url, &summary.server_id)?;
                 }
@@ -4670,7 +4670,7 @@ fn resume_remembered(
 ) -> Result<(Session, Bootstrap, Instant, Option<u64>), String> {
     let pin = remembered.confirmed_server_id(expected)?;
     // Public probe first; a replaced community never receives a saved token.
-    let summary = check_server(http, url)?;
+    let summary = check_server_for_login(http, url)?;
     if summary.server_id != pin {
         return Err(IDENTITY_CHANGED.into());
     }
@@ -4708,13 +4708,31 @@ fn check_server(
     http: &Client,
     url: &str,
 ) -> Result<crate::connection_setup::ServerSummary, String> {
+    check_server_with_timeout(http, url, Duration::from_secs(2))
+}
+
+fn check_server_for_login(
+    http: &Client,
+    url: &str,
+) -> Result<crate::connection_setup::ServerSummary, String> {
+    // Sign-in and saved-session restoration need the normal request budget,
+    // not the short discovery budget: a cold public TLS connection can exceed
+    // two seconds. The probe remains anonymous and identity-checked.
+    check_server_with_timeout(http, url, Duration::from_secs(8))
+}
+
+fn check_server_with_timeout(
+    http: &Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<crate::connection_setup::ServerSummary, String> {
     crate::tailscale_connect::ensure_private_connection(url)?;
     // Public, credential-free and bounded. Never follow an invite to a redirect.
     let response = http
         .get(crate::embedded_network::endpoint(&format!(
             "{url}/api/health"
         )))
-        .timeout(Duration::from_secs(2))
+        .timeout(timeout)
         .send()
         .map_err(network_error)?;
     if !response.status().is_success() {

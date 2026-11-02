@@ -46,7 +46,7 @@ impl Worker {
         request_id: u64,
     ) -> Result<(), String> {
         let url = account_destination(&url)?;
-        let summary = check_server(&self.http, &url)?;
+        let summary = check_server_for_login(&self.http, &url)?;
         if expected.is_some_and(|id| id != summary.server_id) {
             return Err(IDENTITY_CHANGED.into());
         }
@@ -77,7 +77,7 @@ impl Worker {
             return Ok(());
         }
         let url = account_destination(&url)?;
-        let summary = check_server(&self.http, &url)?;
+        let summary = check_server_for_login(&self.http, &url)?;
         if summary.server_id != expected {
             return Err(IDENTITY_CHANGED.into());
         }

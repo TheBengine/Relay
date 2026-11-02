@@ -5818,6 +5818,47 @@ fn account_login_checks_the_server_pin_before_sending_any_proof() {
 }
 
 #[test]
+fn account_login_accepts_slow_health_but_still_checks_identity_before_challenge() {
+    const ID: &str = "4be44aef-8c98-4db6-a9d5-81c2eb311330";
+    for matching in [true, false] {
+        let server = MockHttp::new(|path| match path {
+            "/api/health" => {
+                thread::sleep(Duration::from_millis(2300));
+                Reply::json(200, invitation_health(ID))
+            }
+            "/api/account-login/challenge" => Reply::json(200, json!({"server_id":ID})),
+            _ => Reply::json(404, json!({})),
+        });
+        let expected = if matching { ID } else { "49eb3c90-3520-4932-ae14-2f63ec80c38b" };
+        let mut client = TestWorker::new();
+        let result = client.worker.account_login_begin(
+            None,
+            server.url.clone(),
+            Some(expected.into()),
+            zeroize::Zeroizing::new(String::new()),
+            true,
+            None,
+            53,
+        );
+        let updates = client.drain();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests[0].path, "/api/health");
+        assert!(requests[0].authorization.is_none() && requests[0].body.is_empty());
+        if matching {
+            result.unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1].path, "/api/account-login/challenge");
+            assert!(updates.iter().any(|update| matches!(update,
+                Update::AccountLoginChallenge { request_id: 53, .. })));
+        } else {
+            assert_eq!(result.unwrap_err(), IDENTITY_CHANGED);
+            assert_eq!(requests.len(), 1);
+            assert!(updates.is_empty());
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires an explicitly owned loopback identity provider and real Relay server"]
 fn owned_live_account_first_joins_and_reopens_the_same_community_identity() {
     use crate::central_account::{Controller, Provider};
