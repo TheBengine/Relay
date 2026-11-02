@@ -113,6 +113,7 @@ impl RelayApp {
         }
         #[cfg(windows)]
         if activate {
+            if let Some(tray) = &self.tray { tray.prepare_show(); }
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);

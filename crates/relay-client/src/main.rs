@@ -132,6 +132,8 @@ mod timeline;
 mod tls_crypto;
 #[cfg(windows)]
 mod tray;
+#[cfg(windows)]
+mod startup;
 mod unread_navigation;
 mod update_ui;
 #[cfg(windows)]
@@ -178,7 +180,8 @@ fn main() -> eframe::Result<()> {
     }
     if !installation.is_ready() {
         #[cfg(windows)]
-        if matches!(url_protocol::operation(&args), Ok(Some(_))) {
+        if matches!(url_protocol::operation(&args), Ok(Some(_)))
+            || args.iter().any(|arg| matches!(arg.as_str(), "--register-windows-startup" | "--unregister-windows-startup")) {
             eprintln!("{}", installation.diagnostic());
             std::process::exit(2);
         }
@@ -253,9 +256,21 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     let mut launch = invitation_launch::Launch::default();
+    let start_in_tray = cfg!(windows) && args.iter().any(|arg| arg == "--start-in-tray");
+    #[cfg(windows)]
+    if args.iter().any(|arg| arg == "--register-windows-startup") {
+        startup::initialize(startup::allowed(personal, &installation));
+        std::process::exit(if startup::status().is_some_and(|(_, error)| error.is_none()) { 0 } else { 2 });
+    }
+    #[cfg(windows)]
+    if args.iter().any(|arg| arg == "--unregister-windows-startup") {
+        let removed = startup::allowed(personal, &installation)
+            && startup::unregister_current().is_ok();
+        std::process::exit(if removed { 0 } else { 2 });
+    }
     #[cfg(windows)]
     let _main_owner = if personal {
-        match single_instance::start(None) {
+        match if start_in_tray { single_instance::start_in_background() } else { single_instance::start(None) } {
             Ok(single_instance::Start::Owner(owner, inbox)) => {
                 launch.inbox = Some(inbox);
                 launch.register_protocol =
@@ -271,6 +286,8 @@ fn main() -> eframe::Result<()> {
     } else {
         None
     };
+    #[cfg(windows)]
+    startup::initialize(startup::allowed(personal, &installation));
     if let Err(error) = profile_paths::configure(&args) {
         eprintln!("Cannot open Relay profile: {error}");
         std::process::exit(2);
@@ -313,8 +330,8 @@ fn main() -> eframe::Result<()> {
             width,
             height,
         })
-        .with_active(!capture_only && !args.iter().any(|arg| arg == "--background"))
-        .with_visible(!capture_only)
+        .with_active(!capture_only && !start_in_tray && !args.iter().any(|arg| arg == "--background"))
+        .with_visible(!capture_only && !start_in_tray)
         .with_inner_size(size)
         .with_min_inner_size([940.0, 650.0]);
     if let Some(position) = position {

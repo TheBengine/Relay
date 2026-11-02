@@ -1209,7 +1209,8 @@ impl RelayApp {
                         self.profile_ui.clear_session();
                         self.encryption_ui.clear_session();
                         self.message_protection.clear();
-                        self.open_saved_community_login(url.clone());
+                        // Keep the current view and global login. The server
+                        // rail and reconnect action expose explicit sign-in.
                     }
                     if url == self.login.url {
                         clear_recovered_connection_error(

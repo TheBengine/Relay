@@ -422,6 +422,15 @@ impl RelayApp {
                                         .size(font_size(12.0))
                                         .color(c_accent()),
                                     );
+                                    if self.connection_status == ConnectionStatus::SignInRequired
+                                        && ui.small_button("Sign in to reconnect").clicked()
+                                    {
+                                        if self.in_people() {
+                                            self.open_people();
+                                        } else {
+                                            self.open_saved_community_login(self.login.url.clone());
+                                        }
+                                    }
                                 } else if let Some((notice, _)) = &self.notice {
                                     ui.label(
                                         RichText::new(notice)

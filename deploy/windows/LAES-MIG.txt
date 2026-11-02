@@ -1,0 +1,38 @@
+Relay - get started with friends
+
+Your account and servers
+1. Open Relay. Sign in or choose Create account; no invitation is required.
+2. The account form opens inside Relay when WebView2 is available.
+   You can also choose to sign in with your browser.
+3. Choose Create a server, or join with a friend's invitation.
+4. Server encryption is off by default (recommended). You can turn it on when creating a server.
+
+Invite a friend
+1. Open Invite friends > Share and copy invitation.
+2. Relay prepares the iroh connection and copies the invitation.
+3. Send the invitation privately to your friend.
+4. Keep Relay and the host PC running while friends use your server.
+Advanced connection choices include Tailscale and direct addresses.
+Copy invitation is also available for an already prepared connection.
+
+Join friends
+Open the invitation link in a browser and allow it to open the installed Relay.
+You can also paste the invitation in Join friends and choose Join server.
+If connection fails, ask the host to keep Relay open, then choose Try again.
+A local network address alone cannot reach a friend in another home.
+If a protected conversation requests confirmation, follow Settings > Encryption.
+Keep device keys; an account password cannot restore lost private keys.
+
+Closing and updating
+Relay starts quietly with Windows after installation or an update.
+Turn this off in Settings > Advanced > Start Relay with Windows.
+The cross hides Relay in the Windows notification area by default.
+Right-click its icon > Quit Relay to exit. Hosted servers finish closing.
+Run a newer installer from https://github.com/TheBengine/Relay/releases.
+Its Stop my local server and continue option requests normal server shutdown.
+Do not uninstall first. Accounts, keys and history are preserved.
+
+Data and removal
+Local server data normally lives in %LOCALAPPDATA%\Relay\server-data.
+Uninstall through Windows Settings > Apps > Installed apps > Relay.
+Uninstall removes the program and preserves your data.

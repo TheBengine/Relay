@@ -1205,7 +1205,7 @@ impl RelayApp {
         let mut app = Self {
             #[cfg(windows)]
             tray: if capture_path.is_none() {
-                crate::tray::Tray::bind(cc).ok()
+                crate::tray::Tray::bind(cc, args.iter().any(|arg| arg == "--start-in-tray")).ok()
             } else {
                 None
             },
@@ -1600,6 +1600,15 @@ impl RelayApp {
                     .map(|saved| saved.server_id.clone())
                     .filter(|id| !id.is_empty()),
             });
+        }
+        // Hidden startup must always leave a way back into Relay. If Explorer's
+        // notification area is unavailable, show the window instead.
+        #[cfg(windows)]
+        if capture_path.is_none()
+            && args.iter().any(|arg| arg == "--start-in-tray")
+            && !app.tray.as_ref().is_some_and(|tray| tray.available())
+        {
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
         app
     }
@@ -2354,6 +2363,8 @@ impl RelayApp {
                 self.close_settings();
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            #[cfg(windows)]
+            if let Some(tray) = &self.tray { tray.prepare_show(); }
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             if click.origin.url == self.login.url {

@@ -127,6 +127,21 @@ impl Default for State {
 }
 
 impl State {
+    /// Automatic reconnection may use saved credentials, but only an explicit
+    /// user action may replace the current view with interactive authentication.
+    fn defer_background_signin(&mut self, request: u64, url: &str) -> bool {
+        if !self.pending.as_ref().is_some_and(|a| a.background && a.request == request && a.url == url) {
+            return false;
+        }
+        let attempt = self.pending.take().expect("matching background attempt");
+        if attempt.people {
+            self.friends_error = Some("Friends needs you to sign in again. Select Retry Friends to continue. Your Relay account is still signed in.".into());
+        }
+        // Dropping the attempt cancels its challenge/worker, not the global
+        // account controller or any saved credentials.
+        true
+    }
+
     pub(super) fn remembered_friends_target(&self, scope: &str, bootstrap: &Bootstrap) -> Option<Target> {
         self.friends_view.as_ref()
             .filter(|(saved_scope, _)| saved_scope == scope)
@@ -762,7 +777,7 @@ impl RelayApp {
         if !auto.friends {
             auto.friends = true;
             if self.people_url().is_some() {
-                self.open_people();
+                self.open_people_with_interaction(false);
                 if self.account_start.pending.is_some()
                     || self.account_start.auto.as_ref().is_some_and(|auto| auto.resuming.is_some()) {
                     return;
@@ -888,6 +903,10 @@ impl RelayApp {
     }
 
     pub(super) fn open_people(&mut self) {
+        self.open_people_with_interaction(true);
+    }
+
+    fn open_people_with_interaction(&mut self, interactive: bool) {
         if self.central_account.account.is_none() { self.account_start.home = true; return; }
         if self.voice_channel.is_some() || self.joining_voice.is_some() {
             self.notice = Some(("Finish your current call before opening Friends.".into(), Instant::now()));
@@ -939,6 +958,7 @@ impl RelayApp {
         self.begin_account_login(false);
         if let Some(attempt) = &mut self.account_start.pending {
             attempt.people = true;
+            attempt.background = !interactive;
         }
         self.login = previous_login;
     }
@@ -1104,6 +1124,10 @@ impl RelayApp {
                 && attempt.expected.as_ref().is_none_or(|e| e == server)
                 && challenge_matches(nonce, url, server)
             {
+                if self.defer_background_account_signin(request, url) {
+                    return;
+                }
+                let attempt = self.account_start.pending.as_mut().expect("validated attempt");
                 let mut browser = crate::central_account::Controller::default();
                 browser.provider = Some(service);
                 browser.start_community(ctx.clone(), nonce.into(), attempt.account.clone());
@@ -1139,6 +1163,11 @@ impl RelayApp {
             return;
         };
         if let Some(url) = browser.poll() {
+            let request = a.request;
+            let destination = a.url.clone();
+            if self.defer_background_account_signin(request, &destination) {
+                return;
+            }
             #[cfg(windows)]
             if let Some(surface) = self
                 .account_webview
@@ -1163,6 +1192,8 @@ impl RelayApp {
                 new_tab: true,
             });
         }
+        let a = self.account_start.pending.as_mut().expect("current attempt");
+        let browser = a.browser.as_mut().expect("current browser");
         if let Some(error) = browser.error {
             if a.people { self.account_start.friends_error = Some(error.into()); }
             self.error = Some(error.into());
@@ -1185,11 +1216,67 @@ impl RelayApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
+
+    fn defer_background_account_signin(&mut self, request: u64, url: &str) -> bool {
+        if !self.account_start.defer_background_signin(request, url) {
+            return false;
+        }
+        self.community_statuses.insert(url.into(), ConnectionStatus::SignInRequired);
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn reconnect_attempt(background: bool, people: bool) -> Attempt {
+        Attempt {
+            url: "https://community.invalid".into(), expected: None, request: 7,
+            other: false, people,
+            account: crate::central_account::Account {
+                issuer: "https://accounts.invalid".into(), subject: "fixture-account".into(),
+                handle: "fixture".into(), expires_at: u64::MAX,
+            },
+            cancel: Arc::new(AtomicBool::new(false)),
+            form_cancel: Arc::new(AtomicBool::new(false)), browser: None, challenge: None,
+            authority: None, background, detached: true,
+        }
+    }
+
+    #[test]
+    fn automatic_server_and_friends_auth_cancel_only_the_attempt_and_keep_navigation() {
+        for people in [false, true] {
+            let attempt = reconnect_attempt(true, people);
+            let cancel = attempt.cancel.clone();
+            let mut state = State { pending: Some(attempt), entered: true, home: false,
+                friends_requested: people, navigation_restore: Some("https://current.invalid".into()),
+                ..Default::default() };
+            assert!(state.defer_background_signin(7, "https://community.invalid"));
+            assert!(cancel.load(Ordering::Acquire));
+            assert!(state.pending.is_none() && state.entered && !state.home);
+            assert_eq!(state.navigation_restore.as_deref(), Some("https://current.invalid"));
+            assert_eq!(state.friends_requested, people);
+            assert_eq!(state.friends_error.is_some(), people);
+            assert!(state.clearing_previous_account.is_none());
+        }
+    }
+
+    #[test]
+    fn stale_background_events_do_not_cancel_replacement_or_explicit_signin() {
+        for background in [false, true] {
+            let attempt = reconnect_attempt(background, true);
+            let cancel = attempt.cancel.clone();
+            let mut state = State { pending: Some(attempt), ..Default::default() };
+            assert!(!state.defer_background_signin(6, "https://community.invalid"));
+            assert!(!state.defer_background_signin(7, "https://other.invalid"));
+            if !background {
+                assert!(!state.defer_background_signin(7, "https://community.invalid"));
+            }
+            assert!(!cancel.load(Ordering::Acquire));
+            assert!(state.pending.is_some() && state.friends_error.is_none());
+        }
+    }
+
     #[test]
     fn account_cleanup_survives_restart_and_only_matching_success_ack_advances_identity() {
         let account = crate::central_account::Account {

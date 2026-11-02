@@ -3,6 +3,10 @@ use super::*;
 use crate::audio_settings::LatencyMode;
 use crate::settings_ui as controls;
 
+fn settings_close_rect(viewport: Rect) -> Rect {
+    Rect::from_min_size(Pos2::new(viewport.right() - 52.0, viewport.top() + 18.0), Vec2::new(40.0, 62.0))
+}
+
 // Keep every live state on the same three rows: changing meter values must
 // never reflow the settings beneath them.
 fn sensitivity_readout(ui: &mut egui::Ui, level_db: f32, open_db: Option<f32>,
@@ -456,27 +460,17 @@ impl RelayApp {
                             });
                     });
                 egui::SidePanel::right("settings-close-gutter")
-                    .exact_width(44.0)
+                    .exact_width(64.0)
                     .resizable(false)
                     .frame(
                         egui::Frame::none()
                             .fill(c_bg())
-                            .inner_margin(Margin::symmetric(7.0, 14.0)),
+                            .inner_margin(Margin::symmetric(16.0, 18.0)),
                     )
                     .show_inside(ui, |ui| {
-                        if icon_button(ui, Icon::Close, false, "Close settings · Esc").clicked() {
-                            self.close_settings();
-                        }
-                        // Caption size; one line, so large text cannot wrap
-                        // "ESC" in the 44 px close column.
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new("ESC")
-                                    .size(font_size(crate::appearance::TEXT_CAPTION))
-                                    .color(c_muted()),
-                            )
-                            .wrap(false),
-                        );
+                        // Reserve the gutter here; draw its controls last at
+                        // viewport-bound coordinates so wide content cannot move them.
+                        ui.allocate_space(Vec2::new(32.0, 60.0));
                     });
                 egui::CentralPanel::default()
                     .frame(
@@ -569,6 +563,8 @@ impl RelayApp {
                             capture_bottom,
                         );
                         scroll.show(ui, |ui| {
+                            // Readable lines and consistent controls at wide desktop sizes.
+                            ui.set_max_width(ui.available_width().min(800.0));
                             match self.settings_tab {
                                 SettingsTab::Account => self.account_page(ui),
                                 SettingsTab::Profiles => self.profiles_page(ui),
@@ -599,6 +595,16 @@ impl RelayApp {
                             }
                         });
                     });
+                let close_rect = settings_close_rect(rect);
+                ui.allocate_ui_at_rect(close_rect, |ui| {
+                    ui.set_clip_rect(rect);
+                    ui.vertical_centered(|ui| {
+                        if icon_button_sized(ui, 32.0, Icon::Close, false, "Close settings · Esc").clicked() {
+                            self.close_settings();
+                        }
+                        ui.add(egui::Label::new(RichText::new("ESC").size(11.0).color(c_muted())).wrap(false));
+                    });
+                });
             });
         let after = (
             self.compact,
@@ -1096,16 +1102,10 @@ impl RelayApp {
             } else {
                 db(self.prefs.audio.activation_threshold)
             };
-            ui.spacing_mut().slider_width = (ui.available_width() - 140.0).max(40.0);
-            if ui
-                .add_enabled(
-                    !automatic,
-                    egui::Slider::new(&mut threshold_db, -60.0..=-6.0)
-                        .step_by(1.0)
-                        .suffix(" dB")
-                        .text("Threshold"),
-                )
-                .changed()
+            if ui.add_enabled_ui(!automatic, |ui| {
+                controls::slider_f32(ui, "input-threshold", if automatic { "Threshold · Automatic" } else { "Threshold" },
+                    "", &mut threshold_db, -60.0..=-6.0, " dB")
+            }).inner.changed()
             {
                 self.prefs.audio.activation_threshold = 10f32.powf(threshold_db / 20.0).clamp(0.001, 0.5);
             }
@@ -1160,7 +1160,7 @@ impl RelayApp {
             (true, model) => Some(model),
         };
         for (option, label, body) in [
-            (Some(NoiseModel::RECOMMENDED), "Enhanced (recommended)", NoiseModel::RECOMMENDED.description()),
+            (Some(NoiseModel::RECOMMENDED), "Enhanced (recommended)", "Reduce background noise and keyboard clicks while keeping your voice clear."),
             (None, "None", "No noise filter. Other microphone settings still apply."),
         ] {
             controls::radio_value(ui, ("noise-model", label), &mut choice, option, label, body);
@@ -1186,18 +1186,16 @@ impl RelayApp {
                 }
                 controls::description(ui, "Automatic volume (Relay / Sonora), speech detection (Silero) and receive buffering are separate controls. Keep them the same for a fair model comparison.");
             });
-        if let Some(model) = choice {
-            controls::description(ui, &format!("Selected: {} · ~{} ms filter delay", model.label(), model.suppression_ms_for(batch)));
-            if self.mic_test {
+        if choice.is_some() && self.mic_test {
                 let status = self.media.as_ref().map_or(crate::audio_model_lab::Status::Idle, MediaEngine::noise_model_status);
                 controls::description(ui, status.label());
-            }
         }
         audio.noise_suppression = choice.is_some();
         if let Some(model) = choice {
             audio.noise_model = model;
         }
         if choice == Some(NoiseModel::Enhanced) {
+            egui::CollapsingHeader::new("Adjust Enhanced strength").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Strength").color(c_muted()));
                 for strength in [NoiseStrength::Low, NoiseStrength::Normal, NoiseStrength::High] {
@@ -1213,6 +1211,7 @@ impl RelayApp {
                 NoiseStrength::Low => "Low: clicks between your words are softened; your voice is never touched.",
                 NoiseStrength::Normal => "Normal: clicks between words are removed and softened while you talk; noise that is not voice is lowered.",
                 NoiseStrength::High => "High: as quiet as possible while you game or type. Quiet word endings can sound a little thinner.",
+            });
             });
         }
     }
@@ -1334,7 +1333,7 @@ impl RelayApp {
             ui,
             "echo-cancellation",
             "Echo Cancellation",
-            "Remove your speakers' sound from your microphone. Relay switches it on by itself once it hears your speakers in the microphone; with headphones your voice is left untouched.",
+            "Reduce speaker echo. Relay adapts automatically; headphones usually need no correction.",
             &mut self.prefs.audio.echo_cancellation,
         );
         controls::switch_row(
@@ -1372,7 +1371,8 @@ impl RelayApp {
         );
         controls::divider(ui);
         // Discord keeps network and codec choices under Advanced, after the voice basics.
-        controls::nav_group(ui, "ADVANCED");
+        let reveal_direct = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new("scroll-direct-voice"))).unwrap_or(false);
+        egui::CollapsingHeader::new("Advanced voice settings").open(reveal_direct.then_some(true)).show(ui, |ui| {
         controls::switch_row(ui, "compare-silero-vad", "Compare speech detection",
             "Show Silero's speech estimate during a call or microphone test. It does not change your sound or decide when you transmit.",
             &mut self.prefs.audio.compare_silero_vad);
@@ -1549,6 +1549,7 @@ impl RelayApp {
             );
         }
         controls::description(ui, "Mark a priority speaker from their voice menu. The overlay is a click-through floating window for windowed/borderless games. Each option is independent and applies with Save Changes.");
+        });
         controls::description(
             ui,
             "Save Changes applies your voice settings. Extra timing controls are under Debugging.",
@@ -2205,8 +2206,15 @@ impl RelayApp {
             controls::section_heading(
                 ui,
                 "Window behavior",
-                "Choose what happens when you close the window.",
+                "Choose when Relay starts and what happens when you close it.",
             );
+            if let Some((mut enabled, error)) = crate::startup::status() {
+                let before = enabled;
+                controls::switch_row(ui, "start-with-windows", "Start Relay with Windows",
+                    "Start quietly in the notification area when you sign in to this PC.", &mut enabled);
+                if before != enabled { crate::startup::set_enabled(enabled); }
+                if let Some(error) = error { controls::description(ui, &error); }
+            }
             let before = self.prefs.close_to_tray;
             controls::switch_row(ui, "close-to-tray", "Keep Relay running in the background",
                 "The close button hides Relay in the notification area (hidden icons). Calls and hosted servers keep running. Right-click its icon and choose Quit Relay to stop everything.",
@@ -2337,6 +2345,26 @@ fn unavailable_choice_saved(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_button_stays_inside_viewport_when_page_content_overflows() {
+        let context = egui::Context::default();
+        configure(&context);
+        for width in [626.0, 940.0, 1384.0, 1920.0] {
+            let screen = Rect::from_min_size(Pos2::new(0.0, 32.0), Vec2::new(width, 600.0));
+            let _ = context.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.allocate_space(Vec2::new(width + 300.0, 50.0));
+                    ui.allocate_ui_at_rect(settings_close_rect(screen), |ui| {
+                        ui.vertical_centered(|ui| {
+                            let button = icon_button_sized(ui, 32.0, Icon::Close, false, "Close");
+                            assert!(screen.contains_rect(button.rect));
+                        });
+                    });
+                });
+            });
+        }
+    }
 
     #[test]
     fn changing_sensitivity_readings_never_moves_the_next_control() {

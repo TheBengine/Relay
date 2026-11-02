@@ -8,6 +8,9 @@
 #ifndef RelayRegisterProtocol
   #define RelayRegisterProtocol 0
 #endif
+#ifndef RelayRegisterStartup
+  #define RelayRegisterStartup 0
+#endif
 
 [Setup]
 AppId={#RelayAppId}
@@ -67,11 +70,16 @@ Name: "{userdesktop}\Relay"; Filename: "{app}\relay.exe"; WorkingDir: "{app}"; T
 [Run]
 Filename: "{app}\relay.exe"; Parameters: "--wait-for-installer={code:InstallerIdentity}"; WorkingDir: "{app}"; Description: "Open Relay"; Flags: nowait postinstall skipifsilent; Check: OfferOpenRelay
 
-#if Str(RelayRegisterProtocol) == "1"
+#if (Str(RelayRegisterProtocol) == "1") || (Str(RelayRegisterStartup) == "1")
 [UninstallRun]
+#if Str(RelayRegisterStartup) == "1"
+Filename: "{app}\{#RelayClientExecutable}"; Parameters: "--unregister-windows-startup"; WorkingDir: "{app}"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RelayWindowsStartupV1"
+#endif
+#if Str(RelayRegisterProtocol) == "1"
 ; Invoke dist\relay.exe directly: the visible launcher exits before its child.
 ; The client checks exact command+owner and preserves another installation.
 Filename: "{app}\{#RelayClientExecutable}"; Parameters: "--unregister-invitation-protocol"; WorkingDir: "{app}"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RelayInvitationProtocolV1"
+#endif
 #endif
 
 [Code]
@@ -906,11 +914,26 @@ begin
 end;
 #endif
 
+#if Str(RelayRegisterStartup) == "1"
+procedure RegisterWindowsStartup;
+var ResultCode: Integer;
+begin
+  { Includes silent installs and installs where Open Relay is unchecked. }
+  if not Exec(ExpandConstant('{app}\{#RelayClientExecutable}'),
+    '--register-windows-startup --wait-for-installer=' + InstallerIdentity(''),
+    ExpandConstant('{app}'), SW_HIDE, ewNoWait, ResultCode) then
+    Log('Windows startup registration could not start: ' + SysErrorMessage(ResultCode));
+end;
+#endif
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then InstallationBegin;
   if CurStep = ssDone then begin
     InstallationFinish;
+#if Str(RelayRegisterStartup) == "1"
+    RegisterWindowsStartup;
+#endif
 #if Str(RelayRegisterProtocol) == "1"
     RegisterInvitationProtocol;
 #endif

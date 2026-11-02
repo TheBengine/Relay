@@ -202,6 +202,10 @@ pub fn start(invitation: Option<Invitation>) -> Result<Start, &'static str> {
     start_scoped("main", invitation, true)
 }
 
+pub fn start_in_background() -> Result<Start, &'static str> {
+    start_scoped_mode("main", None, false, false)
+}
+
 /// Keep a browser's capability-bearing argv out of the long-lived UI process.
 /// Cold and warm opens both use the same authenticated UI acknowledgement.
 pub fn open(invitation: Invitation) -> Result<(), &'static str> {
@@ -252,12 +256,23 @@ fn start_scoped(
     invitation: Option<Invitation>,
     focus: bool,
 ) -> Result<Start, &'static str> {
+    start_scoped_mode(scope, invitation, focus, true)
+}
+
+fn start_scoped_mode(
+    scope: &str,
+    invitation: Option<Invitation>,
+    focus: bool,
+    activate_existing: bool,
+) -> Result<Start, &'static str> {
     let identity = Identity::current()?;
     let namespace = identity.namespace(scope);
     let pipe = format!(r"\\.\pipe\{namespace}");
     match instance_identity::elect(&identity, &namespace)? {
         Election::Existing => {
-            forward(&identity, &pipe, invitation, focus)?;
+            if activate_existing {
+                forward(&identity, &pipe, invitation, focus)?;
+            }
             Ok(Start::Forwarded)
         }
         Election::Owner(lease) => {
@@ -826,6 +841,24 @@ mod tests {
                 }
             );
         }
+        drop(owner);
+    }
+
+    #[test]
+    fn background_start_does_not_activate_an_existing_window_but_manual_open_does() {
+        let scope = uuid::Uuid::new_v4().to_string();
+        let Start::Owner(owner, inbox) = start_scoped_mode(&scope, None, false, false).unwrap() else {
+            panic!("Fresh fixture occupied")
+        };
+        let quiet_scope = scope.clone();
+        assert!(thread::spawn(move || matches!(start_scoped_mode(&quiet_scope, None, false, false).unwrap(), Start::Forwarded)).join().unwrap());
+        assert!(inbox.next().is_none());
+        let other = scope.clone();
+        let caller = thread::spawn(move || matches!(start_scoped(&other, None, false).unwrap(), Start::Forwarded));
+        let incoming = inbox.receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(matches!(incoming.action, Action::Activate));
+        incoming.respond(Offer::Accepted);
+        assert!(caller.join().unwrap());
         drop(owner);
     }
 

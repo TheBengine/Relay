@@ -30,6 +30,7 @@ impl BuildMetadata {
         serde_json::json!({
             "schema": 1,
             "invitation_protocol": if cfg!(windows) {1} else {0},
+            "windows_startup": if cfg!(windows) {1} else {0},
             "version": self.version,
             "build_id": self.build_id(),
             "sequence": self.stamp.sequence,
@@ -123,6 +124,7 @@ mod tests {
             if cfg!(windows) { 1 } else { 0 }
         );
         assert_eq!(json["version"], "0.10.0");
+        assert_eq!(json["windows_startup"], if cfg!(windows) { 1 } else { 0 });
         assert_eq!(json["sequence"], info.stamp.sequence);
         assert_eq!(json["built_at"], "2026-10-15T23:59:59Z");
         assert_eq!(json["git_dirty"], true);

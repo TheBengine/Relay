@@ -16,10 +16,12 @@ use windows::{
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetWindowThreadProcessId,
                 IsIconic, IsWindowVisible, LoadIconW, PostMessageW, RegisterWindowMessageW, SendMessageW,
-                SetForegroundWindow, ShowWindow, TrackPopupMenu, HICON, ICON_BIG, ICON_SMALL,
+                SetForegroundWindow, ShowWindow, TrackPopupMenu, SetTimer, KillTimer, HICON, ICON_BIG, ICON_SMALL,
                 IDI_APPLICATION, MF_STRING, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_BOTTOMALIGN,
                 TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_GETICON,
-                WM_LBUTTONDBLCLK, WM_NCDESTROY, WM_NULL, WM_PAINT,
+                WM_LBUTTONDBLCLK, WM_NCDESTROY, WM_NULL, WM_PAINT, WM_TIMER,
+                WM_WINDOWPOSCHANGING, WINDOWPOS, SWP_SHOWWINDOW,
+                WM_STYLECHANGING, GWL_STYLE, STYLESTRUCT, WS_VISIBLE,
             },
         },
     },
@@ -31,6 +33,7 @@ const ICON_ID: u32 = 1;
 const OPEN: usize = 1;
 const QUIT: usize = 2;
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
+const BACKGROUND_TICK: usize = 0x524c5449;
 
 struct State {
     window: HWND,
@@ -39,6 +42,9 @@ struct State {
     available: Cell<bool>,
     quitting: Cell<bool>,
     alive: Cell<bool>,
+    suppress_first_show: Cell<bool>,
+    paint_pending: Cell<bool>,
+    heartbeat_available: Cell<bool>,
     ctx: eframe::egui::Context,
 }
 
@@ -85,6 +91,7 @@ impl State {
 
     fn restore(&self) {
         if self.alive.get() && !self.quitting.get() {
+            self.suppress_first_show.set(false);
             unsafe {
                 let command = if IsIconic(self.window).as_bool() {
                     SW_RESTORE
@@ -171,9 +178,31 @@ unsafe extern "system" fn window_proc(
     pointer: usize,
 ) -> LRESULT {
     let state = &*(pointer as *const State);
-    if message == state.taskbar_created && message != 0 && !state.quitting.get() {
+    if message == WM_WINDOWPOSCHANGING && lparam.0 != 0 {
+        let position = &mut *(lparam.0 as *mut WINDOWPOS);
+        // eframe shows its first frame; winit then writes WS_VISIBLE separately.
+        // Keep both native paths hidden until an explicit activation.
+        if state.suppress_first_show.get() && state.available.get() {
+            position.flags &= !SWP_SHOWWINDOW;
+        }
+    } else if message == WM_STYLECHANGING && wparam.0 as i32 == GWL_STYLE.0 && lparam.0 != 0 {
+        if state.suppress_first_show.get() && state.available.get() {
+            let style = &mut *(lparam.0 as *mut STYLESTRUCT);
+            style.styleNew &= !WS_VISIBLE.0;
+        }
+    } else if message == WM_TIMER && wparam.0 == BACKGROUND_TICK {
+        // Winit does not dispatch requested redraws for hidden Win32 windows.
+        // Keep sign-in, inbox delivery and orderly shutdown running while hidden.
+        if !IsWindowVisible(window).as_bool() && !state.quitting.get() && !state.paint_pending.replace(true)
+            && PostMessageW(window, WM_PAINT, WPARAM(0), LPARAM(0)).is_err() {
+            state.paint_pending.set(false);
+        }
+        return LRESULT(0);
+    } else if message == WM_PAINT {
+        state.paint_pending.set(false);
+    } else if message == state.taskbar_created && message != 0 && !state.quitting.get() {
         state.available.set(false);
-        state.add();
+        if state.heartbeat_available.get() { state.add(); }
         // Do not leave an unreachable hidden app if Explorer cannot restore it.
         if !state.available.get() {
             state.restore();
@@ -188,6 +217,7 @@ unsafe extern "system" fn window_proc(
         }
         return LRESULT(0);
     } else if message == WM_NCDESTROY {
+        let _ = KillTimer(window, BACKGROUND_TICK);
         state.remove();
         state.alive.set(false);
         let _ = RemoveWindowSubclass(window, Some(window_proc), subclass);
@@ -196,7 +226,7 @@ unsafe extern "system" fn window_proc(
 }
 
 impl Tray {
-    pub(crate) fn bind(cc: &eframe::CreationContext<'_>) -> Result<Self, &'static str> {
+    pub(crate) fn bind(cc: &eframe::CreationContext<'_>, start_hidden: bool) -> Result<Self, &'static str> {
         let RawWindowHandle::Win32(handle) = cc
             .window_handle()
             .map_err(|_| "Tray window unavailable")?
@@ -229,6 +259,9 @@ impl Tray {
             available: Cell::new(false),
             quitting: Cell::new(false),
             alive: Cell::new(true),
+            suppress_first_show: Cell::new(start_hidden),
+            paint_pending: Cell::new(false),
+            heartbeat_available: Cell::new(false),
             ctx: cc.egui_ctx.clone(),
         });
         if !unsafe {
@@ -244,6 +277,12 @@ impl Tray {
             return Err("Tray window callback unavailable");
         }
         state.add();
+        state.heartbeat_available.set(unsafe { SetTimer(window, BACKGROUND_TICK, 250, None) } != 0);
+        if !state.heartbeat_available.get() {
+            // A hidden window must still process activation and connection work.
+            state.suppress_first_show.set(false);
+            state.remove();
+        }
         Ok(Self {
             state,
             _ui_thread: PhantomData,
@@ -252,6 +291,11 @@ impl Tray {
 
     pub(crate) fn available(&self) -> bool {
         self.state.available.get()
+    }
+    pub(crate) fn prepare_show(&self) {
+        // Winit may already cache VISIBLE=true after its suppressed first show.
+        // Native restoration also handles windows hidden through our tray.
+        self.state.restore();
     }
     pub(crate) fn quitting(&self) -> bool {
         self.state.quitting.get()
@@ -288,6 +332,7 @@ impl Drop for Tray {
         self.state.remove();
         if self.state.alive.get() {
             unsafe {
+                let _ = KillTimer(self.state.window, BACKGROUND_TICK);
                 let _ = RemoveWindowSubclass(self.state.window, Some(window_proc), SUBCLASS);
             }
         }

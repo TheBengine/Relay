@@ -146,6 +146,10 @@ def bound_client_build(metadata, files, version, sequence, required=False):
         keys.add('invitation_protocol')
         if type(info['invitation_protocol']) is not int or info['invitation_protocol'] not in (0, 1):
             raise ValueError('Unsupported invitation protocol capability.')
+    if isinstance(info, dict) and 'windows_startup' in info:
+        keys.add('windows_startup')
+        if type(info['windows_startup']) is not int or info['windows_startup'] not in (0, 1):
+            raise ValueError('Unsupported Windows startup capability.')
     if not isinstance(info, dict) or set(info) != keys or type(info['schema']) is not int or info['schema'] != 1:
         raise ValueError('Unsupported or incomplete client build identity.')
     if (release_version(info['version']) != version or metadata.get('version') != version
@@ -178,6 +182,12 @@ def protocol_registration_define(client_build, app_id, name):
     enabled = (client_build is not None and client_build.get('invitation_protocol') == 1
                and app_id == APP_ID and name == 'Relay')
     return '/DRelayRegisterProtocol=' + ('1' if enabled else '0')
+
+
+def startup_registration_define(client_build, app_id, name):
+    enabled = (client_build is not None and client_build.get('windows_startup') == 1
+               and app_id == APP_ID and name == 'Relay')
+    return '/DRelayRegisterStartup=' + ('1' if enabled else '0')
 
 
 def release_version_define(version):
@@ -510,6 +520,7 @@ def main():
 
     command = [str(compiler), '/Qp', '/DStage=' + str(stage), '/DOutput=' + str(output), release_version_define(version), '/DReleaseSequence=' + args.sequence, '/DReleasePayloadHash=' + payload_hash, '/DRelayAppId=' + app_id, '/DRelayAppName=' + args.name, '/DRelayDisplayIcon=' + (r'dist\relay.exe' if distribution else 'relay.exe'), '/DRelayIcon=' + str(icon), '/DRelayLicense=' + str(license_file), str(script)]
     command.insert(-1, protocol_registration_define(client_build, app_id, args.name))
+    command.insert(-1, startup_registration_define(client_build, app_id, args.name))
     command.insert(-1, '/DRelayClientExecutable=' + (r'dist\relay.exe' if distribution else 'relay.exe'))
     command.insert(-1, '/DRelayStopServerPayload=' + stop_payload)
     command.insert(-1, '/DRelayStopServerSHA256=' + files[server_name])
@@ -535,6 +546,14 @@ def version_self_tests():
     import unittest
 
     class ReleaseVersionTests(unittest.TestCase):
+        def test_startup_hooks_only_for_capable_production_installers(self):
+            enabled = {'windows_startup': 1}
+            self.assertEqual(startup_registration_define(enabled, APP_ID, 'Relay'), '/DRelayRegisterStartup=1')
+            for info, app_id, name in ((None, APP_ID, 'Relay'), ({}, APP_ID, 'Relay'),
+                                       ({'windows_startup': 0}, APP_ID, 'Relay'),
+                                       (enabled, RECOVERY_APP_ID, RECOVERY_APP_NAME)):
+                self.assertEqual(startup_registration_define(info, app_id, name), '/DRelayRegisterStartup=0')
+
         def test_invitation_hooks_require_bound_capability_and_exact_production_identity(self):
             enabled = {'invitation_protocol': 1}
             self.assertEqual(protocol_registration_define(enabled, APP_ID, 'Relay'), '/DRelayRegisterProtocol=1')
