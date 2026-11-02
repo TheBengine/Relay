@@ -19,6 +19,7 @@ mod windows_audio;
 #[cfg(windows)]
 mod account_webview;
 mod adaptive_audio;
+mod arrival_delay;
 #[cfg(feature = "native-rtc")]
 mod adaptive_video;
 mod app;
@@ -33,6 +34,8 @@ mod audio_duck;
 mod audio_echo;
 mod audio_resample;
 mod audio_settings;
+mod audio_gain;
+mod silero_vad;
 mod self_listen;
 mod voice_priority;
 mod delay_estimate;

@@ -127,6 +127,13 @@ pub fn chains() -> Vec<ChainSpec> {
         ChainSpec::new("none", || Box::new(Passthrough)),
         ChainSpec::new("rnnoise", || Box::new(CurrentChain::rnnoise())),
         ChainSpec::new("rnnoise+enhanced", || Box::new(CurrentChain::rnnoise_enhanced())),
+        ChainSpec::new("rnnoise+enhanced+sonora", || Box::new(CurrentChain::new(
+            "rnnoise+enhanced+sonora",
+            &AudioSettings {
+                automatic_volume_model: crate::audio_settings::AutomaticVolumeModel::Sonora,
+                ..Default::default()
+            },
+        ))),
     ]
     .into_iter()
     .chain(crate::noise_suppressor::bench::chains())

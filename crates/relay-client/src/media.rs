@@ -39,6 +39,13 @@ use std::{
 #[path = "microphone_preview.rs"]
 mod microphone_preview;
 
+#[cfg(test)]
+#[path = "audio_gain_tests.rs"]
+mod sonora_tests;
+#[cfg(test)]
+#[path = "silero_vad_tests.rs"]
+mod silero_tests;
+
 const FRAME_TIME: Duration = Duration::from_millis(20);
 // Keep at most two codec frames locally. The receive jitter target belongs to
 // the packet reorder buffer; adding it again to device playout doubles buffering.
@@ -82,6 +89,9 @@ pub(crate) struct AudioControls {
     threshold: AtomicU32,
     automatic_sensitivity: AtomicBool,
     automatic_microphone_volume: AtomicBool,
+    automatic_volume_model: AtomicU32,
+    compare_silero_vad: AtomicBool,
+    silero_meter: crate::silero_vad::Meter,
     preserve_speech_start: AtomicBool,
     hold_ms: AtomicU32,
     bitrate_kbps: AtomicU32,
@@ -173,6 +183,9 @@ impl AudioControls {
             threshold: AtomicU32::new(settings.activation_threshold.to_bits()),
             automatic_sensitivity: AtomicBool::new(settings.automatic_sensitivity()),
             automatic_microphone_volume: AtomicBool::new(settings.automatic_microphone_volume),
+            automatic_volume_model: AtomicU32::new(settings.automatic_volume_model as u32),
+            compare_silero_vad: AtomicBool::new(settings.compare_silero_vad),
+            silero_meter: Default::default(),
             preserve_speech_start: AtomicBool::new(settings.preserve_speech_start),
             hold_ms: AtomicU32::new(settings.activation_hold_ms),
             bitrate_kbps: AtomicU32::new(settings.bitrate_kbps),
@@ -243,10 +256,13 @@ impl AudioControls {
     }
     fn apply_with(&self, settings: &AudioSettings, preview: bool) {
         let mode_changed = self.transmission.load(Ordering::Relaxed) != settings.transmission as u32;
+        let volume_model_changed = self.automatic_volume_model.load(Ordering::Relaxed)
+            != settings.automatic_volume_model as u32;
         // Changing playback/receive settings must not reset VAD, RNNoise, gain
         // tracking or Opus history halfway through the local person's sentence.
         let capture_changed = self.gain.load(Ordering::Relaxed)
             != settings.microphone_gain.to_bits()
+            || volume_model_changed
             || self.threshold.load(Ordering::Relaxed) != settings.activation_threshold.to_bits()
             || self.automatic_sensitivity.load(Ordering::Relaxed)
                 != settings.automatic_sensitivity()
@@ -278,6 +294,9 @@ impl AudioControls {
             .store(settings.automatic_sensitivity(), Ordering::Relaxed);
         self.automatic_microphone_volume
             .store(settings.automatic_microphone_volume, Ordering::Relaxed);
+        self.automatic_volume_model
+            .store(settings.automatic_volume_model as u32, Ordering::Relaxed);
+        self.compare_silero_vad.store(settings.compare_silero_vad, Ordering::Relaxed);
         self.hold_ms
             .store(settings.activation_hold_ms, Ordering::Relaxed);
         // Gate ramps change no privacy boundary; they apply on the next block.
@@ -341,7 +360,7 @@ impl AudioControls {
             self.echo_delay_ms
                 .store(settings.echo_delay_ms, Ordering::Relaxed);
         }
-        let capture_changed = if preview { mode_changed } else { capture_changed };
+        let capture_changed = if preview { mode_changed || volume_model_changed } else { capture_changed };
         // Publish after the changed capture policy, so an acquired generation
         // includes those stores before accepting queued microphone/tunnel audio.
         if capture_changed {
@@ -1254,12 +1273,27 @@ impl MediaEngine {
         }
         self.is_active().then(|| self.shared.controls.gate_meter.take())
     }
+
+    pub(crate) fn silero_reading(&self) -> crate::silero_vad::Reading {
+        if let Some(preview) = self.preview.as_ref().filter(|_| self.is_microphone_test_active()) {
+            return preview.controls.silero_meter.read();
+        }
+        if self.is_active()
+            && !self.shared.muted.load(Ordering::Acquire)
+            && !self.shared.deafened.load(Ordering::Acquire)
+        {
+            self.shared.controls.silero_meter.read()
+        } else {
+            crate::silero_vad::Reading::Idle
+        }
+    }
     /// Gate threshold, sensitivity mode and ramps of an unsaved draft, heard in
     /// the running call on the next block. None of them is a privacy boundary,
     /// so no history is discarded; Reset or closing Settings writes them back.
     pub(crate) fn preview_gate(&self, settings: &AudioSettings) {
         let settings = settings.clone().normalized();
         let controls = &self.shared.controls;
+        controls.compare_silero_vad.store(settings.compare_silero_vad, Ordering::Relaxed);
         controls
             .threshold
             .store(settings.activation_threshold.to_bits(), Ordering::Relaxed);
@@ -3263,7 +3297,10 @@ struct VoiceWorker {
 }
 
 fn capture_processing_samples(packet_samples: usize, controls: &AudioControls) -> usize {
-    let needs_dsp = controls.suppression.load(Ordering::Relaxed);
+    let needs_dsp = controls.suppression.load(Ordering::Relaxed)
+        || (controls.automatic_microphone_volume.load(Ordering::Relaxed)
+            && controls.automatic_volume_model.load(Ordering::Relaxed)
+                == crate::audio_settings::AutomaticVolumeModel::Sonora as u32);
     #[cfg(feature = "native-rtc")]
     let needs_dsp = needs_dsp || controls.echo_enabled.load(Ordering::Acquire);
     if needs_dsp {
@@ -3310,6 +3347,8 @@ pub(crate) struct MicrophoneProcessor {
     noise_minimum: f32,
     noise_samples: usize,
     automatic_gain: f32,
+    sonora_gain: Option<crate::audio_gain::SonoraGain>,
+    silero: Option<crate::silero_vad::ShadowDetector>,
     speech_output_gain: f32,
     speech_power: f32,
     /// Samples the speech gain is still held for after the last speech block.
@@ -3337,6 +3376,8 @@ impl MicrophoneProcessor {
             noise_minimum: f32::INFINITY,
             noise_samples: 0,
             automatic_gain: 1.0,
+            sonora_gain: None,
+            silero: None,
             speech_output_gain: 1.0,
             speech_power: 0.0,
             speech_hold: 0,
@@ -3380,6 +3421,9 @@ impl MicrophoneProcessor {
             self.clicks = crate::click_suppression::ClickSuppressor::new();
             self.gate = crate::voice_gate::NoiseGate::new();
             self.automatic_gain = 1.0;
+            self.sonora_gain = None;
+            self.silero = None;
+            controls.silero_meter.record(crate::silero_vad::Reading::Idle);
             self.speech_output_gain = 1.0;
             self.speech_power = 0.0;
             self.speech_hold = 0;
@@ -3492,6 +3536,14 @@ impl MicrophoneProcessor {
         }
         // Detect before automatic volume adjustment: amplification must not turn
         // background noise into speech. The manual threshold keeps its meaning.
+        if controls.compare_silero_vad.load(Ordering::Relaxed) {
+            let reading = self.silero.get_or_insert_with(crate::silero_vad::ShadowDetector::new)
+                .observe(input);
+            controls.silero_meter.record(reading);
+        } else {
+            self.silero = None;
+            controls.silero_meter.record(crate::silero_vad::Reading::Idle);
+        }
         let rms = (input.iter().map(|v| v * v).sum::<f32>() / input.len() as f32).sqrt();
         // With an echo path, a block far below the far end's level is what is
         // left of its echo: never boost it, nor let it open the gate.
@@ -3509,7 +3561,35 @@ impl MicrophoneProcessor {
         #[cfg(not(feature = "native-rtc"))]
         let far_talking = false;
         let detected = detected.map(|speech| speech && !echo_like);
-        if controls.automatic_microphone_volume.load(Ordering::Relaxed) {
+        let automatic_volume = controls.automatic_microphone_volume.load(Ordering::Relaxed);
+        let use_sonora = automatic_volume
+            && controls.automatic_volume_model.load(Ordering::Relaxed)
+                == crate::audio_settings::AutomaticVolumeModel::Sonora as u32;
+        if !use_sonora {
+            self.sonora_gain = None;
+        }
+        if use_sonora {
+            // The controllers are alternatives: never run two gains in series,
+            // or restore a stale Relay gain when changing back in the preview.
+            self.automatic_gain = 1.0;
+            self.speech_output_gain = 1.0;
+            self.speech_power = 0.0;
+            self.speech_hold = 0;
+            if far_talking || echo_like {
+                // AGC2 has no far-end reference in this gain-only pipeline.
+                // Do not let residual echo teach or receive amplification.
+                self.sonora_gain = None;
+                for sample in input.iter_mut() {
+                    *sample = sample.clamp(-0.95, 0.95);
+                }
+            } else if !self.sonora_gain
+                .get_or_insert_with(crate::audio_gain::SonoraGain::new)
+                .process(input)
+            {
+                self.sonora_gain = None;
+                return false;
+            }
+        } else if automatic_volume {
             let peak = input
                 .iter()
                 .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
@@ -5417,15 +5497,9 @@ pub(crate) fn send_delay_budget_for_capture(
 ) -> DelayBudget {
     let settings = settings.clone().normalized();
     let shown = settings.voice_delay_budget();
-    let packet_samples = settings.packet_samples();
-    let needs_dsp = settings.noise_suppression;
-    #[cfg(feature = "native-rtc")]
-    let needs_dsp = needs_dsp || settings.echo_cancellation;
-    let block = if needs_dsp {
-        packet_samples.max(480)
-    } else {
-        packet_samples
-    };
+    // Use the same processing batch as the settings budget, including AGC2
+    // when noise suppression and echo cancellation are both disabled.
+    let block = (shown.capture_ms * AUDIO_SAMPLE_RATE as f32 / 1000.0).round() as usize;
     let period = (period_ms * AUDIO_SAMPLE_RATE as f32 / 1000.0).round() as usize;
     let capture_period = if sample_rate != AUDIO_SAMPLE_RATE {
         // Resampled callbacks never line up with a block: up to a period more.

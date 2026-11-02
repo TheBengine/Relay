@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/snakers4/silero-vad",
+  "tag": "v6.2.2",
+  "commit": "60b7ffa243625ebdc1070275a29f18c87843786a",
+  "model_sha256": "7ed98ddbad84ccac4cd0aeb3099049280713df825c610a8ed34543318f1b2c49",
+  "fixed_model_sha256": "5f25bc1ef80412e6d66f8e15137011dacd6d15c1f83f66990c6279ccc9293faf",
+  "preparation": {
+    "onnx": "1.21.0",
+    "onnxslim": "0.1.98",
+    "onnxruntime": "1.24.4",
+    "numpy": "2.4.4",
+    "verified_windows": 500,
+    "max_probability_and_state_error": 0.0
+  }
+}

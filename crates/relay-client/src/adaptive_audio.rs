@@ -1,5 +1,5 @@
 //! Receive timing policy only; never operates on transport or encryption counters.
-use relay_protocol::AUDIO_SAMPLE_RATE;
+use crate::arrival_delay::{Observation, RelativeDelay};
 use std::time::{Duration, Instant};
 
 pub(crate) const MIN_DELAY_MS: u32 = 10;
@@ -9,8 +9,7 @@ const RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) struct AdaptiveDelay {
     target_ms: u32,
-    previous: Option<(u64, Instant)>,
-    jitter_ms: f64,
+    arrivals: RelativeDelay,
     last_raise: Option<Instant>,
     good_since: Option<Instant>,
 }
@@ -19,8 +18,7 @@ impl Default for AdaptiveDelay {
     fn default() -> Self {
         Self {
             target_ms: MIN_DELAY_MS,
-            previous: None,
-            jitter_ms: 0.0,
+            arrivals: RelativeDelay::default(),
             last_raise: None,
             good_since: None,
         }
@@ -33,31 +31,15 @@ impl AdaptiveDelay {
     }
 
     pub(crate) fn observe(&mut self, timestamp: u64, restart: bool, now: Instant) {
-        let previous = self.previous.replace((timestamp, now));
-        let Some((at, received)) = previous else {
-            return;
+        let extra = match self.arrivals.observe(timestamp, restart, now) {
+            Observation::Reset => {
+                self.good_since = None;
+                return;
+            }
+            Observation::Ignore => return,
+            // The existing 10 ms minimum already covers small variations.
+            Observation::DelayMs(delay) => delay.saturating_sub(5),
         };
-        let elapsed = now.saturating_duration_since(received);
-        let source_ms =
-            (i128::from(timestamp) - i128::from(at)) as f64 * 1000.0 / f64::from(AUDIO_SAMPLE_RATE);
-        // A talkspurt, suspended worker, or changed source clock is a new timing
-        // baseline, not proof of network congestion or ten seconds of recovery.
-        if restart
-            || elapsed > Duration::from_millis(200)
-            || source_ms.abs() > 200.0
-            || now < received
-        {
-            self.jitter_ms = 0.0;
-            self.good_since = None;
-            return;
-        }
-        // Arrival-order transit variation, using RFC 3550's 1/16 smoothing.
-        // This is a local controller, not an RTCP jitter report.
-        let variation = (elapsed.as_secs_f64() * 1000.0 - source_ms)
-            .abs()
-            .min(200.0);
-        self.jitter_ms += (variation - self.jitter_ms) / 16.0;
-        let extra = (2.0 * self.jitter_ms - 5.0).max(0.0).ceil() as u32;
         let suggested = (MIN_DELAY_MS + extra)
             .div_ceil(10)
             .saturating_mul(10)
@@ -140,7 +122,8 @@ mod tests {
             let arrival = n * 20 + if n % 2 == 0 { 0 } else { 19 };
             policy.observe(n * 960, n == 0, now + Duration::from_millis(arrival));
         }
-        assert!(policy.target_ms() >= 40 && policy.target_ms() <= 80);
+        // 19 ms relative transit variation plus headroom fits a 30 ms target.
+        assert_eq!(policy.target_ms(), 30);
         let raised = policy.target_ms();
         // No traffic is not recovery evidence.
         policy.observe(300 * 960, true, now + Duration::from_secs(60));

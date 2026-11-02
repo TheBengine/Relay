@@ -238,6 +238,9 @@ impl Speaker {
             } else {
                 self.stats.late += 1;
                 if let Some(policy) = &mut self.adaptation {
+                    // Include measured tail delays in the relative distribution,
+                    // even when their audio has already missed its deadline.
+                    policy.observe(timestamp, false, now);
                     policy.late_packet(now);
                 }
                 return;

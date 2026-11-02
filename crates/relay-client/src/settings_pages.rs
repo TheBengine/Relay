@@ -1303,6 +1303,25 @@ impl RelayApp {
             "Boost quieter speech automatically and limit loud peaks.",
             &mut self.prefs.audio.automatic_microphone_volume,
         );
+        if self.prefs.audio.automatic_microphone_volume {
+            use crate::audio_settings::AutomaticVolumeModel;
+            egui::ComboBox::from_id_source("automatic-volume-model")
+                .width(ui.available_width().min(320.0))
+                .selected_text(match self.prefs.audio.automatic_volume_model {
+                    AutomaticVolumeModel::Relay => "Relay · Standard",
+                    AutomaticVolumeModel::Sonora => "Sonora · Experimental",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.prefs.audio.automatic_volume_model,
+                        AutomaticVolumeModel::Relay, "Relay · Standard");
+                    ui.selectable_value(&mut self.prefs.audio.automatic_volume_model,
+                        AutomaticVolumeModel::Sonora, "Sonora · Experimental");
+                });
+            if self.prefs.audio.automatic_volume_model == AutomaticVolumeModel::Sonora {
+                controls::description(ui,
+                    "Try an alternative way to keep speech volume even. Use the microphone test to compare. Processes at least 10 ms at a time, including with shorter voice packets.");
+            }
+        }
         controls::switch_row(
             ui,
             "preserve-speech-start",
@@ -1313,6 +1332,22 @@ impl RelayApp {
         controls::divider(ui);
         // Discord keeps network and codec choices under Advanced, after the voice basics.
         controls::nav_group(ui, "ADVANCED");
+        controls::switch_row(ui, "compare-silero-vad", "Compare speech detection",
+            "Show Silero's speech estimate during a call or microphone test. It does not change your sound or decide when you transmit.",
+            &mut self.prefs.audio.compare_silero_vad);
+        if self.prefs.audio.compare_silero_vad {
+            use crate::silero_vad::Reading;
+            let reading = self.media.as_ref().map_or(Reading::Idle, MediaEngine::silero_reading);
+            let label = match reading {
+                Reading::Idle => "Silero: start the microphone test or unmute to compare.".into(),
+                Reading::Warming => "Silero: preparing speech detection…".into(),
+                Reading::Probability(p) => format!("Silero: {:.0}% speech probability · {}", p * 100.0,
+                    if p >= 0.5 { "speech detected" } else { "no speech detected" }),
+                Reading::Lagging => "Silero: analysis is behind. Your call continues normally.".into(),
+                Reading::Unavailable => "Silero could not start. Your call continues normally.".into(),
+            };
+            controls::description(ui, &label);
+        }
         controls::section_heading(
             ui,
             "Receive Latency",

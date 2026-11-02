@@ -1,6 +1,16 @@
 //! Persisted, bounded settings for the native audio engine.
 use serde::{Deserialize, Serialize};
 
+/// Opt-in gain controller; existing profiles keep Relay's current behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u32)]
+pub enum AutomaticVolumeModel {
+    #[default]
+    Relay = 0,
+    Sonora = 1,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u32)]
@@ -153,6 +163,9 @@ pub struct AudioSettings {
     /// while retaining an older user's custom manual threshold.
     pub automatic_sensitivity: Option<bool>,
     pub automatic_microphone_volume: bool,
+    pub automatic_volume_model: AutomaticVolumeModel,
+    /// Passive, local speech probability only; never controls transmission.
+    pub compare_silero_vad: bool,
     pub activation_hold_ms: u32,
     /// Voice-activation fade-in when the gate opens (0 = instant).
     pub activation_attack_ms: u32,
@@ -218,6 +231,8 @@ impl Default for AudioSettings {
             activation_threshold: 0.02,
             automatic_sensitivity: None,
             automatic_microphone_volume: true,
+            automatic_volume_model: AutomaticVolumeModel::Relay,
+            compare_silero_vad: false,
             activation_hold_ms: 200,
             activation_attack_ms: 5,
             activation_release_ms: 80,
@@ -368,7 +383,9 @@ impl AudioSettings {
 
     pub fn voice_delay_budget(&self) -> VoiceDelayBudget {
         let settings = self.clone().normalized();
-        let needs_dsp = settings.noise_suppression;
+        let needs_dsp = settings.noise_suppression
+            || (settings.automatic_microphone_volume
+                && settings.automatic_volume_model == AutomaticVolumeModel::Sonora);
         #[cfg(feature = "native-rtc")]
         let needs_dsp = needs_dsp || settings.echo_cancellation;
         // Query the actual linked Opus implementation once; never open audio devices.

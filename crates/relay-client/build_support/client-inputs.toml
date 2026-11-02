@@ -10,6 +10,12 @@ workspace_files = [
   "vendor/models/dpdfnet/README.md",
   "vendor/models/dpdfnet/dpdfnet2_48khz_hr.onnx",
   "vendor/models/dpdfnet/dpdfnet8_48khz_hr.onnx",
+  "vendor/models/silero/LICENSE",
+  "vendor/models/silero/silero_vad_16k_fixed.onnx",
+  "vendor/models/silero/silero_vad_16k_op15.onnx",
+  "vendor/models/silero/provenance.json",
+  "vendor/models/silero/reference.json",
+  "vendor/models/silero/prepare.py",
 ]
 
 [packages."crates/relay-client"]
