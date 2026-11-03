@@ -6,15 +6,17 @@
 
 | Package | Best for |
 | --- | --- |
-| [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261102.6/Relay-Setup.exe) | Recommended: install or update Relay like a normal Windows app. |
-| [Relay-Portable.zip](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261102.6/Relay-Portable.zip) | Extract the whole folder and open `Relay.exe`. Keep the files together. |
-| [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261102.6/SHA256SUMS.txt) | Check that downloaded files match the release. |
+| [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261103.1/Relay-Setup.exe) | Recommended: install or update Relay like a normal Windows app. |
+| [Relay-Portable.zip](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261103.1/Relay-Portable.zip) | Extract the whole folder and open `Relay.exe`. Keep the files together. |
+| [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261103.1/SHA256SUMS.txt) | Check that downloaded files match the release. |
 
 This is an **unsigned preview**. Real audio hardware, extended streaming and calls between different homes still need practical acceptance. Local synthetic media tests do not establish that these work on every PC or network.
 
 Relay starts quietly with Windows after installation or an update. Turn this off in **Settings > Advanced > Start Relay with Windows**. Your choice is kept across later updates.
 
 Personalize your profile with built-in avatars, banners, color themes and effects in **Settings > Profiles**. In **Voice & Video**, choose Automatic, Balanced or Save data for your next stream. Adaptive quality follows connection pressure within the selected limits; audio and transport add some traffic.
+
+Click a chat image to view it on a dark backdrop. Use Zoom, Copy or Save, and press Escape to return to the conversation. You can also right-click an image to copy or save it.
 
 ## Get started
 
