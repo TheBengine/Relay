@@ -1,0 +1,57 @@
+name: Build reviewed Relay server for profiles and history
+on:
+  push:
+    branches: [build/profiles-history-settings-20261103]
+permissions:
+  contents: read
+jobs:
+  server:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: rust:1-bookworm@sha256:fbc3a359627c6b5d9c8b20aae5c413a87392954f020006d7a9f7d95938964b23
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: 4d6f8883cf1e8585f1753f6310c5e97bcaf8e417
+          persist-credentials: false
+      - name: Verify pinned source and compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = 4d6f8883cf1e8585f1753f6310c5e97bcaf8e417
+          mkdir out test-fixtures
+          echo "RELAY_TEST_WORK_ROOT=$GITHUB_WORKSPACE/test-fixtures" >> "$GITHUB_ENV"
+          rustc --version | tee out/compiler.txt
+          cargo --version | tee -a out/compiler.txt
+          git rev-parse HEAD > out/source-commit.txt
+      - name: Test server and shared protocol on Linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --release -p relay-protocol -p relay-server -- --test-threads=2 2>&1 | tee out/tests.log
+      - name: Build the production server without QA features
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p relay-server --bin relay-server
+          cp target/release/relay-server out/relay-server
+          out/relay-server --help > out/server-help.txt
+          python3 - <<'PY'
+          import tomllib,pathlib
+          assert 'Usage: relay-server' in pathlib.Path('out/server-help.txt').read_text()
+          version=tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version']
+          pathlib.Path('out/server-version.txt').write_text('relay-server '+version+'\n')
+          PY
+          sha256sum out/relay-server > out/SHA256SUMS.txt
+          ldd out/relay-server > out/runtime-libraries.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: relay-server-profiles-history-linux-amd64
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
