@@ -39,6 +39,8 @@ impl HistoryUi {
 
 impl RelayApp {
     pub(super) fn history_backup_page(&mut self, ui: &mut egui::Ui) {
+        self.history_transfer_page(ui);
+        controls::divider(ui);
         controls::section_heading(ui, "History backup", "Keep a private copy of messages this PC has already opened. Its separate passphrase lets you read the backup on another PC, even while signed out.");
         controls::description(ui, "A backup shows saved messages. It does not confirm a new device or let it send messages. Attached files must still be available separately.");
         if self.command_origin().is_none() {
@@ -52,6 +54,16 @@ impl RelayApp {
         self.history_backup_controls(ui, can_export);
     }
 
+    pub(super) fn history_storage_warning(&self, ui: &mut egui::Ui) {
+        if let Some(usage) = &self.encryption_ui.status.history {
+            let fraction = (usage.archived_bytes as f64 / usage.byte_limit as f64)
+                .max(usage.segments as f64 / usage.segment_limit as f64);
+            if fraction >= 0.8 {
+                ui.add(egui::Label::new(RichText::new("Your protected history archive is nearly full. Make a history backup before moving to a new device. Relay preserves existing messages and keys when the limit is reached.").color(c_bad())).wrap(true));
+            }
+        }
+    }
+
     pub(super) fn history_backup_advanced(&self, ui: &mut egui::Ui) {
         if let Some(usage) = &self.encryption_ui.status.history {
             let fraction = (usage.archived_bytes as f64 / usage.byte_limit as f64)
@@ -63,9 +75,7 @@ impl RelayApp {
                 usage.records
             )));
             controls::description(ui, &format!("{} of {} archive segments on this device. The active device checkpoint and retired-device archives are separate.", usage.segments, usage.segment_limit));
-            if fraction >= 0.8 {
-                ui.add(egui::Label::new(RichText::new("Your protected history archive is nearly full. Make a history backup before moving to a new device. Relay preserves existing messages and keys when the limit is reached.").color(c_bad())).wrap(true));
-            }
+
         }
     }
 

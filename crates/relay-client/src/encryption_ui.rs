@@ -7,6 +7,8 @@ use crate::e2ee::{CryptoPeerStatus, CryptoUiStatus, MessageProtection, TrustNoti
 use crate::settings_ui as controls;
 #[path = "history_backup_ui.rs"]
 mod history_backup;
+#[path = "history_transfer_ui.rs"]
+mod history_transfer;
 
 pub(super) fn notification_body(message: &Message, previews: bool) -> String {
     if !previews {
@@ -195,6 +197,7 @@ pub(super) struct EncryptionUi {
     recovery: Option<RecoveryConfirmation>,
     safety: Option<SafetyCheck>,
     pub(super) history: history_backup::HistoryUi,
+    pub(super) transfer: history_transfer::TransferUi,
 }
 
 #[derive(Default)]
@@ -261,6 +264,9 @@ impl EncryptionUi {
     }
 
     pub(super) fn apply_status(&mut self, status: CryptoUiStatus) {
+        if self.status.own_device_id != status.own_device_id {
+            self.transfer = history_transfer::TransferUi::default();
+        }
         self.expanded_people
             .retain(|user_id| status.peers.iter().any(|peer| &peer.user_id == user_id));
         self.approvals.retain(|identity, _| {
@@ -620,6 +626,10 @@ impl RelayApp {
                 )
                 .on_hover_text(reason);
             }
+            Some(MessageProtection::Recovered) => {
+                ui.label(RichText::new("History transferred from your other PC").size(font_size(TEXT_CAPTION)).color(c_muted()))
+                    .on_hover_text("This copy was unlocked with your transfer code. Live encryption and device verification are separate.");
+            }
             Some(MessageProtection::Protected) | None => {}
         }
     }
@@ -765,6 +775,7 @@ impl RelayApp {
             });
         ui.add_space(10.0);
         let dismiss = self.trust_notices(ui, &status);
+        self.history_storage_warning(ui);
 
         if !open {
             self.protection_section(ui);
@@ -933,6 +944,7 @@ impl RelayApp {
             });
 
         ui.add_space(12.0);
+        controls::description(ui, "Using a new PC? Open Backup and recovery to request message history from your original PC, or read a saved backup.");
         egui::CollapsingHeader::new("Backup and recovery")
             .id_source("encryption-backup-and-recovery")
             .default_open(false)

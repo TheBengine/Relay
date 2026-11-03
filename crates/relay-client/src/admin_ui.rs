@@ -254,11 +254,51 @@ impl RelayApp {
         let Some(b) = self.bootstrap.clone() else {
             return;
         };
+        let server_section = match panel {
+            "settings-overview" => Some(Section::Overview),
+            "settings-channels" => Some(Section::Channels),
+            "settings-roles" => Some(Section::Roles),
+            "settings-members" => Some(Section::Members),
+            "settings-invites" => Some(Section::Invites),
+            "settings-hosts" => Some(Section::Hosts),
+            "settings-backups" => Some(Section::Backups),
+            "settings-uploads" => Some(Section::Uploads),
+            "settings-expressions" => Some(Section::Expressions),
+            "settings-audit" => Some(Section::Audit),
+            "settings-reports" => Some(Section::Reports),
+            "settings-discord" => Some(Section::Discord),
+            _ => None,
+        };
+        if let Some(section) = server_section {
+            self.settings_open = true;
+            self.settings_tab = SettingsTab::Server;
+            self.admin_ui.section = section;
+        }
         self.profile_capture_panel(panel);
         if self.encryption_capture_panel(panel) {
             self.admin_ui.welcome_open = false;
         }
         match panel {
+            "settings-help-connection" | "settings-help-recovery" => {
+                self.settings_open = true;
+                self.settings_tab = SettingsTab::Help;
+                self.capture_ctx.data_mut(|d| d.insert_temp(egui::Id::new("help-section"),
+                    if panel == "settings-help-connection" { 1u8 } else { 2u8 }));
+            }
+            "settings-voice-gaming" | "settings-voice-routing" | "settings-voice-stability" => {
+                self.settings_open = true;
+                self.settings_tab = SettingsTab::VoiceVideo;
+                self.voice_video_tab = VoiceVideoTab::Voice;
+                let id = match panel {
+                    "settings-voice-gaming" => "voice-gaming-settings",
+                    "settings-voice-routing" => "voice-route-settings",
+                    _ => "voice-stability-settings",
+                };
+                // CollapsingHeader derives persistent ids from the parent UI;
+                // the page consumes this capture-only hint when it renders.
+                self.capture_ctx.data_mut(|d| d.insert_temp(egui::Id::new("settings-capture-expansion"), id.to_owned()));
+                self.settings_scroll_bottom = true;
+            }
             "automatic-latency" => {
                 self.prefs
                     .audio
@@ -798,7 +838,7 @@ impl RelayApp {
                 settings_heading(
                     ui,
                     &bootstrap.server_name,
-                    "A community you can host yourself, or join through a friend.",
+                    "Your connection to this server. These actions apply only to this community.",
                 );
                 ui.label(
                     RichText::new(&self.login.url)
@@ -843,7 +883,7 @@ impl RelayApp {
                         self.lan_host_section(ui);
                         if ui.small_button("Refresh hosting status").clicked(){self.lan_host.reset();self.refresh_admin_data("metadata","/api/admin/metadata");}
                     });
-                    egui::CollapsingHeader::new("Advanced")
+                    egui::CollapsingHeader::new("Server details")
                         .id_source(("server-advanced", &self.login.url, &bootstrap.server_id))
                         .default_open(false)
                         .show(ui, |ui| {
@@ -1104,7 +1144,7 @@ impl RelayApp {
                     }
                 });
             ui.horizontal(|ui| {
-                ui.radio_value(&mut channel.visibility, "public".into(), "Public channel");
+                ui.radio_value(&mut channel.visibility, "public".into(), "All server members");
                 ui.radio_value(&mut channel.visibility, "private".into(), "Private channel");
             });
             if channel.kind == "text" && self.has_chat_capability("slowmode-v1") {
@@ -1157,7 +1197,7 @@ impl RelayApp {
             }
             self.admin_ui.channel = Some(channel.clone());
             ui.collapsing("Channel permissions",|ui| {
-                ui.label(RichText::new("Public channels allow access by default. Private channels require an explicit role or person; administrators always have access.").size(font_size(TEXT_BODY)).color(c_muted()));
+                ui.label(RichText::new("The All server members option allows access by default. Private channels require an explicit role or person; administrators always have access. Neither option makes a channel public on the internet.").size(font_size(TEXT_BODY)).color(c_muted()));
                 if self.admin_requests.values().any(|key|key==&format!("permissions:{}",channel.id)){ui.label("Loading permissions…");return;}
                 for role in ["member","moderator"] {
                     if !self.admin_ui.permissions.iter().any(|entry|entry.subject_kind=="role"&&entry.subject_id==role)&&ui.small_button(format!("Add {role} permissions")).clicked(){self.admin_ui.permissions.push(ChannelPermission{subject_kind:"role".into(),subject_id:role.into(),read:false,send:false,join:false,stream:false});}
@@ -1167,7 +1207,7 @@ impl RelayApp {
                     ui.horizontal_wrapped(|ui| {
                         let label=if entry.subject_kind=="role" {bootstrap.roles.iter().find(|role|role.id==entry.subject_id).map(|role|role.name.clone()).unwrap_or_else(||entry.subject_id.clone())}else{bootstrap.members.iter().find(|member|member.id==entry.subject_id).map(|member|member.username.clone()).unwrap_or_else(||"Member".into())};
                         ui.label(RichText::new(label).strong());
-                        ui.checkbox(&mut entry.read,"Read");ui.checkbox(&mut entry.send,"Send");ui.checkbox(&mut entry.join,"Join voice");ui.checkbox(&mut entry.stream,"Share");
+                        ui.checkbox(&mut entry.read,"Read");ui.checkbox(&mut entry.send,"Send");ui.checkbox(&mut entry.join,"Join voice");ui.checkbox(&mut entry.stream,"Share screen / video");
                         if ui.small_button("×").clicked(){remove=Some(index);}
                     });
                 }
@@ -1353,7 +1393,7 @@ impl RelayApp {
                         && id != bootstrap.user.id
                         && role != "admin"
                         && ui
-                            .add(secondary("Create reset code"))
+                            .add(secondary("Create password reset code"))
                             .on_hover_text("A one-time code, valid 24 hours, that lets this member set a new community password.")
                             .clicked()
                     {
@@ -1468,7 +1508,7 @@ impl RelayApp {
             }
         }
         ui.add_space(12.0);
-        ui.collapsing("Advanced invitation limits", |ui| {
+        ui.collapsing("Create an invite with custom limits", |ui| {
         if self.admin_ui.invite_uses == 0 {
             self.admin_ui.invite_uses = 1;
         }
@@ -1477,7 +1517,7 @@ impl RelayApp {
         }
         field(ui, "LABEL", &mut self.admin_ui.invite_label, false);
         ui.horizontal(|ui| {
-            ui.label("Uses");
+            ui.label("Maximum joins");
             ui.add(egui::DragValue::new(&mut self.admin_ui.invite_uses).clamp_range(1..=1000));
             egui::ComboBox::from_id_source("invite-expiry")
                 .selected_text(duration_name(self.admin_ui.invite_seconds))
@@ -1528,12 +1568,13 @@ impl RelayApp {
     }
 
     pub(super) fn account_settings_ui(&mut self, ui: &mut egui::Ui) {
+        crate::settings_ui::section_heading(ui, "Security on this server", "These settings apply to your community login, not your shared Relay account.");
         self.authenticator_settings(ui);
         self.ensure_admin_data("sessions", "/api/sessions");
         settings_heading(
             ui,
-            "Signed-in devices",
-            "Revoke sessions you no longer use.",
+            "Sessions on this server",
+            "Sign out a login on this community. Encryption devices are managed separately under Encryption.",
         );
         if let Some(sessions) = self
             .admin_data
@@ -1588,7 +1629,7 @@ impl RelayApp {
         {
             return;
         }
-        ui.collapsing("Recovery code", |ui| {
+        ui.collapsing("Community password recovery code", |ui| {
             ui.label(RichText::new("Save a recovery code somewhere safe. If this community moves to a new host, community passwords do not move with it; the code lets you set a new one. Creating a new code replaces the old one.").size(font_size(TEXT_CAPTION)).color(c_muted()));
             if ui.add(secondary("Create recovery code")).clicked() {
                 self.admin_data.remove("issued-code");
@@ -1596,9 +1637,9 @@ impl RelayApp {
             }
             issued_code_ui(ui, &self.admin_data, "recovery-code", "Write this down now. It is shown only once.");
         });
-        ui.collapsing("Change password",|ui|{
+        ui.collapsing("Change community password",|ui|{
             field(ui,"CURRENT PASSWORD",&mut self.admin_ui.current_password,true);field(ui,"NEW PASSWORD",&mut self.admin_ui.new_password,true);
-            ui.label(RichText::new("Use at least 10 characters. Changing it signs out every session.").size(font_size(TEXT_CAPTION)).color(c_muted()));
+            ui.label(RichText::new("Use at least 10 characters. Changing it signs out every session on this server.").size(font_size(TEXT_CAPTION)).color(c_muted()));
             if ui.add_enabled(!self.admin_ui.current_password.is_empty()&&self.admin_ui.new_password.len()>=10,primary("Change password")).clicked(){self.admin_request(AdminMethod::Patch,"/api/password".into(),json!({"current_password":self.admin_ui.current_password,"new_password":self.admin_ui.new_password}),"action:password".into());self.admin_ui.current_password.clear();self.admin_ui.new_password.clear();}
         });
     }
@@ -1610,6 +1651,7 @@ impl RelayApp {
             "Community backups",
             "Back up accounts, messages and uploaded files together.",
         );
+        crate::settings_ui::description(ui, "A server backup preserves encrypted messages but cannot restore a PC's private encryption keys. To read old messages on another PC, use Encryption → Backup and recovery.");
         ui.horizontal_wrapped(|ui| {
             if ui.add(primary("Save backup to this PC")).clicked() {
                 if let Some(path) = rfd::FileDialog::new()

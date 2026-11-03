@@ -1,6 +1,8 @@
 use crate::{chat_media, media::CaptureFrame};
 #[path = "network_account_login.rs"]
 mod account_login;
+#[path = "network_account_avatar.rs"]
+mod account_avatar;
 #[path = "network_call_switch.rs"]
 pub(crate) mod call_switch;
 #[path = "network_game_activity.rs"]
@@ -94,6 +96,13 @@ pub enum Command {
         cancel: Arc<AtomicBool>,
         request_id: u64,
     },
+    HistoryTransfer {
+        origin: CommandOrigin,
+        request_id: u64,
+        code: zeroize::Zeroizing<String>,
+        send: bool,
+        cancel: Arc<AtomicBool>,
+    },
     HistoryBackup {
         origin: Option<CommandOrigin>,
         path: PathBuf,
@@ -146,6 +155,7 @@ pub enum Command {
         request_id: u64,
     },
     SaveProfile {
+        effect_settings: Option<ProfileEffectSettings>,
         origin: CommandOrigin,
         display_name: String,
         bio: String,
@@ -255,6 +265,7 @@ pub enum Command {
         expected_revision: u64,
     },
     React {
+        request_id: u64,
         origin: CommandOrigin,
         target: Target,
         message_id: String,
@@ -467,6 +478,7 @@ pub enum ProfileAvatarChange {
     #[default]
     Keep,
     Remove,
+    #[cfg(test)] // Legacy file-path upload remains exercised by transport regressions.
     Upload(PathBuf),
     Prepared(Vec<u8>),
 }
@@ -553,6 +565,11 @@ pub enum Update {
         bootstrap: Box<Bootstrap>,
         request_id: u64,
     },
+    HistoryTransferred {
+        origin: CommandOrigin,
+        request_id: u64,
+        result: Result<String, String>,
+    },
     HistoryBackup {
         origin: Option<CommandOrigin>,
         request_id: u64,
@@ -566,6 +583,11 @@ pub enum Update {
     },
     WhisperInvalidated {
         peer: String,
+    },
+    ReactionFinished {
+        origin: CommandOrigin,
+        request_id: u64,
+        error: Option<String>,
     },
     ReactionSnapshot {
         url: String,
@@ -1059,6 +1081,7 @@ impl Network {
                     Err(mpsc::TryRecvError::Disconnected) => break,
                     Err(mpsc::TryRecvError::Empty) => false,
                 };
+                worker.poll_history_transfer();
                 worker.poll_host_resume();
                 worker.poll_handover();
                 worker.poll_host_locator();
@@ -1150,6 +1173,7 @@ struct Worker {
     work: Arc<shutdown::Work>,
     server_check_active: Arc<AtomicBool>,
     archive_busy: Arc<AtomicBool>,
+    history_transfer_job: Option<history_transfer::Job>,
     updates: mpsc::SyncSender<Update>,
     ctx: eframe::egui::Context,
     refresh_pending: Arc<AtomicBool>,
@@ -1157,6 +1181,7 @@ struct Worker {
     send_wait: Option<(SendWait, String)>,
     wake: idle::Wake,
     snapshots: std::sync::Mutex<snapshots::Snapshots>,
+    account_avatar: account_avatar::Sync,
     message_repair_at: Instant,
     socket_stop: Arc<AtomicBool>,
     connection: Option<Connection>,
@@ -1904,10 +1929,12 @@ impl Worker {
             work: work.clone(),
             server_check_active: work.server_check.clone(),
             archive_busy: work.archive.clone(),
+            history_transfer_job: None,
             ctx,
             refresh_pending,
             wake,
             snapshots: std::sync::Mutex::new(snapshots::Snapshots::default()),
+            account_avatar: account_avatar::Sync::default(),
             message_repair_at: Instant::now(),
             socket_stop: Arc::new(AtomicBool::new(false)),
             connection: None,
@@ -2168,6 +2195,12 @@ impl Worker {
             });
             return;
         }
+        if let Command::HistoryTransfer { origin, request_id, code, send, cancel } = command {
+            if let Err(error)=self.start_history_transfer(origin.clone(),request_id,code,send,cancel) {
+                self.emit(Update::HistoryTransferred {origin, request_id, result:Err(error)});
+            }
+            return;
+        }
         if let Command::HistoryBackup {
             origin,
             path,
@@ -2287,9 +2320,12 @@ impl Worker {
                 | Command::HostEmbedded { .. } | Command::HostTailscale { .. }
                 | Command::RestoreLocal { .. });
         self.send_wait = None;
+        let tracked_reaction = matches!(&command, Command::React { .. });
         let result = self.handle(command);
         if let Err(error) = result {
-            if let Some(target) = send_target {
+            if tracked_reaction {
+                // ReactionFinished already carries the scoped failure to the UI.
+            } else if let Some(target) = send_target {
                 let wait = self.send_wait.take();
                 self.emit(send_failure(target, error, wait, send_origin));
             } else if let Some(message_id) = edit_message_id {
@@ -3083,6 +3119,7 @@ impl Worker {
                 }
             }
             Command::React {
+                request_id,
                 origin,
                 target,
                 message_id,
@@ -3090,8 +3127,11 @@ impl Worker {
                 emoji,
                 active,
             } => {
-                self.command_connection(&origin)?;
-                self.send_reaction(target, message_id, target_client_id, emoji, active)?;
+                let result = self.command_connection(&origin).map(|_| ()).and_then(|()| {
+                    self.send_reaction(target, message_id, target_client_id, emoji, active)
+                });
+                self.emit(Update::ReactionFinished { origin, request_id, error: result.as_ref().err().cloned() });
+                result?;
             }
             Command::DeleteMessage(id) => {
                 checked(
@@ -4903,6 +4943,8 @@ mod encrypted;
 mod extended;
 #[path = "network_history_backup.rs"]
 mod history_backup;
+#[path = "network_history_transfer.rs"]
+mod history_transfer;
 #[path = "network_legacy_reactions.rs"]
 mod legacy_reactions;
 #[path = "network_reactions.rs"]

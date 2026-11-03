@@ -20,6 +20,7 @@ struct ProfileDraft {
     display_name: String,
     bio: String,
     appearance: ProfileAppearance,
+    effect_settings: ProfileEffectSettings,
     avatar: ProfileAvatarChange,
 }
 
@@ -40,6 +41,7 @@ impl Editor {
                 display_name: user.profile.display_name.clone(),
                 bio: user.profile.bio.clone(),
                 appearance: user.profile.appearance.clone(),
+                effect_settings: user.profile.effect_settings,
                 avatar: ProfileAvatarChange::Keep,
             },
             baseline: user,
@@ -52,12 +54,14 @@ impl Editor {
         self.draft.display_name != self.baseline.profile.display_name
             || self.draft.bio != self.baseline.profile.bio
             || self.draft.appearance != self.baseline.profile.appearance
+            || self.draft.effect_settings != self.baseline.profile.effect_settings
             || self.draft.avatar != ProfileAvatarChange::Keep
     }
     fn valid(&self) -> bool {
         self.draft.display_name.trim().chars().count() <= 32
             && self.draft.bio.chars().count() <= 190
             && self.draft.appearance.valid()
+            && self.draft.effect_settings.valid()
     }
     fn apply(&mut self, user: User, submitted: Option<ProfileDraft>, complete: bool) {
         if user.profile.version < self.baseline.profile.version {
@@ -73,6 +77,9 @@ impl Editor {
             if self.draft.appearance == submitted.appearance {
                 self.draft.appearance = user.profile.appearance.clone();
             }
+            if self.draft.effect_settings == submitted.effect_settings {
+                self.draft.effect_settings = user.profile.effect_settings;
+            }
             if complete && self.draft.avatar == submitted.avatar {
                 self.draft.avatar = ProfileAvatarChange::Keep;
                 self.preview = None;
@@ -82,6 +89,7 @@ impl Editor {
             self.draft.display_name = user.profile.display_name.clone();
             self.draft.bio = user.profile.bio.clone();
             self.draft.appearance = user.profile.appearance.clone();
+            self.draft.effect_settings = user.profile.effect_settings;
         }
         self.baseline = user;
     }
@@ -454,7 +462,7 @@ impl RelayApp {
                         controls::nav_group(ui, "YOUR ACCOUNTS");
                         controls::description(
                             ui,
-                            "One account per community. Each community has its own profile.",
+                            "Your Relay account shares one avatar. Names, About Me and profile styling can differ by server.",
                         );
                         let mut accounts = self.prefs.communities.clone();
                         if !accounts.iter().any(|a| a.url == self.login.url) {
@@ -649,10 +657,13 @@ impl RelayApp {
         self.row_heights = Default::default();
     }
     pub(super) fn profiles_page(&mut self, ui: &mut egui::Ui) {
+        let shared_avatar = self.central_account.account.as_ref().is_some_and(|account|
+            self.bootstrap.as_ref().is_some_and(|b| b.linked_identities.iter().any(|i|
+                i.user_id == b.user.id && i.issuer == account.issuer && i.handle == account.handle)));
         controls::page_heading(
             ui,
-            "Main Profile",
-            "Make this profile yours. Changes are shared with this community.",
+            "Profiles",
+            "Choose how you appear to people here. Preview your changes before saving.",
         );
         let Some(user) = self.bootstrap.as_ref().map(|b| b.user.clone()) else {
             controls::description(ui, "Connect to a server to edit your profile.");
@@ -672,6 +683,7 @@ impl RelayApp {
             .is_some_and(|b| b.capabilities.iter().any(|c| c == "profiles-v2"));
         let effects = self.has_chat_capability("profiles-v3");
         let expanded_effects = self.has_chat_capability("profiles-v4");
+        let tunable_effects = self.has_chat_capability("profiles-v5");
         let reduced_motion = self.prefs.reduced_motion;
         let scope = format!("{}|{}", self.login.url, user.id);
         if !self
@@ -724,56 +736,28 @@ impl RelayApp {
                         controls::description(ui, "Leave empty to use your username.");
                     }
                     if section == ProfileSection::Avatar {
-                        controls::nav_group(ui, "CHOOSE AN AVATAR");
-                        if let Some((texture, bytes)) = gallery.avatars(ui) {
-                            editor.draft.avatar = ProfileAvatarChange::Prepared(bytes);
-                            editor.preview = Some(texture);
-                            editor.preview_rx = None;
+                        controls::section_heading(ui, if shared_avatar { "Account Avatar" } else { "Avatar" },
+                            if shared_avatar { "One picture for Friends and all your servers. Changes sync when each server connects." }
+                            else { "Upload a picture, then drag and zoom to frame it." });
+                        if shared_avatar {
+                            controls::description(ui, "Choose and save a picture here to use it everywhere. Removing it also removes it from your other servers. Servers need the latest Relay update.");
                         }
-                        controls::description(ui, "Pick a character, or upload your own. Save Changes to apply your choice.");
-                        ui.add_space(16.0);
-                        controls::nav_group(ui, "YOUR OWN IMAGE");
                         ui.horizontal_wrapped(|ui| {
-                            if ui
-                                .add_enabled(
-                                    editor.preview_rx.is_none(),
-                                    secondary("Change Avatar"),
-                                )
-                                .clicked()
-                            {
-                                if assets {
-                                    crop_avatar = true;
-                                } else if let Some(path) = crate::file_pick::pick(
-                                    rfd::FileDialog::new()
-                                        .add_filter("Avatar image", &["png", "jpg", "jpeg", "webp"]),
-                                ) {
-                                    let (tx, rx) = mpsc::sync_channel(1);
-                                    let preview_path = path.clone();
-                                    if std::thread::Builder::new()
-                                        .name("relay-avatar-preview".into())
-                                        .spawn(move || {
-                                            let _ = tx.send(local_avatar_preview(&preview_path));
-                                        })
-                                        .is_ok()
-                                    {
-                                        editor.draft.avatar = ProfileAvatarChange::Upload(path);
-                                        editor.preview = None;
-                                        editor.preview_rx = Some(rx);
-                                    } else {
-                                        self.error = Some("Cannot start avatar preview.".into());
-                                    }
-                                }
-                            }
-                            if ui.add(secondary("Remove Avatar")).clicked() {
+                            if ui.add(primary("Change Avatar")).clicked() { crop_avatar = true; }
+                            if ui.add_enabled(user.profile.avatar_url.is_some() || editor.draft.avatar != ProfileAvatarChange::Keep, secondary("Remove Avatar")).clicked() {
                                 editor.draft.avatar = ProfileAvatarChange::Remove;
                                 editor.preview = None;
                                 editor.preview_rx = None;
                             }
                         });
-                        controls::description(ui, if assets {
-                            "PNG, JPEG, WebP or ICO. Preview and crop locally; saved as PNG up to 256 × 256. Apply to the draft, then Save Profile."
-                        } else {
-                            "PNG, JPEG or WebP · up to 2 MiB (legacy server)"
+                        controls::description(ui, "PNG, JPEG, WebP, BMP or ICO. Your picture changes when you choose Save Changes.");
+                        ui.add_space(16.0);
+                        egui::CollapsingHeader::new("Choose a built-in avatar").show(ui, |ui| {
+                            if let Some((texture, bytes)) = gallery.avatars(ui) {
+                                editor.draft.avatar = ProfileAvatarChange::Prepared(bytes);
+                                editor.preview = Some(texture);
+                                editor.preview_rx = None;
+                            }
                         });
                     }
                     if section == ProfileSection::Banner {
@@ -785,11 +769,7 @@ impl RelayApp {
                             );
                         }
                         if assets {
-                            controls::nav_group(ui, "CHOOSE A BANNER");
-                            preset_banner = gallery.banners(ui);
-                            controls::description(ui, "Choose a design to preview and crop it. Save Image applies the banner separately from your profile text and colors.");
-                            ui.add_space(16.0);
-                            controls::nav_group(ui, "YOUR OWN IMAGE");
+                            controls::section_heading(ui, "Banner image", "Choose a picture for the top of your profile.");
                             ui.horizontal_wrapped(|ui| {
                                 if ui.add(secondary("Change Banner")).clicked() {
                                     crop_banner = true;
@@ -803,6 +783,11 @@ impl RelayApp {
                                 {
                                     remove_banner = true;
                                 }
+                            });
+                            controls::description(ui, "Save Image in the crop preview updates your banner. Profile colors use Save Changes below.");
+                            ui.add_space(16.0);
+                            egui::CollapsingHeader::new("Choose a built-in banner").show(ui, |ui| {
+                                preset_banner = gallery.banners(ui);
                             });
                         }
                     }
@@ -849,25 +834,45 @@ impl RelayApp {
                     }
                     if effects && section == ProfileSection::Effects {
                         controls::nav_group(ui, "PROFILE EFFECT");
+                        let tile_width = ((ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0).clamp(84.0, 130.0);
                         ui.horizontal_wrapped(|ui| {
                             for &effect in available_effects(expanded_effects) {
                                 let selected =
-                                    editor.draft.appearance.effect.as_deref().unwrap_or("none")
-                                        == effect;
+                                    editor.draft.appearance.effect.as_deref().unwrap_or("none") == effect;
                                 let button = ui.add(
-                                    egui::Button::new(effect_name(effect))
-                                        .min_size(Vec2::new(130.0, 70.0))
+                                    egui::Button::new(format!("\n\n{}", effect_name(effect)))
+                                        .min_size(Vec2::new(tile_width, 72.0))
                                         .stroke(Stroke::new(
                                             if selected { 2.0_f32 } else { 1.0_f32 },
                                             if selected { c_accent() } else { c_line() },
                                         )),
                                 );
+                                let tile = Rect::from_min_max(button.rect.min + Vec2::splat(5.0), button.rect.max - Vec2::new(5.0, 32.0));
+                                let tile_appearance = ProfileAppearance { effect: Some(effect.into()), ..editor.draft.appearance.clone() };
+                                paint_profile_effect(ui, tile, &tile_appearance, ProfileEffectSettings::default(), true);
                                 if button.clicked() {
                                     editor.draft.appearance.effect = Some(effect.into());
+                                    if effect == "none" { editor.draft.effect_settings = ProfileEffectSettings::default(); }
                                 }
                             }
                         });
-                        controls::description(ui, "Preview your choice on the profile card. Reduced Motion keeps effects still.");
+                        ui.add_space(16.0);
+                        let effect = editor.draft.appearance.effect.as_deref().unwrap_or("none");
+                        let ProfileEffectSettings { mut speed, mut amount } = editor.draft.effect_settings;
+                        if effect != "none" {
+                            controls::nav_group(ui, "CUSTOMIZE EFFECT");
+                            ui.add_enabled_ui(tunable_effects, |ui| {
+                                ui.add(egui::Slider::new(&mut speed, 25..=200).text("Speed").suffix("%"));
+                                ui.add(egui::Slider::new(&mut amount, 25..=200).text("Amount").suffix("%"));
+                                if ui.add(secondary("Reset effect")).clicked() { speed = 100; amount = 100; }
+                            });
+                            if tunable_effects {
+                                editor.draft.effect_settings = ProfileEffectSettings { speed, amount };
+                            } else {
+                                controls::description(ui, "Update this server to adjust effect speed and amount.");
+                            }
+                        }
+                        controls::description(ui, if reduced_motion { "Reduced Motion is on: effects stay still. You can change this in Accessibility." } else { "Your choice is shown on the profile card. Save Changes to share it." });
                         if !expanded_effects {
                             controls::description(ui, "More effects are available after this server is updated.");
                         }
@@ -896,6 +901,7 @@ impl RelayApp {
                 preview.profile.display_name = editor.draft.display_name.clone();
                 preview.profile.bio = editor.draft.bio.clone();
                 preview.profile.appearance = editor.draft.appearance.clone();
+                preview.profile.effect_settings = editor.draft.effect_settings;
                 let avatar = if editor.draft.avatar == ProfileAvatarChange::Remove {
                     None
                 } else {
@@ -910,7 +916,9 @@ impl RelayApp {
                     false,
                 );
                 ui.add_space(12.0);
-                controls::description(ui, "This profile is shared with members of this server.");
+                controls::description(ui, if shared_avatar {
+                    "Your avatar is shared across your Relay account. About Me, banner, theme and effects apply to this server."
+                } else { "This profile is shared with members of this server." });
             }
         });
         ui.add_space(22.0);
@@ -925,7 +933,7 @@ impl RelayApp {
                         ui.label(if pending {
                             "Saving your profile…"
                         } else {
-                            "Careful — you have unsaved changes!"
+                            "Unsaved changes"
                         });
                         if ui.add_enabled(!pending, secondary("Reset")).clicked() {
                             *editor = Editor::new(editor.scope.clone(), editor.baseline.clone());
@@ -961,6 +969,7 @@ impl RelayApp {
             };
             let request_id = self.next_request();
             match self.network.send(Command::SaveProfile {
+                effect_settings: tunable_effects.then_some(draft.effect_settings),
                 origin,
                 display_name: draft.display_name.clone(),
                 bio: draft.bio.clone(),
@@ -1116,6 +1125,7 @@ pub(super) fn paint_user_avatar(
     }
 }
 
+#[cfg(test)]
 fn local_avatar_preview(path: &std::path::Path) -> Result<egui::ColorImage, String> {
     use std::io::Read;
     let mut bytes = Vec::new();
@@ -1244,7 +1254,7 @@ fn profile_preview(
                     .rounding(8.0)
                     .paint_at(ui, banner);
             }
-            paint_profile_effect(ui, banner, &user.profile.appearance, reduced_motion);
+            paint_profile_effect(ui, banner, &user.profile.appearance, user.profile.effect_settings, reduced_motion);
             egui::Frame::none()
                 .inner_margin(Margin::same(16.0))
                 .show(ui, |ui| {
@@ -1440,35 +1450,40 @@ fn paint_profile_effect(
     ui: &mut egui::Ui,
     rect: Rect,
     appearance: &ProfileAppearance,
+    settings: ProfileEffectSettings,
     reduced_motion: bool,
 ) {
     let effect = appearance.effect.as_deref().unwrap_or("none");
+    // Also bound data from remote servers before generating geometry.
+    let speed = settings.speed.clamp(25, 200);
+    let amount = settings.amount.clamp(25, 200);
+    let count = |base: u16| (base * amount / 100).max(1);
     if effect == "none" {
         return;
     }
     let time = if reduced_motion {
         0.0
     } else {
-        ui.input(|i| i.time) as f32
+        ui.input(|i| i.time) as f32 * f32::from(speed) / 100.0
     };
     let color = profile_color(appearance.accent);
     let painter = ui.painter().with_clip_rect(rect);
     match effect {
         "glow" => {
             let pulse = 0.5 + 0.5 * (time * 1.6).sin();
-            for ring in 0..5 {
+            for ring in 0..count(5) {
                 painter.rect_stroke(
                     rect.shrink(2.0 + ring as f32 * 2.0),
                     8.0,
                     Stroke::new(
                         2.0_f32,
-                        color.linear_multiply((0.16 + pulse * 0.12) * (1.0 - ring as f32 / 6.0)),
+                        color.linear_multiply((0.16 + pulse * 0.12) * (1.0 - ring as f32 / (f32::from(count(5)) + 1.0))),
                     ),
                 );
             }
         }
         "sparkle" => {
-            for index in 0..12 {
+            for index in 0..count(12) {
                 let x = ((index as f32 * 0.618 + time * 0.025).fract() + 1.0).fract();
                 let y = ((index as f32 * 0.383 + time * 0.015).fract() + 1.0).fract();
                 let pulse = 0.5 + 0.5 * (time * 1.4 + index as f32).sin();
@@ -1483,7 +1498,7 @@ fn paint_profile_effect(
             }
         }
         "wave" => {
-            for line in 0..4 {
+            for line in 0..count(4) {
                 let mut points = Vec::with_capacity(25);
                 for step in 0..25 {
                     let x = step as f32 / 24.0;
@@ -1502,7 +1517,7 @@ fn paint_profile_effect(
             }
         }
         "aurora" => {
-            for band in 0..6 {
+            for band in 0..count(6) {
                 let points = (0..33).map(|step| {
                     let x = step as f32 / 32.0;
                     egui::pos2(rect.left()+x*rect.width(), rect.top()+rect.height()*(0.4+band as f32*0.04+0.2*(x*5.0+time*0.3+band as f32*0.2).sin()))
@@ -1514,13 +1529,13 @@ fn paint_profile_effect(
             let center=rect.center();
             let radius=rect.height()*0.34;
             painter.circle_stroke(center,radius,Stroke::new(1.0_f32,color.linear_multiply(0.4)));
-            for index in 0..4 {
-                let angle=time*0.35+index as f32*std::f32::consts::FRAC_PI_2;
+            for index in 0..count(4) {
+                let angle=time*0.35+index as f32*std::f32::consts::TAU/f32::from(count(4));
                 painter.circle_filled(center+Vec2::angled(angle)*radius,3.0,color);
             }
         }
         "rain" | "confetti" | "hearts" | "fireflies" => {
-            for index in 0..18 {
+            for index in 0..count(18) {
                 let phase=index as f32;
                 let x=(phase*0.618+0.018*(time*0.4+phase).sin()).rem_euclid(1.0);
                 let y=(phase*0.383+time*if effect=="rain" {0.13} else {-0.035}).rem_euclid(1.0);
@@ -1551,6 +1566,29 @@ fn paint_profile_effect(
 mod tests {
     use super::*;
     #[test]
+    fn effect_tuning_changes_geometry_and_speed_but_respects_reduced_motion() {
+        fn draw(effect: &str, time: f64, reduced: bool) -> String {
+            let ctx = egui::Context::default();
+            let (base, speed, amount) = relay_protocol::profile_effect_parameters(effect).unwrap();
+            let appearance = ProfileAppearance { effect: Some(base.into()), ..Default::default() };
+            let output = ctx.run(egui::RawInput { time: Some(time), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    paint_profile_effect(ui, Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 84.0)), &appearance, ProfileEffectSettings { speed, amount }, reduced);
+                });
+            });
+            format!("{:?}", output.shapes)
+        }
+        assert_ne!(draw("sparkle@50,100", 5.0, false), draw("sparkle@150,100", 5.0, false));
+        assert_ne!(draw("sparkle@100,25", 5.0, true), draw("sparkle@100,200", 5.0, true));
+        assert_eq!(draw("sparkle@50,200", 5.0, true), draw("sparkle@150,200", 25.0, true));
+        for &effect in relay_protocol::PROFILE_EFFECTS {
+            let tuned = relay_protocol::profile_effect_value(effect, 200, 200);
+            assert!(ProfileEffectSettings { speed: 200, amount: 200 }.valid());
+            assert_eq!(draw(&tuned, 2.0, true), draw(&tuned, 22.0, true));
+        }
+    }
+
+    #[test]
     fn effect_catalog_respects_old_servers_and_reduced_motion() {
         assert_eq!(available_effects(false), &["none", "glow", "sparkle", "wave"]);
         for &effect in available_effects(true) {
@@ -1560,7 +1598,7 @@ mod tests {
             let draw=|time| ctx.run(egui::RawInput { time: Some(time), ..Default::default() }, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let rect=Rect::from_min_size(Pos2::new(20.0,20.0),Vec2::new(260.0,84.0));
-                    paint_profile_effect(ui,rect,&appearance,true);
+                    paint_profile_effect(ui,rect,&appearance,ProfileEffectSettings::default(),true);
                 });
             });
             let _=draw(0.0);

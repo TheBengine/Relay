@@ -196,11 +196,22 @@ impl Worker {
                 .is_some_and(|c| c.chat.plain_allowed())
         {
             super::extended::path_id(&message_id)?;
-            let _: Message = self.post(
+            let message: Message = self.post(
                 &format!("/api/messages/{message_id}/reactions"),
                 &serde_json::json!({"emoji":emoji,"active":active}),
             )?;
-            return self.load_messages();
+            let c = self.connection.as_ref().ok_or("Not connected.")?;
+            if message.id != message_id
+                || !super::legacy_reactions::belongs_to(&message, &target, &c.session.user.id)
+                || message.content.starts_with(crate::e2ee::MESSAGE_PREFIX)
+            {
+                return Err("The reaction response did not match this conversation.".into());
+            }
+            // Pins/search can show originals outside the latest history page.
+            // Install their authoritative row before clearing the local intent.
+            self.emit(Update::ReactionSnapshot { url: c.url.clone(), target,
+                message_id, target_client_id: None, rows: message.reactions });
+            return Ok(());
         }
         let scope = self.crypto_scope(&target)?;
         let action = MessageAction::Reaction {

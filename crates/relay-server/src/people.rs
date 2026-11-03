@@ -265,7 +265,9 @@ pub(super) async fn guard(
             | "/rtc/v1"
             | "/rtc/validate"
             | "/rtc/v1/validate"
-    ) || conversation_route(path, request.method())
+    ) || (path == "/api/profile/avatar" && matches!(request.method().as_str(), "GET" | "PUT" | "DELETE"))
+        || (path == "/api/profile/account" && request.method() == axum::http::Method::GET)
+        || conversation_route(path, request.method())
         || host_locator_directory::is_route(path, request.method())
         || gateway_admission::friends_route(path, request.method())
         || [
@@ -276,6 +278,7 @@ pub(super) async fn guard(
             "/api/profiles/",
             "/api/messages/",
             "/api/uploads/",
+            "/api/history-transfer/",
             "/api/voice/",
             "/api/media/",
             "/api/sessions/",

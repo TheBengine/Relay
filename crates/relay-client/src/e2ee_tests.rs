@@ -2,6 +2,8 @@
 use super::*;
 #[path = "e2ee_history_cache_tests.rs"]
 mod history_cache_tests;
+#[path = "e2ee_transfer_tests.rs"]
+mod transfer_tests;
 
 #[path = "e2ee_history_measurement_tests.rs"]
 mod history_measurement_tests;

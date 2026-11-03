@@ -125,11 +125,6 @@ pub(super) fn help_content(
     ui: &mut egui::Ui,
     viewer: HelpViewer,
 ) -> (Option<HelpAction>, Vec<(HelpAction, Rect)>) {
-    controls::page_heading(
-        ui,
-        "Help",
-        "Short answers to get you started. Open a topic for more detail.",
-    );
     let mut clicked = None;
     let mut buttons = Vec::new();
     for (index, topic) in topics(viewer).into_iter().enumerate() {
@@ -170,6 +165,30 @@ impl RelayApp {
     }
 
     pub(super) fn help_page(&mut self, ui: &mut egui::Ui) {
+        // A check may finish after switching away from Connection status.
+        // Collect its result for support reports without starting another probe.
+        self.service_health.collect();
+        controls::page_heading(ui, "Help", "Get started, check your connection or recover access.");
+        let tab_id = egui::Id::new("help-section");
+        let mut section = ui.ctx().data(|d| d.get_temp::<u8>(tab_id)).unwrap_or(0).min(2);
+        ui.horizontal_wrapped(|ui| {
+            for (index, label) in [(0, "Getting started"), (1, "Connection status"), (2, "Recovery & support")] {
+                if controls::top_tab(ui, ("help-tab", index), label, section == index).clicked() {
+                    section = index;
+                }
+            }
+        });
+        ui.ctx().data_mut(|d| d.insert_temp(tab_id, section));
+        if section == 1 {
+            self.connection_status_section(ui);
+            return;
+        }
+        if section == 2 {
+            self.recovery_help_section(ui);
+            self.support_report_section(ui);
+            return;
+        }
+        controls::divider(ui);
         let viewer = self.help_viewer();
         let (clicked, _) = help_content(ui, viewer);
         match clicked {
@@ -196,9 +215,6 @@ impl RelayApp {
             Some(HelpAction::KeyboardShortcuts) => self.settings_tab = SettingsTab::Keybinds,
             _ => {}
         }
-        self.connection_status_section(ui);
-        self.recovery_help_section(ui);
-        self.support_report_section(ui);
     }
 }
 

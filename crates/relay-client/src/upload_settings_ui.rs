@@ -141,21 +141,21 @@ impl RelayApp {
         let has_error = state.error.is_some();
         if let Some(draft) = state.draft.as_mut() {
             ui.add_enabled_ui(!pending, |ui| {
-                ui.horizontal(|ui| { ui.label("Server ceiling"); upload_limit_choice(ui, "upload-ceiling", &mut draft.max_file_bytes); });
-                ui.horizontal(|ui| { ui.label("Default for members"); upload_limit_choice(ui, "upload-default", &mut draft.default_file_bytes); });
+                ui.horizontal(|ui| { ui.label("Maximum file size"); upload_limit_choice(ui, "upload-ceiling", &mut draft.max_file_bytes); });
+                ui.horizontal(|ui| { ui.label("Default member limit"); upload_limit_choice(ui, "upload-default", &mut draft.default_file_bytes); });
                 if draft.default_file_bytes > draft.max_file_bytes {
-                    ui.colored_label(c_bad(), "The default must not exceed the server ceiling.");
+                    ui.colored_label(c_bad(), "The default must not exceed the server maximum.");
                 }
                 crate::settings_ui::description(ui,
-                    "Role entries inherit the default unless set explicitly. The largest explicit allowance among a member's roles wins, capped by the server ceiling. Disabled means zero only when no other explicit role grants more. Server administrators use the ceiling.");
+                    "Role entries inherit the default unless set explicitly. The largest explicit allowance among a member's roles wins, capped by the server maximum. Disabled means zero only when no other explicit role grants more. Server administrators use the maximum.");
                 for role in &bootstrap.roles {
                     let mut choice = draft.role_limits.get(&role.id).copied();
                     ui.horizontal(|ui| {
                         ui.label(&role.name);
                         egui::ComboBox::from_id_source(("upload-role", &role.id))
-                            .selected_text(choice.map_or_else(|| "Inherit default".into(), upload_limit_label))
+                            .selected_text(choice.map_or_else(|| "Use default".into(), upload_limit_label))
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut choice, None, "Inherit default");
+                                ui.selectable_value(&mut choice, None, "Use default");
                                 for mib in 0..=25 {
                                     ui.selectable_value(&mut choice, Some(mib * UPLOAD_MIB), upload_limit_label(mib * UPLOAD_MIB));
                                 }

@@ -39,6 +39,37 @@ Poll questions, options and mention lists are message content inside MLS. Votes 
 
 Roles, audit records, presentation images/emoji, status, event details and routing are host-visible metadata. Friends and blocks are owner scoped; reports are staff scoped. A report shares decrypted evidence only when the user explicitly opts in and submits it. Blocking another shared-channel author suppresses display and notifications, while processing their MLS generations preserves the shared conversation's ratchet.
 
+## History transfer between PCs
+
+Current source adds an explicit **Encryption → Backup and recovery** transfer.
+Sign in to the same account and community on both PCs. On the new PC choose
+**This is my new PC**; enter that code on the original PC and choose **Approve
+and send history**. Then choose **Receive history** on the new PC. Repeat for
+other communities. Both client and server must support `history-transfer-v1`.
+
+The random 256-bit code stays on the PCs. The original PC encrypts a bounded
+snapshot with XChaCha20-Poly1305; its authenticated context includes the transfer,
+community and account. The server only relays opaque ciphertext in memory,
+owner-scoped, until consumption, expiry after 15 minutes, or restart. Its 128 MiB
+budget includes in-flight uploads and retained responses; each snapshot is at
+most 32 MiB and 100,000 records. This is an explicit snapshot of messages already
+opened on the original PC, not ongoing synchronization or a permanent backup.
+Expired entries are purged on subsequent transfer requests; they cannot be fetched
+after their deadline. A server operator can retain ciphertext outside this service.
+
+Received messages appear in their conversations when the server still supplies
+the matching ciphertext, with **History transferred from your other PC** provenance.
+Attachment keys transfer, but the original uploaded files must still exist. Older
+reaction totals are not reconstructed from the transferred copy. Live unread/edit
+ordering, device verification, pending sends and MLS ratchets are not imported.
+Each PC retains its own device identity. New devices still need ordinary admission
+to receive future messages. Recovered history is stored in separate DPAPI segments
+and atomically referenced by checkpoint version 4; older clients cannot open that
+checkpoint. Failed or cancelled staging removes its newly created files.
+
+A personal recovery key, authenticator-based recovery and email recovery are
+not implemented by this feature. Existing read-only history backups remain separate.
+
 ## Keys, restart and recovery
 
 Remembered logins are stored in Windows Credential Manager with the normalized address, community ID and account session. A remembered token is sent only after an anonymous health check matches the saved community ID; the authenticated bootstrap must also match that community and account before Relay opens its private actor or replaces an active connection. Unknown or conflicting IDs require signing in again and preserve private history. An older remembered login without an embedded community ID needs a previously saved community pin before it can be validated and upgraded. IDs are continuity checks; use a trusted address and HTTPS for an internet host. This does not approve another person's encryption device or replace fingerprint comparison.

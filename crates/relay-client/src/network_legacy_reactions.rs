@@ -90,7 +90,7 @@ impl LegacyReactions {
     }
 }
 
-fn belongs_to(message: &Message, target: &Target, own: &str) -> bool {
+pub(super) fn belongs_to(message: &Message, target: &Target, own: &str) -> bool {
     match target {
         Target::Channel(id) => {
             message.channel_id.as_ref() == Some(id) && message.recipient_id.is_none()

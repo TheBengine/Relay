@@ -791,6 +791,7 @@ impl Worker {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         self.transfer_epoch.fetch_add(1, Ordering::SeqCst);
+        self.account_avatar.invalidate();
         for cancel in self.transfers.values() {
             cancel.store(true, Ordering::SeqCst);
         }
@@ -941,6 +942,7 @@ impl Worker {
                 });
             }
             Command::SaveProfile {
+                effect_settings,
                 origin,
                 display_name,
                 bio,
@@ -948,7 +950,7 @@ impl Worker {
                 avatar,
                 request_id,
             } => {
-                self.start_profile_save(&origin, display_name, bio, appearance, avatar, request_id)?
+                self.start_profile_save(&origin, UpdateProfile { display_name, bio, appearance, effect_settings }, avatar, request_id)?
             }
             Command::SelectConversation(target) => {
                 if self.connection.as_ref().and_then(|c| c.current.as_ref()) != Some(&target) {
@@ -2422,7 +2424,7 @@ impl Worker {
         self.publish_communities();
     }
 
-    fn transfer_client(&mut self) -> Result<Client, String> {
+    pub(super) fn transfer_client(&mut self) -> Result<Client, String> {
         if self.transfer_http.is_none() {
             self.transfer_http = Some(
                 Client::builder()
@@ -2757,16 +2759,14 @@ impl Worker {
     fn start_profile_save(
         &mut self,
         origin: &CommandOrigin,
-        display_name: String,
-        bio: String,
-        appearance: Option<ProfileAppearance>,
+        profile: UpdateProfile,
         avatar: ProfileAvatarChange,
         request_id: u64,
     ) -> Result<(), String> {
         // Bind queued text and local avatar paths before validating content or
         // spawning a transfer. A connection switch must never redirect a save.
         let c = self.command_connection(origin)?;
-        if display_name.trim().chars().count() > 32 || bio.chars().count() > 190 {
+        if profile.display_name.trim().chars().count() > 32 || profile.bio.chars().count() > 190 {
             return Err(
                 "Use up to 32 characters for your display name and 190 for About Me.".into(),
             );
@@ -2774,9 +2774,16 @@ impl Worker {
         if !c.chat.supports("profiles-v1") {
             return Err("Update this server to edit profiles.".into());
         }
+        if profile.effect_settings.is_some() && !c.chat.supports("profiles-v5") {
+            return Err("Update this server to adjust profile effects.".into());
+        }
         let url = c.url.clone();
         let token = c.session.token.clone();
         let expected_user_id = c.session.user.id.clone();
+        let account_linked_server = c.chat.supports("account-link-v1");
+        let avatar_target = account_avatar::Endpoint::from(c);
+        let (avatar_issuer, avatar_source) = if account_linked_server { self.account_avatar_source() } else { (None, None) };
+        self.account_avatar.invalidate();
         let operation_id = format!("profile-{request_id}");
         if self.transfers.contains_key(&operation_id) {
             return Err("This profile save is already running.".into());
@@ -2806,11 +2813,7 @@ impl Worker {
                     {
                         return Err("Profile save cancelled.".into());
                     }
-                    let body = UpdateProfile {
-                        display_name,
-                        bio,
-                        appearance,
-                    };
+                    let body = profile;
                     let user: User = parse(
                         http.put(crate::embedded_network::endpoint(&format!(
                             "{url}/api/profile"
@@ -2828,6 +2831,12 @@ impl Worker {
                         || current_epoch.load(Ordering::SeqCst) != epoch
                     {
                         return Err("Profile save cancelled.".into());
+                    }
+                    if let Some(user) = account_avatar::save(&http, &avatar_target,
+                        avatar_source.as_ref(), avatar_issuer.as_deref(), &avatar,
+                        || worker_cancel.load(Ordering::SeqCst) || current_epoch.load(Ordering::SeqCst) != epoch)? {
+                        latest = Some(user);
+                        return Ok(());
                     }
                     let response = match avatar {
                         ProfileAvatarChange::Prepared(bytes) => {
@@ -2860,6 +2869,7 @@ impl Worker {
                             .send()
                             .map_err(network_error)?,
                         ),
+                        #[cfg(test)]
                         ProfileAvatarChange::Upload(path) => {
                             let file = std::fs::File::open(path)
                                 .map_err(|_| "The selected avatar cannot be read.")?;
@@ -3265,6 +3275,7 @@ impl Worker {
     }
 
     pub(super) fn poll_transfers(&mut self) {
+        self.poll_account_avatar();
         while let Ok(result) = self.transfer_results.try_recv() {
             if result.epoch != self.transfer_epoch.load(Ordering::SeqCst) {
                 continue;
@@ -3434,9 +3445,9 @@ fn valid_admin_path(path: &str) -> bool {
 
 // Keep the total number of workers bounded even when a cancelled HTTP read
 // takes time to return after switching communities.
-struct TransferPermit(Arc<AtomicUsize>);
+pub(super) struct TransferPermit(Arc<AtomicUsize>);
 impl TransferPermit {
-    fn acquire(active: Arc<AtomicUsize>) -> Result<Self, String> {
+    pub(super) fn acquire(active: Arc<AtomicUsize>) -> Result<Self, String> {
         active
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 (count < 2).then_some(count + 1)

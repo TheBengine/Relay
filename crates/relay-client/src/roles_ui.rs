@@ -116,12 +116,12 @@ impl RelayApp {
                 .custom_role_edits
                 .entry(role.id.clone())
                 .or_insert_with(|| role.clone());
-            egui::CollapsingHeader::new(RichText::new(&role.name).color(profile_ui::profile_color(role.color))).id_source(("custom-role",&role.id)).default_open(true).show(ui,|ui| {
+            egui::CollapsingHeader::new(RichText::new(&role.name).color(profile_ui::profile_color(role.color))).id_source(("custom-role",&role.id)).default_open(false).show(ui,|ui| {
                 ui.add_enabled_ui(!pending && editable, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut draft.name).char_limit(64).desired_width(240.0));
                         profile_ui::profile_color_editor(ui,"Role color",&mut draft.color);
-                        ui.label("Position");ui.add(egui::DragValue::new(&mut draft.position).clamp_range(1..=own_rank.saturating_sub(1).clamp(1,1000)));
+                        ui.label("Role rank");ui.add(egui::DragValue::new(&mut draft.position).clamp_range(1..=own_rank.saturating_sub(1).clamp(1,1000)));
                     });
                     ui.add_space(10.0);
                     role_templates::section(ui,&role.id,bootstrap.member_roles.iter().filter(|m|m.role_ids.contains(&role.id)).count(),draft,role_templates::grantable(|bit|bootstrap.has_permission(bit)),role_templates::lock_reason(pending,editable));

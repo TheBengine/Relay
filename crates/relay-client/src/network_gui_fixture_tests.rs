@@ -364,6 +364,7 @@ fn actual_server_gui_crypto_seed() {
                 workers[1].prepare(&target);
                 let origin = CommandOrigin::from(workers[1].worker.connection.as_ref().unwrap());
                 workers[1].handle(Command::React {
+                request_id: 0,
                     origin,
                     target: target.clone(),
                     message_id: message.id.clone(),
@@ -450,6 +451,7 @@ fn actual_server_gui_crypto_seed() {
                 workers[0].pace();
                 let origin = CommandOrigin::from(workers[0].worker.connection.as_ref().unwrap());
                 workers[0].handle(Command::React {
+                request_id: 0,
                     origin,
                     target: general.clone(),
                     message_id: message.id.clone(),

@@ -1,4 +1,69 @@
 use super::*;
+
+#[tokio::test]
+async fn account_avatar_source_distinguishes_unconfigured_removed_and_stale_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path(), "Account avatar", 0).unwrap();
+    let app = router(state.clone());
+    let admin = signup(&app, "Admin", "").await;
+    let read = || request(&app, "GET", "/api/profile/avatar", Some(&admin.token), serde_json::Value::Null);
+    let (status, initial) = read().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(initial["configured"], false);
+    assert!(initial["image"].is_null());
+    assert_eq!(request(&app, "GET", "/api/profile/avatar", None, serde_json::Value::Null).await.0, StatusCode::UNAUTHORIZED);
+    let stale = initial["version"].as_u64().unwrap();
+    assert_eq!(request(&app, "DELETE", "/api/profile/avatar", Some(&admin.token), serde_json::Value::Null).await.0, StatusCode::OK);
+    let (_, removed) = read().await;
+    assert_eq!(removed["configured"], true);
+    assert!(removed["image"].is_null());
+    assert!(removed["version"].as_u64().unwrap() > stale);
+    let stale_request = Request::builder().method("DELETE").uri("/api/profile/avatar")
+        .header("authorization", format!("Bearer {}", admin.token))
+        .header("if-match", format!("\"profile-{stale}\""))
+        .body(Body::empty()).unwrap();
+    assert_eq!(app.clone().oneshot(stale_request).await.unwrap().status(), StatusCode::PRECONDITION_FAILED);
+    let conditional = Request::builder().uri("/api/profile/avatar")
+        .header("authorization", format!("Bearer {}", admin.token))
+        .header("if-none-match", format!("\"profile-{}\"", removed["version"].as_u64().unwrap()))
+        .body(Body::empty()).unwrap();
+    assert_eq!(app.clone().oneshot(conditional).await.unwrap().status(), StatusCode::NOT_MODIFIED);
+    drop(app); drop(state);
+    let app = router(AppState::open(temp.path(), "Account avatar", 0).unwrap());
+    assert_eq!(request(&app, "GET", "/api/profile/avatar", Some(&admin.token), serde_json::Value::Null).await.1, removed);
+}
+
+#[tokio::test]
+async fn account_avatar_identity_is_own_only_and_uses_subject_not_handle() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path(), "Account identity", 0).unwrap();
+    let app = router(state.clone());
+    let admin = signup(&app, "Admin", "").await;
+    assert!(request(&app, "GET", "/api/profile/account", Some(&admin.token), serde_json::Value::Null).await.1.is_null());
+    {
+        let db = lock(&state.0.db);
+        db.execute("INSERT INTO linked_identities VALUES(?1,'https://account.example/realm','subject-one','same-handle','now')", [&admin.user.id]).unwrap();
+    }
+    let (_, first) = request(&app, "GET", "/api/profile/account", Some(&admin.token), serde_json::Value::Null).await;
+    assert_eq!(first["issuer"], "https://account.example/realm");
+    assert_eq!(first["binding"].as_str().unwrap().len(), 64);
+    assert!(!first.to_string().contains("subject-one"));
+    lock(&state.0.db).execute("UPDATE linked_identities SET handle='new-handle' WHERE user_id=?1", [&admin.user.id]).unwrap();
+    assert_eq!(request(&app, "GET", "/api/profile/account", Some(&admin.token), serde_json::Value::Null).await.1, first);
+    lock(&state.0.db).execute("UPDATE linked_identities SET subject='subject-two' WHERE user_id=?1", [&admin.user.id]).unwrap();
+    assert_ne!(request(&app, "GET", "/api/profile/account", Some(&admin.token), serde_json::Value::Null).await.1, first);
+    assert_eq!(request(&app, "GET", "/api/profile/account", None, serde_json::Value::Null).await.0, StatusCode::UNAUTHORIZED);
+    for method in ["GET", "DELETE"] {
+        let stale = Request::builder().method(method).uri("/api/profile/avatar")
+            .header("authorization", format!("Bearer {}", admin.token))
+            .header("x-relay-account-binding", first["binding"].as_str().unwrap())
+            .header("if-match", "\"profile-0\"")
+            .body(Body::empty()).unwrap();
+        assert_eq!(app.clone().oneshot(stale).await.unwrap().status(), StatusCode::PRECONDITION_FAILED);
+    }
+    assert_eq!(request(&app, "GET", "/api/profile/avatar", Some(&admin.token), serde_json::Value::Null).await.1["configured"], false);
+}
+
 use crate::tests::{new_invite, request, signup};
 use axum::http::Request;
 use http_body_util::BodyExt;
@@ -12,6 +77,7 @@ async fn local_profile_effects_are_validated_preserved_for_old_clients_and_persi
     let admin = signup(&app, "Admin", "").await;
     let (_, bootstrap) = request(&app, "GET", "/api/bootstrap", Some(&admin.token), serde_json::Value::Null).await;
     assert!(bootstrap["capabilities"].as_array().unwrap().iter().any(|c| c == "profiles-v4"));
+    assert!(bootstrap["capabilities"].as_array().unwrap().iter().any(|c| c == "profiles-v5"));
     for &effect in relay_protocol::PROFILE_EFFECTS {
         let (status, user) = request(
             &app,
@@ -25,34 +91,42 @@ async fn local_profile_effects_are_validated_preserved_for_old_clients_and_persi
         assert_eq!(user["profile"]["appearance"]["effect"], effect);
     }
     assert_eq!(request(&app,"PUT","/api/profile",Some(&admin.token),serde_json::json!({"display_name":"Alex","bio":"","appearance":{"effect":"https://untrusted.example/animation"}})).await.0,StatusCode::BAD_REQUEST);
+    for effect in ["sparkle@0,100", "sparkle@201,100", "sparkle@100,500", "none@100,100", "sparkle@100,100,5"] {
+        assert_eq!(request(&app,"PUT","/api/profile",Some(&admin.token),serde_json::json!({"display_name":"Alex","bio":"","appearance":{"effect":effect}})).await.0,StatusCode::BAD_REQUEST);
+    }
     let (_, saved) = request(
         &app,
         "PUT",
         "/api/profile",
         Some(&admin.token),
-        serde_json::json!({"display_name":"Alex","bio":"","appearance":{"effect":"aurora"}}),
+        serde_json::json!({"display_name":"Alex","bio":"","appearance":{"effect":"aurora"},"effect_settings":{"speed":150,"amount":75}}),
     )
     .await;
+    assert!(relay_protocol::profile_effect_parameters(&format!("glow@{}100,100", "0".repeat(2000))).is_none());
+    let legacy_appearance: ProfileAppearance = serde_json::from_value(saved["profile"]["appearance"].clone()).unwrap();
+    assert!(legacy_appearance.valid());
+    assert_eq!(saved["profile"]["appearance"]["effect"], "aurora");
+    assert_eq!(saved["profile"]["effect_settings"], serde_json::json!({"speed":150,"amount":75}));
     let (_, legacy)=request(&app,"PUT","/api/profile",Some(&admin.token),serde_json::json!({"display_name":"Alex","bio":"Older client","appearance":{"pronouns":"they/them","accent":0x5865f2,"banner":0x245a83}})).await;
     assert_eq!(
         legacy["profile"]["appearance"]["effect"],
         saved["profile"]["appearance"]["effect"]
     );
+    assert_eq!(legacy["profile"]["effect_settings"], saved["profile"]["effect_settings"]);
+    for settings in [serde_json::json!({"speed":0,"amount":100}), serde_json::json!({"speed":100,"amount":201})] {
+        assert_eq!(request(&app,"PUT","/api/profile",Some(&admin.token),serde_json::json!({"display_name":"Alex","bio":"","effect_settings":settings})).await.0,StatusCode::BAD_REQUEST);
+    }
     drop(app);
     drop(state);
     let app = router(AppState::open(temp.path(), "Effects", 0).unwrap());
     assert_eq!(
-        request(
-            &app,
-            "GET",
-            "/api/profile",
-            Some(&admin.token),
-            serde_json::Value::Null
-        )
-        .await
-        .1["profile"],
+        request(&app,"GET","/api/profile",Some(&admin.token),serde_json::Value::Null).await.1["profile"],
         legacy["profile"]
     );
+    let (_, reset) = request(&app,"PUT","/api/profile",Some(&admin.token),serde_json::json!({"display_name":"Alex","bio":"","effect_settings":{"speed":100,"amount":100}})).await;
+    assert_eq!(reset["profile"]["effect_settings"], serde_json::json!({"speed":100,"amount":100}));
+    let (_, off) = request(&app,"PUT","/api/profile",Some(&admin.token),serde_json::json!({"display_name":"Alex","bio":"","appearance":{"effect":"none"},"effect_settings":{"speed":180,"amount":180}})).await;
+    assert_eq!(off["profile"]["effect_settings"], serde_json::json!({"speed":100,"amount":100}));
 }
 
 #[tokio::test]

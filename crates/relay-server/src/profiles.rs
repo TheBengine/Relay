@@ -15,18 +15,19 @@ pub fn read_profile(
 ) -> rusqlite::Result<UserProfile> {
     let user_id: String = row.get(user_column)?;
     let version = row.get::<_, Option<u64>>(first + 2)?.unwrap_or(0);
+    let mut appearance: ProfileAppearance = serde_json::from_str(
+        &row.get::<_, Option<String>>(first + 4)?.unwrap_or_else(|| "{}".into()),
+    ).map_err(|error| rusqlite::Error::FromSqlConversionFailure(first + 4, rusqlite::types::Type::Text, Box::new(error)))?;
+    let mut effect_settings = ProfileEffectSettings::default();
+    if let Some(stored) = appearance.effect.as_deref() {
+        let (effect, speed, amount) = relay_protocol::profile_effect_parameters(stored)
+            .ok_or_else(|| rusqlite::Error::InvalidColumnType(first + 4, "appearance".into(), rusqlite::types::Type::Text))?;
+        effect_settings = ProfileEffectSettings { speed, amount };
+        appearance.effect = Some(effect.into());
+    }
     Ok(UserProfile {
-        appearance: serde_json::from_str(
-            &row.get::<_, Option<String>>(first + 4)?
-                .unwrap_or_else(|| "{}".into()),
-        )
-        .map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                first + 4,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?,
+        appearance,
+        effect_settings,
         display_name: row.get::<_, Option<String>>(first)?.unwrap_or_default(),
         bio: row.get::<_, Option<String>>(first + 1)?.unwrap_or_default(),
         version,
@@ -87,6 +88,7 @@ fn valid_profile(input: &UpdateProfile) -> bool {
         .appearance
         .as_ref()
         .is_none_or(ProfileAppearance::valid)
+        && input.effect_settings.as_ref().is_none_or(ProfileEffectSettings::valid)
         && input.display_name.chars().count() <= 32
         && input.bio.chars().count() <= 190
         && !input
@@ -140,9 +142,18 @@ pub async fn update_profile(
         if appearance.effect.is_none() {
             appearance.effect = previous.profile.appearance.effect.clone();
         }
+        let effect_settings = if appearance.effect.as_deref().is_none_or(|id| id == "none") {
+            ProfileEffectSettings::default()
+        } else {
+            input.effect_settings.unwrap_or(previous.profile.effect_settings)
+        };
         let changed = previous.profile.display_name != input.display_name
             || previous.profile.bio != input.bio
-            || previous.profile.appearance != appearance;
+            || previous.profile.appearance != appearance
+            || previous.profile.effect_settings != effect_settings;
+        if let Some(effect) = appearance.effect.as_deref() {
+            appearance.effect = Some(relay_protocol::profile_effect_value(effect, effect_settings.speed, effect_settings.amount));
+        }
         if changed {
             next_version(previous.profile.version)?;
             tx.execute("UPDATE user_profiles SET display_name=?2,bio=?3,appearance=?4,version=version+1 WHERE user_id=?1", params![auth.user.id,input.display_name,input.bio,serde_json::to_string(&appearance).map_err(|_| bad("Invalid profile colors"))?])?;
@@ -269,6 +280,84 @@ pub(super) fn normalize_image(
     Ok(output.into_inner())
 }
 
+// Only the authenticated owner can compare this stable account binding.
+// Public linked identities continue to expose handles, never subjects/digests.
+pub async fn own_account(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+    let auth = state.auth(&headers)?;
+    let db = lock(&state.0.db);
+    let account = avatar_account(&db, &auth.user.id)?.map(|(issuer, binding)|
+        serde_json::json!({"issuer":issuer,"binding":binding}));
+    Ok(([("cache-control", "private, no-store")], Json(account)).into_response())
+}
+
+fn avatar_account(db: &rusqlite::Connection, user_id: &str) -> ApiResult<Option<(String, String)>> {
+    use sha2::{Digest, Sha256};
+    let identity: Option<(String, String)> = db.query_row(
+        "SELECT issuer,subject FROM linked_identities WHERE user_id=?1", [user_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    Ok(identity.map(|(issuer, subject)| {
+        let mut hash = Sha256::new();
+        hash.update(b"relay-account-avatar-v1");
+        hash.update((issuer.len() as u64).to_be_bytes());
+        hash.update(issuer.as_bytes());
+        hash.update(subject.as_bytes());
+        (issuer, format!("{:x}", hash.finalize()))
+    }))
+}
+
+// An account can be unlinked/relinked without changing its profile version.
+// Check the binding under the same DB lock/transaction as the read or mutation.
+fn avatar_account_precondition(db: &rusqlite::Connection, user_id: &str, headers: &HeaderMap) -> ApiResult<()> {
+    if let Some(expected) = headers.get("x-relay-account-binding") {
+        let actual = avatar_account(db, user_id)?;
+        if expected.to_str().ok().filter(|v| v.len() == 64)
+            != actual.as_ref().map(|(_, binding)| binding.as_str()) || actual.is_none() {
+            return Err(ApiError::new(StatusCode::PRECONDITION_FAILED, "Your linked account changed. Reconnect before updating your avatar."));
+        }
+    }
+    Ok(())
+}
+
+// Own-account source for avatar replication. Never accepts a destination or a
+// third-party credential. Old accounts without an avatar remain unconfigured.
+pub async fn account_avatar(
+    State(state): State<AppState>, headers: HeaderMap,
+) -> ApiResult<Response> {
+    use base64::Engine;
+    let auth = state.auth(&headers)?;
+    let db = lock(&state.0.db);
+    let user = get_user(&db, &auth.user.id)?;
+    avatar_account_precondition(&db, &auth.user.id, &headers)?;
+    let tag = format!("\"profile-{}\"", user.profile.version);
+    if headers.get("if-none-match").and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
+        return Ok((StatusCode::NOT_MODIFIED, [("cache-control", "private, no-store")]).into_response());
+    }
+    let image: Option<Vec<u8>> = db.query_row(
+        "SELECT avatar FROM user_profiles WHERE user_id=?1", [&auth.user.id], |r| r.get(0),
+    ).optional()?.flatten();
+    let configured = image.is_some() || avatar_configured(&db, &auth.user.id)?;
+    Ok(([("cache-control", "private, no-store")], Json(serde_json::json!({
+        "configured": configured, "version": user.profile.version,
+        "image": image.map(|v| base64::engine::general_purpose::STANDARD.encode(v)),
+    }))).into_response())
+}
+
+fn avatar_configured(db: &rusqlite::Connection, user_id: &str) -> ApiResult<bool> {
+    Ok(db.query_row("SELECT 1 FROM metadata WHERE key=?1", [format!("account-avatar:{user_id}")],
+        |_| Ok(true)).optional()?.unwrap_or(false))
+}
+
+fn avatar_precondition(headers: &HeaderMap, version: u64) -> ApiResult<()> {
+    if let Some(value) = headers.get("if-match") {
+        if value.to_str().ok() != Some(format!("\"profile-{version}\"").as_str()) {
+            return Err(ApiError::new(StatusCode::PRECONDITION_FAILED,
+                "Your profile changed on another device. Try again."));
+        }
+    }
+    Ok(())
+}
+
 pub async fn upload_avatar(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -295,12 +384,15 @@ pub async fn upload_avatar(
             "INSERT OR IGNORE INTO user_profiles(user_id) VALUES(?1)",
             [&auth.user.id],
         )?;
+        avatar_account_precondition(&tx, &auth.user.id, &headers)?;
+        avatar_precondition(&headers, get_user(&tx, &auth.user.id)?.profile.version)?;
+        let configured = avatar_configured(&tx, &auth.user.id)?;
         let previous: Option<Vec<u8>> = tx.query_row(
             "SELECT avatar FROM user_profiles WHERE user_id=?1",
             [&auth.user.id],
             |r| r.get(0),
         )?;
-        let changed = previous.as_deref() != Some(normalized.as_slice());
+        let changed = !configured || previous.as_deref() != Some(normalized.as_slice());
         if changed {
             let (total, owned) = storage_usage(&tx, &auth.user.id)?;
             let previous_size = previous.as_ref().map_or(0, |bytes| bytes.len() as u64);
@@ -321,6 +413,7 @@ pub async fn upload_avatar(
                 params![auth.user.id, normalized],
             )?;
         }
+        tx.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES(?1,'1')", [format!("account-avatar:{}", auth.user.id)])?;
         let user = get_user(&tx, &auth.user.id)?;
         tx.commit()?;
         (user, changed)
@@ -340,7 +433,11 @@ pub async fn remove_avatar(
         let mut db = lock(&state.0.db);
         let tx = db.transaction()?;
         let previous = get_user(&tx, &auth.user.id)?;
-        let changed = previous.profile.avatar_url.is_some();
+        avatar_account_precondition(&tx, &auth.user.id, &headers)?;
+        avatar_precondition(&headers, previous.profile.version)?;
+        let changed = previous.profile.avatar_url.is_some() || !avatar_configured(&tx, &auth.user.id)?;
+        tx.execute("INSERT OR IGNORE INTO user_profiles(user_id) VALUES(?1)", [&auth.user.id])?;
+        tx.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES(?1,'1')", [format!("account-avatar:{}", auth.user.id)])?;
         if changed {
             next_version(previous.profile.version)?;
             tx.execute(

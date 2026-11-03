@@ -285,6 +285,9 @@ fn actual_app_host_starts_stops_and_restores_the_same_community() {
     assert!(data.join("relay.sqlite3").is_file());
 }
 
+#[path = "network_history_transfer_tests.rs"]
+mod history_transfer_tests;
+
 impl TestWorker {
     fn new() -> Self {
         // Tests invoke the worker synchronously; allow its bounded encryption,
@@ -2828,6 +2831,7 @@ fn queued_private_chat_actions_reject_switched_identity_before_http_or_ratchet_c
                 content: "private queued edit must not cross accounts".into(),
             },
             Command::React {
+                request_id: 0,
                 origin: stale.clone(),
                 target: target.clone(),
                 message_id: "old-message".into(),
@@ -3236,6 +3240,43 @@ fn pending_control_update_never_sends_to_a_changed_account_or_community() {
     }
 }
 
+#[test]
+fn plain_reaction_ack_updates_old_rows_before_finishing_and_failures_are_scoped() {
+    for fail in [false, true] {
+        let server = MockHttp::new(move |request| {
+            assert_eq!(request, "/api/messages/old-original/reactions");
+            if fail { Reply::json(403, json!({"error":"Reaction denied"})) }
+            else { Reply::json(200, serde_json::to_value(Message {
+                id: "old-original".into(), channel_id: Some("room".into()),
+                reactions: vec![Reaction { emoji: "heart".into(), user_ids: vec!["fixture-user".into()] }],
+                ..Default::default()
+            }).unwrap()) }
+        });
+        let mut client = TestWorker::new();
+        client.connection(server.url.clone());
+        let c = client.worker.connection.as_mut().unwrap();
+        c.chat = extended::ChatSession::new(&Bootstrap {
+            protection: CommunityProtection { level: ProtectionLevel::Open, revision: 1, changed_by: None },
+            ..Default::default()
+        });
+        c.chat.set_open_consent(Some(1));
+        let origin = client.command_origin();
+        client.drain();
+        client.worker.command(Command::React {
+            request_id: 431, origin: origin.clone(), target: Target::Channel("room".into()),
+            message_id: "old-original".into(), target_client_id: None, emoji: "heart".into(), active: true,
+        });
+        let updates = client.drain();
+        let finished = updates.iter().position(|u| matches!(u, Update::ReactionFinished { origin: o, request_id: 431, error } if o == &origin && error.is_some() == fail)).unwrap();
+        assert!(!updates.iter().any(|u| matches!(u, Update::Error(_))));
+        if !fail {
+            let snapshot = updates.iter().position(|u| matches!(u, Update::ReactionSnapshot { message_id, .. } if message_id == "old-original")).unwrap();
+            assert!(snapshot < finished);
+        }
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+}
+
 fn profile_worker(server: &MockHttp) -> TestWorker {
     let mut client = TestWorker::new();
     client.connection(server.url.clone());
@@ -3275,6 +3316,7 @@ fn queued_profile_saves_reject_changed_community_server_and_account_before_any_t
             (32, ProfileAvatarChange::Upload(avatar_path.clone())),
         ] {
             client.worker.command(Command::SaveProfile {
+        effect_settings: None,
                 origin: queued_origin.clone(),
                 display_name: "Original community name".into(),
                 bio: "Private profile text from the original community".into(),
@@ -3329,6 +3371,7 @@ fn profile_saves_are_background_scoped_and_partial_avatar_failure_keeps_saved_te
     });
     let mut client = profile_worker(&server);
     let immediate = client.handle(Command::SaveProfile {
+        effect_settings: None,
         origin: client.command_origin(),
         display_name: "Visible".into(),
         bio: "About".into(),
@@ -3426,6 +3469,7 @@ fn a_profile_save_finishing_after_account_switch_cannot_update_the_new_session_o
     });
     let mut client = profile_worker(&server);
     client.handle(Command::SaveProfile {
+        effect_settings: None,
         appearance: None,
         origin: client.command_origin(),
         display_name: "Old account".into(),
@@ -3780,6 +3824,7 @@ fn encrypted_reactions_retry_uncertain_commits_with_exact_wire_and_never_send_pl
     client.connection(server.url.clone());
     install_file_crypto(&mut client, crypto);
     client.handle(Command::React {
+                request_id: 0,
         origin: client.command_origin(),
         target,
         message_id: "original".into(),
@@ -3838,6 +3883,7 @@ fn definite_reaction_cooldown_never_auto_retries_and_retains_original_encrypted_
             client
                 .worker
                 .handle(Command::React {
+                request_id: 0,
                     origin: client.command_origin(),
                     target: target.clone(),
                     message_id: "original".into(),

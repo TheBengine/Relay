@@ -58,10 +58,10 @@ impl Problem {
                 "Lost a device? On another device you still have, open Encryption, expand Advanced and choose Revoke This Device under Your registered devices.",
             ],
             Self::History => &[
+                "Still have a PC that can read your messages? On the new PC open Encryption > Backup and recovery > This is my new PC. Enter its transfer code on the original PC and choose Approve and send history, then Receive history on the new PC.",
                 "Open Encryption and expand Backup and recovery. If you made a history backup earlier, open that file with its passphrase to read the saved messages.",
                 "A backup is a read-only copy of messages this PC had already opened. It does not restore live chat, approve a device or let you send.",
                 "Without a backup, messages that only a lost device could read cannot be recovered by Relay or by the server.",
-                "Next time, make a history backup before you move to a new device.",
             ],
         }
     }

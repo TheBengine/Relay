@@ -215,6 +215,7 @@ pub(super) fn run() {
         let started = Instant::now();
         network
             .send(Command::React {
+                request_id: 0,
                 origin: origin.clone(),
                 target: target.clone(),
                 message_id: raw[0].id.clone(),

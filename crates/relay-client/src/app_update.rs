@@ -528,6 +528,7 @@ impl RelayApp {
                     }
                 }
                 Update::Disconnected => {
+                    self.pending_reactions = reaction_ui::PendingReactions::default();
                     self.server_actions.clear();
                     self.voice_retry = None;
                     self.hosting_setup.cancel_invitation_copy();
@@ -1416,6 +1417,11 @@ impl RelayApp {
                     }
                 }
                 Update::CryptoStatus { status } => self.encryption_ui.apply_status(status),
+                Update::HistoryTransferred { origin, request_id, result } => {
+                    if Some(origin) == self.command_origin() {
+                        self.encryption_ui.transfer.finish(request_id,result);
+                    }
+                }
                 Update::HistoryBackup {
                     origin,
                     request_id,
@@ -1432,6 +1438,14 @@ impl RelayApp {
                     if origin.url == self.login.url && self.session.is_some() {
                         for (message_id, protection) in protections {
                             self.message_protection.insert(message_id, protection);
+                        }
+                    }
+                }
+                Update::ReactionFinished { origin, request_id, error } => {
+                    if let Some(message_id) = self.pending_reactions.finish(&origin, request_id) {
+                        self.row_heights.invalidate(&message_id);
+                        if self.command_origin().as_ref() == Some(&origin) {
+                            if let Some(error) = error { self.error = Some(format!("Reaction could not be saved: {error}")); }
                         }
                     }
                 }

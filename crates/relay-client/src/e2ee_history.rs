@@ -13,11 +13,22 @@ const FILTER_BYTES: usize = 512;
 
 pub(super) fn usage(state: &PrivateState) -> HistoryUsage {
     HistoryUsage {
-        archived_bytes: state.history.iter().map(|s| s.bytes).sum(),
+        archived_bytes: state
+            .history
+            .iter()
+            .chain(&state.recovered_history)
+            .map(|s| s.bytes)
+            .sum(),
         byte_limit: MAX_HISTORY_BYTES,
-        segments: state.history.len(),
+        segments: state.history.len() + state.recovered_history.len(),
         segment_limit: MAX_SEGMENTS,
-        records: state.cached.len() + state.history.iter().map(|s| s.count).sum::<usize>(),
+        records: state.cached.len()
+            + state
+                .history
+                .iter()
+                .chain(&state.recovered_history)
+                .map(|s| s.count)
+                .sum::<usize>(),
     }
 }
 
@@ -206,7 +217,7 @@ pub(super) fn compact(state: &mut PrivateState, path: &Path, binding: &str) -> R
         .map(|(_, wire)| cipher_hash(wire))
         .collect();
     while state.cached.len() > ACTIVE_LIMIT {
-        if state.history.len() >= MAX_SEGMENTS {
+        if state.history.len() + state.recovered_history.len() >= MAX_SEGMENTS {
             return Err("Protected history reached its archive quota. Existing history and keys were preserved.".into());
         }
         let mut candidates: Vec<_> = state
@@ -226,57 +237,18 @@ pub(super) fn compact(state: &mut PrivateState, path: &Path, binding: &str) -> R
             .iter()
             .map(|(hash, _, _)| (hash.clone(), state.cached[hash].clone()))
             .collect();
-        let mut scopes: Vec<_> = entries.values().map(|e| e.envelope.scope.clone()).collect();
-        scopes.sort_unstable();
-        scopes.dedup();
-        let mut segment = Segment {
-            file: format!("{}.history", uuid::Uuid::new_v4()),
-            sha256: String::new(),
-            bytes: 0,
-            count: entries.len(),
-            scopes,
-            wires: filter(entries.keys().cloned()),
-            sends: filter(
-                entries
-                    .values()
-                    .filter(|e| e.author == state.identity)
-                    .map(|e| e.envelope.client_id.clone()),
-            ),
-        };
-        let contents = Contents {
-            version: 1,
-            identity: state.identity.clone(),
+        let segment = write_segment(
+            path,
+            binding,
+            &state.identity,
             entries,
-        };
-        let plain = Zeroizing::new(serde_json::to_vec(&contents).map_err(|_| invalid())?);
-        if plain.len() > MAX_SEGMENT_PLAIN {
-            return Err("Protected history segment exceeds its storage limit.".into());
-        }
-        let bytes = protected::protect(&plain, &entropy(binding, &state.identity, &segment))?;
-        segment.bytes = bytes.len() as u64;
-        segment.sha256 = format!("{:x}", Sha256::digest(&bytes));
-        if segment.bytes > MAX_SEGMENT_BYTES
-            || state.history.iter().map(|s| s.bytes).sum::<u64>() + segment.bytes
-                > MAX_HISTORY_BYTES
-        {
-            return Err("Protected history reached its 1 GiB archive quota. Existing history and keys were preserved.".into());
-        }
-        let directory = root(path, &state.identity);
-        std::fs::create_dir_all(&directory)
-            .map_err(|_| "Cannot create protected history storage.")?;
-        regular(&directory, true)?;
-        let destination = directory.join(&segment.file);
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&destination)
-            .map_err(|_| "Cannot create protected history segment.")?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "Cannot save protected history; encryption is paused.")?;
-        drop(file);
-        // Verify the written content before the checkpoint can reference it.
-        read(path, binding, &state.identity, &segment)?;
+            state
+                .history
+                .iter()
+                .chain(&state.recovered_history)
+                .map(|s| s.bytes)
+                .sum(),
+        )?;
         state.history.push(segment);
         for (hash, _, _) in candidates {
             state.cached.remove(&hash);
@@ -284,6 +256,70 @@ pub(super) fn compact(state: &mut PrivateState, path: &Path, binding: &str) -> R
     }
     Ok(())
 }
+
+fn write_segment(
+    path: &Path,
+    binding: &str,
+    identity: &Identity,
+    entries: HashMap<String, CachedEnvelope>,
+    already_bytes: u64,
+) -> Result<Segment, String> {
+    let mut scopes: Vec<_> = entries.values().map(|e| e.envelope.scope.clone()).collect();
+    scopes.sort_unstable();
+    scopes.dedup();
+    let mut segment = Segment {
+        file: format!("{}.history", uuid::Uuid::new_v4()),
+        sha256: String::new(),
+        bytes: 0,
+        count: entries.len(),
+        scopes,
+        wires: filter(entries.keys().cloned()),
+        sends: filter(
+            entries
+                .values()
+                .filter(|e| e.author == *identity)
+                .map(|e| e.envelope.client_id.clone()),
+        ),
+    };
+    let contents = Contents {
+        version: 1,
+        identity: identity.clone(),
+        entries,
+    };
+    let plain = Zeroizing::new(serde_json::to_vec(&contents).map_err(|_| invalid())?);
+    if plain.len() > MAX_SEGMENT_PLAIN {
+        return Err("Protected history segment exceeds its storage limit.".into());
+    }
+    let bytes = protected::protect(&plain, &entropy(binding, identity, &segment))?;
+    segment.bytes = bytes.len() as u64;
+    segment.sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if segment.bytes > MAX_SEGMENT_BYTES || already_bytes + segment.bytes > MAX_HISTORY_BYTES {
+        return Err("Protected history reached its 1 GiB archive quota. Existing history and keys were preserved.".into());
+    }
+    let directory = root(path, identity);
+    std::fs::create_dir_all(&directory).map_err(|_| "Cannot create protected history storage.")?;
+    regular(&directory, true)?;
+    let destination = directory.join(&segment.file);
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&destination)
+        .map_err(|_| "Cannot create protected history segment.")?;
+    let written = file
+        .write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "Cannot save protected history; encryption is paused.".to_string());
+    drop(file);
+    // Failed staging never leaves an uncharged partial file behind.
+    if let Err(error) = written.and_then(|_| read(path, binding, identity, &segment).map(|_| ())) {
+        if regular(&destination, false).is_ok() {
+            let _ = std::fs::remove_file(&destination);
+        }
+        return Err(error);
+    }
+    Ok(segment)
+}
+
 pub(super) fn lookup(
     state: &PrivateState,
     path: &Path,
@@ -404,4 +440,279 @@ pub(super) fn records_cached<'a>(
             }
         });
     active.chain(archives)
+}
+
+pub(super) fn recovered_records<'a>(
+    state: &'a PrivateState,
+    path: &'a Path,
+    binding: String,
+) -> impl Iterator<Item = Result<(String, CachedEnvelope), String>> + 'a {
+    state.recovered_history.iter().flat_map(move |segment| {
+        match read(path, &binding, &state.identity, segment) {
+            Ok(entries) => entries.into_iter().map(Ok).collect::<Vec<_>>(),
+            Err(error) => vec![Err(error)],
+        }
+    })
+}
+pub(super) fn recovered_lookup(
+    state: &PrivateState,
+    path: &Path,
+    binding: &str,
+    hash: &str,
+) -> Result<Option<CachedEnvelope>, String> {
+    for segment in state.recovered_history.iter().rev() {
+        if may_contain(&segment.wires, hash)? {
+            if let Some(row) = read(path, binding, &state.identity, segment)?.remove(hash) {
+                return Ok(Some(row));
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) struct TransferSource {
+    identity: Identity,
+    path: PathBuf,
+    binding: String,
+    active: HashMap<String, CachedEnvelope>,
+    history: Vec<Segment>,
+    recovered: Vec<Segment>,
+}
+pub(super) fn transfer_source(
+    state: &PrivateState,
+    path: &Path,
+    binding: String,
+) -> TransferSource {
+    TransferSource {
+        identity: state.identity.clone(),
+        path: path.into(),
+        binding,
+        active: state.cached.clone(),
+        history: state.history.clone(),
+        recovered: state.recovered_history.clone(),
+    }
+}
+impl TransferSource {
+    pub(crate) fn snapshot(
+        &self,
+        origin: &crate::network::CommandOrigin,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::history_transfer::Snapshot, String> {
+        self.check(origin)?;
+        let mut snapshot = crate::history_transfer::Snapshot {
+            version: 1,
+            server_id: origin.server_id.clone(),
+            user_id: origin.user_id.clone(),
+            source_device: self.identity.device_id.clone(),
+            entries: HashMap::new(),
+        };
+        let mut bytes = 2048usize;
+        let mut push = |hash: String, mut row: CachedEnvelope| -> Result<(), String> {
+            cancelled(cancel)?;
+            if row.message_id.is_none() || row.sequence == 0 || snapshot.entries.contains_key(&hash)
+            {
+                return Ok(());
+            }
+            row.delivery_revision = 0;
+            bytes = bytes.saturating_add(
+                Zeroizing::new(serde_json::to_vec(&row).map_err(|_| invalid())?).len() + 72,
+            );
+            if bytes > crate::history_transfer::MAX_BYTES - 48 || snapshot.entries.len() >= 100_000
+            {
+                return Err(
+                    "History exceeds the 32 MiB / 100,000 record transfer limit. Nothing was sent."
+                        .into(),
+                );
+            }
+            snapshot.entries.insert(hash, row);
+            Ok(())
+        };
+        for (hash, row) in &self.active {
+            push(hash.clone(), row.clone())?;
+        }
+        for segment in self.history.iter().chain(&self.recovered) {
+            cancelled(cancel)?;
+            for (hash, row) in read(&self.path, &self.binding, &self.identity, segment)? {
+                push(hash, row)?;
+            }
+        }
+        snapshot.validate(origin)?;
+        Ok(snapshot)
+    }
+    fn check(&self, origin: &crate::network::CommandOrigin) -> Result<(), String> {
+        if self.identity.server_id != origin.server_id || self.identity.user_id != origin.user_id {
+            return Err("History account changed.".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn stage(
+        &self,
+        mut snapshot: crate::history_transfer::Snapshot,
+        origin: &crate::network::CommandOrigin,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<PreparedTransfer, String> {
+        self.check(origin)?;
+        snapshot.validate(origin)?;
+        cancelled(cancel)?;
+        let mut incoming = std::mem::take(&mut snapshot.entries);
+        for row in incoming.values_mut() {
+            row.delivery_revision = 0;
+        }
+        // Read each immutable segment once, rather than once for every incoming row.
+        for hash in self.active.keys() {
+            incoming.remove(hash);
+        }
+        for segment in &self.history {
+            cancelled(cancel)?;
+            if incoming.is_empty() {
+                break;
+            }
+            for hash in read(&self.path, &self.binding, &self.identity, segment)?.keys() {
+                incoming.remove(hash);
+            }
+        }
+        for segment in &self.recovered {
+            cancelled(cancel)?;
+            if incoming.is_empty() {
+                break;
+            }
+            for (hash, mut previous) in read(&self.path, &self.binding, &self.identity, segment)? {
+                if let Some(row) = incoming.remove(&hash) {
+                    previous.delivery_revision = 0;
+                    let a = Zeroizing::new(serde_json::to_vec(&previous).map_err(|_| invalid())?);
+                    let b = Zeroizing::new(serde_json::to_vec(&row).map_err(|_| invalid())?);
+                    if a != b {
+                        return Err("Transferred history conflicts with an earlier transfer. Nothing was imported.".into());
+                    }
+                }
+            }
+        }
+        let count = incoming.len();
+        if self.history.len() + self.recovered.len() + count.div_ceil(SEGMENT_ENTRIES)
+            > MAX_SEGMENTS
+        {
+            return Err("History storage is full.".into());
+        }
+        let mut prepared = PreparedTransfer {
+            identity: self.identity.clone(),
+            path: self.path.clone(),
+            binding: self.binding.clone(),
+            previous: self.recovered.iter().map(|s| s.file.clone()).collect(),
+            segments: Vec::new(),
+            count,
+            committed: false,
+        };
+        let mut used = self
+            .history
+            .iter()
+            .chain(&self.recovered)
+            .map(|s| s.bytes)
+            .sum::<u64>();
+        let mut remaining = incoming.into_iter();
+        loop {
+            cancelled(cancel)?;
+            let chunk: HashMap<_, _> = remaining.by_ref().take(SEGMENT_ENTRIES).collect();
+            if chunk.is_empty() {
+                return Ok(prepared);
+            }
+            let segment = write_segment(&self.path, &self.binding, &self.identity, chunk, used)?;
+            used += segment.bytes;
+            prepared.segments.push(segment);
+        }
+    }
+}
+fn cancelled(cancel: &std::sync::atomic::AtomicBool) -> Result<(), String> {
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        Err("History transfer was cancelled.".into())
+    } else {
+        Ok(())
+    }
+}
+pub(crate) struct PreparedTransfer {
+    identity: Identity,
+    path: PathBuf,
+    binding: String,
+    previous: Vec<String>,
+    segments: Vec<Segment>,
+    pub(crate) count: usize,
+    committed: bool,
+}
+impl PreparedTransfer {
+    pub(super) fn attach(
+        &self,
+        state: &mut PrivateState,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
+        cancelled(cancel)?;
+        if state.identity != self.identity
+            || state
+                .recovered_history
+                .iter()
+                .map(|s| &s.file)
+                .ne(self.previous.iter())
+        {
+            return Err("The device or its history changed during transfer. Try again.".into());
+        }
+        let used = state
+            .history
+            .iter()
+            .chain(&state.recovered_history)
+            .chain(&self.segments)
+            .map(|s| s.bytes)
+            .sum::<u64>();
+        if used > MAX_HISTORY_BYTES
+            || state.history.len() + state.recovered_history.len() + self.segments.len()
+                > MAX_SEGMENTS
+        {
+            return Err("History storage is full. Existing messages were preserved.".into());
+        }
+        state
+            .recovered_history
+            .extend(self.segments.iter().cloned());
+        Ok(())
+    }
+    pub(super) fn committed(&mut self) {
+        self.committed = true;
+    }
+}
+impl Drop for PreparedTransfer {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let directory = root(&self.path, &self.identity);
+        if regular(&directory, true).is_err() {
+            return;
+        }
+        // save() installs the checkpoint before updating its Windows marker. A marker
+        // failure can therefore return an error AFTER the new manifest is durable.
+        // Keep every referenced segment, and keep all staged files if the installed
+        // checkpoint cannot be authenticated. Never turn an uncertain save into loss.
+        let installed = (|| -> Result<PrivateState, String> {
+            let meta = regular(&self.path, false)?;
+            if meta.len() > (MAX_PRIVATE_BYTES + 1024 * 1024) as u64 {
+                return Err(invalid());
+            }
+            let bytes = std::fs::read(&self.path).map_err(|_| invalid())?;
+            let plain = protected::unprotect(&bytes, &self.binding)?;
+            serde_json::from_slice(&plain).map_err(|_| invalid())
+        })();
+        let Ok(installed) = installed else {
+            return;
+        };
+        for segment in &self.segments {
+            if installed
+                .history
+                .iter()
+                .chain(&installed.recovered_history)
+                .any(|saved| saved.file == segment.file && saved.sha256 == segment.sha256)
+            {
+                continue;
+            }
+            // Only our newly-created UUID files, verified unchanged, may be removed.
+            if blob(&self.path, &self.identity, segment).is_ok() {
+                let _ = std::fs::remove_file(directory.join(&segment.file));
+            }
+        }
+    }
 }

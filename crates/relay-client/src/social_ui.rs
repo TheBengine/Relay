@@ -637,7 +637,6 @@ impl RelayApp {
         let Some(b) = self.bootstrap.clone() else {
             return;
         };
-        ui.separator();
         crate::settings_ui::section_heading(
             ui,
             "Community & Channels",
@@ -1367,17 +1366,34 @@ impl RelayApp {
             }));
     }
     pub(super) fn reports_ui(&mut self, ui: &mut egui::Ui) {
-        self.ensure_admin_data("reports", "/api/reports");
+        crate::settings_ui::section_heading(ui, "Reports", "Review reports submitted by members of this server.");
+        // This cache is cleared on community/account changes. Do not restart
+        // a failed request every frame; Refresh Reports explicitly retries.
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.admin_data.entry("reports-load-started".into()) {
+            entry.insert(Value::Bool(true));
+            self.ensure_admin_data("reports", "/api/reports");
+        }
         let reports = self
             .admin_data
             .get("reports")
             .cloned()
-            .and_then(|v| serde_json::from_value::<Vec<UserReport>>(v).ok())
-            .unwrap_or_default();
+            .and_then(|v| serde_json::from_value::<Vec<UserReport>>(v).ok());
         if ui.button("Refresh Reports").clicked() {
             self.refresh_admin_data("reports", "/api/reports");
         }
-        for report in reports {
+        if reports.as_ref().is_none_or(Vec::is_empty) {
+            if self.admin_requests.values().any(|key| key == "reports") {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading reports…");
+                });
+            } else if reports.is_some() {
+                crate::settings_ui::description(ui, "No reports have been submitted on this server.");
+            } else {
+                crate::settings_ui::description(ui, "Reports are unavailable. Choose Refresh Reports to try again.");
+            }
+        }
+        for report in reports.unwrap_or_default() {
             ui.collapsing(
                 format!(
                     "{} · {}{}",

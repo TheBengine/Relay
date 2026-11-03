@@ -669,6 +669,7 @@ fn open_server_calls_work_without_e2ee_devices_and_require_each_person_to_accept
         .any(|m| m.id == message.id && m.content == "open edited test"));
     for active in [true, true, false, false] {
         bob.handle(Command::React {
+                request_id: 0,
             origin: bob.origin(),
             target: target.clone(),
             message_id: message.id.clone(),
@@ -1820,6 +1821,7 @@ fn actual_server_mls_worker_groups_voice_text_threads_polls_inbox_and_revocation
     assert_eq!(received.content, poll);
     assert_eq!(received.mentions, vec![e_id.clone()]);
     eve.handle(Command::React {
+                request_id: 0,
         origin: eve.origin(),
         target: target.clone(),
         message_id: received.id.clone(),
@@ -2693,6 +2695,7 @@ fn actual_server_mls_worker_chat_files_and_restart() {
     assert_eq!(reply.content, edited_reply);
     assert_eq!(reply.reply_to_id.as_deref(), Some(raw[0].id.as_str()));
     bob.handle(Command::React {
+                request_id: 0,
         origin: CommandOrigin::from(bob.worker.connection.as_ref().unwrap()),
         target: target.clone(),
         message_id: raw[0].id.clone(),

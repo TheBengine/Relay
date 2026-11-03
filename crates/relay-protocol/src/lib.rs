@@ -32,6 +32,8 @@ pub struct User {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct UserProfile {
     #[serde(default)]
+    pub effect_settings: ProfileEffectSettings,
+    #[serde(default)]
     pub appearance: ProfileAppearance,
     #[serde(default)]
     pub display_name: String,
@@ -46,6 +48,8 @@ pub struct UserProfile {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_settings: Option<ProfileEffectSettings>,
     pub display_name: String,
     pub bio: String,
     #[serde(default)]
@@ -74,6 +78,40 @@ impl Default for ProfileAppearance {
 }
 /// Ordered catalog: the first four IDs are supported by profiles-v3 servers.
 pub const PROFILE_EFFECTS: &[&str] = &["none", "glow", "sparkle", "wave", "aurora", "confetti", "orbit", "rain", "hearts", "fireflies"];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfileEffectSettings {
+    pub speed: u16,
+    pub amount: u16,
+}
+impl Default for ProfileEffectSettings {
+    fn default() -> Self { Self { speed: 100, amount: 100 } }
+}
+impl ProfileEffectSettings {
+    pub fn valid(&self) -> bool {
+        (25..=200).contains(&self.speed) && (25..=200).contains(&self.amount)
+    }
+}
+/// Compact database representation only. API responses keep the base effect ID
+/// and expose settings beside appearance, so older clients can still edit it.
+pub fn profile_effect_parameters(value: &str) -> Option<(&str, u16, u16)> {
+    if value.len() > 32 { return None; }
+    if PROFILE_EFFECTS.contains(&value) { return Some((value, 100, 100)); }
+    let (effect, tuning) = value.split_once('@')?;
+    if effect == "none" || !PROFILE_EFFECTS.contains(&effect) { return None; }
+    let (speed, amount) = tuning.split_once(',')?;
+    if !speed.bytes().all(|c| c.is_ascii_digit()) || !amount.bytes().all(|c| c.is_ascii_digit()) { return None; }
+    if speed.len() > 3 || amount.len() > 3 { return None; }
+    let speed: u16 = speed.parse().ok()?;
+    let amount: u16 = amount.parse().ok()?;
+    ((25..=200).contains(&speed) && (25..=200).contains(&amount)).then_some((effect, speed, amount))
+}
+
+pub fn profile_effect_value(effect: &str, speed: u16, amount: u16) -> String {
+    if effect == "none" || (speed == 100 && amount == 100) { effect.into() }
+    else { format!("{effect}@{speed},{amount}") }
+}
 
 impl ProfileAppearance {
     pub fn valid(&self) -> bool {

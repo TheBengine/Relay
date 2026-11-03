@@ -64,6 +64,9 @@ pub(crate) use call::VERIFY_BEFORE_CALL;
 mod history;
 #[path = "e2ee_history_cache.rs"]
 mod history_cache;
+#[path = "e2ee_transfer.rs"]
+mod transfer;
+pub(crate) use history::PreparedTransfer;
 const PREFERENCES_MAGIC: &[u8] = b"RLYPREF1";
 pub fn protect_local_preferences(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if bytes.len() > 4 * 1024 * 1024 {
@@ -237,6 +240,7 @@ pub(crate) fn peer_trust(device: &Device, public: &PublicDevice) -> (bool, bool,
 #[derive(Clone, Debug)]
 pub enum MessageProtection {
     Protected,
+    Recovered,
     Legacy,
     Unavailable(String),
 }
@@ -311,6 +315,8 @@ pub(crate) struct PrivateState {
     revocation_outbox: Vec<String>,
     #[serde(default)]
     history: Vec<history::Segment>,
+    #[serde(default)]
+    recovered_history: Vec<history::Segment>,
     #[serde(default)]
     delivery_clock: u64,
     #[serde(default)]
@@ -568,11 +574,12 @@ impl CryptoSession {
             let state: PrivateState = serde_json::from_slice(&plain).map_err(|_| {
                 "Cannot read this device's encryption state. Its keys were not reset."
             })?;
-            if !matches!(state.version, 1..=3)
-                || (state.version != 3
+            if !matches!(state.version, 1..=4)
+                || (state.version < 3
                     && (!state.call.is_empty()
                         || !state.invitations.is_empty()
                         || !state.via_invitation.is_empty()))
+                || (state.version < 4 && !state.recovered_history.is_empty())
                 || state.invitations.len() > MAX_ACTIVE_INVITATIONS
                 || state.via_invitation.len() > MAX_VIA_INVITATION
                 || state.trust_notices.len() > MAX_TRUST_NOTICES
@@ -634,6 +641,7 @@ impl CryptoSession {
                 completed_order: Vec::new(),
                 revocation_outbox: retiring_device.into_iter().map(str::to_string).collect(),
                 history: Vec::new(),
+                recovered_history: Vec::new(),
                 delivery_clock: 0,
                 call: call::CallState::default(),
                 invitations: Vec::new(),
@@ -648,7 +656,8 @@ impl CryptoSession {
             }
         }
         let device = Device::restore(&state.crypto, &state.identity)?;
-        history::verify_files(&path, &state.identity, &state.history)?;
+        let all_history: Vec<_> = state.history.iter().chain(&state.recovered_history).cloned().collect();
+        history::verify_files(&path, &state.identity, &all_history)?;
         let mut session = Self {
             device,
             state,
@@ -737,7 +746,9 @@ impl CryptoSession {
                 let mut state = state.borrow_mut();
                 // Old clients must reject this checkpoint instead of silently
                 // ignoring archived send IDs and encrypting them a second time.
-                state.version = if state.call.is_empty()
+                state.version = if !state.recovered_history.is_empty() {
+                    4
+                } else if state.call.is_empty()
                     && state.invitations.is_empty()
                     && state.via_invitation.is_empty()
                 {
@@ -1732,6 +1743,11 @@ impl CryptoSession {
                 return Ok(Some(file));
             }
         }
+        for entry in history::recovered_records(&self.state, &self.path, self.binding()) {
+            if let Some(file) = entry?.1.envelope.attachments.into_iter().find(|file| file.id == id) {
+                return Ok(Some(file));
+            }
+        }
         Ok(None)
     }
     pub fn bind_delivery(
@@ -1994,6 +2010,19 @@ fn receive_envelope(
         sequence: 0,
         delivery_revision: 0,
     })
+}
+pub(crate) fn validate_transferred_envelope(e: &Envelope) -> Result<(), String> {
+    let id = |s: &str| !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control);
+    let mut files = HashSet::new();
+    if e.version != 1 || e.scope.is_empty() || e.scope.len() > 512
+        || e.content.len() > 10000 || !id(&e.client_id)
+        || e.mentions.len() > 64 || e.mentions.iter().any(|s| !id(s))
+        || e.reply_to_id.as_ref().is_some_and(|s| !id(s)) || e.attachments.len() > 8
+        || e.attachments.iter().any(|f| !id(&f.id) || !files.insert(&f.id)
+            || f.name.len() > 512 || f.mime.len() > 128 || f.file.binding.len() > 512
+            || f.file.size > relay_crypto::files::MAX_FILE_BYTES as u64)
+    { return Err("Invalid transferred message context.".into()); }
+    validate_action(e)
 }
 fn validate_action(envelope: &Envelope) -> Result<(), String> {
     if let Some(MessageAction::Reaction {
@@ -2404,7 +2433,13 @@ pub(crate) mod protected {
         };
         result
     }
+    #[cfg(test)]
+    thread_local! {static FAIL_NEXT_HEAD_WRITE: std::cell::Cell<bool> = const {std::cell::Cell::new(false)};}
+    #[cfg(test)]
+    pub(crate) fn fail_next_head_write() {FAIL_NEXT_HEAD_WRITE.set(true);}
     pub fn set_head(binding: &str, revision: u64, device_id: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if FAIL_NEXT_HEAD_WRITE.replace(false) {return Err("Synthetic checkpoint marker failure.".into());}
         let device_hash = identity_hash(device_id)?;
         with_credential_lock(|| {
             if marker_unlocked(binding)?.is_some_and(|previous| previous.revision >= revision) {

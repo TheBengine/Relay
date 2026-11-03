@@ -107,6 +107,20 @@ fn source_label(cue: AudioCue, source: &SoundSource) -> String {
     }
 }
 
+fn sound_volume_row(ui: &mut egui::Ui, label: &str, enabled: &mut bool, volume: &mut f32) -> egui::Response {
+    ui.scope(|ui| {
+        // The full-width master slider must not widen an event's wrapped row.
+        ui.checkbox(enabled, label);
+        ui.spacing_mut().slider_width = (ui.available_width() - 140.0).clamp(40.0, 220.0);
+        ui.horizontal(|ui| {
+            ui.label("Volume");
+            ui.add(egui::Slider::new(volume, 0.0..=1.0)
+                .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
+                .custom_parser(|value| value.trim_end_matches('%').trim().parse::<f64>().ok().map(|number| number / 100.0)));
+        });
+    }).response
+}
+
 impl RelayApp {
     pub(super) fn poll_sound_settings(&mut self) {
         let mut cache_changed = false;
@@ -216,8 +230,10 @@ impl RelayApp {
                 ][..],
             ),
         ] {
-            ui.label(RichText::new(title).strong());
-            ui.add_space(6.0);
+            egui::CollapsingHeader::new(title)
+                .id_source(("sound-category", title))
+                .default_open(title == "Messages")
+                .show(ui, |ui| {
             for &cue in cues {
                 ui.push_id(("event-sound", cue), |ui| {
                     let mut sound = self.prefs.audio.event_sounds.get(cue);
@@ -227,13 +243,7 @@ impl RelayApp {
                         .rounding(6.0)
                         .inner_margin(Margin::same(12.0))
                         .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.checkbox(&mut sound.enabled, cue.label());
-                                ui.add(egui::Slider::new(&mut sound.volume, 0.0..=1.0)
-                                    .text("Volume")
-                                    .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
-                                    .custom_parser(|value| value.trim_end_matches('%').trim().parse::<f64>().ok().map(|number| number / 100.0)));
-                            });
+                            sound_volume_row(ui, cue.label(), &mut sound.enabled, &mut sound.volume);
                             ui.horizontal_wrapped(|ui| {
                                 egui::ComboBox::from_id_source("source")
                                     .width(210.0)
@@ -266,6 +276,7 @@ impl RelayApp {
                 });
                 ui.add_space(8.0);
             }
+            });
             ui.add_space(10.0);
         }
         if ui.add(secondary("Reset All Sounds")).clicked() {
@@ -290,6 +301,29 @@ impl RelayApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_volume_rows_fit_after_a_full_width_master_slider() {
+        let context = egui::Context::default();
+        configure(&context);
+        for width in [280.0, 440.0, 800.0] {
+            for _ in 0..3 {
+                let _ = context.run(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 600.0))),
+                    ..Default::default()
+                }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut master = 0.5;
+                        settings_pages::percent_slider(ui, "Master", &mut master, 0.0..=1.0);
+                        let edge = ui.max_rect().right();
+                        let row = sound_volume_row(ui, "Message notification", &mut true, &mut 1.0);
+                        assert!(row.rect.right() <= edge + 1.0, "sound row exceeded the settings column: width={width}, row={:?}, edge={edge}", row.rect);
+                    });
+                });
+            }
+        }
+    }
+
 
     #[test]
     fn delayed_import_cannot_restore_discarded_or_replaced_choices() {

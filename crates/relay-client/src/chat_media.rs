@@ -86,6 +86,7 @@ pub(crate) fn png_header_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> 
     check_dimensions(width, height, STATIC_THUMBNAIL_LIMITS)?;
     Ok((width, height))
 }
+#[cfg(test)]
 pub(crate) fn decode_legacy_avatar_webp(bytes: &[u8]) -> Result<image::DynamicImage, String> {
     if bytes.len() > 2 * 1024 * 1024 { return Err("Avatars can be up to 2 MiB.".into()); }
     decode_webp_with_limits(bytes, PreviewLimits {

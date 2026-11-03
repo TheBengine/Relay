@@ -41,8 +41,9 @@ fn crop_controls(ui: &mut egui::Ui, picker: &mut ImagePicker, pending: bool) -> 
                 picker.y,
             );
             let width = ui.available_width().min(460.0);
-            ui.add(
+            let preview = ui.add(
                 egui::Image::new((texture.id(), Vec2::new(width, width / aspect)))
+                    .sense(Sense::drag())
                     .uv(Rect::from_min_size(
                         Pos2::new(crop.x, crop.y),
                         Vec2::new(crop.width, crop.height),
@@ -53,12 +54,17 @@ fn crop_controls(ui: &mut egui::Ui, picker: &mut ImagePicker, pending: bool) -> 
                         6.0
                     }),
             );
-            ui.add(egui::Slider::new(&mut picker.zoom, 1.0..=8.0).text("Zoom"));
-            ui.add(egui::Slider::new(&mut picker.x, 0.0..=1.0).text("Horizontal Position"));
-            ui.add(egui::Slider::new(&mut picker.y, 0.0..=1.0).text("Vertical Position"));
-            if let Some((width, height)) = normalized_asset_dimensions(&picker.kind) {
-                ui.label(format!("Saved as PNG, resized to fit {width} × {height}. The preview stays on this PC until you save."));
+            if preview.dragged() {
+                let delta = preview.drag_delta();
+                if crop.width < 0.999 { picker.x = (picker.x - delta.x / width * crop.width / (1.0 - crop.width)).clamp(0.0, 1.0); }
+                if crop.height < 0.999 { picker.y = (picker.y - delta.y / (width / aspect) * crop.height / (1.0 - crop.height)).clamp(0.0, 1.0); }
             }
+            ui.label("Drag the picture to reposition it.");
+            ui.add(egui::Slider::new(&mut picker.zoom, 1.0..=8.0).text("Zoom"));
+            egui::CollapsingHeader::new("Fine adjustment").show(ui, |ui| {
+                ui.add(egui::Slider::new(&mut picker.x, 0.0..=1.0).text("Horizontal position"));
+                ui.add(egui::Slider::new(&mut picker.y, 0.0..=1.0).text("Vertical position"));
+            });
             ui.horizontal(|ui| {
                 if ui.button("Reset Crop").clicked() {
                     picker.zoom = 1.0;
@@ -67,7 +73,7 @@ fn crop_controls(ui: &mut egui::Ui, picker: &mut ImagePicker, pending: bool) -> 
                 }
                 save = ui
                     .add(primary(if picker.kind == "avatar" {
-                        "Apply to Profile Draft"
+                        "Apply"
                     } else {
                         "Save Image"
                     }))

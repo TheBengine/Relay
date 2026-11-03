@@ -351,6 +351,7 @@ pub(super) fn reactions() {
     for active in [true, false, true] {
         let origin = bob.origin();
         bob.handle(Command::React {
+                request_id: 0,
             origin,
             target: channel.clone(),
             message_id: original.id.clone(),
@@ -389,6 +390,7 @@ pub(super) fn reactions() {
     for active in [true, false] {
         let origin = bob.origin();
         bob.handle(Command::React {
+                request_id: 0,
             origin,
             target: channel.clone(),
             message_id: plain.id.clone(),

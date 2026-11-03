@@ -3,6 +3,45 @@ use crate::tests::request;
 use serde_json::{json, Value};
 
 #[tokio::test]
+async fn friends_can_upload_and_remove_own_avatar_without_exposing_other_profiles() {
+    use tower::ServiceExt;
+    use http_body_util::BodyExt;
+    let data = tempfile::tempdir().unwrap();
+    let state = AppState::open_with_config(data.path(), "Avatar test", 0, config()).unwrap();
+    let alice = account(&state, "alice");
+    let bob = account(&state, "bob");
+    let app = router(state);
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(12, 12).write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let upload = axum::http::Request::builder().method("PUT").uri("/api/profile/avatar")
+        .header(header::AUTHORIZATION, format!("Bearer {}", alice.token))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(png.into_inner())).unwrap();
+    let response = app.clone().oneshot(upload).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let user: User = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(user.id, alice.user.id);
+    let url = user.profile.avatar_url.unwrap();
+    let (status, own_avatar) = request(&app, "GET", "/api/profile/avatar", Some(&alice.token), Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(own_avatar["configured"], true);
+    assert!(own_avatar["image"].is_string());
+    assert_eq!(request(&app, "GET", "/api/profile/avatar", Some(&bob.token), Value::Null).await.1["configured"], false);
+    assert_eq!(request(&app, "GET", "/api/profile/account", Some(&alice.token), Value::Null).await.0, StatusCode::OK);
+    for (token, expected) in [(&alice.token, StatusCode::OK), (&bob.token, StatusCode::FORBIDDEN)] {
+        let response = app.clone().oneshot(axum::http::Request::builder().uri(&url)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert_eq!(request(&app, "POST", "/api/profile/avatar", Some(&alice.token), Value::Null).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(request(&app, "DELETE", "/api/profile/avatar", Some(&alice.token), Value::Null).await.0, StatusCode::OK);
+    let (_, profile) = request(&app, "GET", "/api/profile", Some(&alice.token), Value::Null).await;
+    assert!(profile["profile"]["avatar_url"].is_null());
+}
+
+#[tokio::test]
 async fn people_encrypted_messages_survive_offline_recipient_and_restart_without_plaintext_storage()
 {
     use relay_crypto::{Device, Identity, Received};

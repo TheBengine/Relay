@@ -654,6 +654,7 @@ impl RelayApp {
                 .size(font_size(TEXT_CAPTION))
                 .color(c_muted()),
             );
+            crate::settings_ui::description(ui, "Takeover protection pauses changes during setup. Once enabled, changes need confirmation from a co-host and stop while both co-hosts are offline.");
             let ready_to_arm = view.takeover_setup.len() >= 4
                 && view.takeover_setup[..view.takeover_setup.len() - 2].iter().all(|step| step.done)
                 && !view.takeover_setup.last().is_some_and(|step| step.done);
@@ -740,7 +741,7 @@ impl RelayApp {
                 return;
             };
             ui.radio_value(&mut draft.mode, SwitchMode::KeepCurrent, "Keep the current host");
-            ui.radio_value(&mut draft.mode, SwitchMode::UseThisHost, "Use this host");
+            ui.radio_value(&mut draft.mode, SwitchMode::UseThisHost, "Choose a specific host");
             if draft.mode == SwitchMode::UseThisHost {
                 let shown = approved
                     .iter()
@@ -767,7 +768,7 @@ impl RelayApp {
             if approved.is_empty() {
                 ui.label(RichText::new("No member holds an approved data copy yet, so no backup can be chosen.").color(c_muted()));
             } else {
-                ui.label(RichText::new("Set as backup").strong());
+                ui.label(RichText::new("Standby host").strong());
                 for (id, name) in &approved {
                     let mut on = draft.backups.contains(id);
                     if ui.checkbox(&mut on, name).changed() {

@@ -2339,6 +2339,7 @@ pub(super) fn decrypt_in_connection(
     // Consume application ratchets chronologically, regardless of HTTP page order.
     let mut order: Vec<_> = (0..messages.len()).collect();
     order.sort_by_key(|index| messages[*index].sequence);
+    let mut recovered = std::collections::HashSet::new();
     let mut decoded: HashMap<usize, Result<crate::e2ee::CachedEnvelope, String>> = HashMap::new();
     for chunk in order.chunks(200) {
         let encrypted: Vec<_> = chunk
@@ -2355,12 +2356,25 @@ pub(super) fn decrypt_in_connection(
             .map(|index| messages[*index].content.as_str())
             .collect();
         let results = if let Some(crypto) = c.crypto.as_mut().filter(|_| identity_matches) {
-            crypto.decrypt_contents(&scope, &wires)
+            let mut results=vec![Err("Message not processed.".into());wires.len()];
+            let mut missing=Vec::new();
+            for (slot,wire) in wires.iter().enumerate() {
+                match crypto.stored_content(&scope,wire) {
+                    Ok(Some((row,is_recovered)))=>{
+                        if is_recovered {recovered.insert(encrypted[slot]);}
+                        results[slot]=Ok(row);
+                    }
+                    Ok(None)=>missing.push(slot),
+                    Err(error)=>results[slot]=Err(error),
+                }
+            }
+            if !missing.is_empty() {
+                let inputs:Vec<_>=missing.iter().map(|slot|wires[*slot]).collect();
+                for (slot,result) in missing.into_iter().zip(crypto.decrypt_contents(&scope,&inputs)) {results[slot]=result;}
+            }
+            results
         } else {
-            vec![
-                Err("Encryption keys are not ready for this account and community.".into());
-                encrypted.len()
-            ]
+            vec![Err("Encryption keys are not ready for this account and community.".into());encrypted.len()]
         };
         for (index, result) in encrypted.iter().copied().zip(results) {
             let message = &messages[index];
@@ -2378,6 +2392,7 @@ pub(super) fn decrypt_in_connection(
                     }
                 };
                 if !routing_matches
+                    || (recovered.contains(&index) && (cached.message_id.as_deref()!=Some(message.id.as_str()) || cached.sequence!=message.sequence))
                     || cached.author.user_id != message.author.id
                     || message.client_id.as_deref() != Some(cached.envelope.client_id.as_str())
                     || message.attachments.len() != cached.envelope.attachments.len()
@@ -2398,7 +2413,7 @@ pub(super) fn decrypt_in_connection(
         }
         let bindings: Vec<_> = encrypted
             .into_iter()
-            .filter(|index| decoded[index].is_ok())
+            .filter(|index| decoded[index].is_ok() && !recovered.contains(index))
             .collect();
         let deliveries: Vec<_> = bindings
             .iter()
@@ -2448,7 +2463,7 @@ pub(super) fn decrypt_in_connection(
                         attachment.mime = file.mime.clone();
                         attachment.size = file.file.size;
                     }
-                    MessageProtection::Protected
+                    if recovered.contains(&index) { MessageProtection::Recovered } else { MessageProtection::Protected }
                 }
                 Err(reason) => {
                     message.content = "Encrypted message unavailable".into();

@@ -112,6 +112,7 @@ mod profile_paths;
 mod data_location;
 mod protection;
 mod recovery;
+mod history_transfer;
 mod replica_copy;
 mod route_choice;
 #[cfg(feature = "native-rtc")]

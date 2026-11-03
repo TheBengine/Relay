@@ -626,6 +626,10 @@ impl RelayApp {
     }
 
     pub(super) fn message_row(&mut self, ui: &mut egui::Ui, message: &Message, grouped: bool) {
+        let reactions = match (self.command_origin(), self.current.as_ref()) {
+            (Some(origin), Some(target)) => self.pending_reactions.rows(&origin, target, message),
+            _ => message.reactions.clone(),
+        };
         let delivery = self
             .outgoing_messages
             .iter()
@@ -1138,15 +1142,13 @@ impl RelayApp {
                                     == Some(message.id.as_str()),
                             );
                         }
-                        if message
-                            .reactions
+                        if reactions
                             .iter()
                             .any(|r| !Self::is_poll_vote(&r.emoji))
                         {
                             ui.add_space(4.0);
                             ui.horizontal_wrapped(|ui| {
-                                for reaction in message
-                                    .reactions
+                                for reaction in reactions
                                     .iter()
                                     .filter(|r| !Self::is_poll_vote(&r.emoji))
                                 {

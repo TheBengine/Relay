@@ -202,22 +202,22 @@ impl SettingsTab {
     fn matches(self, query: &str) -> bool {
         let words = match self {
             Self::Account => "account password sessions devices username logout authenticator two factor security recovery shared global unique browser",
-            Self::Profiles => "profiles avatar display name bio about me pronouns accent banner colors identity",
+            Self::Profiles => "profiles avatar account picture display name bio about me pronouns accent banner colors identity effects animation speed amount",
             Self::Friends => "friends requests block blocked status online idle invisible do not disturb",
             Self::Events => "events scheduled interested calendar upcoming",
             Self::Mentions => "inbox mentions unread notifications",
-            Self::Encryption => "encryption security devices fingerprint verify keys trust",
+            Self::Encryption => "encryption security devices fingerprint verify keys trust history backup recovery transfer new pc computer",
             Self::Privacy => "privacy safety remembered login drafts credentials vault",
-            Self::Connections => "connections communities servers address",
-            Self::VoiceVideo => "voice video microphone input output volume camera screen noise echo buffer bitrate debugging delay latency",
+            Self::Connections => "connections communities servers address invitation method automatic tailscale iroh direct route",
+            Self::VoiceVideo => "voice video microphone input output volume camera screen noise echo buffer bitrate debugging troubleshooting delay latency overlay whisper priority gaming bandwidth codec encoder gateway",
             Self::Appearance => "appearance theme dark light onyx ash font zoom compact cozy messages spacing emoji suggestions convert send chat box composer",
             Self::Accessibility => "accessibility motion animation gifs text readability",
-            Self::Notifications => "notifications mentions alerts desktop previews",
+            Self::Notifications => "notifications mentions alerts desktop previews mute community channel",
             Self::Sounds => "sounds audio notifications ring ringtone ringback call message mute unmute deafen undeafen join leave volume custom wav",
             Self::Keybinds => "keybinds keyboard shortcuts push talk hotkey mute deafen overlay squad whisper",
-            Self::Advanced => "advanced storage data location folder drive move preferences reset version connection close quit window tray background hidden icons lan party profile low latency",
+            Self::Advanced => "advanced updates download automatic startup windows storage data location folder drive move preferences reset version connection close quit window tray background hidden icons lan party profile low latency gif giphy offline licenses",
             Self::Server => "server community roles channels permissions members invitations backups hosting access check effective",
-            Self::Help => "help start invite join friends encryption verify devices keyboard shortcuts status connection health live check support report diagnostics",
+            Self::Help => "help start invite join friends encryption verify devices keyboard shortcuts status connection health live check support report diagnostics recovery missing history new device",
         };
         query.split_whitespace().all(|word| words.contains(word))
     }
@@ -387,16 +387,16 @@ impl RelayApp {
                                                 (
                                                     "APP SETTINGS",
                                                     &[
-                                                        SettingsTab::Accessibility,
                                                         SettingsTab::VoiceVideo,
                                                         SettingsTab::Notifications,
                                                         SettingsTab::Sounds,
                                                         SettingsTab::Keybinds,
+                                                        SettingsTab::Appearance,
+                                                        SettingsTab::Accessibility,
                                                         SettingsTab::Advanced,
                                                         SettingsTab::Help,
                                                     ][..],
                                                 ),
-                                                ("DISPLAY", &[SettingsTab::Appearance][..]),
                                                 ("COMMUNITY", &[SettingsTab::Server][..]),
                                             ] {
                                                 let visible: Vec<_> = pages
@@ -654,7 +654,7 @@ impl RelayApp {
         controls::page_heading(
             ui,
             "My Account",
-            "Your account belongs to the community you are connected to.",
+            "Manage your Relay account and your access to this community.",
         );
         self.central_account_settings(ui);
         self.account_link_settings(ui);
@@ -751,6 +751,8 @@ impl RelayApp {
             "Restore drafts and unconfirmed outgoing messages after restarting Relay. They are protected by Windows for this PC's user account. Turning this off keeps them only until Relay closes.",
             &mut self.prefs.remember_drafts,
         );
+        ui.collapsing("Clear drafts and unsent messages on this PC", |ui| {
+        controls::description(ui, "This affects all your communities on this PC. Messages already delivered are kept.");
         if ui.add(secondary("Clear Saved Drafts")).clicked() {
             self.prefs.conversations.clear_drafts();
             self.drafts = DraftStore::default();
@@ -773,6 +775,7 @@ impl RelayApp {
                 self.notice = Some(("Saved outgoing messages cleared from this PC".into(), Instant::now()));
             }
         }
+        });
         controls::divider(ui);
         controls::section_heading(ui,"Community privacy","The server's owner controls access and retention. Private channels and direct messages follow server permissions.");
         controls::description(ui,"Passwords are never stored in your local preferences. Signing out revokes the current server session.");
@@ -842,7 +845,10 @@ impl RelayApp {
             "Connections",
             "How Relay connects, and your saved self-hosted communities.",
         );
-        self.connection_route_settings(ui);
+        controls::section_heading(ui, "Your communities", "Manage the servers you have joined.");
+        if self.prefs.communities.is_empty() {
+            controls::description(ui, "Your joined communities will appear here.");
+        }
         for community in self.prefs.communities.clone() {
             egui::Frame::none()
                 .fill(c_card())
@@ -867,6 +873,13 @@ impl RelayApp {
         if ui.add(primary("Add a Community")).clicked() {
             self.open_community_dialog();
         }
+        controls::divider(ui);
+        controls::section_heading(ui, "Connection preferences", "Used for new invitations. Existing communities keep their connection.");
+        controls::description(ui, &format!("Current choice: {}", self.prefs.connection.mode.label()));
+        if unavailable_choice_saved(&self.prefs.connection, crate::route_choice::Capabilities::current()) {
+            ui.label(RichText::new("Your saved connection method is unavailable in this copy of Relay.").color(c_bad()));
+        }
+        ui.collapsing("Change connection method", |ui| self.connection_route_settings(ui));
     }
 
     fn voice_video_page(&mut self, ui: &mut egui::Ui) {
@@ -879,7 +892,7 @@ impl RelayApp {
             for (page, label) in [
                 (VoiceVideoTab::Voice, "Voice"),
                 (VoiceVideoTab::Video, "Video"),
-                (VoiceVideoTab::Debugging, "Debugging"),
+                (VoiceVideoTab::Debugging, "Troubleshooting"),
             ] {
                 if controls::top_tab(
                     ui,
@@ -1372,7 +1385,8 @@ impl RelayApp {
         controls::divider(ui);
         // Discord keeps network and codec choices under Advanced, after the voice basics.
         let reveal_direct = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new("scroll-direct-voice"))).unwrap_or(false);
-        egui::CollapsingHeader::new("Advanced voice settings").open(reveal_direct.then_some(true)).show(ui, |ui| {
+        let capture_expansion = self.capture_path.as_ref().and_then(|_| ui.ctx().data(|d| d.get_temp::<String>(egui::Id::new("settings-capture-expansion"))));
+        egui::CollapsingHeader::new("Voice delay and connection stability").id_source("voice-stability-settings").open((capture_expansion.as_deref() == Some("voice-stability-settings")).then_some(true)).show(ui, |ui| {
         controls::switch_row(ui, "compare-silero-vad", "Compare speech detection",
             "Show Silero's speech estimate during a call or microphone test. It does not change your sound or decide when you transmit.",
             &mut self.prefs.audio.compare_silero_vad);
@@ -1482,8 +1496,10 @@ impl RelayApp {
         {
             controls::description(ui, "Recovery is inactive with 2.5 or 5 ms packets. Choose 10 or 20 ms packets to use it.");
         }
-        controls::divider(ui);
-        controls::nav_group(ui, "GAMING FEATURES");
+        });
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new("In-game voice tools").id_source("voice-gaming-settings").open((capture_expansion.as_deref() == Some("voice-gaming-settings")).then_some(true)).show(ui, |ui| {
+        controls::description(ui, "Choose an overlay, quieter background apps, whispers or priority speakers. Each option applies with Save Changes.");
         ui.checkbox(
             &mut self.prefs.audio.overlay_enabled,
             "Show speaking overlay",
@@ -1510,10 +1526,25 @@ impl RelayApp {
             "Enable private whispers - hold F8",
         );
         controls::description(ui, "Choose a person, a room or a squad from its voice member menu. Cross-room voice requires permission to join the destination room. Whisper uses a separately verified private conversation; if its keys are unavailable, no whisper audio is sent.");
+        ui.checkbox(
+            &mut self.prefs.audio.priority_enabled,
+            "Enable priority speakers",
+        );
+        if self.prefs.audio.priority_enabled {
+            ui.add(
+                egui::Slider::new(&mut self.prefs.audio.priority_volume, 0.0..=1.0)
+                    .text("Other speakers volume"),
+            );
+        }
+        controls::description(ui, "Mark a priority speaker from their voice menu. The overlay works with windowed and borderless games; clicks pass through it.");
+        });
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new("Advanced audio and voice connections").id_source("voice-route-settings").open((reveal_direct || capture_expansion.as_deref() == Some("voice-route-settings")).then_some(true)).show(ui, |ui| {
+        controls::description(ui, "Optional device and network tuning. Keep the defaults unless you need a different connection.");
         #[cfg(windows)]
         {
             ui.checkbox(&mut self.prefs.audio.low_latency_device, "Use the shortest supported Windows audio period").on_hover_text("Relay asks the device for its smallest supported shared audio period. If the device cannot use it, Relay automatically uses the normal audio driver. Other apps can keep playing audio.");
-            controls::description(ui, "The actual device period appears in Debugging while connected. Device timing is separate from the settings estimate.");
+            controls::description(ui, "The actual device period appears in Troubleshooting during a call. Device timing is separate from the settings estimate.");
         }
         let direct_response = ui.checkbox(&mut self.prefs.audio.direct_voice_enabled, "Use a direct connection when faster").on_hover_text("Both participants must enable this. Your network address is shared with the other participant. Encrypted voice returns to the server if the direct route fails. If a server permission update is lost, it can take up to half a second to apply.");
         if ui
@@ -1538,29 +1569,18 @@ impl RelayApp {
             "Use TCP voice if UDP is blocked",
         );
         controls::description(ui, "Account-free connections use this fallback automatically when voice packets cannot get through.");
-        ui.checkbox(
-            &mut self.prefs.audio.priority_enabled,
-            "Enable priority speakers",
-        );
-        if self.prefs.audio.priority_enabled {
-            ui.add(
-                egui::Slider::new(&mut self.prefs.audio.priority_volume, 0.0..=1.0)
-                    .text("Other speakers volume"),
-            );
-        }
-        controls::description(ui, "Mark a priority speaker from their voice menu. The overlay is a click-through floating window for windowed/borderless games. Each option is independent and applies with Save Changes.");
         });
         controls::description(
             ui,
-            "Save Changes applies your voice settings. Extra timing controls are under Debugging.",
+            "Save Changes applies your voice settings. Live connection details and manual tuning are under Troubleshooting.",
         );
     }
 
     fn ptt_control(&mut self, ui: &mut egui::Ui) {
         controls::section_heading(
             ui,
-            "Shortcut",
-            "Hold this key to talk, even when Relay is in the background.",
+            "Push-to-talk key",
+            "Used when Input Mode is set to Push to talk. Hold it to speak, even with Relay in the background.",
         );
         egui::ComboBox::from_id_source("settings-ptt-key")
             .width(ui.available_width().min(300.0))
@@ -1703,6 +1723,7 @@ impl RelayApp {
         );
         controls::switch_row(ui,"default-app-audio","Share Application Audio","Include the selected window's process audio when screen sharing. You can change this in the share picker.",&mut self.prefs.screen_options.application_audio);
         controls::divider(ui);
+        egui::CollapsingHeader::new("Advanced video encoding").id_source("video-encoding-options").show(ui, |ui| {
         controls::section_heading(
             ui,
             "Video Encoding",
@@ -1721,6 +1742,7 @@ impl RelayApp {
             &mut self.prefs.camera_options.codec,
         );
         controls::description(ui,"Automatic tries hardware H.264 and can fall back to software VP8. Target frame rates depend on your device and connection. Restart sharing to apply changes.");
+        });
         if ui.small_button("Refresh Cameras and Screens").clicked() {
             self.refresh_devices();
         }
@@ -1732,49 +1754,8 @@ impl RelayApp {
     fn debug_page(&mut self, ui: &mut egui::Ui) {
         controls::section_heading(
             ui,
-            "Advanced Voice Settings",
-            "Tune quality and buffering for your connection.",
-        );
-        ui.spacing_mut().slider_width = (ui.available_width() - 140.0).max(40.0);
-        controls::nav_group(ui, "BITRATE");
-        ui.add(
-            egui::Slider::new(&mut self.prefs.audio.bitrate_kbps, 16..=128)
-                .step_by(16.0)
-                .suffix(" kbps"),
-        );
-        controls::nav_group(ui, "RECEIVE BUFFER");
-        ui.add_enabled(
-            !self.prefs.audio.adaptive_jitter,
-            egui::Slider::new(&mut self.prefs.audio.jitter_ms, 5..=120)
-                .step_by(5.0)
-                .suffix(" ms"),
-        );
-        controls::description(
-            ui,
-            if self.prefs.audio.adaptive_jitter {
-                "Automatic receive buffering is enabled. Choose a manual profile on the Voice tab to set a fixed target."
-            } else {
-                "A smaller receive buffer reduces delay; a larger buffer tolerates uneven packet arrival."
-            },
-        );
-        controls::nav_group(ui, "VOICE ACTIVITY HOLD");
-        ui.add(
-            egui::Slider::new(&mut self.prefs.audio.activation_hold_ms, 0..=1000)
-                .step_by(50.0)
-                .suffix(" ms"),
-        );
-        #[cfg(feature = "native-rtc")]
-        controls::nav_group(ui, "ECHO DELAY");
-        #[cfg(feature = "native-rtc")]
-        ui.add_enabled(
-            self.prefs.audio.echo_cancellation,
-            egui::Slider::new(&mut self.prefs.audio.echo_delay_ms, 0..=250).suffix(" ms"),
-        );
-        controls::divider(ui);
-        controls::section_heading(
-            ui,
             "Connection Diagnostics",
-            "Live counters for the current call.",
+            "Check your current call before changing any settings. Manual tuning is below.",
         );
         if let Some(media) = self.media.as_ref().filter(|media| media.is_active()) {
             let stats = media.network_stats();
@@ -1884,6 +1865,49 @@ impl RelayApp {
                 controls::description(ui, &d.source);
             }
         }
+        controls::divider(ui);
+        egui::CollapsingHeader::new("Manual voice tuning").id_source("voice-manual-tuning").show(ui, |ui| {
+        controls::section_heading(
+            ui,
+            "Advanced Voice Settings",
+            "Tune quality and buffering for your connection.",
+        );
+        ui.spacing_mut().slider_width = (ui.available_width() - 140.0).max(40.0);
+        controls::nav_group(ui, "BITRATE");
+        ui.add(
+            egui::Slider::new(&mut self.prefs.audio.bitrate_kbps, 16..=128)
+                .step_by(16.0)
+                .suffix(" kbps"),
+        );
+        controls::nav_group(ui, "RECEIVE BUFFER");
+        ui.add_enabled(
+            !self.prefs.audio.adaptive_jitter,
+            egui::Slider::new(&mut self.prefs.audio.jitter_ms, 5..=120)
+                .step_by(5.0)
+                .suffix(" ms"),
+        );
+        controls::description(
+            ui,
+            if self.prefs.audio.adaptive_jitter {
+                "Automatic receive buffering is enabled. Choose a manual profile on the Voice tab to set a fixed target."
+            } else {
+                "A smaller receive buffer reduces delay; a larger buffer tolerates uneven packet arrival."
+            },
+        );
+        controls::nav_group(ui, "VOICE ACTIVITY HOLD");
+        ui.add(
+            egui::Slider::new(&mut self.prefs.audio.activation_hold_ms, 0..=1000)
+                .step_by(50.0)
+                .suffix(" ms"),
+        );
+        #[cfg(feature = "native-rtc")]
+        controls::nav_group(ui, "ECHO DELAY");
+        #[cfg(feature = "native-rtc")]
+        ui.add_enabled(
+            self.prefs.audio.echo_cancellation,
+            egui::Slider::new(&mut self.prefs.audio.echo_delay_ms, 0..=250).suffix(" ms"),
+        );
+        });
         controls::divider(ui);
         if ui
             .add(secondary("Reset Voice and Video Settings"))
@@ -2116,7 +2140,7 @@ impl RelayApp {
             ui,
             "reduced-motion",
             "Enable Reduced Motion",
-            "Pause GIF animations throughout Relay.",
+            "Pause GIF animations and profile effects throughout Relay.",
             &mut self.prefs.reduced_motion,
         );
         controls::switch_row(
@@ -2143,7 +2167,6 @@ impl RelayApp {
     }
 
     fn notifications_page(&mut self, ui: &mut egui::Ui) {
-        self.notification_scopes_ui(ui);
         controls::page_heading(ui, "Notifications", "Choose what gets your attention.");
         controls::switch_row(
             ui,
@@ -2177,6 +2200,8 @@ impl RelayApp {
         if ui.add(secondary("Customize Sounds")).clicked() {
             self.settings_tab = SettingsTab::Sounds;
         }
+        controls::divider(ui);
+        self.notification_scopes_ui(ui);
     }
 
     fn keybinds_page(&mut self, ui: &mut egui::Ui) {
@@ -2228,28 +2253,6 @@ impl RelayApp {
             controls::description(ui, "When you quit, the window disappears immediately while your servers finish shutting down in the background.");
             controls::divider(ui);
         }
-        self.lan_profile_section(ui);
-        controls::divider(ui);
-        controls::section_heading(
-            ui,
-            "About Relay",
-            "A native Rust desktop app with self-hosted communities.",
-        );
-        ui.label(crate::build_metadata::current().label());
-        ui.collapsing("Build details", |ui| {
-            ui.add(egui::Label::new(crate::build_metadata::current().details()).wrap(true));
-            if ui.add(secondary("Copy build information")).clicked() {
-                let text = crate::build_metadata::current().json().to_string();
-                ui.output_mut(|output| output.copied_text = text);
-            }
-        });
-        ui.hyperlink_to(
-            "Emoji artwork: Twemoji (CC BY 4.0)",
-            "https://github.com/jdecked/twemoji",
-        );
-        controls::description(ui, "Twemoji by Twitter and contributors / jdecked. Artwork resized and packed for Relay. Unicode 17 data; emoji shortcodes by iamcal/emoji-data (MIT).");
-        controls::description(ui, &self.login.url);
-        controls::divider(ui);
         let in_call = self.voice_channel.is_some()
             || self.audio_connecting
             || self.joining_voice.is_some()
@@ -2276,6 +2279,7 @@ impl RelayApp {
         }
         controls::description(ui, "Check after startup and every six hours. Update and restart downloads, verifies and installs only when you choose it. Download only keeps Relay open.");
         controls::divider(ui);
+        ui.collapsing("GIF search and previews", |ui| {
         controls::section_heading(
             ui,
             "Online GIFs",
@@ -2291,9 +2295,14 @@ impl RelayApp {
             self.defer_preferences();
         }
         self.online_gif_setup(ui);
+        });
         controls::divider(ui);
-        self.data_location_ui.show(ui);
+        ui.collapsing("Storage on this PC", |ui| self.data_location_ui.show(ui));
+        controls::description(ui, "Choose where Relay stores messages, settings and hosted servers on this PC.");
         controls::divider(ui);
+        ui.collapsing("Voice on a local network (LAN)", |ui| self.lan_profile_section(ui));
+        controls::divider(ui);
+        ui.collapsing("Reset appearance", |ui| {
         controls::section_heading(
             ui,
             "Local Preferences",
@@ -2309,6 +2318,30 @@ impl RelayApp {
             ui,
             "This resets themes, text sizes, message layout and motion preferences.",
         );
+        });
+        controls::divider(ui);
+        ui.collapsing("About Relay and licenses", |ui| {
+        controls::section_heading(
+            ui,
+            "About Relay",
+            "A native Rust desktop app with self-hosted communities.",
+        );
+        ui.label(crate::build_metadata::current().label());
+        ui.collapsing("Build details", |ui| {
+            ui.add(egui::Label::new(crate::build_metadata::current().details()).wrap(true));
+            if ui.add(secondary("Copy build information")).clicked() {
+                let text = crate::build_metadata::current().json().to_string();
+                ui.output_mut(|output| output.copied_text = text);
+            }
+        });
+        ui.hyperlink_to(
+            "Emoji artwork: Twemoji (CC BY 4.0)",
+            "https://github.com/jdecked/twemoji",
+        );
+        controls::description(ui, "Twemoji by Twitter and contributors / jdecked. Artwork resized and packed for Relay. Unicode 17 data; emoji shortcodes by iamcal/emoji-data (MIT).");
+        controls::description(ui, &self.login.url);
+        controls::divider(ui);
+        });
         controls::divider(ui);
         if ui.add(secondary("Open Server Settings")).clicked() {
             self.settings_tab = SettingsTab::Server;

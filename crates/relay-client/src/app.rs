@@ -132,6 +132,8 @@ mod preference_writer;
 mod private_call_ui;
 #[path = "profile_ui.rs"]
 mod profile_ui;
+#[path = "reaction_ui.rs"]
+mod reaction_ui;
 #[path = "protection_ui.rs"]
 mod protection_ui;
 #[path = "quick_switch_ui.rs"]
@@ -855,6 +857,7 @@ pub struct RelayApp {
     profile_ui: profile_ui::ProfileUi,
     encryption_ui: encryption_ui::EncryptionUi,
     message_protection: encryption_ui::ProtectionCache,
+    pending_reactions: reaction_ui::PendingReactions,
     protection_ui: protection_ui::ProtectionUi,
     draft: String,
     reply: Option<ReplyDraft>,
@@ -1345,6 +1348,7 @@ impl RelayApp {
             profile_ui: profile_ui::ProfileUi::default(),
             encryption_ui: encryption_ui::EncryptionUi::default(),
             message_protection: encryption_ui::ProtectionCache::default(),
+            pending_reactions: reaction_ui::PendingReactions::default(),
             protection_ui: protection_ui::ProtectionUi::default(),
             draft: String::new(),
             reply: None,
@@ -3464,26 +3468,37 @@ impl RelayApp {
         let target_client_id = match self.message_protection.get(&message.id) {
             Some(crate::e2ee::MessageProtection::Protected) => message.client_id.clone(),
             Some(crate::e2ee::MessageProtection::Legacy) => None,
+            Some(crate::e2ee::MessageProtection::Recovered) => {
+                self.error=Some("Reactions to transferred history are not available on this PC yet.".into());
+                return;
+            }
             _ => {
                 self.error =
                     Some("Wait for this message's encryption status before reacting.".into());
                 return;
             }
         };
-        let active = !message.reactions.iter().any(|reaction| {
-            reaction.emoji == emoji && reaction.user_ids.contains(&session.user.id)
-        });
-        let Some(origin) = self.command_origin() else {
+        let own_id = session.user.id.clone();
+        let Some(origin) = self.command_origin() else { return; };
+        let rows = self.pending_reactions.rows(&origin, &target, message);
+        let active = !rows.iter().any(|r| r.emoji == emoji && r.user_ids.contains(&own_id));
+        let request_id = self.next_request();
+        if !self.pending_reactions.can_stage(&origin, &target, message, emoji) {
+            self.error = Some("Please wait for your pending reactions to finish.".into());
             return;
-        };
-        self.send(Command::React {
-            origin,
-            target,
-            message_id: message.id.clone(),
-            target_client_id,
-            emoji: emoji.into(),
-            active,
-        });
+        }
+        match self.network.send(Command::React {
+            origin: origin.clone(), target: target.clone(),
+            message_id: message.id.clone(), target_client_id,
+            emoji: emoji.into(), active, request_id,
+        }) {
+            Ok(()) => {
+                self.pending_reactions.stage(origin, target, message, emoji, active, request_id);
+                self.row_heights.invalidate(&message.id);
+                self.capture_ctx.request_repaint();
+            }
+            Err(error) => self.error = Some(error),
+        }
     }
 
     fn attachment_preview(

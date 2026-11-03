@@ -28,6 +28,7 @@ mod password_policy;
 mod people;
 mod private_calls;
 mod profiles;
+mod history_transfer;
 mod protection;
 #[allow(dead_code)]
 mod replica;
@@ -137,6 +138,7 @@ struct Inner {
     locator_rates: Mutex<HashMap<String, (u64, u32)>>,
     /// Short-lived LAN pairing entries and per-peer counters. In memory only.
     lan_pairing: lan_pairing::Store,
+    history_transfer: history_transfer::Store,
     mutation_rates: Mutex<HashMap<String, (u64, u32)>>,
     password_jobs: Arc<tokio::sync::Semaphore>,
     transfer_jobs: Arc<tokio::sync::Semaphore>,
@@ -526,6 +528,7 @@ impl AppState {
             route_rates: Mutex::new(HashMap::new()),
             locator_rates: Mutex::new(HashMap::new()),
             lan_pairing: lan_pairing::Store::default(),
+            history_transfer: history_transfer::Store::default(),
             mutation_rates: Mutex::new(HashMap::new()),
             password_jobs: Arc::new(tokio::sync::Semaphore::new(4)),
             transfer_jobs: Arc::new(tokio::sync::Semaphore::new(8)),
@@ -1058,9 +1061,11 @@ pub fn router(state: AppState) -> Router {
             get(profiles::own_profile).put(profiles::update_profile),
         )
         .route("/api/profiles/{id}", get(profiles::member_profile))
+        .route("/api/profile/account", get(profiles::own_account))
         .route(
             "/api/profile/avatar",
             axum::routing::put(profiles::upload_avatar)
+                .get(profiles::account_avatar)
                 .delete(profiles::remove_avatar)
                 .layer(DefaultBodyLimit::max(profiles::MAX_AVATAR_UPLOAD_BYTES)),
         )
@@ -1146,6 +1151,9 @@ pub fn router(state: AppState) -> Router {
             post(upload).layer(DefaultBodyLimit::max(MAX_SUPPORTED_UPLOAD_BYTES)),
         )
         .route("/api/uploads/{upload_id}", get(download))
+        .route("/api/history-transfer/{id}", get(history_transfer::get_transfer)
+            .put(history_transfer::put_transfer).delete(history_transfer::delete_transfer)
+            .layer(DefaultBodyLimit::max(history_transfer::MAX_BYTES)))
         .route("/api/events", get(events))
         .route("/api/voice/join", post(voice_join))
         .route("/api/voice/resume", post(voice_recovery::resume))
@@ -1920,6 +1928,7 @@ async fn bootstrap(
         capabilities: {
             let mut capabilities = vec![
                 "history".into(),
+                "history-transfer-v1".into(),
                 "search".into(),
                 "read-state".into(),
                 "changes".into(),
@@ -1945,6 +1954,8 @@ async fn bootstrap(
                 "welcome-v1".into(),
                 "profiles-v3".into(),
             "profiles-v4".into(),
+            "profiles-v5".into(),
+            "account-avatar-v1".into(),
                 "custom-roles-v1".into(),
                 "voice-text-v1".into(),
                 "social-v1".into(),
