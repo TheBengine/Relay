@@ -2510,6 +2510,7 @@ impl eframe::App for RelayApp {
         // (Crop only in its own conversation scope), so Escape there closes
         // that dialog alone instead of also closing Settings or the profile editor.
         if self.profile_ui.card.is_none()
+            && self.media_preview.is_none()
             && !self.server_actions.removal_open()
             && !self.add_community_open
             && !self.welcome_dialog_shown()

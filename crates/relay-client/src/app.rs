@@ -44,6 +44,8 @@ mod dm_navigation_native_fixture;
 mod admin_ui;
 #[path = "app_dialogs.rs"]
 mod app_dialogs;
+#[path = "image_viewer.rs"]
+mod image_viewer;
 #[path = "app_update.rs"]
 mod app_update;
 #[path = "audio_device_menu.rs"]
@@ -965,6 +967,9 @@ pub struct RelayApp {
     chat_media_pending: HashSet<String>,
     chat_media_errors: HashMap<String, String>,
     media_preview: Option<String>,
+    media_preview_zoom: bool,
+    media_preview_pan: Vec2,
+    image_copy: image_viewer::ImageCopy,
     gif_picker: bool,
     composer_anchor: Option<Rect>,
     online_gifs: online_gif_ui::GifBrowser,
@@ -1470,6 +1475,9 @@ impl RelayApp {
             chat_media_pending: HashSet::new(),
             chat_media_errors: HashMap::new(),
             media_preview: None,
+            media_preview_zoom: false,
+            media_preview_pan: Vec2::ZERO,
+            image_copy: Default::default(),
             gif_picker: args.iter().any(|arg| arg == "--gif-picker"),
             composer_anchor: None,
             online_gifs: online_gif_ui::GifBrowser::default(),
@@ -3484,18 +3492,12 @@ impl RelayApp {
         attachment: &Attachment,
         message: &Message,
     ) {
-        let name = attachment.name.to_ascii_lowercase();
-        if !matches!(attachment.mime.as_str(), "image/png" | "image/jpeg" | "image/gif") && ![".gif", ".png", ".jpg", ".jpeg"]
-            .iter()
-            .any(|ext| name.ends_with(ext))
-        {
-            return;
-        }
+        if !image_viewer::is_image(attachment) { return; }
         if let Some(image) = self.chat_media.get_mut(&attachment.id) {
             ui.add_space(6.0);
             let dimensions = image.dimensions();
-            let scale = (ui.available_width().min(400.0) / dimensions.x)
-                .min(260.0 / dimensions.y)
+            let scale = (ui.available_width().clamp(1.0, 550.0) / dimensions.x)
+                .min(350.0 / dimensions.y)
                 .min(1.0);
             let size = dimensions * scale;
             let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
@@ -3512,13 +3514,15 @@ impl RelayApp {
                     .sense(Sense::click()),
             );
             if response.clicked() {
-                self.media_preview = Some(attachment.id.clone());
+                self.open_image_preview(&attachment.id);
             }
             response.context_menu(|ui| {
                 if ui.button("View image").clicked() {
-                    self.media_preview = Some(attachment.id.clone());
+                    self.open_image_preview(&attachment.id);
                     ui.close_menu();
                 }
+                self.image_actions(ui, attachment);
+                ui.separator();
                 self.message_actions(ui, message);
             });
         } else if let Some(error) = self.chat_media_errors.get(&attachment.id) {

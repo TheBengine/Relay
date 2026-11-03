@@ -106,52 +106,6 @@ fn channel_type_card(
 }
 
 impl RelayApp {
-    pub(super) fn media_preview_dialog(&mut self, ctx: &egui::Context) {
-        let Some(id) = self.media_preview.clone() else {
-            return;
-        };
-        self.request_original_preview(ctx, &id);
-        let Some(image) = self.chat_media.get_mut(&id) else {
-            self.media_preview = None;
-            return;
-        };
-        let mut open = true;
-        let window = desktop_ui::dialog(ctx, "Image preview")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false);
-        // The shared header (title, Close, Escape) stays above the scrolling body.
-        if host_setup_ui::show_with_header(ctx, window, "Image preview", |ui| {
-            let dimensions = image.dimensions();
-            let scale = ((ctx.screen_rect().width() - 120.0).min(800.0) / dimensions.x)
-                .min((ctx.screen_rect().height() - 160.0) / dimensions.y)
-                .min(2.0);
-            let size = dimensions * scale;
-            let texture = image.texture_with_autoplay(
-                ctx,
-                true,
-                self.prefs.reduced_motion,
-                self.prefs.appearance.gif_autoplay,
-            );
-            let response = ui.add(
-                egui::Image::new((texture, size))
-                    .rounding(8.0)
-                    .sense(Sense::click()),
-            );
-            response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, "GIF animation")
-            });
-            if image.is_animated() && !self.prefs.reduced_motion && response.clicked() {
-                image.set_paused(!image.is_paused_for(self.prefs.appearance.gif_autoplay));
-            }
-        }) {
-            open = false;
-        }
-        if !open {
-            self.media_preview = None;
-        }
-    }
-
     pub(super) fn stream_preview_dialog(&mut self, ctx: &egui::Context) {
         let Some(key) = self.stream_preview.clone() else {
             return;
@@ -611,6 +565,7 @@ impl RelayApp {
         if self.share_picker.is_some() {
             self.share_dialog(ctx);
         }
+        self.poll_image_copy();
         if self.media_preview.is_some() {
             self.media_preview_dialog(ctx);
         }

@@ -359,6 +359,10 @@ impl AnimatedImage {
         egui::vec2(size[0] as f32, size[1] as f32)
     }
 
+    pub fn displayed_frame(&self) -> Arc<ColorImage> {
+        self.media.frames[self.texture_frame.min(self.media.frames.len() - 1)].image.clone()
+    }
+
     pub fn is_thumbnail(&self) -> bool {
         self.media.source_size != self.media.frames[0].image.size
     }

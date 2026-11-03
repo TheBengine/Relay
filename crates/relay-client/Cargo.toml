@@ -47,8 +47,8 @@ qrcodegen = "=1.8.0"
 openidconnect = { version = "=4.0.1", default-features = false, features = ["reqwest-blocking"] }
 subtle = "2"
 eframe = { version = "0.27.2", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
-# Text-only clipboard reads (R2.3); already built for egui-winit, no image support.
-arboard = { version = "3.6.1", default-features = false }
+# Clipboard text and bounded decoded image copies.
+arboard = { version = "3.6.1", default-features = false, features = ["image-data"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

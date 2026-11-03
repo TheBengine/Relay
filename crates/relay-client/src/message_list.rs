@@ -1098,6 +1098,8 @@ impl RelayApp {
                             if cards.response.rect.is_positive() { media_click_regions.push(cards.response.rect); }
                         }
                         for attachment in &message.attachments {
+                            if image_viewer::is_image(attachment)
+                                && !self.chat_media_errors.contains_key(&attachment.id) { continue; }
                             ui.add_space(6.0);
                             if ui
                                 .add(secondary(&format!(
