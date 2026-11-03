@@ -6,9 +6,9 @@
 
 | Package | Best for |
 | --- | --- |
-| [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261103.1/Relay-Setup.exe) | Recommended: install or update Relay like a normal Windows app. |
-| [Relay-Portable.zip](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261103.1/Relay-Portable.zip) | Extract the whole folder and open `Relay.exe`. Keep the files together. |
-| [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261103.1/SHA256SUMS.txt) | Check that downloaded files match the release. |
+| [**Relay-Setup.exe**](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261103.2/Relay-Setup.exe) | Recommended: install or update Relay like a normal Windows app. |
+| [Relay-Portable.zip](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261103.2/Relay-Portable.zip) | Extract the whole folder and open `Relay.exe`. Keep the files together. |
+| [SHA256SUMS.txt](https://github.com/TheBengine/Relay/releases/download/v0.10.0-preview.20261103.2/SHA256SUMS.txt) | Check that downloaded files match the release. |
 
 This is an **unsigned preview**. Real audio hardware, extended streaming and calls between different homes still need practical acceptance. Local synthetic media tests do not establish that these work on every PC or network.
 
@@ -17,6 +17,8 @@ Relay starts quietly with Windows after installation or an update. Turn this off
 Personalize your profile with built-in avatars, banners, color themes and effects in **Settings > Profiles**. In **Voice & Video**, choose Automatic, Balanced or Save data for your next stream. Adaptive quality follows connection pressure within the selected limits; audio and transport add some traffic.
 
 Click a chat image to view it on a dark backdrop. Use Zoom, Copy or Save, and press Escape to return to the conversation. You can also right-click an image to copy or save it.
+
+For a new PC, open Encryption > Backup and recovery to request history from a PC that can already read it. Approve the transfer on that original PC. Recovered history is read-only. Profile settings include crop/zoom and effect speed/amount controls.
 
 ## Get started
 
