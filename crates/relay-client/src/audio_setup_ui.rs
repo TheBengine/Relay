@@ -84,18 +84,22 @@ impl RelayApp {
         }
     }
 
-    pub(super) fn audio_setup_dialog(&mut self, ctx: &egui::Context) {
-        self.offer_audio_setup();
-        let Some(mut setup) = self.audio_setup.take() else { return };
+    pub(super) fn audio_setup_tick(&mut self) {
         if self.voice_channel.is_some() || self.joining_voice.is_some() || self.settings_open {
+            let Some(setup) = self.audio_setup.take() else { return };
             // A call or the Settings editor owns the devices and the draft now.
             let call = !self.settings_open;
             self.cancel_audio_setup(setup);
             if call {
                 self.notice = Some(("Sound setup closed because a call started. Nothing was changed; run it again from Settings › Voice & Video.".into(), Instant::now()));
             }
-            return;
         }
+    }
+
+    pub(super) fn audio_setup_dialog(&mut self, ctx: &egui::Context) {
+        self.offer_audio_setup();
+        self.audio_setup_tick();
+        let Some(mut setup) = self.audio_setup.take() else { return };
         let mut open = true;
         let mut later = false;
         let mut finished = false;

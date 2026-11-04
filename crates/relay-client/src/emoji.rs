@@ -234,21 +234,76 @@ pub fn completion(
     (fence == 0).then(|| (start..end, query.to_owned()))
 }
 
-pub fn texture(ctx: &egui::Context) -> egui::TextureHandle {
-    let id = egui::Id::new("relay-emoji-atlas");
-    if let Some(texture) = ctx.data(|data| data.get_temp::<egui::TextureHandle>(id)) {
-        return texture;
-    }
+#[derive(Clone)]
+struct Atlas(std::sync::Arc<std::sync::Mutex<AtlasState>>);
+enum AtlasState {
+    Pending,
+    Ready(egui::TextureHandle),
+    Failed,
+}
+
+fn decode_atlas() -> Result<egui::ColorImage, String> {
     let image = image::load_from_memory(include_bytes!("../assets/emoji/atlas.png"))
-        .expect("bundled emoji atlas")
-        .into_rgba8();
-    let color = egui::ColorImage::from_rgba_unmultiplied(
-        [image.width() as usize, image.height() as usize],
-        image.as_raw(),
-    );
-    let texture = ctx.load_texture("Twemoji Unicode 17", color, egui::TextureOptions::LINEAR);
-    ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
-    texture
+        .map_err(|error| error.to_string())?.into_rgba8();
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [image.width() as usize, image.height() as usize], image.as_raw(),
+    ))
+}
+
+// One short-lived decode job per Context. No UI-thread decode/wait, no idle
+// polling timer and no retained CPU bitmap after the renderer consumes it.
+fn request_atlas(
+    ctx: &egui::Context,
+    decode: impl FnOnce() -> Result<egui::ColorImage, String> + Send + 'static,
+) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new("relay-emoji-atlas-async");
+    let mut start = false;
+    let atlas = ctx.data_mut(|data| {
+        data.get_temp_mut_or_insert_with(id, || {
+            start = true;
+            Atlas(std::sync::Arc::new(std::sync::Mutex::new(AtlasState::Pending)))
+        }).clone()
+    });
+    if start {
+        let result = atlas.clone();
+        let wake = ctx.clone();
+        if std::thread::Builder::new().name("relay-emoji-atlas".into()).spawn(move || {
+            let next = match decode() {
+                Ok(image) => AtlasState::Ready(wake.load_texture(
+                    "Twemoji Unicode 17", image, egui::TextureOptions::LINEAR,
+                )),
+                Err(_) => AtlasState::Failed,
+            };
+            *result.0.lock().unwrap_or_else(|error| error.into_inner()) = next;
+            wake.request_repaint();
+        }).is_err() {
+            *atlas.0.lock().unwrap_or_else(|error| error.into_inner()) = AtlasState::Failed;
+        }
+    }
+    let state = atlas.0.try_lock().ok()?;
+    match &*state {
+        AtlasState::Ready(texture) => Some(texture.clone()),
+        AtlasState::Pending | AtlasState::Failed => None,
+    }
+}
+
+pub fn texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    request_atlas(ctx, decode_atlas)
+}
+
+pub fn paint_image(
+    painter: &egui::Painter, texture: Option<&egui::TextureHandle>,
+    index: usize, rect: Rect, tint: Color32,
+) {
+    if let Some(texture) = texture {
+        painter.image(texture.id(), rect, catalog().uv(index), tint);
+    } else {
+        // Keep the already allocated layout/cursor positions and accessible
+        // labels while the artwork loads; message emoji must not disappear.
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER,
+            &catalog().entries[index].unicode,
+            FontId::proportional(rect.height() * 0.85), tint);
+    }
 }
 
 pub fn install_fonts(fonts: &mut egui::FontDefinitions) {
@@ -455,14 +510,16 @@ pub fn button(ui: &mut egui::Ui, index: usize, size: f32) -> egui::Response {
     let data = catalog();
     let entry = &data.entries[index];
     let texture = texture(ui.ctx());
-    let response = ui
-        .add(
-            egui::ImageButton::new(
-                egui::Image::new((texture.id(), Vec2::splat(size))).uv(data.uv(index)),
-            )
-            .frame(false),
-        )
-        .on_hover_text(format!("{} · :{}:", entry.name, entry.aliases[0]));
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
+    if response.hovered() || response.has_focus() {
+        let visuals = ui.style().interact(&response);
+        ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
+        if response.has_focus() { ui.painter().rect_stroke(rect, 4.0, visuals.bg_stroke); }
+    }
+    if ui.is_rect_visible(rect) {
+        paint_image(ui.painter(), texture.as_ref(), index, rect, Color32::WHITE);
+    }
+    let response = response.on_hover_text(format!("{} · :{}:", entry.name, entry.aliases[0]));
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, &entry.name));
     response
 }
@@ -478,12 +535,7 @@ pub fn action_button(ui: &mut egui::Ui, index: usize) -> egui::Response {
             ui.painter().rect_stroke(rect, 4.0, visuals.bg_stroke);
         }
     }
-    ui.painter().image(
-        texture(ui.ctx()).id(),
-        rect.shrink(4.0),
-        data.uv(index),
-        Color32::WHITE,
-    );
+    paint_image(ui.painter(), texture(ui.ctx()).as_ref(), index, rect.shrink(4.0), Color32::WHITE);
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, &entry.name));
     response.on_hover_text(format!("{} · :{}:", entry.name, entry.aliases[0]))
 }
@@ -715,7 +767,7 @@ impl Inline {
         if self.images.is_empty() && self.custom.is_empty() && self.quotes.is_empty() {
             return;
         }
-        let texture = (!self.images.is_empty()).then(|| texture(ui.ctx()));
+        let texture = (!self.images.is_empty()).then(|| texture(ui.ctx())).flatten();
         let painter = ui.painter().with_clip_rect(clip);
         let mut start = 0;
         for row in &galley.rows {
@@ -758,12 +810,8 @@ impl Inline {
                         Vec2::splat(size),
                     );
                     if ui.is_rect_visible(rect) {
-                        painter.image(
-                            texture.as_ref().unwrap().id(),
-                            rect,
-                            catalog().uv(index),
-                            self.image_tint.unwrap_or(Color32::WHITE),
-                        );
+                        paint_image(&painter, texture.as_ref(), index, rect,
+                            self.image_tint.unwrap_or(Color32::WHITE));
                     }
                 }
             }
@@ -792,6 +840,80 @@ impl Inline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_artwork_decode_never_blocks_the_ui_or_starts_twice() {
+        let ctx = egui::Context::default();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (woken, wake) = std::sync::mpsc::channel();
+        ctx.set_request_repaint_callback(move |_| { let _ = woken.send(()); });
+        assert!(request_atlas(&ctx, move || {
+            entered.send(()).unwrap();
+            wait.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            Ok(egui::ColorImage::new([32,32], Color32::WHITE))
+        }).is_none());
+        started.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        for _ in 0..8 {
+            assert!(request_atlas(&ctx, || panic!("Only one decode per Context")).is_none());
+        }
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = button(ui, catalog().shortcode("grinning").unwrap(), 28.0);
+                assert_eq!(response.rect.size(), Vec2::splat(28.0));
+                // The same update can draw ordinary controls while decode is blocked.
+                let _ = ui.button("Still responsive");
+            });
+        });
+        assert!(!output.shapes.is_empty());
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let loaded = loop {
+            if let Some(texture) = request_atlas(&ctx, || panic!("Do not decode again")) { break texture; }
+            assert!(std::time::Instant::now() < deadline);
+            let _ = wake.recv_timeout(std::time::Duration::from_millis(100));
+        };
+        assert_eq!(loaded.size(), [32,32]);
+        assert_eq!(request_atlas(&ctx, || panic!("Ready is cached")).unwrap().id(), loaded.id());
+    }
+
+    #[test]
+    fn failed_artwork_is_terminal_and_inline_fallback_is_visible() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("relay-emoji-atlas-async");
+        ctx.data_mut(|data| data.insert_temp(id, Atlas(std::sync::Arc::new(std::sync::Mutex::new(AtlasState::Failed)))));
+        assert!(request_atlas(&ctx, || panic!("Failure must not retry each frame")).is_none());
+        let mut fonts = egui::FontDefinitions::default();
+        install_fonts(&mut fonts);ctx.set_fonts(fonts);
+        let output=ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut inline=Inline::default();let mut job=egui::text::LayoutJob::default();
+                inline.append(&mut job,"😀",egui::TextFormat::default(),true);
+                let galley=ui.painter().layout_job(job);
+                inline.paint(ui,&galley,ui.min_rect().min);
+            });
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,egui::epaint::Shape::Text(text) if text.galley.job.text=="😀")));
+    }
+
+    #[test]
+    #[ignore = "Explicit bundled-artwork decode and UI scheduling timing report"]
+    fn report_first_emoji_artwork_cost() {
+        let started=std::time::Instant::now();
+        let image=decode_atlas().unwrap();
+        let baseline_ms=started.elapsed().as_secs_f64()*1000.0;
+        assert_eq!(image.size,[3200,3100]);drop(image);
+        let ctx=egui::Context::default();let started=std::time::Instant::now();
+        let first=texture(&ctx);let request_ms=started.elapsed().as_secs_f64()*1000.0;
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(15);
+        let loaded=loop {
+            if let Some(texture)=texture(&ctx){break texture;}
+            assert!(std::time::Instant::now()<deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(loaded.size(),[3200,3100]);
+        println!("EMOJI_TIMING {{\"synchronous_decode_ms\":{baseline_ms},\"nonblocking_request_ms\":{request_ms},\"first_returned_pending\":{}}}",first.is_none());
+    }
 
     #[test]
     fn custom_editor_keeps_original_cursor_indices_and_one_image_width() {

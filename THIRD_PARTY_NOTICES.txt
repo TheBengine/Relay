@@ -25232,6 +25232,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ========================================================================
 eframe 0.27.2
 License: MIT OR Apache-2.0
+Packaged source: vendor/eframe-0.27.2
+Local change: avoid polling undeliverable hidden-window redraws; see RELAY-PATCH.md in the packaged source.
 Repository: https://github.com/emilk/egui/tree/master/crates/eframe
 
 

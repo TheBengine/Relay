@@ -114,3 +114,7 @@ files = ["build.rs"]
 [packages."vendor/deep-filter"]
 directories = ["src"]
 files = ["LICENSE-MIT", "LICENSE-APACHE", "PROVENANCE.json"]
+
+[packages."vendor/eframe-0.27.2"]
+directories = ["src", "data"]
+files = ["Cargo.toml.orig", "README.md", "LICENSE-MIT", "LICENSE-APACHE", "RELAY-PATCH.md", "UPSTREAM-SHA256.json"]

@@ -103,6 +103,10 @@ impl RelayApp {
         {
             return;
         }
+        if ctx.frame_nr() > 0 && !self.remote_video_window_visible(ctx) {
+            self.call_switch.offer = Some(offer);
+            return;
+        }
         let mut confirm = false;
         let mut cancel = false;
         egui::Window::new("Leave and answer?")

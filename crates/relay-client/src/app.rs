@@ -4821,6 +4821,10 @@ mod tests;
 #[path = "background_alert_native_fixture.rs"]
 mod background_alert_native_fixture;
 
+#[cfg(all(test, windows))]
+#[path = "idle_navigation_native_fixture.rs"]
+mod idle_navigation_native_fixture;
+
 #[path = "preview_cache_ui.rs"]
 mod preview_cache_ui;
 

@@ -153,6 +153,26 @@ impl State {
                 })
     }
 
+    pub(super) fn connection_pending(&self) -> bool {
+        self.auto.is_some() || self.pending.is_some() || self.friends_resume.is_some()
+    }
+
+    /// Friends starts at its overview. Only a deliberate destination or a
+    /// conversation visited in this process may open a chat; persisted channel
+    /// defaults are community navigation, including on reconnect.
+    pub(super) fn connected_target(
+        &self, scope: &str, bootstrap: &Bootstrap, explicit: Option<Target>,
+        community_default: Option<Target>, preserve_friends_shell: bool,
+    ) -> Option<Target> {
+        if bootstrap.capabilities.iter().any(|capability| capability == "people-v1") {
+            explicit.or_else(|| self.remembered_friends_target(scope, bootstrap))
+        } else if preserve_friends_shell {
+            None
+        } else {
+            explicit.or(community_default)
+        }
+    }
+
     fn cancel_navigation(&mut self, destination: Option<&str>) {
         self.navigation_restore = destination.map(str::to_owned);
         if let Some(auto) = self.auto.take() {
@@ -291,6 +311,7 @@ impl RelayApp {
             return false;
         }
         if self.account_start.clearing_previous_account.is_some() {
+            if ctx.frame_nr() > 0 && !self.remote_video_window_visible(ctx) { return true; }
             entry_surface::page(ctx, "relay-account-switch", |ui| {
                 if let Some(error) = &self.account_start.account_cleanup_error {
                     ui.add(egui::Label::new(RichText::new(error).color(c_bad())).wrap(true));
@@ -343,6 +364,7 @@ impl RelayApp {
         let home = self.central_account.account.is_some()
             && (self.account_start.home || self.hosting_setup.choosing_creation);
         if !gate && !home { return false; }
+        if ctx.frame_nr() > 0 && !self.remote_video_window_visible(ctx) { return true; }
         // Silent restoration starts at launch. Interactive sign-in is an
         // explicit action, after the user can see the saved-login choice.
         self.people_call_notice(ctx);

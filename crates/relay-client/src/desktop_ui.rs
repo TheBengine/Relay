@@ -162,6 +162,7 @@ impl RelayApp {
     pub(super) fn window_close(&mut self, ctx: &egui::Context) {
         if self.hide_on_close() {
             self.pause_hidden_remote_video();
+            self.stop_source_preview();
             #[cfg(windows)]
             if let Some(tray) = &self.tray {
                 tray.hide();
@@ -176,6 +177,7 @@ impl RelayApp {
         if requested {
             if self.hide_on_close() {
                 self.pause_hidden_remote_video();
+                self.stop_source_preview();
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 #[cfg(windows)]
                 if let Some(tray) = &self.tray {
@@ -243,6 +245,7 @@ impl RelayApp {
                     }
                     Some(TitleAction::Minimize) => {
                         self.pause_hidden_remote_video();
+                        self.stop_source_preview();
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     }
                     Some(TitleAction::Maximize) => {

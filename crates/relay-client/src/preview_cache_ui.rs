@@ -11,7 +11,7 @@ impl RelayApp {
         }
     }
     pub(super) fn trim_preview_cache(&mut self, ctx: &egui::Context) {
-        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        let minimized = !self.remote_video_window_visible(ctx);
         PreviewCache {
             attachments: &mut self.chat_media,
             errors: &mut self.chat_media_errors,

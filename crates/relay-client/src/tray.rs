@@ -45,6 +45,7 @@ struct State {
     suppress_first_show: Cell<bool>,
     paint_pending: Cell<bool>,
     heartbeat_available: Cell<bool>,
+    heartbeat_ms: Cell<u32>,
     ctx: eframe::egui::Context,
 }
 
@@ -193,7 +194,7 @@ unsafe extern "system" fn window_proc(
     } else if message == WM_TIMER && wparam.0 == BACKGROUND_TICK {
         // Winit does not dispatch requested redraws for hidden Win32 windows.
         // Keep sign-in, inbox delivery and orderly shutdown running while hidden.
-        if !IsWindowVisible(window).as_bool() && !state.quitting.get() && !state.paint_pending.replace(true)
+        if (!IsWindowVisible(window).as_bool() || IsIconic(window).as_bool()) && !state.quitting.get() && !state.paint_pending.replace(true)
             && PostMessageW(window, WM_PAINT, WPARAM(0), LPARAM(0)).is_err() {
             state.paint_pending.set(false);
         }
@@ -262,6 +263,7 @@ impl Tray {
             suppress_first_show: Cell::new(start_hidden),
             paint_pending: Cell::new(false),
             heartbeat_available: Cell::new(false),
+            heartbeat_ms: Cell::new(250),
             ctx: cc.egui_ctx.clone(),
         });
         if !unsafe {
@@ -291,6 +293,18 @@ impl Tray {
 
     pub(crate) fn available(&self) -> bool {
         self.state.available.get()
+    }
+    /// Hidden windows need a native pump, but an idle account does not need
+    /// four full eframe/graphics wakeups each second. Calls and in-flight work
+    /// retain the existing cadence. Network alerts have their own delivery.
+    pub(crate) fn set_background_active(&self, active: bool) {
+        let milliseconds = if active { 250 } else { 1000 };
+        if self.state.alive.get() && self.state.heartbeat_available.get()
+            && self.state.heartbeat_ms.get() != milliseconds
+            && unsafe { SetTimer(self.state.window, BACKGROUND_TICK, milliseconds, None) } != 0
+        {
+            self.state.heartbeat_ms.set(milliseconds);
+        }
     }
     pub(crate) fn prepare_show(&self) {
         // Winit may already cache VISIBLE=true after its suppressed first show.

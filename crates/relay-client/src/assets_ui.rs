@@ -733,8 +733,11 @@ impl RelayApp {
         {
             ui.push_id(&asset.id, |ui| {
                 ui.horizontal(|ui| {
-                    if let Some(texture) = self.asset_texture(&asset.kind, &asset.name) {
-                        ui.add(egui::Image::new((texture.id(), Vec2::splat(48.0))));
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
+                    if ui.is_rect_visible(rect) {
+                        if let Some(texture) = self.asset_texture(&asset.kind, &asset.name) {
+                            ui.painter().image(texture.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                        }
                     }
                     ui.label(format!("{} · {}", asset.name, asset.kind));
                     if ui.button("Replace").clicked() {
@@ -909,36 +912,24 @@ impl RelayApp {
                                         ui.horizontal_wrapped(|ui| {
                                             for asset in assets {
                                                 ui.push_id(&asset.id, |ui| {
-                                                    if let Some(texture) =
-                                                        self.asset_texture(&asset.kind, &asset.name)
-                                                    {
-                                                        let response = ui
-                                                            .add(
-                                                                egui::ImageButton::new((
-                                                                    texture.id(),
-                                                                    Vec2::splat(
-                                                                        if kind == "emoji" {
-                                                                            30.0
-                                                                        } else {
-                                                                            88.0
-                                                                        },
-                                                                    ),
-                                                                ))
-                                                                .frame(false),
-                                                            )
-                                                            .on_hover_text(&asset.name);
-                                                        response.widget_info(|| {
-                                                            egui::WidgetInfo::labeled(
-                                                                egui::WidgetType::Button,
-                                                                &asset.name,
-                                                            )
-                                                        });
-                                                        if response.clicked() {
-                                                            chosen = Some(asset.clone());
+                                                    let size = if kind == "emoji" { 30.0 } else { 88.0 };
+                                                    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+                                                    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, &asset.name));
+                                                    if ui.is_rect_visible(rect) {
+                                                        let texture = self.asset_texture(&asset.kind, &asset.name);
+                                                        if response.hovered() || response.has_focus() {
+                                                            let visuals = ui.style().interact(&response);
+                                                            ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
+                                                            if response.has_focus() { ui.painter().rect_stroke(rect, 4.0, visuals.bg_stroke); }
                                                         }
-                                                    } else {
-                                                        ui.add(egui::Button::new(&asset.name))
-                                                            .on_hover_text("Loading image…");
+                                                        if let Some(texture) = texture {
+                                                            ui.painter().image(texture.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                                                            if response.clicked() { chosen = Some(asset.clone()); }
+                                                            response.on_hover_text(&asset.name);
+                                                        } else {
+                                                            ui.painter().rect_filled(rect.shrink(4.0), 4.0, c_panel());
+                                                            response.on_hover_text(format!("{} · Loading image…", asset.name));
+                                                        }
                                                     }
                                                 });
                                             }
@@ -1479,5 +1470,73 @@ mod welcome_crop_header_tests {
             // The crop draft itself is untouched by closing.
             assert_eq!((draft.zoom, draft.x, draft.y), (1.0, 0.5, 0.5), "{case}");
         }
+    }
+}
+
+// Reclaim cold, large images without making quick reopen/scroll interactions
+// download the same artwork again. Recent/visible entries remain protected.
+const IDLE_ASSET_BYTES: usize = 8 * 1024 * 1024;
+const ASSET_REUSE_GRACE: Duration = Duration::from_secs(60);
+fn trim_cold_asset_textures(
+    cache: &mut HashMap<String, (egui::TextureHandle, Instant)>, now: Instant,
+) -> Option<Duration> {
+    let bytes = |texture: &egui::TextureHandle| {
+        let [width, height] = texture.size();
+        width.saturating_mul(height).saturating_mul(4)
+    };
+    let mut total = cache.values().map(|(texture, _)| bytes(texture)).sum::<usize>();
+    while total > IDLE_ASSET_BYTES {
+        let (key, used, size) = cache.iter().min_by_key(|(_, (_, used))| used)
+            .map(|(key, (texture, used))| (key.clone(), *used, bytes(texture)))?;
+        let age = now.saturating_duration_since(used);
+        if age < ASSET_REUSE_GRACE { return Some(ASSET_REUSE_GRACE - age); }
+        cache.remove(&key);
+        total = total.saturating_sub(size);
+    }
+    None
+}
+impl RelayApp {
+    pub(super) fn trim_idle_asset_textures(&mut self, ctx: &egui::Context) {
+        if let Some(wait) = trim_cold_asset_textures(&mut self.admin_ui.asset_cache, Instant::now()) {
+            ctx.request_repaint_after(wait);
+        }
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    #[test]
+    fn cold_banners_release_memory_but_reopening_does_not_thrash_the_cache() {
+        let ctx = egui::Context::default();
+        let now = Instant::now();
+        let image = std::sync::Arc::new(egui::ColorImage::new([1200, 480], Color32::WHITE));
+        let mut cache = HashMap::new();
+        for i in 0..32 {
+            cache.insert(i.to_string(), (ctx.load_texture(i.to_string(), image.clone(), Default::default()), now));
+        }
+        // Even a large currently-visible working set is protected, not evicted
+        // and refetched on every frame. The existing 32-entry bound still holds.
+        for _ in 0..10 {
+            assert_eq!(trim_cold_asset_textures(&mut cache, now), Some(ASSET_REUSE_GRACE));
+            assert_eq!(cache.len(), 32);
+        }
+        // One recently used banner survives the expiry of the older ones.
+        cache.get_mut("0").unwrap().1 = now + Duration::from_secs(59);
+        assert_eq!(trim_cold_asset_textures(&mut cache, now + ASSET_REUSE_GRACE), None);
+        assert!(cache.contains_key("0"));
+        let bytes: usize = cache.values().map(|(t, _)| t.size()[0] * t.size()[1] * 4).sum();
+        assert!(bytes <= IDLE_ASSET_BYTES);
+        assert_eq!(cache.len(), 3);
+        println!("Cold banner texture bytes: {} -> {}", 32 * 1200 * 480 * 4, bytes);
+        assert!(trim_cold_asset_textures(&mut cache, now + Duration::from_secs(120)).is_none());
+    }
+    #[test]
+    fn small_asset_cache_needs_no_cleanup_timer() {
+        let ctx = egui::Context::default();
+        let mut cache = HashMap::new();
+        cache.insert("icon".into(), (ctx.load_texture("icon", egui::ColorImage::new([96,96], Color32::WHITE), Default::default()), Instant::now()));
+        assert!(trim_cold_asset_textures(&mut cache, Instant::now()).is_none());
+        assert_eq!(cache.len(), 1);
     }
 }

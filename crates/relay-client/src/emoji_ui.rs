@@ -69,10 +69,8 @@ impl RelayApp {
                     ] {
                         ui.horizontal(|ui| {
                             let index = data.with_tone(data.shortcode("wave").unwrap(), tone);
-                            ui.add(
-                                egui::Image::new((texture.id(), Vec2::splat(20.0)))
-                                    .uv(data.uv(index)),
-                            );
+                            let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                            crate::emoji::paint_image(ui.painter(), texture.as_ref(), index, rect, Color32::WHITE);
                             if ui
                                 .selectable_value(&mut self.prefs.emoji_tone, tone, name)
                                 .changed()
@@ -136,12 +134,11 @@ impl RelayApp {
                                     .position(|entry| entry.category == category)
                                     .unwrap_or(0)
                             });
-                            let button = egui::ImageButton::new(
-                                egui::Image::new((texture.id(), Vec2::splat(23.0)))
-                                    .uv(data.uv(index)),
-                            )
-                            .selected(self.admin_ui.expression_category == Some(category));
-                            if ui.add(button).on_hover_text(name).clicked() {
+                            let selected = self.admin_ui.expression_category == Some(category);
+                            let response = ui.add(egui::Button::new("").min_size(Vec2::splat(31.0)).selected(selected));
+                            crate::emoji::paint_image(ui.painter(), texture.as_ref(), index, response.rect.shrink(4.0), Color32::WHITE);
+                            response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, selected, name));
+                            if response.on_hover_text(name).clicked() {
                                 self.admin_ui.expression_category = Some(category);
                             }
                         }
@@ -230,7 +227,8 @@ impl RelayApp {
             .unwrap_or_else(|| data.shortcode("grinning").unwrap());
         let entry = &data.entries[index];
         ui.horizontal(|ui| {
-            ui.add(egui::Image::new((texture.id(), Vec2::splat(30.0))).uv(data.uv(index)));
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
+            crate::emoji::paint_image(ui.painter(), texture.as_ref(), index, rect, Color32::WHITE);
             ui.vertical(|ui| {
                 ui.add(
                     egui::Label::new(

@@ -33,6 +33,12 @@ impl RelayApp {
         {
             self.preview_release = None;
         }
+        // Local device previews are useful only while visible; live outgoing
+        // captures have separate ownership and must continue in the background.
+        if ctx.frame_nr() > 0 && self.capture_path.is_none()
+            && !self.remote_video_window_visible(ctx) {
+            self.stop_source_preview();
+        }
         #[cfg(feature = "native-rtc")]
         if let Some(error) = self
             .source_preview
@@ -233,6 +239,9 @@ impl RelayApp {
                         });
                         continue;
                     }
+                    if self.login.url == url {
+                        self.remember_people_view();
+                    }
                     let preserve_friends_shell = self.friends_shell_selected()
                         && (self.account_start.auto.is_some() || self.people_url().as_deref() == Some(url.as_str()));
                     self.friends_connection_adopted(&url, bootstrap.capabilities.iter().any(|c| c == "people-v1"));
@@ -340,7 +349,7 @@ impl RelayApp {
                                         && crate::direct_targets::actionable(&bootstrap, id)
                                 }),
                             });
-                    let target = initial_direct
+                    let explicit_target = initial_direct
                         .and_then(|name| {
                             bootstrap
                                 .members
@@ -359,8 +368,8 @@ impl RelayApp {
                                     .find(|c| c.name == name)
                                     .map(|c| Target::Channel(c.id.clone()))
                             })
-                        })
-                        .or(remembered)
+                        });
+                    let target = remembered
                         .or_else(|| {
                             bootstrap
                                 .server_presentation
@@ -376,12 +385,14 @@ impl RelayApp {
                                 .find(|c| c.kind == "text")
                                 .map(|c| Target::Channel(c.id.clone()))
                         });
-                    let target = pending_notification_target(
+                    let explicit_target = pending_notification_target(
                         self.notification_target.take(),
                         &self.login.url,
                         &bootstrap,
-                    )
-                    .or(target);
+                    ).or(explicit_target);
+                    let target = self.account_start.connected_target(
+                        &scope, &bootstrap, explicit_target, target, preserve_friends_shell,
+                    );
                     self.session = Some(session);
                     self.bootstrap = Some(Arc::new(bootstrap));
                     self.unread_navigation = None;
@@ -493,11 +504,6 @@ impl RelayApp {
                     if let Err(error) = self.remember_current_local() {
                         self.notice = Some((error, Instant::now()));
                     }
-                    let target = if preserve_friends_shell && self.in_people() {
-                        self.account_start.remembered_friends_target(&scope, self.bootstrap.as_ref().unwrap())
-                    } else {
-                        target.filter(|_| !preserve_friends_shell)
-                    };
                     if let Some(target) = target {
                         self.select(target);
                     }
@@ -2373,6 +2379,50 @@ impl RelayApp {
     }
 }
 
+impl RelayApp {
+    fn finish_frame(&mut self, ctx: &egui::Context) {
+        self.trim_idle_asset_textures(ctx);
+        #[cfg(windows)]
+        if let Some(tray) = &self.tray {
+            tray.set_background_active(
+                self.voice_channel.is_some() || self.joining_voice.is_some()
+                    || self.audio_connecting || self.mic_test || self.rtc_request.is_some()
+                    || self.private_calls.intent.is_some() || self.call_switch_pending()
+                    || self.busy || self.central_account.waiting()
+                    || self.account_start.connection_pending()
+                    || self.preferences_dirty_at.is_some() || !self.pending_sends.is_empty()
+                    || self.update_ui.preparing_install() || self.network.update_busy(),
+            );
+        }
+        if self.mic_test {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else if self.audio_connecting || self.media.as_ref().is_some_and(MediaEngine::is_starting)
+        {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        } else if self.voice_channel.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+        if let Some((_, at)) = &self.notice {
+            ctx.request_repaint_after(Duration::from_secs(5).saturating_sub(at.elapsed()));
+        }
+        if let Some(at) = self.preferences_dirty_at {
+            if at.elapsed() >= Duration::from_millis(750) {
+                self.save_preferences();
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(750).saturating_sub(at.elapsed()));
+            }
+        }
+        if let Some(at) = self.search_changed_at {
+            if at.elapsed() >= Duration::from_millis(350) {
+                self.search_changed_at = None;
+                self.search_history(false);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(350).saturating_sub(at.elapsed()));
+            }
+        }
+    }
+}
+
 impl eframe::App for RelayApp {
     fn on_exit(&mut self, _glow: Option<&eframe::glow::Context>) {
         self.hide_for_exit();
@@ -2420,6 +2470,7 @@ impl eframe::App for RelayApp {
             self.network.reopen_if_stopped(ctx);
         }
         self.updates(ctx);
+        self.audio_setup_tick();
         self.replica_copy_tick();
         self.device_follow_tick();
         self.camera_follow_tick();
@@ -2479,6 +2530,23 @@ impl eframe::App for RelayApp {
             if let Some(panel) = self.initial_capture_panel.take() {
                 self.prepare_join_capture_panel(&panel);
             }
+        }
+        // Windows pumps hidden windows so accounts, messages, calls and update
+        // handoff keep progressing. Those service ticks must not also lay out,
+        // animate and tessellate the entire hidden chat/settings UI.
+        // Keep the first frame and explicit captures for eframe initialization.
+        if ctx.frame_nr() > 0 && self.capture_path.is_none()
+            && !self.remote_video_window_visible(ctx)
+        {
+            #[cfg(windows)]
+            let account_surface = self.account_webview.as_ref().is_some_and(|s| s.visible());
+            #[cfg(not(windows))]
+            let account_surface = false;
+            if !account_surface { self.account_front(ctx); }
+            self.stop_typing();
+            self.trim_preview_cache(ctx);
+            self.finish_frame(ctx);
+            return;
         }
         // Ctrl + Shift shortcuts first: Ctrl-only matches ignore an extra Shift.
         self.handle_voice_shortcuts(ctx);
@@ -2658,32 +2726,7 @@ impl eframe::App for RelayApp {
         self.desktop_resize(ctx);
         self.typing_heartbeat(ctx);
         self.trim_preview_cache(ctx);
-        if self.mic_test {
-            ctx.request_repaint_after(Duration::from_millis(50));
-        } else if self.audio_connecting || self.media.as_ref().is_some_and(MediaEngine::is_starting)
-        {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        } else if self.voice_channel.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(150));
-        }
-        if let Some((_, at)) = &self.notice {
-            ctx.request_repaint_after(Duration::from_secs(5).saturating_sub(at.elapsed()));
-        }
-        if let Some(at) = self.preferences_dirty_at {
-            if at.elapsed() >= Duration::from_millis(750) {
-                self.save_preferences();
-            } else {
-                ctx.request_repaint_after(Duration::from_millis(750).saturating_sub(at.elapsed()));
-            }
-        }
-        if let Some(at) = self.search_changed_at {
-            if at.elapsed() >= Duration::from_millis(350) {
-                self.search_changed_at = None;
-                self.search_history(false);
-            } else {
-                ctx.request_repaint_after(Duration::from_millis(350).saturating_sub(at.elapsed()));
-            }
-        }
+        self.finish_frame(ctx);
         if self.capture_path.is_some() && !self.capture_requested {
             ctx.request_repaint_after(
                 Duration::from_secs(3)

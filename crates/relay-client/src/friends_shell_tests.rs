@@ -2,6 +2,49 @@
 use super::*;
 
 #[test]
+fn friends_connection_ignores_persisted_chat_and_first_text_channel() {
+    let mut bootstrap = Bootstrap::default();
+    bootstrap.capabilities.push("people-v1".into());
+    bootstrap.channels.push(relay_protocol::Channel { id: "old-group".into(), ..Default::default() });
+    let state = State::default();
+    for preserve_shell in [false, true] {
+        assert_eq!(state.connected_target("account", &bootstrap, None,
+            Some(Target::Channel("old-group".into())), preserve_shell), None);
+        // A notification/deep link is an explicit request, even while the
+        // initial Friends shell is waiting for its connection.
+        assert_eq!(state.connected_target("account", &bootstrap,
+            Some(Target::Channel("old-group".into())), None, preserve_shell),
+            Some(Target::Channel("old-group".into())));
+    }
+}
+
+#[test]
+fn friends_connection_returns_to_session_view_but_never_another_account() {
+    let mut bootstrap = Bootstrap::default();
+    bootstrap.capabilities.push("people-v1".into());
+    bootstrap.channels.push(relay_protocol::Channel { id: "visited".into(), ..Default::default() });
+    let mut state = State {
+        friends_view: Some(("account".into(), Some(Target::Channel("visited".into())))),
+        ..Default::default()
+    };
+    assert_eq!(state.connected_target("account", &bootstrap, None, None, true),
+        Some(Target::Channel("visited".into())));
+    assert_eq!(state.connected_target("other-account", &bootstrap, None, None, false), None);
+    state.friends_view = Some(("account".into(), None));
+    assert_eq!(state.connected_target("account", &bootstrap, None,
+        Some(Target::Channel("visited".into())), false), None);
+}
+
+#[test]
+fn community_connection_keeps_its_default_except_during_friends_entry() {
+    let state = State::default();
+    let bootstrap = Bootstrap::default();
+    let target = Some(Target::Channel("general".into()));
+    assert_eq!(state.connected_target("account", &bootstrap, None, target.clone(), false), target);
+    assert_eq!(state.connected_target("account", &bootstrap, None, target, true), None);
+}
+
+#[test]
 fn friends_restores_only_a_visited_and_still_allowed_conversation_in_this_account() {
     let mut bootstrap = Bootstrap::default();
     bootstrap.user.id = "me".into();

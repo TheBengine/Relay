@@ -967,6 +967,9 @@ impl RelayApp {
         if self.hosting_setup.pending_invitation_copy.is_some() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
+        if ctx.frame_nr() > 0 && self.capture_path.is_none() && !self.remote_video_window_visible(ctx) {
+            return;
+        }
         let mut open = true;
         let mut go_to_account = false;
         let identity = self

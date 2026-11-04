@@ -27,6 +27,15 @@ fn preview_options() -> CaptureOptions {
 }
 
 impl SourcePreview {
+    #[cfg(test)]
+    pub(super) fn owned_generated() -> Self {
+        let (tx, frames) = mpsc::sync_channel(1);
+        Self {
+            source_id: "owned-generated".into(), camera: false,
+            capture: Some(CaptureSession::synthetic_raw(tx, 0, preview_options()).unwrap()),
+            frames, texture: None,
+        }
+    }
     pub fn new(source: CaptureSource, camera: bool) -> Result<Self, String> {
         if (source.kind == SourceKind::Camera) != camera {
             return Err("Select the matching camera or screen source.".into());
