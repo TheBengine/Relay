@@ -2,12 +2,6 @@
   "schema": 1,
   "targets": [
     {
-      "tag": "v0.10.0-preview.20261103.2",
-      "path": "updates/beta/targets/windows-x64/beta/Relay-0.10.0-20261103144053-Setup.exe",
-      "sha256": "6e1553491fb778b2a97e42a6a610e4afec230c6824d4384a5b05287f94e0ae2d",
-      "bytes": 159248227
-    },
-    {
       "tag": "v0.10.0-preview.20261104.1",
       "path": "updates/beta/targets/windows-x64/beta/Relay-0.10.0-20261104111717-Setup.exe",
       "sha256": "b332229c727a08f8fe923cd92f7bbba427b41f87c05dece49b17b828d738ebdb",
@@ -18,6 +12,12 @@
       "path": "updates/beta/targets/windows-x64/beta/Relay-0.10.0-20261106072026-Setup.exe",
       "sha256": "0daf97795a1cfe15e5504d16a290c6631857bbd6dc0e0be4965fdbf92c5aeb79",
       "bytes": 159308765
+    },
+    {
+      "tag": "v0.10.0-preview.20261107.1",
+      "path": "updates/beta/targets/windows-x64/beta/Relay-0.10.0-20261106131423-Setup.exe",
+      "sha256": "7de3d8fbfe4a0f6341c3834b61d306eb5a4ec2bc492c00feb7424bf95238c1a6",
+      "bytes": 114053980
     }
   ]
 }
