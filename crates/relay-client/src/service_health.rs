@@ -310,9 +310,12 @@ pub(super) fn account_check(issuer: &url::Url) -> Outcome {
         return Outcome::Failed;
     }
     let ms = started.elapsed().as_millis();
-    let Ok(body) = response.bytes() else {
+    // Read at most one byte past the limit: an oversized answer fails at once
+    // instead of being buffered whole until the timeout.
+    let mut body = Vec::new();
+    if std::io::Read::read_to_end(&mut std::io::Read::take(response, 65_537), &mut body).is_err() {
         return Outcome::Failed;
-    };
+    }
     let named = body.len() <= 65_536
         && serde_json::from_slice::<serde_json::Value>(&body).is_ok_and(|doc| {
             doc.get("issuer")
@@ -480,6 +483,33 @@ mod tests {
         });
         assert!(matches!(account_check(&issuer), Outcome::Answered { .. }));
         assert_eq!(account_check(&issuer), Outcome::Failed);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn the_account_check_stops_reading_an_oversized_answer() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let issuer = url::Url::parse(&format!("http://{address}/realms/relay")).unwrap();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            // Announce a huge document, send a little over the limit, then stall.
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000000000\r\n\r\n");
+            let _ = stream.write_all(&vec![b' '; 70_000]);
+            let _ = finished.recv_timeout(Duration::from_secs(10));
+        });
+        let started = Instant::now();
+        assert_eq!(account_check(&issuer), Outcome::Failed);
+        assert!(
+            started.elapsed() < Duration::from_millis(2_500),
+            "refused at the size limit, not at the 3 s timeout: {:?}",
+            started.elapsed()
+        );
+        done.send(()).unwrap();
         server.join().unwrap();
     }
 }

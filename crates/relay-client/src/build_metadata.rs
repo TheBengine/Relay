@@ -27,10 +27,12 @@ impl BuildMetadata {
     }
 
     pub fn json(&self) -> serde_json::Value {
+        let publisher = relay_updater::bundled_publisher().ok().flatten();
         serde_json::json!({
             "schema": 1,
             "invitation_protocol": if cfg!(windows) {1} else {0},
             "windows_startup": if cfg!(windows) {1} else {0},
+            "update_channel": publisher.as_ref().map(|publisher| publisher.channel()),
             "version": self.version,
             "build_id": self.build_id(),
             "sequence": self.stamp.sequence,

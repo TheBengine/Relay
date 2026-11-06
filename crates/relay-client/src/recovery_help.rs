@@ -53,8 +53,8 @@ impl Problem {
             ],
             Self::Device => &[
                 "Sign in on the new device. It gets its own encryption identity; your old device's keys do not move over.",
-                "Open Encryption, expand Your security code, and send your code or verification card to the people you chat with through a contact you already trust.",
-                "They open your device in Encryption, check the code and choose Approve Device. Until then, protected conversations and calls with them cannot resume on the new device.",
+                "To let people confirm it is you, open Encryption, expand Your security code, and send your code or verification card through a contact you already trust.",
+                "Anyone who verified your old device must check the new code and choose Approve Device or Accept new code. Until then, their protected conversations and calls with you wait. Everyone else continues without a step.",
                 "Lost a device? On another device you still have, open Encryption, expand Advanced and choose Revoke This Device under Your registered devices.",
             ],
             Self::History => &[
@@ -77,7 +77,7 @@ impl Problem {
 /// Shown under every guide, so no one has to find them.
 pub(super) const LIMITS: [&str; 3] = [
     "Changing or resetting an account password does not restore old device keys or message history.",
-    "Other devices and people you trust may need to approve a new device before group keys are shared with it. An existing group may also need the device that started its protected conversation to be online.",
+    "People who verified you may need to approve a new device before their conversations share keys with it. An existing group may also need the device that started its protected conversation to be online.",
     "A server backup cannot by itself recreate keys held only by a lost device. There is no server-side recovery for encryption keys.",
 ];
 
@@ -219,6 +219,7 @@ mod tests {
         for name in [
             "Your security code",
             "Approve Device",
+            "Accept new code",
             "Revoke This Device",
             "Your registered devices",
             "\"Advanced\"",
@@ -235,6 +236,7 @@ mod tests {
         for name in [
             "Your security code",
             "Approve Device",
+            "Accept new code",
             "Revoke This Device",
             "Your registered devices",
             "Advanced",

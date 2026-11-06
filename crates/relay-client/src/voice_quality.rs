@@ -18,6 +18,10 @@ struct Window {
     expected: u64,
     received: u64,
     late: u64,
+    /// Gaps in the sequence: one per loss event, however long.
+    loss_events: u64,
+    /// Packets missing in gaps of two or more in a row.
+    burst_lost: u64,
 }
 
 pub(crate) struct ArrivalStats {
@@ -75,6 +79,12 @@ impl ArrivalStats {
             Some(highest) if !restart && sequence > highest => {
                 let gap = sequence - highest;
                 self.current.expected += if gap <= MAX_GAP { gap } else { 1 };
+                if (2..=MAX_GAP).contains(&gap) {
+                    self.current.loss_events += 1;
+                    if gap >= 3 {
+                        self.current.burst_lost += gap - 1;
+                    }
+                }
                 self.current.received += 1;
                 self.highest = Some(sequence);
                 gap
@@ -115,6 +125,25 @@ impl ArrivalStats {
     pub(crate) fn late(&mut self, now: Instant) {
         self.roll(now);
         self.current.late += 1;
+    }
+
+    /// How the loss in the last one to two windows came: single packets or
+    /// runs. Nothing while too few packets arrived.
+    pub(crate) fn bursts(&mut self, now: Instant) -> Option<Bursts> {
+        self.roll(now);
+        let previous = self.previous.unwrap_or_default();
+        let expected = previous.expected + self.current.expected;
+        if expected < MIN_PACKETS {
+            return None;
+        }
+        let received = previous.received + self.current.received;
+        Some(Bursts {
+            loss_percent: (expected.saturating_sub(received) as f64 * 100.0 / expected as f64)
+                as f32,
+            loss_events: previous.loss_events + self.current.loss_events,
+            burst_lost: previous.burst_lost + self.current.burst_lost,
+            expected,
+        })
     }
 
     /// The last one to two windows, or nothing while too few packets arrived.
@@ -172,6 +201,63 @@ impl LossRecoveryPolicy {
             self.active = true;
             self.clean_since = None;
         } else if self.active && quality.is_some() {
+            let since = *self.clean_since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= RECOVERY_CLEAN_TIME {
+                self.active = false;
+                self.clean_since = None;
+            }
+        }
+        self.active
+    }
+}
+
+/// Loss runs over the same window as `Quality`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Bursts {
+    pub loss_percent: f32,
+    /// Gaps in the sequence, one per loss event.
+    pub loss_events: u64,
+    /// Packets lost two or more in a row.
+    pub burst_lost: u64,
+    pub expected: u64,
+}
+
+impl Bursts {
+    /// Loss above the recovery threshold that comes in runs: at least two
+    /// runs of two or more, holding at least a third of the lost packets.
+    /// Opus recovery covers only the frame just before a packet, so these
+    /// are the losses it cannot rebuild.
+    pub(crate) fn bursty(self) -> bool {
+        let lost = (f64::from(self.loss_percent) * self.expected as f64 / 100.0).round() as u64;
+        self.expected >= LOSS_EVIDENCE_PACKETS
+            && self.loss_percent > RECOVERY_LOSS_PERCENT
+            && self.loss_events > 0
+            && self.burst_lost >= 4
+            && self.burst_lost * 3 >= lost
+    }
+}
+
+/// Automatic packet redundancy, decided like `LossRecoveryPolicy`: on while
+/// someone we hear loses packets in runs, off after a clean minute without
+/// such runs. `None` (too few packets heard) is no evidence either way.
+#[derive(Default)]
+pub(crate) struct RedundancyPolicy {
+    active: bool,
+    clean_since: Option<Instant>,
+}
+
+impl RedundancyPolicy {
+    pub(crate) fn observe(&mut self, bursts: impl IntoIterator<Item = Bursts>, now: Instant) -> bool {
+        let mut evidence = false;
+        let mut bursty = false;
+        for speaker in bursts {
+            evidence |= speaker.expected >= LOSS_EVIDENCE_PACKETS;
+            bursty |= speaker.bursty();
+        }
+        if bursty {
+            self.active = true;
+            self.clean_since = None;
+        } else if self.active && evidence {
             let since = *self.clean_since.get_or_insert(now);
             if now.saturating_duration_since(since) >= RECOVERY_CLEAN_TIME {
                 self.active = false;
@@ -357,6 +443,56 @@ mod tests {
         let mut policy = LossRecoveryPolicy::default();
         let now = stream(&mut stats, start, 200, |sequence| sequence % 100 == 0);
         assert!(!policy.observe(stats.quality(now), now), "1 % stays off");
+    }
+
+    #[test]
+    fn redundancy_turns_on_for_paired_losses_but_not_for_single_ones() {
+        let start = Instant::now();
+        // 3 % loss in pairs, as on busy Wi-Fi: packets 31-32, 61-62, ...
+        let mut stats = ArrivalStats::new(start);
+        let now = stream(&mut stats, start, 200, |sequence| sequence % 30 == 1 || sequence % 30 == 2);
+        let paired = stats.bursts(now).unwrap();
+        assert_eq!((paired.loss_events, paired.burst_lost), (6, 12), "{paired:?}");
+        assert!(paired.bursty());
+        let mut policy = RedundancyPolicy::default();
+        assert!(policy.observe([paired], now));
+        // 5 % loss, one packet at a time, as on a mobile hotspot: Opus
+        // recovery already rebuilds those.
+        let mut stats = ArrivalStats::new(start);
+        let now = stream(&mut stats, start, 200, |sequence| sequence % 20 == 0);
+        let single = stats.bursts(now).unwrap();
+        assert_eq!((single.loss_events, single.burst_lost), (9, 0));
+        assert!(!single.bursty());
+        assert!(!RedundancyPolicy::default().observe([single], now));
+        // One run is not a pattern; runs under 2 % loss are not worth it.
+        let one = Bursts { loss_percent: 3.0, loss_events: 5, burst_lost: 2, expected: 500 };
+        assert!(!one.bursty());
+        let rare = Bursts { loss_percent: 1.5, loss_events: 3, burst_lost: 6, expected: 500 };
+        assert!(!rare.bursty());
+        // A reordered packet fills its gap and is no run.
+        let mut stats = ArrivalStats::new(start);
+        stream(&mut stats, start, 150, |sequence| sequence % 10 == 0);
+        for sequence in (10..=150).step_by(10) {
+            stats.observe(sequence, sequence * 960, false, start + FRAME * 151);
+        }
+        assert_eq!(stats.bursts(start + FRAME * 151).unwrap().burst_lost, 0);
+    }
+
+    #[test]
+    fn redundancy_stays_on_for_a_clean_minute_like_recovery() {
+        let start = Instant::now();
+        let bursty = Bursts { loss_percent: 3.0, loss_events: 8, burst_lost: 16, expected: 500 };
+        let clean = Bursts { loss_percent: 0.0, loss_events: 0, burst_lost: 0, expected: 500 };
+        let mut policy = RedundancyPolicy::default();
+        assert!(!policy.observe([], start));
+        assert!(policy.observe([clean, bursty], start), "the worst person decides");
+        for second in 1..=60 {
+            assert!(policy.observe([clean], start + Duration::from_secs(second)), "{second}");
+        }
+        // Silence is no evidence: the minute neither ends nor restarts.
+        assert!(policy.observe([], start + Duration::from_secs(90)));
+        assert!(!policy.observe([clean], start + Duration::from_secs(61 + 60)));
+        assert!(policy.observe([bursty], start + Duration::from_secs(200)));
     }
 
     #[test]

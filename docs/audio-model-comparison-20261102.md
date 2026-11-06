@@ -30,3 +30,9 @@ Each AudioControls owns at most one comparison worker; job/result queues are bou
 - Bounded overload, stale-result/private-audio rejection, capture stalls, 20/40/200 ms bursts, saved settings, UI and existing Enhanced preview regression tests.
 
 Reference agreement and synthetic buffering tests do not establish perceived speech quality, echo performance or hardware end-to-end latency. The user's model preference remains open. Public beta publication is separate from this local test build.
+
+## Note til næste lydtest før stabil udgivelse
+
+- [ ] Prøv modellerne med samme mikrofon, gain, tale og baggrundsstøj i **Listen to Myself** og i et rigtigt opkald. Brug Enhanced som reference. Notér taleklarhed, støj mellem ord og oplevet forsinkelse.
+- [ ] Mål installationspakkens og den installerede klients størrelse med og uden de modeller, der kan undværes. Kontrollér også delte biblioteker og **Studio automatic**, som kan bruge en model som reserve.
+- [ ] Vælg hvilke modeller der skal med ud fra lytningen og den målte besparelse. Afprøv opgradering fra gemte indstillinger, der vælger en udgået model.

@@ -265,6 +265,47 @@ fn a_listing_without_a_package_is_adopted_only_with_its_exact_fingerprint() {
     assert!(restored.first_use_candidates.is_empty());
 }
 
+/// A server lists one of its own keys under the user's account, reusing the
+/// device ID of a person the user verified (or merely trusted). Pins are keyed
+/// by device ID, so without a check the own-account rule would replace (and
+/// unverify) that person's pin, and the key manager would swap their leaf.
+#[test]
+fn a_listing_that_moves_a_pinned_device_id_to_another_account_is_held() {
+    let mut alice = device("alice", "alice-pc");
+    let mut bob = device("bob", "bob-pc");
+    let mut carol = device("carol", "carol-pc");
+    let b = package(&mut bob);
+    let c = package(&mut carol);
+    durable(&mut alice, |d| d.trust_on_first_use(&b));
+    durable(&mut alice, |d| d.trust_on_first_use(&c));
+    durable(&mut alice, |d| d.approve(&c, &c.fingerprint));
+
+    for (target, owner) in [
+        (&c, "alice"),
+        (&c, "mallory"),
+        (&b, "alice"),
+        (&b, "mallory"),
+    ] {
+        let mut moved = device(owner, &target.identity.device_id);
+        let forged = package(&mut moved);
+        assert_eq!(alice.first_use_decision(&forged), FirstUse::Held);
+        assert_eq!(
+            durable(&mut alice, |d| d.trust_on_first_use(&forged)),
+            FirstUse::Held
+        );
+        assert!(
+            alice
+                .transact(|d| d.accept_new_key(&forged, None), |_| Ok(()))
+                .is_err(),
+            "a pinned device ID never changes account, even by one click"
+        );
+        assert!(alice.trust(&forged).is_none());
+    }
+    assert_eq!(alice.trust(&c), Some(Trust::Verified));
+    assert!(alice.person_verified("carol"));
+    assert_eq!(alice.trust(&b), Some(Trust::FirstUse));
+}
+
 #[test]
 fn a_new_own_device_is_always_trusted_and_this_device_cannot_be_replaced() {
     let mut pc = device("alice", "alice-pc");
@@ -363,4 +404,48 @@ fn a_key_managers_addition_of_an_unlisted_device_is_followed_only_for_unverified
     // Only her decision lets the update in.
     durable(&mut alice, |d| d.accept_new_key(&dave_phone, None));
     durable(&mut alice, |d| d.receive("channel:one", &add_phone.commit));
+}
+
+// GUIDE.md, LAES-MIG.txt and the recovery help say lost device keys cannot be repaired
+// with an account password or a server backup alone. Everything the server keeps for a
+// device (its public listing, the Welcome and the ciphertext) does not let a replacement
+// device for the same account and device ID read what the lost device could.
+#[test]
+fn a_replacement_device_for_the_same_account_cannot_read_what_the_lost_device_could() {
+    let mut alice = device("alice", "alice-pc");
+    let mut lost = device("bob", "bob-pc");
+    let a = package(&mut alice);
+    let b = package(&mut lost);
+    durable(&mut alice, |d| d.trust_on_first_use(&b));
+    durable(&mut lost, |d| d.trust_on_first_use(&a));
+    durable(&mut alice, |d| d.create_group("dm:bob", "fixture-dm"));
+    let change = durable(&mut alice, |d| {
+        d.add_members("dm:bob", std::slice::from_ref(&b))
+    });
+    let welcome = change.welcome.clone().unwrap();
+    let wire = durable(&mut alice, |d| {
+        d.encrypt("dm:bob", b"only the original device can read this")
+    });
+    durable(&mut lost, |d| {
+        d.join("dm:bob", "fixture-dm", a.identity.clone(), &welcome)
+    });
+    assert!(matches!(
+        durable(&mut lost, |d| d.receive("dm:bob", &wire)),
+        Received::Application { .. }
+    ));
+    drop(lost);
+
+    let mut replacement = device("bob", "bob-pc");
+    let r = package(&mut replacement);
+    assert_ne!(r.fingerprint, b.fingerprint, "a new device gets new keys");
+    durable(&mut replacement, |d| d.trust_on_first_use(&a));
+    assert!(replacement
+        .transact(
+            |d| d.join("dm:bob", "fixture-dm", a.identity.clone(), &welcome),
+            |_| Ok(())
+        )
+        .is_err());
+    assert!(replacement
+        .transact(|d| d.receive("dm:bob", &wire), |_| Ok(()))
+        .is_err());
 }

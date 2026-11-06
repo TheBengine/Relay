@@ -900,10 +900,14 @@ Runs the noise corpus through each send chain and prints a Markdown table.
   --write-wav    also write the corpus and every chain's output as WAV
   --input-16bit  feed every chain the 16-bit samples the corpus WAVs hold,
                  as an outside tool behind a replay chain was fed
+  --key-hold-cpu time the key-hold stage alone (plain and guided) per 10 ms
+                 block on keyboard_during_speech, then exit
 Environment:
   VOICE_TEST_WAV=<48 kHz mono 16-bit WAV>  a recorded talker for every row
   RELAY_REPLAY_DIR=<folder>  one chain `replay:<label>` per subfolder <label>
                  (see noise_suppressor::bench::Replay)
+  RELAY_KEYS_CHAINS=<name:settings;...>  extra dpdfnet8 key-hold chains
+                 (see noise_suppressor::bench::keys_chains_from_env)
 Results: target/audio-bench/<chain>.json";
 
 /// Entry point of the `audio-bench` binary. Returns the process exit code.
@@ -928,6 +932,18 @@ pub fn run_cli() -> i32 {
             },
             "--write-wav" => write_wavs = true,
             "--input-16bit" => input_16bit = true,
+            "--key-hold-cpu" => {
+                let row = corpus().into_iter().find(|item| item.name == "keyboard_during_speech").expect("row");
+                let noisy = row.noisy();
+                for guided in [false, true] {
+                    let (p50, p99, max) = crate::noise_suppressor::bench::key_hold_cpu(&noisy, guided);
+                    println!(
+                        "key hold{}: p50 {p50:.4} ms, p99 {p99:.4} ms, max {max:.4} ms per 10 ms block",
+                        if guided { " (guided)" } else { "" }
+                    );
+                }
+                return 0;
+            }
             other => {
                 eprintln!("Unknown argument {other}\n{USAGE}");
                 return 2;

@@ -518,6 +518,10 @@ fn moving_back_copies_current_data_over_the_stale_copy() {
     let root = move_to_folder(&w);
     // Relay ran from the new folder and changed data there.
     put(root.join("config").join("preferences.json"), b"newer prefs");
+    let update_caches = ["updates", "updates-stable"];
+    for cache in update_caches {
+        put(root.join(cache).join("publisher.json"), cache.as_bytes());
+    }
     put(
         root.join("server-data").join("relay.sqlite3"),
         b"newer sqlite",
@@ -544,6 +548,13 @@ fn moving_back_copies_current_data_over_the_stale_copy() {
         fs::read(d.local.join("encryption").join("a.device")).unwrap(),
         b"device-checkpoint"
     );
+    for cache in update_caches {
+        assert!(!d.local.join(cache).exists());
+        assert_eq!(
+            fs::read(root.join(cache).join("publisher.json")).unwrap(),
+            cache.as_bytes()
+        );
+    }
     for slot in [&d.config, &d.local, &d.server, &d.replicas] {
         assert!(!slot.join(IN_PROGRESS).exists());
         let parent = slot.parent().unwrap();

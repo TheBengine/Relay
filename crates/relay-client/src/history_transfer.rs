@@ -227,6 +227,31 @@ mod tests {
             assert!(Code::parse(text).is_err());
         }
     }
+    // docs/encryption.md: a random 256-bit code that stays on the PCs, and at most
+    // 100,000 records per snapshot.
+    #[test]
+    fn history_transfer_never_uploads_its_code_and_bounds_records() {
+        let (origin, mut snapshot) = fixture();
+        let code = Code::generate().unwrap();
+        assert_eq!(code.0.len(), 32);
+        let wire = seal(&snapshot, &code, &origin).unwrap();
+        let hex: String = code.0.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!wire.windows(32).any(|w| w == code.0.as_slice()));
+        assert!(!wire.windows(hex.len()).any(|w| w.eq_ignore_ascii_case(hex.as_bytes())));
+        assert_ne!(code.id(), hex, "the server-visible id is not the code");
+        let row = snapshot.entries.values().next().unwrap().clone();
+        snapshot.entries.clear();
+        for index in 0..=MAX_ROWS {
+            let mut copy = row.clone();
+            copy.message_id = Some(format!("message-{index}"));
+            copy.envelope.client_id = format!("client-{index}");
+            snapshot.entries.insert(format!("{index:064x}"), copy);
+        }
+        assert_eq!(snapshot.entries.len(), 100_001);
+        assert!(snapshot.validate(&origin).is_err());
+        snapshot.entries.remove(&format!("{:064x}", MAX_ROWS));
+        assert!(snapshot.validate(&origin).is_ok());
+    }
     #[test]
     fn history_transfer_rejects_unbound_records_and_invalid_actions() {
         let (origin, mut snapshot) = fixture();

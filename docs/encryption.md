@@ -50,12 +50,18 @@ other communities. Both client and server must support `history-transfer-v1`.
 The random 256-bit code stays on the PCs. The original PC encrypts a bounded
 snapshot with XChaCha20-Poly1305; its authenticated context includes the transfer,
 community and account. The server only relays opaque ciphertext in memory,
-owner-scoped, until consumption, expiry after 15 minutes, or restart. Its 128 MiB
+owner-scoped, until consumption, expiry after 15 minutes, server restart or
+database restore. Its 128 MiB
 budget includes in-flight uploads and retained responses; each snapshot is at
 most 32 MiB and 100,000 records. This is an explicit snapshot of messages already
 opened on the original PC, not ongoing synchronization or a permanent backup.
 Expired entries are purged on subsequent transfer requests; they cannot be fetched
 after their deadline. A server operator can retain ciphertext outside this service.
+The server checks the current session and membership before publishing,
+reading or consuming a transfer. A slow upload releases the maintenance lock
+while the bytes arrive, so sign-out, session revocation and database restore can
+proceed. After a successful restore, create and approve a new transfer. An
+already-issued download can still finish delivering its encrypted bytes.
 
 Received messages appear in their conversations when the server still supplies
 the matching ciphertext, with **History transferred from your other PC** provenance.
@@ -65,7 +71,8 @@ ordering, device verification, pending sends and MLS ratchets are not imported.
 Each PC retains its own device identity. New devices still need ordinary admission
 to receive future messages. Recovered history is stored in separate DPAPI segments
 and atomically referenced by checkpoint version 4; older clients cannot open that
-checkpoint. Failed or cancelled staging removes its newly created files.
+checkpoint. Failed or cancelled staging removes uncommitted files. Segments
+that may already be referenced by a checkpoint are preserved for recovery.
 
 A personal recovery key, authenticator-based recovery and email recovery are
 not implemented by this feature. Existing read-only history backups remain separate.
@@ -81,6 +88,10 @@ The private actor saves its ratchets and exact outgoing ciphertext before publis
 Windows DPAPI protects the saved state for the current Windows user. An account-bound Windows ownership lease and an exclusive file lock prevent concurrent actors from using the same account's ratchets, including a current snapshot copied into another storage folder. Relay coordinates credential operations across processes; each revision must advance and its write is checked before publication. Atomic file replacement and a separate Windows Credential Manager marker bind the revision to the device identity. Existing state with a missing marker, an older revision, or a different device generation fails closed. A preview's counter-only marker also requires explicit device reset; it cannot authorize reopening old keys. A failed save pauses encryption; plaintext is never used as a storage fallback.
 
 **Reset This Encryption Device** requires typed confirmation bound to the displayed community, account and device. It preserves the old protected file as a retired archive and creates a new identity. When the live actor identifies the previous device, reset durably retries revoking its registration before registering the replacement. If damaged or unavailable protected state prevents that identification, use the own-device list to revoke the previous registration explicitly. Other participants must compare the new fingerprint. A retired archive is not an automatic history recovery facility; a new device cannot decrypt previous content without its old keys. Own-device revocation is separate from removing local verification of another person's device.
+
+On a server with the revocation fix, a revoked device ID stays revoked across reconnects and restarts. To use that PC again, reset its encryption device and compare the new fingerprint. Revoke the login session separately if you also need to sign out that PC.
+
+A device that had already re-registered on an older server appears active and must be revoked again. Relay-managed restore of the same community preserves device revocations from the current database, including devices and owners absent from the older backup. The restore invalidates existing sessions. A manually replaced database or a fresh host can only use the revocations recorded in the backup it receives.
 
 Server backups contain opaque encrypted content and public delivery state, not clients' private keys. Restoring only a server database, copying a device file between Windows users, or rewinding a private snapshot is not a coordinated cryptographic recovery procedure. Preserve both sides before experimenting with restore. Same-user malware or a stolen unlocked session can read endpoint data despite DPAPI.
 
@@ -157,7 +168,7 @@ Initial attestation delivery gets at most one extra attempt after a transport er
 
 ## Turning end-to-end encryption off for a community
 
-By default every community uses Relay's end-to-end encryption. On 16 October 2026 the user decided that the community owner must be able to turn it off completely. This covers sending and reading ordinary text and files. Voice, video, edits and reactions are unchanged and keep needing working encryption keys.
+The current server creation flow recommends end-to-end encryption and preselects protected mode. A creator can choose open mode, and existing communities keep their settings. The steps below describe the original rollout for text and files. Open-mode support for later features has its own behavior.
 
 ### How it works
 

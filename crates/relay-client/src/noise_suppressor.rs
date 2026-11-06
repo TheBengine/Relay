@@ -60,6 +60,12 @@ pub(crate) enum SuppressorKind {
 /// bench, see `docs/audio-studio-level-20261030.md`.
 pub(crate) const STUDIO_CLICKS: bool = false;
 
+/// Studio holds back no keys struck while the user talks: every key-hold
+/// candidate (before the model, after it, guided by what the model removed)
+/// let as much or more of the keys through and most changed the voice; see
+/// `docs/audio-keys-on-words-20261030.md`. They stay on the bench.
+pub(crate) const STUDIO_KEYS: Option<crate::click_suppression::KeyHoldParams> = None;
+
 /// The suppressor for the noise settings: RNNoise for Standard and for
 /// every Enhanced strength, DPDFNet (dpdfnet8, with the overrun guard) for
 /// Studio. The measured alternatives to RNNoise (WebRTC NS in front of it,
@@ -78,6 +84,8 @@ pub(crate) fn for_setting(
             variant: crate::dpdfnet::Variant::Eight,
             probability: STUDIO_CLICKS,
             guarded: true,
+            keys_before: STUDIO_KEYS,
+            keys_after: STUDIO_KEYS,
         }),
         crate::audio_settings::NoiseModel::WebRtc => SuppressorKind::WebRtcNs(NsLevel::High),
         crate::audio_settings::NoiseModel::RnNoiseThenWebRtc => SuppressorKind::RnNoiseThenWebRtcNs(NsLevel::High),
@@ -313,7 +321,7 @@ pub(crate) mod bench {
     use crate::dpdfnet::{StudioKind, Variant};
     use crate::audio_bench::{ChainSpec, SendChain};
     use crate::audio_settings::{AudioSettings, NoiseModel};
-    use crate::click_suppression::NoiseStrength;
+    use crate::click_suppression::{KeyHoldParams, NoiseStrength};
     use crate::media::{AudioControls, MicrophoneProcessor};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, OnceLock};
@@ -503,13 +511,93 @@ pub(crate) mod bench {
     }
 
     fn studio(variant: Variant, probability: bool) -> SuppressorKind {
-        SuppressorKind::DpdfNet(StudioKind { variant, probability, guarded: false })
+        studio_keys(variant, probability, None, None)
+    }
+
+    fn studio_keys(
+        variant: Variant,
+        probability: bool,
+        keys_before: Option<KeyHoldParams>,
+        keys_after: Option<KeyHoldParams>,
+    ) -> SuppressorKind {
+        SuppressorKind::DpdfNet(StudioKind { variant, probability, guarded: false, keys_before, keys_after })
+    }
+
+    /// The plan's candidate (b): a 12 dB jump within 2 ms against the 50 ms
+    /// median, the band above 1 kHz held for at most 8 ms, after the model.
+    const KEYS_AFTER: KeyHoldParams = KeyHoldParams { split_hz: 1_000, onset_db: 12, hold_db: 0, max_ms: 8, removed_db: 0 };
+    /// The same detector on the model's input, before the model sees the key.
+    const KEYS_BEFORE: KeyHoldParams = KeyHoldParams { split_hz: 1_000, onset_db: 12, hold_db: 0, max_ms: 40, removed_db: 0 };
+    /// After the model, looking for the jump in the model's input and only
+    /// where the model removed at least 6 dB of it: spares consonants.
+    pub(crate) const KEYS_GUIDED: KeyHoldParams =
+        KeyHoldParams { split_hz: 1_000, onset_db: 12, hold_db: 0, max_ms: 8, removed_db: 6 };
+
+    /// `RELAY_KEYS_CHAINS=name:before=HZ/DB/HOLD_DB/MS,after=HZ/DB/HOLD_DB/MS/REMOVED_DB;name2:...`
+    /// adds a dpdfnet8 chain per entry with those key-hold settings (either
+    /// part may be left out), for parameter sweeps without a rebuild.
+    fn keys_chains_from_env() -> Vec<ChainSpec> {
+        let Ok(text) = std::env::var("RELAY_KEYS_CHAINS") else {
+            return Vec::new();
+        };
+        let parse = |value: &str| -> KeyHoldParams {
+            let parts: Vec<i32> = value
+                .split('/')
+                .map(|p| p.trim().parse().unwrap_or_else(|_| panic!("RELAY_KEYS_CHAINS: bad number in {value:?}")))
+                .collect();
+            assert!(matches!(parts.len(), 4 | 5), "RELAY_KEYS_CHAINS: HZ/DB/HOLD_DB/MS[/REMOVED_DB], not {value:?}");
+            KeyHoldParams {
+                split_hz: parts[0] as u16,
+                onset_db: parts[1] as u8,
+                hold_db: parts[2] as i8,
+                max_ms: parts[3] as u8,
+                removed_db: parts.get(4).copied().unwrap_or(0) as u8,
+            }
+        };
+        text.split(';')
+            .filter(|entry| !entry.trim().is_empty())
+            .map(|entry| {
+                let (name, settings) = entry.split_once(':').expect("RELAY_KEYS_CHAINS: name:settings");
+                let (mut before, mut after) = (None, None);
+                for part in settings.split(',') {
+                    match part.split_once('=') {
+                        Some(("before", value)) => before = Some(parse(value)),
+                        Some(("after", value)) => after = Some(parse(value)),
+                        _ => panic!("RELAY_KEYS_CHAINS: before=... or after=..., not {part:?}"),
+                    }
+                }
+                let name: &'static str = Box::leak(format!("dpdfnet8+{}", name.trim()).into_boxed_str());
+                let kind = studio_keys(Variant::Eight, false, before, after);
+                ChainSpec::new(name, move || Box::new(Candidate::new(name, kind, None)))
+            })
+            .collect()
     }
 
     macro_rules! candidate {
         ($name:literal, $kind:expr, $clicks:expr) => {
             ChainSpec::new($name, || Box::new(Candidate::new($name, $kind, $clicks)))
         };
+    }
+
+    /// CPU of one key-hold stage per 10 ms block on `signal` (and, guided,
+    /// the same signal as its reference): (p50, p99, max) in ms.
+    pub fn key_hold_cpu(signal: &[f32], guided: bool) -> (f32, f32, f32) {
+        let params = if guided { KEYS_GUIDED } else { KEYS_AFTER };
+        let mut stage = crate::click_suppression::KeyHold::new(params);
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            for chunk in signal.chunks_exact(BLOCK) {
+                let reference: [f32; BLOCK] = chunk.try_into().expect("whole blocks");
+                let mut block = reference;
+                let started = std::time::Instant::now();
+                stage.process_with(&mut block, guided.then_some(&reference));
+                times.push(started.elapsed().as_secs_f32() * 1000.0);
+                std::hint::black_box(&block);
+            }
+        }
+        times.sort_by(f32::total_cmp);
+        let at = |f: f32| times[((times.len() - 1) as f32 * f).round() as usize];
+        (at(0.5), at(0.99), at(1.0))
     }
 
     pub fn chains() -> Vec<ChainSpec> {
@@ -532,7 +620,17 @@ pub(crate) mod bench {
             // Click suppression fed the model's output-to-input energy ratio.
             candidate!("dpdfnet8+ratio-clicks", studio(Variant::Eight, true), Some(Normal)),
             candidate!("dpdfnet2+ratio-clicks", studio(Variant::Two, true), Some(Normal)),
+            // Keys struck while talking (docs/audio-keys-on-words-20261030.md).
+            candidate!("dpdfnet8+keys-after", studio_keys(Variant::Eight, false, None, Some(KEYS_AFTER)), None),
+            candidate!(
+                "dpdfnet8+ratio-clicks+keys-after",
+                studio_keys(Variant::Eight, true, None, Some(KEYS_AFTER)),
+                Some(Normal)
+            ),
+            candidate!("dpdfnet8+keys-before", studio_keys(Variant::Eight, false, Some(KEYS_BEFORE), None), None),
+            candidate!("dpdfnet8+keys-guided", studio_keys(Variant::Eight, false, None, Some(KEYS_GUIDED)), None),
         ];
+        chains.extend(keys_chains_from_env());
         // Worker E's DeepFilterNet routes (docs/audio-deepfilter-decision-20261029.md),
         // kept for its reruns; RELAY_REPLAY_DIR does the same for any tool.
         let input = crate::audio_bench::output_directory().join("wav");
@@ -609,9 +707,25 @@ mod tests {
                     variant: crate::dpdfnet::Variant::Eight,
                     probability: STUDIO_CLICKS,
                     guarded: true,
+                    keys_before: None,
+                    keys_after: None,
                 })
             );
         }
+    }
+
+    /// Keys on words (docs/audio-keys-on-words-20261030.md): no key hold
+    /// shipped, so Studio's delay stays 60 ms and its output is the model's.
+    #[test]
+    fn studio_holds_back_no_keys_and_keeps_its_delay() {
+        use crate::audio_settings::NoiseModel;
+        use crate::click_suppression::NoiseStrength::Normal;
+        assert_eq!(STUDIO_KEYS, None);
+        let SuppressorKind::DpdfNet(kind) = for_setting(NoiseModel::Studio, Normal) else {
+            panic!("Studio is DPDFNet");
+        };
+        assert_eq!((kind.keys_before, kind.keys_after), (None, None));
+        assert_eq!(crate::dpdfnet::DELAY_SAMPLES, 2_880);
     }
 
     /// The one candidate that meets the plan's fan target, pinned so the

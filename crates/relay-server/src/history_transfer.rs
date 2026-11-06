@@ -1,16 +1,39 @@
 //! Temporary owner-only opaque relay. Never writes snapshots to DB, disk or replicas.
 use super::*;
+use axum::{extract::OriginalUri, Extension};
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Instant,
 };
 pub const MAX_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const ROUTE: &str = "/api/history-transfer/{id}";
 const MAX_TOTAL: usize = 128 * 1024 * 1024;
 const TTL: Duration = Duration::from_secs(15 * 60);
 #[derive(Default)]
 pub(super) struct Store {
     entries: Mutex<HashMap<String, Entry>>,
     used: Arc<AtomicUsize>,
+}
+
+impl Store {
+    /// Called under the DB lock as soon as a restore replaces the database.
+    pub(super) fn clear_after_restore(&self) {
+        lock(&self.entries).clear();
+    }
+}
+/// Dispatch holds maintenance through authentication and rate limiting. The
+/// upload takes the guard out before awaiting a potentially slow request body.
+#[derive(Clone)]
+pub(super) struct UploadAdmission(Arc<Mutex<Option<tokio::sync::OwnedRwLockReadGuard<()>>>>);
+
+impl UploadAdmission {
+    pub(super) fn new(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
+        Self(Arc::new(Mutex::new(Some(guard))))
+    }
+
+    fn release_for_body(self) {
+        drop(lock(&self.0).take());
+    }
 }
 struct Entry {
     id: String,
@@ -71,9 +94,25 @@ fn valid(id: &str) -> ApiResult<()> {
 fn clean(entries: &mut HashMap<String, Entry>) {
     entries.retain(|_, entry| entry.expires > Instant::now());
 }
-pub async fn put_transfer(
+
+fn require_live_session(db: &Connection, auth: &Auth) -> ApiResult<()> {
+    let live: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions s JOIN membership m ON m.user_id=s.user_id
+          WHERE s.token_hash=?1 AND s.user_id=?2 AND s.expires>?3 AND m.status='active')",
+        params![auth.token_hash, auth.user.id, now()],
+        |row| row.get(0),
+    )?;
+    if live {
+        Ok(())
+    } else {
+        Err(unauthorized())
+    }
+}
+pub(super) async fn put_transfer(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    Extension(admission): Extension<UploadAdmission>,
     headers: HeaderMap,
     body: Body,
 ) -> ApiResult<StatusCode> {
@@ -95,6 +134,7 @@ pub async fn put_transfer(
     }
     // Count in-flight uploads and retained response bodies, not just stored entries.
     let mut reservation = Reservation::acquire(&state.0.history_transfer.used)?;
+    admission.release_for_body();
     let bytes = tokio::time::timeout(
         Duration::from_secs(45),
         axum::body::to_bytes(body, MAX_BYTES),
@@ -111,6 +151,12 @@ pub async fn put_transfer(
         return Err(bad("Invalid encrypted history transfer"));
     }
     reservation.shrink(bytes.len());
+    let _maintenance = community::request_read_guard(&state).await?;
+    community::check_request_admission(&state, uri.path(), true)?;
+    // Retain the DB guard through publication. Expiry and membership changes
+    // may have invalidated the initial authentication during the body read.
+    let db = lock(&state.0.db);
+    require_live_session(&db, &auth)?;
     let mut entries = lock(&state.0.history_transfer.entries);
     clean(&mut entries);
     if let Some(existing) = entries.get(&auth.user.id) {
@@ -155,6 +201,8 @@ pub async fn get_transfer(
 ) -> ApiResult<Response> {
     valid(&id)?;
     let auth = state.auth(&headers)?;
+    let db = lock(&state.0.db);
+    require_live_session(&db, &auth)?;
     let mut entries = lock(&state.0.history_transfer.entries);
     clean(&mut entries);
     let data = entries
@@ -183,6 +231,8 @@ pub async fn delete_transfer(
 ) -> ApiResult<StatusCode> {
     valid(&id)?;
     let auth = state.auth(&headers)?;
+    let db = lock(&state.0.db);
+    require_live_session(&db, &auth)?;
     let mut entries = lock(&state.0.history_transfer.entries);
     clean(&mut entries);
     if let Some(entry) = entries.get_mut(&auth.user.id).filter(|e| e.id == id) {
@@ -193,9 +243,10 @@ pub async fn delete_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{new_invite, signup};
+    use crate::tests::{new_invite, request, signup};
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use std::path::PathBuf;
     use tower::ServiceExt;
     async fn call(
         app: &Router,
@@ -220,6 +271,261 @@ mod tests {
         b.extend([7; 80]);
         b
     }
+
+    fn backup_for_restore(state: &AppState) -> (String, PathBuf) {
+        let backup_id = id();
+        let directory = state.0.data.join("backups");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join(format!("{backup_id}.sqlite3"));
+        state.backup_to(&file).unwrap();
+        (backup_id, file)
+    }
+
+    #[tokio::test]
+    async fn history_upload_rechecks_session_and_membership_after_reading_the_body() {
+        for change in ["logout", "revoke", "expire", "remove", "pause", "restore"] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = AppState::open(temp.path(), "Transfer revocation", 0).unwrap();
+            let app = router(state.clone());
+            let alice = signup(&app, "Alice", "").await;
+            let auth = state.authenticate_token(&alice.token).unwrap();
+            let id = "a".repeat(64);
+            let (reading, started) = tokio::sync::oneshot::channel();
+            let (release, resume) = tokio::sync::oneshot::channel();
+            let body = Body::from_stream(futures_util::stream::once(async move {
+                reading.send(()).unwrap();
+                resume.await.unwrap();
+                Ok::<_, std::io::Error>(Bytes::from(wire()))
+            }));
+            let upload = Request::put(format!("/api/history-transfer/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", alice.token))
+                .body(body)
+                .unwrap();
+            let pending = tokio::spawn(app.clone().oneshot(upload));
+            tokio::time::timeout(Duration::from_secs(5), started)
+                .await
+                .unwrap()
+                .unwrap();
+            match change {
+                "logout" => {
+                    assert_eq!(
+                        request(
+                            &app,
+                            "POST",
+                            "/api/logout",
+                            Some(&alice.token),
+                            serde_json::Value::Null,
+                        )
+                        .await
+                        .0,
+                        StatusCode::NO_CONTENT
+                    );
+                }
+                "revoke" => {
+                    let other =
+                        new_session(&lock(&state.0.db), &state.0.seal, alice.user.clone()).unwrap();
+                    let path = format!("/api/sessions/{}", auth.token_hash);
+                    assert_eq!(
+                        request(
+                            &app,
+                            "DELETE",
+                            &path,
+                            Some(&other.token),
+                            serde_json::Value::Null,
+                        )
+                        .await
+                        .0,
+                        StatusCode::NO_CONTENT
+                    );
+                }
+                "expire" => {
+                    lock(&state.0.db)
+                        .execute(
+                            "UPDATE sessions SET expires=0 WHERE token_hash=?1",
+                            [&auth.token_hash],
+                        )
+                        .unwrap();
+                }
+                "remove" => {
+                    lock(&state.0.db)
+                        .execute(
+                            "UPDATE membership SET status='removed' WHERE user_id=?1",
+                            [&alice.user.id],
+                        )
+                        .unwrap();
+                }
+                "pause" => state.0.takeover_failed.store(true, Ordering::Release),
+                "restore" => {
+                    let (backup_id, _) = backup_for_restore(&state);
+                    assert_eq!(
+                        request(
+                            &app,
+                            "POST",
+                            "/api/admin/restore",
+                            Some(&alice.token),
+                            serde_json::json!({
+                                "backup_id":backup_id,"confirm_server_id":state.server_id().unwrap()
+                            }),
+                        )
+                        .await
+                        .0,
+                        StatusCode::OK
+                    );
+                }
+                _ => unreachable!(),
+            }
+            release.send(()).unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(5), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let expected = if change == "pause" {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::UNAUTHORIZED
+            };
+            assert_eq!(reply.status(), expected, "{change}");
+            assert!(lock(&state.0.history_transfer.entries).is_empty());
+            assert_eq!(state.0.history_transfer.used.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn history_transfer_is_discarded_only_after_successful_restore() {
+        for via_http in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = AppState::open(temp.path(), "Transfer restore", 0).unwrap();
+            let app = router(state.clone());
+            let alice = signup(&app, "Alice", "").await;
+            let (backup_id, backup) = backup_for_restore(&state);
+            let transfer = "a".repeat(64);
+            assert_eq!(
+                call(&app, "PUT", &transfer, Some(&alice.token), wire())
+                    .await
+                    .status(),
+                StatusCode::NO_CONTENT
+            );
+            if via_http {
+                assert_eq!(
+                    request(
+                        &app,
+                        "POST",
+                        "/api/admin/restore",
+                        Some(&alice.token),
+                        serde_json::json!({"backup_id":backup_id,"confirm_server_id":"wrong"}),
+                    )
+                    .await
+                    .0,
+                    StatusCode::BAD_REQUEST
+                );
+            } else {
+                assert!(state
+                    .restore_from(&backup.with_extension("missing"))
+                    .is_err());
+            }
+            let issued = call(&app, "GET", &transfer, Some(&alice.token), vec![]).await;
+            assert_eq!(issued.status(), StatusCode::OK);
+
+            if via_http {
+                assert_eq!(
+                    request(
+                        &app,
+                        "POST",
+                        "/api/admin/restore",
+                        Some(&alice.token),
+                        serde_json::json!({
+                            "backup_id":backup_id,"confirm_server_id":state.server_id().unwrap()
+                        }),
+                    )
+                    .await
+                    .0,
+                    StatusCode::OK
+                );
+            } else {
+                state.restore_from(&backup).unwrap();
+            }
+            assert_eq!(
+                call(&app, "GET", &transfer, Some(&alice.token), vec![])
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let fresh = new_session(&lock(&state.0.db), &state.0.seal, alice.user).unwrap();
+            assert_eq!(
+                call(&app, "GET", &transfer, Some(&fresh.token), vec![])
+                    .await
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert!(lock(&state.0.history_transfer.entries).is_empty());
+            assert_eq!(
+                state.0.history_transfer.used.load(Ordering::Acquire),
+                wire().len()
+            );
+            drop(issued);
+            assert_eq!(state.0.history_transfer.used.load(Ordering::Acquire), 0);
+            assert_eq!(
+                call(&app, "PUT", &"b".repeat(64), Some(&fresh.token), wire())
+                    .await
+                    .status(),
+                StatusCode::NO_CONTENT
+            );
+        }
+    }
+
+    // docs/encryption.md and the transfer screen: the server keeps a transfer only in
+    // memory, never on disk, and stops serving it after a restart.
+    #[tokio::test]
+    async fn history_transfer_is_never_written_to_disk_and_is_gone_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = "c".repeat(64);
+        let marker = b"readiness-docs-unique-history-transfer-marker-20261105";
+        let mut body = b"RLYXFER1".to_vec();
+        body.extend_from_slice(marker);
+        body.extend([9; 48]);
+        let token = {
+            let state = AppState::open(temp.path(), "Transfer restart", 0).unwrap();
+            let app = router(state.clone());
+            let alice = signup(&app, "Alice", "").await;
+            assert_eq!(
+                call(&app, "PUT", &id, Some(&alice.token), body.clone()).await.status(),
+                StatusCode::NO_CONTENT
+            );
+            let served = call(&app, "GET", &id, Some(&alice.token), vec![]).await;
+            assert_eq!(served.into_body().collect().await.unwrap().to_bytes(), body);
+            let backup = temp.path().join("restart-check.sqlite3");
+            state.backup_to(&backup).unwrap();
+            for entry in walk(temp.path()) {
+                let bytes = std::fs::read(&entry).unwrap();
+                assert!(
+                    !bytes.windows(marker.len()).any(|w| w == marker),
+                    "transfer bytes reached {}",
+                    entry.display()
+                );
+            }
+            alice.token
+        };
+        let state = AppState::open(temp.path(), "Transfer restart", 0).unwrap();
+        let app = router(state);
+        assert_eq!(
+            call(&app, "GET", &id, Some(&token), vec![]).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    fn walk(root: &std::path::Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { pending.push(path) } else { files.push(path) }
+            }
+        }
+        files
+    }
+
     #[tokio::test]
     async fn owner_only_expiring_transfer_is_atomic_and_consumed() {
         let temp = tempfile::tempdir().unwrap();

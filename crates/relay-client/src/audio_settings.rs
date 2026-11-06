@@ -176,6 +176,8 @@ pub struct VoiceDelayBudget {
     pub playback_ms: f32,
     pub receive_min_ms: u32,
     pub receive_max_ms: u32,
+    /// "Clean up what I hear": the model on the incoming audio.
+    pub incoming_cleanup_ms: f32,
 }
 
 impl VoiceDelayBudget {
@@ -184,7 +186,8 @@ impl VoiceDelayBudget {
             + self.suppression_ms as f32
             + self.speech_start_ms
             + self.codec_ms?
-            + self.playback_ms;
+            + self.playback_ms
+            + self.incoming_cleanup_ms;
         Some((
             outgoing + self.receive_min_ms as f32,
             outgoing + self.receive_max_ms as f32,
@@ -294,6 +297,15 @@ pub struct AudioSettings {
     pub sounds_enabled: bool,
     pub sound_volume: f32,
     pub event_sounds: crate::sound_customization::EventSounds,
+    /// Push-to-talk keeps the microphone open this long after the key is
+    /// released (0..=2000 ms), so the last word is not cut off.
+    pub push_to_talk_release_ms: u32,
+    /// "Make everyone the same volume": level each person you hear toward
+    /// the same loudness, before their own volume.
+    pub level_voices: bool,
+    /// "Clean up what I hear": remove noise from incoming voices (adds
+    /// 67.5 ms to what you hear).
+    pub clean_incoming: bool,
 }
 
 impl Default for AudioSettings {
@@ -341,6 +353,9 @@ impl Default for AudioSettings {
             sounds_enabled: true,
             sound_volume: 0.25,
             event_sounds: Default::default(),
+            push_to_talk_release_ms: 200,
+            level_voices: true,
+            clean_incoming: false,
         }
     }
 }
@@ -508,6 +523,11 @@ impl AudioSettings {
             } else {
                 settings.jitter_ms
             },
+            incoming_cleanup_ms: if settings.clean_incoming {
+                crate::receive_level::CLEANUP_DELAY_MS
+            } else {
+                0.0
+            },
         }
     }
 
@@ -575,6 +595,9 @@ impl AudioSettings {
         }
         self.jitter_ms = self.jitter_ms.clamp(5, 120).div_ceil(5) * 5;
         self.echo_delay_ms = self.echo_delay_ms.min(250);
+        self.push_to_talk_release_ms = self
+            .push_to_talk_release_ms
+            .min(crate::voice_gate::MAX_PTT_RELEASE_MS);
         self
     }
 }
@@ -689,6 +712,22 @@ mod tests {
         }
         .normalized();
         assert_eq!((wild.activation_attack_ms, wild.activation_release_ms), (50, 500));
+    }
+
+    #[test]
+    fn push_to_talk_release_delay_defaults_to_200_ms_for_older_files_and_is_bounded() {
+        // A file saved before the setting existed.
+        let old: super::AudioSettings =
+            serde_json::from_str(r#"{"transmission":"push_to_talk","activation_hold_ms":300}"#).unwrap();
+        assert_eq!(old.push_to_talk_release_ms, 200);
+        assert_eq!(super::AudioSettings::default().push_to_talk_release_ms, 200);
+        let saved = super::AudioSettings { push_to_talk_release_ms: 750, ..Default::default() };
+        let loaded: super::AudioSettings = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(loaded.push_to_talk_release_ms, 750);
+        let wild = super::AudioSettings { push_to_talk_release_ms: u32::MAX, ..Default::default() }.normalized();
+        assert_eq!(wild.push_to_talk_release_ms, 2000);
+        let off = super::AudioSettings { push_to_talk_release_ms: 0, ..Default::default() }.normalized();
+        assert_eq!(off.push_to_talk_release_ms, 0);
     }
 
     #[test]
@@ -1168,6 +1207,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn hearing_settings_are_at_the_end_and_older_files_get_leveling_on_and_cleanup_off() {
+        use super::AudioSettings;
+        // Files written before these settings existed: leveling on, clean-up off.
+        for text in [r#"{}"#, r#"{"playback_volume":0.6,"noise_model":"studio"}"#] {
+            let old: AudioSettings = serde_json::from_str(text).unwrap();
+            assert!(old.level_voices, "{text}");
+            assert!(!old.clean_incoming, "{text}");
+        }
+        let defaults = AudioSettings::default();
+        assert!(defaults.level_voices && !defaults.clean_incoming);
+        // Both are saved, last, and read back.
+        let chosen = AudioSettings { level_voices: false, clean_incoming: true, ..Default::default() };
+        let text = serde_json::to_string(&chosen).unwrap();
+        assert!(text.ends_with(r#""level_voices":false,"clean_incoming":true}"#), "{text}");
+        let back: AudioSettings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, chosen);
+        assert_eq!(back.clone().normalized(), back);
+        // Leveling is a gain only; the clean-up adds 67.5 ms to what you hear.
+        let budget = |settings: &AudioSettings| settings.voice_delay_budget();
+        assert_eq!(budget(&defaults).incoming_cleanup_ms, 0.0);
+        assert_eq!(
+            budget(&AudioSettings { level_voices: false, ..Default::default() }),
+            budget(&defaults)
+        );
+        let cleaned = AudioSettings { clean_incoming: true, ..Default::default() };
+        assert_eq!(budget(&cleaned).incoming_cleanup_ms, 67.5);
+        let (with, without) = (budget(&cleaned).total_ms().unwrap(), budget(&defaults).total_ms().unwrap());
+        assert_eq!((with.0 - without.0, with.1 - without.1), (67.5, 67.5));
     }
 }
 

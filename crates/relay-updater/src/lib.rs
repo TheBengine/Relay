@@ -131,6 +131,11 @@ impl Publisher {
     pub fn policy_identity(&self) -> &str {
         &self.identity
     }
+
+    /// The channel this publisher validates in signed release records.
+    pub fn channel(&self) -> &str {
+        &self.channel
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -1151,7 +1151,7 @@ pub fn router(state: AppState) -> Router {
             post(upload).layer(DefaultBodyLimit::max(MAX_SUPPORTED_UPLOAD_BYTES)),
         )
         .route("/api/uploads/{upload_id}", get(download))
-        .route("/api/history-transfer/{id}", get(history_transfer::get_transfer)
+        .route(history_transfer::ROUTE, get(history_transfer::get_transfer)
             .put(history_transfer::put_transfer).delete(history_transfer::delete_transfer)
             .layer(DefaultBodyLimit::max(history_transfer::MAX_BYTES)))
         .route("/api/events", get(events))

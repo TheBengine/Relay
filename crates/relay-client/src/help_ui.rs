@@ -100,7 +100,7 @@ fn topics(viewer: HelpViewer) -> [Topic; 4] {
             ]
         } else {
             vec![
-                "Private messages and calls are end-to-end encrypted.",
+                "Friends messages and calls, and servers with encryption on, are end-to-end encrypted.",
                 "After you sign in, Encryption shows the devices to confirm.",
             ]
         },
@@ -289,6 +289,9 @@ mod tests {
         assert!(encryption
             .more
             .contains("nothing is approved until you choose Approve Device"));
+        // A server created with encryption off sends text and calls without end-to-end
+        // protection, so the signed-out promise names where encryption applies.
+        assert!(topics(SIGNED_OUT)[2].steps[0].contains("servers with encryption on"));
     }
 
     struct Frame {

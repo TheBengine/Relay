@@ -6,7 +6,7 @@
 //! they accepted (`crate::protection`). The mode and the person's own standing
 //! are shown above the composer for as long as the mode is not the default.
 use super::*;
-use crate::protection::{consent_for, standing, Standing};
+use crate::protection::{consent_for, retained_consent, standing, Standing};
 use crate::settings_ui as controls;
 use relay_protocol::{CommunityProtection, ProtectionLevel};
 
@@ -64,7 +64,15 @@ impl RelayApp {
         let Some((server_id, protection, _)) = self.announced_protection() else {
             return;
         };
-        let value = consent_for(&protection, self.accepted_revision(&server_id));
+        let accepted = self.accepted_revision(&server_id);
+        let retained = retained_consent(&protection, accepted);
+        if retained != accepted {
+            if let Some(index) = self.saved_community_index(&server_id) {
+                self.prefs.communities[index].open_protection_accepted = retained;
+                self.defer_preferences();
+            }
+        }
+        let value = consent_for(&protection, retained);
         let key = (server_id, value);
         if self.protection_ui.last_sent.as_ref() == Some(&key) {
             return;

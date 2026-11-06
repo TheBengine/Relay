@@ -313,6 +313,12 @@ impl Device {
             return FirstUse::Known;
         }
         let pin = self.approved.get(&device.identity.device_id);
+        // Pins are keyed by device ID, and a device ID never changes account.
+        // A listing that moves a pinned ID elsewhere is held; otherwise the
+        // own-account rule below would replace a verified person's pin.
+        if pin.is_some_and(|p| p.identity.user_id != device.identity.user_id) {
+            return FirstUse::Held;
+        }
         let own_account = device.identity.user_id == self.identity.user_id;
         if !own_account
             && (self.person_verified(&device.identity.user_id)
@@ -377,6 +383,13 @@ impl Device {
         }
         if compared_fingerprint.is_some_and(|code| code != device.fingerprint) {
             return Err("The device fingerprint does not match. No key was shared.".into());
+        }
+        if self
+            .approved
+            .get(&device.identity.device_id)
+            .is_some_and(|pin| pin.identity.user_id != device.identity.user_id)
+        {
+            return Err("This device ID belongs to another account. No key was shared.".into());
         }
         self.pin(device, compared_fingerprint.is_none())
     }

@@ -573,6 +573,47 @@ async fn signed_platform_channel_app_and_installer_binding_cannot_be_substituted
         assert!(!dir.path().join("head.json").exists());
     }
 }
+// docs/stabil-kanal-og-signering.md: a stable client refuses prerelease versions.
+#[tokio::test]
+async fn stable_publisher_refuses_a_correctly_signed_prerelease() {
+    let mut fixture = Fixture::new();
+    let (version, sequence) = ("0.10.1-preview.1", "20261010000000");
+    fixture.release.version = version.into();
+    fixture.release.installer_target =
+        format!("windows-x64/stable/Relay-{version}-{sequence}-Setup.exe");
+    fixture.publish(1);
+    let dir = directory();
+    let error = fixture
+        .engine(dir.path())
+        .check_with(fixture.memory.clone())
+        .await
+        .unwrap_err();
+    assert!(error.contains("release channel"), "Unexpected refusal: {error}");
+    assert!(!dir.path().join("head.json").exists());
+
+    // The same signed prerelease is acceptable to a beta publisher, so the refusal
+    // above comes from the stable rule rather than another broken binding.
+    fixture.release.channel = "beta".into();
+    fixture.release.installer_target =
+        format!("windows-x64/beta/Relay-{version}-{sequence}-Setup.exe");
+    assert!(fixture
+        .release
+        .validate(
+            &Publisher::from_bundled_root(
+                fixture.root.clone(),
+                "https://publisher.fixture.invalid/metadata/",
+                "https://publisher.fixture.invalid/targets/",
+                "beta",
+            )
+            .unwrap(),
+            &InstalledRelease {
+                version: "0.10.0".into(),
+                sequence: "20261009034055".into(),
+            },
+            None,
+        )
+        .is_ok());
+}
 #[tokio::test]
 async fn signed_older_release_and_same_identifier_collision_are_refused() {
     let mut fixture = Fixture::new();

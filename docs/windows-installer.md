@@ -9,10 +9,16 @@ a verified Windows signing identity.
 
 ## Update
 
-The `.7` bootstrap is being prepared and is not yet a published release. Once
-published, users of `.6` and earlier need to install it manually once, using the
-steps below. That installation adds the trusted publisher configuration for
-subsequent in-app updates.
+The [4 November preview](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261104.1)
+is available through the signed beta channel. If you use a preview from before
+the 25 October `.7` bootstrap, install the current installer manually once.
+That installation adds the trusted publisher configuration for subsequent
+in-app updates.
+
+This preview remembers shared-account sign-in on this PC by default. Sign in once
+after upgrading from a build that kept the refresh credential only in memory;
+later restarts restore the saved session while the provider's grant remains valid.
+See [staying signed in](sign-in-persistence.md) for opt-out and logout behavior.
 
 The new flow checks for updates after startup and every six hours. Choose
 **Update and restart** in the top notice to download and verify the update,

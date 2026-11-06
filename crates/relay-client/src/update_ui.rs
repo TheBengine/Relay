@@ -71,7 +71,10 @@ impl Controller {
                 version: env!("CARGO_PKG_VERSION").into(),
                 sequence: option_env!("RELAY_BUILD_SEQUENCE").unwrap_or("").into(),
             },
-            update_directory,
+            |channel| {
+                let profile = std::env::var_os("RELAY_PROFILE_DIR").map(PathBuf::from);
+                update_directory(channel, profile)
+            },
             ctx,
         );
         // Only the intentionally unconfigured preview gets the informational fallback.
@@ -84,7 +87,7 @@ impl Controller {
     fn from_policy(
         publisher: Result<Option<Publisher>, String>,
         installed: InstalledRelease,
-        directory: impl FnOnce() -> Result<PathBuf, String>,
+        directory: impl FnOnce(&str) -> Result<PathBuf, String>,
         _ctx: &egui::Context,
     ) -> Self {
         // No root means no verified-download storage, runtime or installer worker.
@@ -94,8 +97,8 @@ impl Controller {
             Ok(None) => return Self::inactive(State::Disabled),
             Err(_) => return Self::inactive(State::Unavailable),
         };
-        let engine =
-            directory().and_then(|path| relay_updater::Engine::new(publisher, installed, path));
+        let engine = directory(publisher.channel())
+            .and_then(|path| relay_updater::Engine::new(publisher, installed, path));
         let Ok(engine) = engine else {
             return Self::inactive(State::Unavailable);
         };
@@ -978,12 +981,25 @@ fn update_button(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Respons
     response
 }
 
-fn update_directory() -> Result<PathBuf, String> {
-    if let Some(root) = std::env::var_os("RELAY_PROFILE_DIR") {
-        return Ok(PathBuf::from(root).join("updates"));
+fn update_directory(channel: &str, profile: Option<PathBuf>) -> Result<PathBuf, String> {
+    // Keep the beta rollback checkpoint in place. Stable uses a sibling store
+    // so an intentional manual upgrade can leave the beta cache intact.
+    let (profile_name, cache_name) = if channel == "stable" {
+        (
+            crate::data_location::PROFILE_STABLE_UPDATE_CACHE,
+            "verified-updates-stable",
+        )
+    } else {
+        (
+            crate::data_location::PROFILE_BETA_UPDATE_CACHE,
+            "verified-updates",
+        )
+    };
+    if let Some(root) = profile {
+        return Ok(root.join(profile_name));
     }
     directories::ProjectDirs::from("org", "Relay", "Relay")
-        .map(|dirs| dirs.cache_dir().join("verified-updates"))
+        .map(|dirs| dirs.cache_dir().join(cache_name))
         .ok_or_else(|| "Your update storage folder is unavailable.".into())
 }
 
@@ -1093,6 +1109,29 @@ mod tests {
         assert!(!restart_due(true, away - Duration::from_secs(1), false));
         assert!(!restart_due(true, away, true));
         assert!(restart_due(true, away, false));
+    }
+
+    // Settings > Advanced > Updates and GUIDE.md describe this: with automatic checks on,
+    // an installed copy updates itself when free; turning them off leaves it to the person.
+    #[test]
+    fn automatic_checks_setting_decides_whether_an_installed_copy_updates_itself() {
+        let ctx = egui::Context::default();
+        for (automatic_checks, updates_itself) in [(false, false), (true, true)] {
+            let mut controller = Controller::inactive(State::Available(Box::new(v2_release())));
+            controller.in_place = true;
+            controller.next_check = Instant::now() + CHECK_INTERVAL;
+            assert!(!controller.tick(&ctx, false, false, false, automatic_checks, || {
+                panic!("Nothing was approved for shutdown")
+            }));
+            assert_eq!(controller.install_when_idle, updates_itself, "automatic checks: {automatic_checks}");
+            assert!(matches!(controller.state, State::Available(_)));
+        }
+        // A portable copy never schedules its own installation.
+        let mut portable = Controller::inactive(State::Available(Box::new(v2_release())));
+        portable.in_place = false;
+        portable.next_check = Instant::now() + CHECK_INTERVAL;
+        portable.tick(&ctx, false, false, false, true, || panic!("Nothing was approved"));
+        assert!(!portable.install_when_idle && portable.install_consent.is_none());
     }
 
     #[test]
@@ -1476,7 +1515,7 @@ mod tests {
                 version: "0.10.0".into(),
                 sequence: String::new(),
             },
-            || panic!("Unconfigured updates may not access storage"),
+            |_| panic!("Unconfigured updates may not access storage"),
             &ctx,
         );
         controller.check(&ctx);
@@ -1498,6 +1537,15 @@ mod tests {
     }
 
     #[test]
+    fn beta_and_stable_keep_separate_update_caches_in_the_same_profile() {
+        let profile = PathBuf::from("fixture-profile");
+        let beta = update_directory("beta", Some(profile.clone())).unwrap();
+        let stable = update_directory("stable", Some(profile.clone())).unwrap();
+        assert_eq!(beta, profile.join("updates"));
+        assert_eq!(stable, profile.join("updates-stable"));
+    }
+
+    #[test]
     fn invalid_bundled_publisher_cannot_resolve_paths_or_create_an_update_worker() {
         let ctx = egui::Context::default();
         let mut controller = Controller::from_policy(
@@ -1506,7 +1554,7 @@ mod tests {
                 version: "0.10.0".into(),
                 sequence: String::new(),
             },
-            || panic!("An invalid publisher may not access personal storage"),
+            |_| panic!("An invalid publisher may not access personal storage"),
             &ctx,
         );
         controller.check(&ctx);

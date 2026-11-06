@@ -846,7 +846,13 @@ fn revoke(provider: &Provider, saved: &SavedSession) {
         .get(discovery)
         .send()
         .ok()
-        .and_then(|response| response.json::<serde_json::Value>().ok())
+        .and_then(|response| {
+            // The same bound as every other account-service response.
+            let mut bytes = Vec::new();
+            response.take(RESPONSE_LIMIT + 1).read_to_end(&mut bytes).ok()?;
+            (bytes.len() as u64 <= RESPONSE_LIMIT).then_some(())?;
+            serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+        })
         .and_then(|metadata| metadata["revocation_endpoint"].as_str().map(str::to_owned))
         .and_then(|endpoint| Url::parse(&endpoint).ok())
         .filter(|endpoint| provider.allows(endpoint))

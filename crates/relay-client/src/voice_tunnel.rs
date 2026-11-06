@@ -10,6 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 use tungstenite::{client::IntoClientRequest, Message};
+/// Largest WebSocket message or frame read from the tunnel. Packets above
+/// `UDP_MAX_PACKET` are still dropped; this only bounds what is buffered.
+const TUNNEL_MESSAGE_LIMIT: usize = 64 * 1024;
 #[derive(Clone)]
 pub struct Config {
     pub url: String,
@@ -94,8 +97,16 @@ impl Tunnel {
                     request
                         .headers_mut()
                         .insert("x-relay-voice-key", config.key.parse().ok()?);
+                    // Packets are at most one UDP datagram; the library default
+                    // would let the peer make this thread buffer 64 MiB messages.
+                    let limits = tungstenite::protocol::WebSocketConfig {
+                        max_message_size: Some(TUNNEL_MESSAGE_LIMIT),
+                        max_frame_size: Some(TUNNEL_MESSAGE_LIMIT),
+                        ..Default::default()
+                    };
                     let (mut socket, _) =
-                        tungstenite::client_tls_with_config(request, stream, None, None).ok()?;
+                        tungstenite::client_tls_with_config(request, stream, Some(limits), None)
+                            .ok()?;
                     match socket.get_mut() {
                         tungstenite::stream::MaybeTlsStream::Plain(stream) => {
                             let _ = stream.set_read_timeout(Some(Duration::from_millis(10)));
@@ -322,6 +333,42 @@ mod tests {
             frames.recv_timeout(Duration::from_secs(2)).unwrap(),
             vec![0]
         );
+        drop(tunnel);
+        server.join().unwrap();
+    }
+    #[test]
+    fn an_oversized_message_drops_the_connection_instead_of_being_buffered() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut first = tungstenite::accept(stream).unwrap();
+            first
+                .send(Message::Binary(vec![7; TUNNEL_MESSAGE_LIMIT + 1]))
+                .unwrap();
+            // The client refuses the frame header and reconnects.
+            listener.set_nonblocking(true).unwrap();
+            let until = Instant::now() + Duration::from_secs(3);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) if Instant::now() < until => thread::sleep(Duration::from_millis(10)),
+                    Err(_) => panic!("the oversized connection was kept open"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut second = tungstenite::accept(stream).unwrap();
+            second.send(Message::Binary(vec![1, 2, 3])).unwrap();
+            thread::sleep(Duration::from_millis(500));
+        });
+        let tunnel = Tunnel::new(config(address), Arc::new(AtomicBool::new(false)), |_| true);
+        let until = Instant::now() + Duration::from_secs(4);
+        let mut packets = Vec::new();
+        while Instant::now() < until && packets.is_empty() {
+            packets.extend(tunnel.receive());
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(packets, vec![vec![1, 2, 3]]);
         drop(tunnel);
         server.join().unwrap();
     }

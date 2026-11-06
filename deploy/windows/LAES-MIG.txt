@@ -5,7 +5,7 @@ Your account and servers
 2. The account form opens inside Relay when WebView2 is available.
    You can also choose to sign in with your browser.
 3. Choose Create a server, or join with a friend's invitation.
-4. Server encryption is off by default (recommended). You can turn it on when creating a server.
+4. Server encryption is on by default (recommended). You can turn it off when creating a server.
 
 Invite a friend
 1. Open Invite friends > Share and copy invitation.
@@ -28,7 +28,8 @@ Relay starts quietly with Windows after installation or an update.
 Turn this off in Settings > Advanced > Start Relay with Windows.
 The cross hides Relay in the Windows notification area by default.
 Right-click its icon > Quit Relay to exit. Hosted servers finish closing.
-Run a newer installer from https://github.com/TheBengine/Relay/releases.
+Installed Relay updates itself when idle (Settings > Advanced > Updates).
+You can also run a newer installer from https://github.com/TheBengine/Relay/releases.
 Its Stop my local server and continue option requests normal server shutdown.
 Do not uninstall first. Accounts, keys and history are preserved.
 

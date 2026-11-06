@@ -1,9 +1,13 @@
 # Publisher setup for the existing updater
 
-## Current preparation — 25 October 2026
+## Current publication — 26 October 2026
 
-The `.7` bootstrap is being prepared; it is not yet a published release. The
-source now bundles the real public TUF root and the beta policy below. Fresh
+The latest public beta is [v0.10.0-preview.20261026.2](https://github.com/TheBengine/Relay/releases/tag/v0.10.0-preview.20261026.2).
+The `.7` bootstrap and `.8` were published on 25 October. The current beta feed
+serves sequence `20261026103357` with signed metadata version 4. Anonymous release
+downloads matched their package hashes, and the production updater checker
+downloaded and revalidated the live installer without executing it. The source
+bundles the real public TUF root and the beta policy below. Fresh
 production keys were created locally, separate from test keys, and are stored
 with Windows current-user DPAPI protection and restricted permissions in
 `%USERPROFILE%/.relay-publisher`. Private keys are not published.
@@ -24,9 +28,12 @@ without changing the release identity. No refresh schedule has been installed.
 The new `in-place-v2` flow downloads, verifies, normally closes Relay and its own
 hosts, installs into the verified existing installation and reopens Relay after
 one **Update and restart** choice. Portable copies retain manual installation.
-The existing `.6` client needs one manual installation of the forthcoming `.7`
-bootstrap before it can use this channel. Publication and the current candidate's
-final checks are tracked separately; configuration is not proof of deployment.
+The `.6` client and older builds need one manual installation of the current
+installer before they can use this channel. Installed `.7` and `.8` builds have
+the trusted beta configuration. The current metadata expires on 25 November
+2026. Publication, source mapping, package checks and public readback are recorded
+in `can/work/relay-release-20261026/publication-receipt.json` in this workspace;
+configuration alone is not proof of deployment.
 
 TUF signatures authenticate approved update bytes. No Authenticode certificate
 exists, so this does not establish a Windows-verified publisher identity or remove

@@ -1,12 +1,14 @@
 """Build a local Inno Setup installer from an explicit, hash-checked release.
 
-This verifies payload integrity. It does not establish publisher trust or sign
-an installer. No personal profiles, registry keys or installed apps are used.
+The default output is unsigned. Explicit signing options use the selected
+current-user certificate to sign staged executables, the generated uninstaller
+and the completed installer.
 """
 import argparse
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -150,6 +152,10 @@ def bound_client_build(metadata, files, version, sequence, required=False):
         keys.add('windows_startup')
         if type(info['windows_startup']) is not int or info['windows_startup'] not in (0, 1):
             raise ValueError('Unsupported Windows startup capability.')
+    if isinstance(info, dict) and 'update_channel' in info:
+        keys.add('update_channel')
+        if info['update_channel'] not in ('beta', 'stable', None):
+            raise ValueError('Unsupported compiled update channel.')
     if not isinstance(info, dict) or set(info) != keys or type(info['schema']) is not int or info['schema'] != 1:
         raise ValueError('Unsupported or incomplete client build identity.')
     if (release_version(info['version']) != version or metadata.get('version') != version
@@ -374,6 +380,80 @@ def pascal(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def sign_distribution(stage, contents, metadata, sign):
+    files = dict(contents['files'])
+    signatures = {}
+    # The manifest has already passed the payload allowlist, which also admits
+    # legacy executable names. Sign every executable that will be installed.
+    for name in sorted(name for name in files if name.lower().endswith('.exe')):
+        path = direct_path(stage / name)
+        signatures[name] = signature = sign(path)
+        sha, size = digest_size(path)
+        if sha != signature['Sha256']:
+            raise ValueError('Signed payload changed after verification: ' + name)
+        files[name] = {'sha256': sha, 'bytes': size}
+    metadata = {**metadata, 'client_sha256': files['dist/relay.exe']['sha256'],
+                'authenticode_signed': True}
+    info = direct_path(stage / 'build-info.json')
+    info.write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
+    sha, size = digest_size(info)
+    files['build-info.json'] = {'sha256': sha, 'bytes': size}
+    manifest = direct_path(stage / 'manifest.json')
+    manifest.write_text(json.dumps({**contents, 'files': files}, indent=2) + '\n', encoding='utf-8')
+    hashed = {name: row['sha256'] for name, row in files.items()}
+    hashed['manifest.json'] = digest(manifest)
+    return hashed, metadata, signatures, sum(row['bytes'] for row in files.values()) + manifest.stat().st_size
+
+
+def compile_installer(command, output, verify_inputs, sign_uninstaller=None):
+    def run(log):
+        verify_inputs()
+        result = subprocess.run(
+            command, capture_output=True, text=True, encoding='utf-8', errors='replace',
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        )
+        direct_path(output / log).write_text(result.stdout + result.stderr, encoding='utf-8')
+        verify_inputs()
+        return result
+
+    uninstaller = None
+    if sign_uninstaller is not None:
+        cache = direct_path(output / 'signed-uninstaller')
+        cache.mkdir()
+        command = [*command[:-1], '-ni', '/DRelaySignedUninstallerDir=' + str(cache), command[-1]]
+        prepare = run('uninstaller-prepare.log')
+        files = list(cache.iterdir())
+        if (prepare.returncode != 2 or 'Signed uninstaller mode is enabled' not in prepare.stderr
+                or len(files) != 1 or not re.fullmatch(r'uninst-[0-9.]+-[0-9a-f]{10}\.e64', files[0].name)):
+            raise RuntimeError('Installer compiler did not prepare the expected unsigned uninstaller.')
+        template = direct_path(files[0])
+        # Sign a PE file with a normal .exe extension so Windows verifies it
+        # through the same Authenticode provider as the final installer.
+        executable = direct_path(output / 'uninstaller-to-sign.exe')
+        with direct_reader(template) as source, executable.open('xb') as target:
+            shutil.copyfileobj(source, target)
+        signature = sign_uninstaller(executable)
+        if digest(executable) != signature['Sha256']:
+            raise ValueError('Uninstaller changed after signature verification.')
+        os.replace(executable, template)
+        uninstaller = {**signature, 'template': template.relative_to(output).as_posix()}
+
+    with ExitStack() as pinned:
+        if uninstaller is not None:
+            stream = pinned.enter_context(direct_reader(template))
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != uninstaller['Sha256']:
+                raise ValueError('The signed uninstaller changed before packaging.')
+        completed = run('compiler.log')
+        if completed.returncode:
+            raise RuntimeError('Installer compiler failed; see compiler.log.')
+        if uninstaller is not None:
+            stream.seek(0)
+            if (list(cache.iterdir()) != [template]
+                    or hashlib.file_digest(stream, 'sha256').hexdigest() != uninstaller['Sha256']):
+                raise ValueError('The signed uninstaller changed during packaging.')
+    return uninstaller
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--payload', required=True)
@@ -386,7 +466,13 @@ def main():
     parser.add_argument('--app-id', default=APP_ID, help='Override only for isolated installer tests.')
     parser.add_argument('--name', default='Relay')
     parser.add_argument('--recovery-probe', choices=RECOVERY_PROBES, help='Isolated fixture-only installer interruption probe.')
+    parser.add_argument('--sign-tool', help='Absolute path to Windows SDK SignTool.exe')
+    parser.add_argument('--signer-thumbprint', help='Expected code-signing certificate in CurrentUser\\My')
+    parser.add_argument('--timestamp-url', help='HTTPS RFC 3161 timestamp service selected by the release operator')
     args = parser.parse_args()
+    signing = bool(args.sign_tool or args.signer_thumbprint or args.timestamp_url)
+    if signing and not (args.sign_tool and args.signer_thumbprint and args.timestamp_url):
+        parser.error('Use --sign-tool, --signer-thumbprint and --timestamp-url together.')
     build_sequence(args.sequence)
     app_id = str(uuid.UUID(args.app_id))
     if args.recovery_probe is not None and (args.app_id != RECOVERY_APP_ID or args.name != RECOVERY_APP_NAME):
@@ -433,6 +519,20 @@ def main():
     if args.require_build_identity and not distribution:
         raise ValueError('Required client build identity is available only for binary distributions.')
     client_build = bound_client_build(metadata, files, version, args.sequence, args.require_build_identity) if distribution else None
+    signing_helper = None
+    if signing:
+        if os.name != 'nt' or app_id != APP_ID or args.name != 'Relay' or not distribution or not client_build:
+            raise ValueError('Signing requires a Windows production binary distribution with bound client identity.')
+        signing_tool = direct_path(args.sign_tool)
+        signing_source = direct_path(root / 'scripts/windows_authenticode.py')
+        # Support the isolated Python interpreter used for release builds.
+        sys.path.insert(0, str(signing_source.parent))
+        spec = importlib.util.spec_from_file_location('windows_authenticode', signing_source)
+        signing_helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(signing_helper)
+        expected_signer = signing_helper.thumbprint(args.signer_thumbprint)
+        timestamp = signing_helper.timestamp_endpoint(args.timestamp_url)
+        signing_helper.require_signing_certificate(expected_signer)
     script = direct_path(root / 'deploy/windows/Relay.iss')
     recovery_script = direct_path(root / 'deploy/windows/Recovery.iss')
     stop_script = direct_path(root / 'deploy/windows/StopLocalServer.ps1')
@@ -448,6 +548,8 @@ def main():
         'license_sha256': license_file,
         'workspace_cargo_sha256': direct_path(root / 'Cargo.toml'),
     }
+    if signing:
+        compiler_inputs.update(signing_helper_sha256=signing_source, signing_tool_sha256=signing_tool)
     before_hashes = {name: digest(path) for name, path in compiler_inputs.items()}
     if before_hashes['workspace_cargo_sha256'] != workspace_cargo_hash:
         raise RuntimeError('Source Cargo version changed before compiler inputs were frozen.')
@@ -457,9 +559,26 @@ def main():
         if changed:
             raise RuntimeError('Installer build inputs changed; no completed build record: ' + ', '.join(changed))
 
-    payload_hash = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     output.mkdir(parents=True)
     stage = direct_path(output / 'stage'); stage.mkdir()
+    for name, expected in files.items():
+        path = direct_path(stage / name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with direct_reader(payload / name) as source, path.open('xb') as target:
+            shutil.copyfileobj(source, target)
+        if digest(path) != expected:
+            raise ValueError('Payload changed during staging: ' + name)
+    signature_receipt = None
+    if signing_helper is not None:
+        def sign(path):
+            require_unchanged_compiler_inputs()
+            return signing_helper.sign_file(signing_tool, expected_signer, timestamp, path)
+        files, metadata, signatures, total = sign_distribution(stage, contents, metadata, sign)
+        if total > 2 * 1024 ** 3:
+            raise ValueError('Signed payload exceeds installer budget.')
+        bound_client_build(metadata, files, version, args.sequence, True)
+        signature_receipt = {'signer_thumbprint': expected_signer, 'payload_executables': signatures}
+    payload_hash = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     generated, validation, path_validation, final_validation = [], [], [], []
     entry = 'Relay.exe' if distribution else 'relay.exe'
     names = [entry] + sorted(set(files) - {entry})
@@ -467,11 +586,9 @@ def main():
     stop_payload = f'verify-{names.index(server_name):02d}.payload'
     for index, name in enumerate(names):
         expected = files[name]
-        path = direct_path(stage / name); path.parent.mkdir(parents=True, exist_ok=True)
-        with direct_reader(payload / name) as source, path.open('xb') as target:
-            shutil.copyfileobj(source, target)
+        path = direct_path(stage / name)
         if digest(path) != expected:
-            raise ValueError('Payload changed during staging: ' + name)
+            raise ValueError('Staged payload changed: ' + name)
         relative = name.replace('/', '\\')
         parent = relative.rpartition('\\')[0]
         destination = '{app}' if not parent else '{app}\\' + parent
@@ -515,7 +632,8 @@ def main():
     before = ('Install Relay for your Windows account. Run a newer installer later to update the same installation; you do not need to uninstall first.\r\n\r\n'
               'Your accounts, conversations, encryption keys and server data are kept in their existing folders.\r\n\r\n'
               'Close the Relay window before updating. Setup can stop this installation\'s local server normally, then continue. No process is force-closed. Accounts, messages and keys are kept.\r\n\r\n'
-              'This preview is not digitally signed.\r\n')
+              + ('Windows can verify the publisher of this signed installer.\r\n'
+                 if signing else 'This preview is not digitally signed.\r\n'))
     direct_path(stage / 'before.txt').write_text(before, encoding='utf-8-sig', newline='')
 
     command = [str(compiler), '/Qp', '/DStage=' + str(stage), '/DOutput=' + str(output), release_version_define(version), '/DReleaseSequence=' + args.sequence, '/DReleasePayloadHash=' + payload_hash, '/DRelayAppId=' + app_id, '/DRelayAppName=' + args.name, '/DRelayDisplayIcon=' + (r'dist\relay.exe' if distribution else 'relay.exe'), '/DRelayIcon=' + str(icon), '/DRelayLicense=' + str(license_file), str(script)]
@@ -527,18 +645,25 @@ def main():
     command.insert(-1, '/DRelayStopScriptSHA256=' + before_hashes['stop_script_sha256'])
     if args.recovery_probe is not None:
         command.insert(-1, '/DRelayRecoveryProbe=' + args.recovery_probe)
-    require_unchanged_compiler_inputs()
-    completed = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-    direct_path(output / 'compiler.log').write_text(completed.stdout + completed.stderr, encoding='utf-8')
-    require_unchanged_compiler_inputs()
-    if completed.returncode:
-        raise RuntimeError('Installer compiler failed; see compiler.log.')
+    uninstaller_signature = compile_installer(
+        command, output, require_unchanged_compiler_inputs, sign if signing_helper is not None else None,
+    )
     installer = direct_path(output / installer_filename(version, args.sequence))
     if not installer.is_file():
         raise RuntimeError('Compiler did not create the named installer.')
-    record = {'app_id': app_id, 'display_name': args.name, 'version': version, 'workspace_version': workspace_version, 'source_archive_version': None if distribution else source_version, 'binary_distribution': distribution, 'sequence': args.sequence, 'client_build': client_build, 'client_build_identity_verified': client_build is not None, 'payload_sha256': payload_hash, 'payload_files': files, 'payload_bytes': total, **before_hashes, 'compiler_inputs_verified_unchanged': True, 'recovery_probe': args.recovery_probe, 'installer': str(installer), 'installer_sha256': digest(installer), 'publisher_verified_or_signed': False}
+    if signature_receipt is not None:
+        signature_receipt['uninstaller'] = uninstaller_signature
+        signature_receipt['installer'] = sign(installer)
+        require_unchanged_compiler_inputs()
+    installer_sha = digest(installer)
+    if signature_receipt is not None and installer_sha != signature_receipt['installer']['Sha256']:
+        raise ValueError('Installer changed after signature verification.')
+    record = {'app_id': app_id, 'display_name': args.name, 'version': version, 'workspace_version': workspace_version, 'source_archive_version': None if distribution else source_version, 'binary_distribution': distribution, 'sequence': args.sequence, 'client_build': client_build, 'client_build_identity_verified': client_build is not None, 'payload_sha256': payload_hash, 'payload_files': files, 'payload_bytes': total, **before_hashes, 'compiler_inputs_verified_unchanged': True, 'recovery_probe': args.recovery_probe, 'installer': str(installer), 'installer_sha256': installer_sha, 'publisher_verified_or_signed': signature_receipt is not None}
+    if signature_receipt is not None:
+        record.update(authenticode=signature_receipt, client_sha256=metadata['client_sha256'],
+                      signed_payload_manifest=str(stage / 'manifest.json'))
     direct_path(output / 'build.json').write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
-    print(json.dumps({'installer': str(installer), 'sha256': record['installer_sha256'], 'files': len(files), 'signed': False}))
+    print(json.dumps({'installer': str(installer), 'sha256': record['installer_sha256'], 'files': len(files), 'signed': signing}))
 
 
 def version_self_tests():
@@ -576,6 +701,11 @@ def version_self_tests():
             capable = {**info, 'invitation_protocol': 1}
             self.assertEqual(bound_client_build({**metadata, 'client_build': capable}, files,
                                                '0.10.0', sequence, True), capable)
+            for channel in ('beta', 'stable', None):
+                with self.subTest(channel=channel):
+                    channel_info = {**info, 'update_channel': channel}
+                    self.assertEqual(bound_client_build({**metadata, 'client_build': channel_info}, files,
+                                                       '0.10.0', sequence, True), channel_info)
             for value in (True, False, None, '1', 2, -1):
                 with self.subTest(capability=value), self.assertRaises(ValueError):
                     bound_client_build({**metadata, 'client_build': {**info, 'invitation_protocol': value}},
@@ -586,7 +716,7 @@ def version_self_tests():
             for key, value in (('schema',True), ('version','0.10.1'), ('sequence','20261015123457'),
                                ('built_at','2026-10-15T12:34:57Z'), ('build_date','2026-10-14'),
                                ('source_sha256','z'*64), ('source_scope','unknown'), ('build_id','wrong'),
-                               ('git_revision','nogit'), ('git_dirty',1)):
+                               ('git_revision','nogit'), ('git_dirty',1), ('update_channel','candidate')):
                 with self.subTest(key=key), self.assertRaises(ValueError):
                     bound_client_build({**metadata, 'client_build':{**info,key:value}}, files, '0.10.0', sequence, True)
             with self.assertRaises(ValueError):

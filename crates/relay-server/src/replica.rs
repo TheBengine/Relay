@@ -402,6 +402,7 @@ pub(crate) const TABLES: &[Table] = &[
     whole("host_locator_records", Withheld),
     whole("user_reports", Withheld),
     whole("audit_log", Withheld),
+    whole("crypto_device_revocations", Withheld),
     whole("crypto_key_packages", Withheld),
     whole("crypto_welcome_packages", Withheld),
     whole("crypto_key_package_consumptions", Withheld),

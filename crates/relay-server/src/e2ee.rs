@@ -12,6 +12,8 @@ const MAX_CONTEXT_BODIES: usize = 2 * 1024 * 1024;
 const MAX_ROSTER: usize = 64;
 const MAX_DEVICES: u32 = 4;
 const MAX_UNUSED_PACKAGES: u32 = 32;
+const REVOKED_DEVICE: &str =
+    "This encryption device was revoked. Reset this encryption device to create a new identity.";
 #[path = "e2ee/call_control.rs"]
 mod call_control;
 pub use call_control::{ack_call_request, call_inbox, call_requests, send_call_request};
@@ -46,12 +48,14 @@ fn decoded(value: &str, maximum: usize) -> ApiResult<Vec<u8>> {
 pub fn extra_storage_usage(db: &Connection, user: &str) -> rusqlite::Result<(u64, u64)> {
     db.query_row("SELECT
         (SELECT COALESCE(SUM(length(device_id)+length(identity)+length(key_package)),0) FROM crypto_devices)+
+        (SELECT COALESCE(SUM(length(device_id)+length(user_id)),0) FROM crypto_device_revocations)+
         (SELECT COALESCE(SUM(length(package_hash)+length(key_package)),0) FROM crypto_key_packages)+
         (SELECT COALESCE(SUM(length(body)+length(operation_id)+128),0) FROM crypto_events)+
         (SELECT COALESCE(SUM(length(operation_id)+length(request_hash)),0) FROM crypto_operations)+
         (SELECT COUNT(*)*160 FROM crypto_welcome_packages)+(SELECT COUNT(*)*160 FROM crypto_key_package_consumptions)+
         (SELECT COALESCE(SUM(length(request_json)+160),0) FROM crypto_call_requests),
         (SELECT COALESCE(SUM(length(device_id)+length(identity)+length(key_package)),0) FROM crypto_devices WHERE user_id=?1)+
+        (SELECT COALESCE(SUM(length(device_id)+length(user_id)),0) FROM crypto_device_revocations WHERE user_id=?1)+
         (SELECT COALESCE(SUM(length(p.package_hash)+length(p.key_package)),0) FROM crypto_key_packages p JOIN crypto_devices d ON d.device_id=p.device_id WHERE d.user_id=?1)+
         (SELECT COALESCE(SUM(length(body)+length(operation_id)+128),0) FROM crypto_events WHERE author_user_id=?1)+
         (SELECT COALESCE(SUM(length(operation_id)+length(request_hash)),0) FROM crypto_operations WHERE author_user_id=?1)+
@@ -160,6 +164,15 @@ fn unused_packages(db: &Connection, device_id: &str) -> rusqlite::Result<u32> {
     )
 }
 
+fn revocation_owner(db: &Connection, device_id: &str) -> rusqlite::Result<Option<String>> {
+    db.query_row(
+        "SELECT user_id FROM crypto_device_revocations WHERE device_id=?1",
+        [device_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 pub async fn register_device(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -179,22 +192,32 @@ pub async fn register_device(
     let registered = {
         let mut db = lock(&state.0.db);
         let tx = db.transaction()?;
-        let existing: Option<(String, String)> = tx
+        let existing: Option<(String, String, bool)> = tx
             .query_row(
-                "SELECT user_id,identity FROM crypto_devices WHERE device_id=?1",
+                "SELECT user_id,identity,active FROM crypto_devices WHERE device_id=?1",
                 [&input.device_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if let Some((owner, identity)) = existing {
+        if let Some((owner, identity, active)) = existing {
             if owner != auth.user.id {
                 return Err(forbidden());
+            }
+            if !active {
+                return Err(conflict(REVOKED_DEVICE));
             }
             if identity != input.identity {
                 return Err(conflict(
                     "This device ID is bound to another identity; explicitly enroll a new device",
                 ));
             }
+        }
+        if let Some(owner) = revocation_owner(&tx, &input.device_id)? {
+            return Err(if owner == auth.user.id {
+                conflict(REVOKED_DEVICE)
+            } else {
+                forbidden()
+            });
         }
         let active_count: u32 = tx.query_row(
             "SELECT COUNT(*) FROM crypto_devices WHERE user_id=?1 AND active=1 AND device_id!=?2",
@@ -206,7 +229,7 @@ pub async fn register_device(
                 "An account may have at most four active encryption devices",
             ));
         }
-        tx.execute("INSERT INTO crypto_devices(device_id,user_id,identity,key_package) VALUES(?1,?2,?3,?4) ON CONFLICT(device_id) DO UPDATE SET key_package=excluded.key_package,active=1",
+        tx.execute("INSERT INTO crypto_devices(device_id,user_id,identity,key_package) VALUES(?1,?2,?3,?4) ON CONFLICT(device_id) DO UPDATE SET key_package=excluded.key_package",
             params![input.device_id,auth.user.id,input.identity,input.key_package])?;
         insert_packages(&tx, &input.device_id, &[input.key_package])?;
         check_quota(&state, &tx, &auth.user.id)?;
@@ -281,23 +304,21 @@ pub async fn revoke_device(
     }
     let mut db = lock(&state.0.db);
     let tx = db.transaction()?;
-    let active: Option<bool> = tx
-        .query_row(
-            "SELECT active FROM crypto_devices WHERE device_id=?1 AND user_id=?2",
-            params![device_id, auth.user.id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match active {
-        // A lost acknowledgement must be retryable without reactivating a
-        // tombstone. Ownership remains required for the idempotent response.
-        Some(_) => {}
-        None => return Err(forbidden()),
-    }
-    // Keep the identity and package ledger tombstoned. A deleted ID cannot be
-    // reassigned to another signing identity, nor can packages be reused.
-    tx.execute(
+    if tx.execute(
         "UPDATE crypto_devices SET active=0 WHERE device_id=?1 AND user_id=?2",
+        params![device_id, auth.user.id],
+    )? == 0
+    {
+        // An older snapshot can omit the device row while retaining revocation.
+        // Its owner may still retry or reset that device.
+        return if revocation_owner(&tx, &device_id)?.as_deref() == Some(auth.user.id.as_str()) {
+            Ok(StatusCode::NO_CONTENT)
+        } else {
+            Err(forbidden())
+        };
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO crypto_device_revocations(device_id,user_id) VALUES(?1,?2)",
         params![device_id, auth.user.id],
     )?;
     // Release only opaque call slots; retain the identity/package tombstones.

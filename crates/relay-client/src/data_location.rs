@@ -21,6 +21,8 @@ pub const MARKER: &str = "relay-data-location.json";
 pub const IN_PROGRESS: &str = "relay-migration.json";
 /// Set together with the `--profile-dir` variables when a chosen folder is active.
 pub const LOCATION_ENV: &str = "RELAY_DATA_LOCATION";
+pub(crate) const PROFILE_BETA_UPDATE_CACHE: &str = "updates";
+pub(crate) const PROFILE_STABLE_UPDATE_CACHE: &str = "updates-stable";
 const VERSION: u32 = 1;
 const MAX_ENTRIES: usize = 1_000_000;
 const MAX_ATTEMPTS: u32 = 3;
@@ -260,11 +262,12 @@ enum Layout<'a> {
 fn root_level_config_item(name: &str) -> bool {
     name == "host-moves" || name.starts_with("host-locator-")
 }
-const RESERVED_TOP: [&str; 6] = [
+const RESERVED_TOP: [&str; 7] = [
     "config",
     "server-data",
     "replica-copies",
-    "updates",
+    PROFILE_BETA_UPDATE_CACHE,
+    PROFILE_STABLE_UPDATE_CACHE,
     MARKER,
     IN_PROGRESS,
 ];
@@ -315,8 +318,14 @@ impl<'a> Layout<'a> {
         match self {
             Self::Folder(root) => walk(root, &mut out, &|rel| {
                 let top = top_name(rel);
-                (![MARKER, IN_PROGRESS, "updates"].contains(&top.as_str()))
-                    .then(|| rel.to_path_buf())
+                (![
+                    MARKER,
+                    IN_PROGRESS,
+                    PROFILE_BETA_UPDATE_CACHE,
+                    PROFILE_STABLE_UPDATE_CACHE,
+                ]
+                .contains(&top.as_str()))
+                .then(|| rel.to_path_buf())
             })?,
             Self::Default(d) => {
                 walk(&d.config, &mut out, &|rel| {

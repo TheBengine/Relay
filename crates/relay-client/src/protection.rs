@@ -44,6 +44,14 @@ pub fn consent_for(protection: &CommunityProtection, accepted: Option<u64>) -> O
     plain_allowed(protection, accepted).then_some(protection.revision)
 }
 
+/// The stored agreement to keep after seeing `protection`. Every change makes a
+/// new revision, so once any other revision is announced the agreement is spent.
+/// A later announcement that reuses its number (a replaying server, or an older
+/// server database restored) must ask the person again.
+pub fn retained_consent(protection: &CommunityProtection, accepted: Option<u64>) -> Option<u64> {
+    accepted.filter(|revision| *revision == protection.revision)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +81,29 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(bootstrap.protection, CommunityProtection::default());
+    }
+
+    #[test]
+    fn an_agreement_is_spent_once_another_revision_is_announced() {
+        let open = announced(ProtectionLevel::Open, 5);
+        assert_eq!(retained_consent(&open, Some(5)), Some(5));
+        assert_eq!(retained_consent(&open, None), None);
+        // The owner turns encryption back on: revision 6 spends the agreement.
+        let protected = announced(ProtectionLevel::Protected, 6);
+        let kept = retained_consent(&protected, Some(5));
+        assert_eq!(kept, None);
+        // A server replays (or a restored database brings back) open@5.
+        assert!(!plain_allowed(&open, kept));
+        assert_eq!(standing(&open, kept), Standing::NeedsDecision);
+        // A newer open revision never reuses an older agreement either.
+        assert_eq!(
+            retained_consent(&announced(ProtectionLevel::Open, 7), Some(5)),
+            None
+        );
+        assert_eq!(
+            retained_consent(&CommunityProtection::default(), Some(5)),
+            None
+        );
     }
 
     #[test]

@@ -101,3 +101,29 @@ fn history_transfer_page_is_read_only_and_rejects_delivery_substitution() {
     );
     c.crypto.as_ref().unwrap().remove_test_checkpoint();
 }
+
+// "Update this server before transferring history between PCs": the client checks the
+// server's history-transfer-v1 capability before it sends or requests anything.
+#[test]
+fn history_transfer_refuses_a_server_without_the_transfer_capability() {
+    let mut test = TestWorker::new();
+    test.connection("http://127.0.0.1".into());
+    let c = test.worker.connection.as_ref().unwrap();
+    assert!(!c.chat.supports(crate::history_transfer::CAPABILITY));
+    let origin = CommandOrigin::from(c);
+    let code = crate::history_transfer::Code::generate().unwrap().display();
+    for send in [true, false] {
+        let error = test
+            .worker
+            .start_history_transfer(
+                origin.clone(),
+                1,
+                zeroize::Zeroizing::new(code.to_string()),
+                send,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .unwrap_err();
+        assert_eq!(error, "Update this server before transferring history between PCs.");
+    }
+    assert!(test.worker.history_transfer_job.is_none());
+}

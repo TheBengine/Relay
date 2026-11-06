@@ -81,6 +81,7 @@ directories = ["src"]
 
 [packages."crates/relay-updater"]
 directories = ["src"]
+files = ["publisher/policy.json", "publisher/policy-stable.json", "publisher/root.json"]
 
 [packages."crates/relay-server"]
 directories = ["src"]

@@ -92,6 +92,9 @@ fn voice_delay_details(ui: &mut egui::Ui, audio: &AudioSettings, period_ms: Opti
                 format!("Receive buffer target: {} ms · fixed", budget.receive_min_ms)
             });
             ui.label(format!("Playback timing reserve: {:.1} ms", budget.playback_ms));
+            if audio.clean_incoming {
+                ui.label(format!("Cleaning up what you hear: {:.1} ms", budget.incoming_cleanup_ms));
+            }
             controls::description(ui, "This combines your outgoing processing with your incoming buffer to compare settings. A real call uses the sender's processing and the listener's buffer; other people may choose different settings.");
             controls::description(ui, "Bitrate changes quality and bandwidth, not a fixed delay. Gain, volume, sounds, overlay, ducking and priority do not add a configured voice buffer.");
             controls::description(ui, "Voice activity threshold decides when speech starts sending. Speech-start history preserves the preceding 10 ms (20 ms with 20 ms packets), adding up to that much to a new talkspurt. A strictly silent lead-in can be skipped when the next packet is already queued; quiet word beginnings are retained. The full history is included in this conservative budget and never used for push-to-talk. Hold keeps sending after speech stops; it is not added to each packet. Push-to-talk adds key detection time.");
@@ -1574,6 +1577,26 @@ impl RelayApp {
             ui,
             "Save Changes applies your voice settings. Live connection details and manual tuning are under Troubleshooting.",
         );
+        controls::divider(ui);
+        controls::section_heading(
+            ui,
+            "What You Hear",
+            "How Relay plays the people in your call.",
+        );
+        controls::switch_row(
+            ui,
+            "level-voices",
+            "Make everyone the same volume",
+            "Turns quiet people up and loud people down, so everyone sounds about as loud. It only changes their voice, never the silence between their words. Each person's own volume still applies on top.",
+            &mut self.prefs.audio.level_voices,
+        );
+        controls::switch_row(
+            ui,
+            "clean-incoming",
+            "Clean up what I hear",
+            "Removes background noise, music and keyboard sounds from other people's voices, for people who send without noise suppression. You hear everyone about 70 ms later, and it uses more of this PC's processor.",
+            &mut self.prefs.audio.clean_incoming,
+        );
     }
 
     fn ptt_control(&mut self, ui: &mut egui::Ui) {
@@ -1597,6 +1620,23 @@ impl RelayApp {
                     ui.selectable_value(&mut self.prefs.ptt_key, key, label);
                 }
             });
+        ui.add_space(8.0);
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = (ui.available_width() - 160.0).max(40.0);
+            ui.add(
+                egui::Slider::new(
+                    &mut self.prefs.audio.push_to_talk_release_ms,
+                    0..=crate::voice_gate::MAX_PTT_RELEASE_MS,
+                )
+                .step_by(10.0)
+                .suffix(" ms")
+                .text("Release delay"),
+            );
+        });
+        controls::description(
+            ui,
+            "Keep the microphone open after releasing push-to-talk, so the end of your last word is not cut off.",
+        );
     }
 
     /// Measured output of a live camera or screen share next to its options.
@@ -2277,7 +2317,7 @@ impl RelayApp {
         {
             self.defer_preferences();
         }
-        controls::description(ui, "Check after startup and every six hours. Update and restart downloads, verifies and installs only when you choose it. Download only keeps Relay open.");
+        controls::description(ui, "Check after startup and every six hours. An installed copy then downloads and verifies a new version by itself and restarts after two minutes without use, never during a call or with an unsent message. Later or Cancel stops this until Relay starts again; Update and restart installs at once.");
         controls::divider(ui);
         ui.collapsing("GIF search and previews", |ui| {
         controls::section_heading(

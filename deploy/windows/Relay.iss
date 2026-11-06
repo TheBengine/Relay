@@ -40,6 +40,10 @@ CloseApplications=no
 RestartApplications=no
 RestartIfNeededByRun=no
 UninstallLogMode=append
+#ifdef RelaySignedUninstallerDir
+SignedUninstaller=yes
+SignedUninstallerDir={#RelaySignedUninstallerDir}
+#endif
 Compression=lzma2
 SolidCompression=yes
 #if Str(RelayRegisterProtocol) == "1"

@@ -3,7 +3,8 @@ use super::*;
 use axum::extract::OriginalUri;
 use std::path::PathBuf;
 
-pub const SCHEMA_VERSION: u32 = 30;
+pub const SCHEMA_VERSION: u32 = 31;
+const DEVICE_REVOCATION_SCHEMA: u32 = 31;
 pub const READ: u32 = 1;
 pub const SEND: u32 = 2;
 pub const JOIN: u32 = 4;
@@ -209,6 +210,10 @@ pub fn migrate_database(db: &mut Connection) -> rusqlite::Result<()> {
             // The digest the host directory needs, sealed under the host-local key;
             // the session verifier itself becomes keyed at startup.
             30 => add_column(&tx, "sessions", "locator", "TEXT")?,
+            DEVICE_REVOCATION_SCHEMA => tx.execute_batch(
+                "CREATE TABLE crypto_device_revocations(device_id TEXT PRIMARY KEY NOT NULL,user_id TEXT NOT NULL);
+                 INSERT INTO crypto_device_revocations SELECT device_id,user_id FROM crypto_devices WHERE active=0;",
+            )?,
             _ => unreachable!(),
         }
         tx.execute(
@@ -1321,32 +1326,109 @@ pub fn restore_database(
     db: &mut Connection,
     source: &FsPath,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let incoming = Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let version: u32 = incoming.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if version != SCHEMA_VERSION {
-        return Err(
-            "Restore requires a backup with the current schema; migrate an offline copy first"
-                .into(),
-        );
-    }
-    let check: String = incoming.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-    if check != "ok" {
-        return Err("Backup integrity check failed".into());
-    }
-    let _: String = server_id(&incoming)?;
-    let foreign = incoming.prepare("PRAGMA foreign_key_check")?.exists([])?;
-    if foreign {
-        return Err("Backup foreign key check failed".into());
-    }
-    rusqlite::backup::Backup::new(&incoming, db)?.run_to_completion(
-        128,
-        Duration::from_millis(5),
-        None,
-    )?;
-    db.execute("DELETE FROM sessions", [])?;
-    // The restored file has another history: no earlier replica cursor is valid.
-    crate::replica::after_restore(db)?;
+    PreparedRestore::open(db, source, false)?.commit(db)?;
     Ok(())
+}
+
+struct PreparedRestore {
+    snapshot: Connection,
+    server: String,
+    _staging: tempfile::TempDir,
+}
+
+impl PreparedRestore {
+    fn open(
+        current: &Connection,
+        source: &FsPath,
+        migrate: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let incoming =
+            Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let directory = current
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(FsPath::new)
+            .and_then(FsPath::parent)
+            .or_else(|| source.parent())
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| FsPath::new("."));
+        let staging = tempfile::Builder::new()
+            .prefix("restore-staging-")
+            .tempdir_in(directory)?;
+        let mut snapshot = Connection::open(staging.path().join("restore.sqlite3"))?;
+        Self::copy(&incoming, &mut snapshot)?;
+        snapshot.pragma_update(None, "foreign_keys", true)?;
+        if migrate {
+            migrate_database(&mut snapshot)?;
+        }
+        let version: u32 = snapshot.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(
+                "Restore requires a backup with the current schema; migrate an offline copy first"
+                    .into(),
+            );
+        }
+        let check: String = snapshot.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        if check != "ok" {
+            return Err("Backup integrity check failed".into());
+        }
+        if snapshot.prepare("PRAGMA foreign_key_check")?.exists([])? {
+            return Err("Backup foreign key check failed".into());
+        }
+        let server = server_id(&snapshot)?;
+
+        // Sanitize the private copy before any page becomes visible in the live
+        // DB. SQLite commits the final backup copy as a unit.
+        let tx = snapshot.transaction()?;
+        let current_version: u32 =
+            current.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if current_version >= 7 && server_id(current)? == server {
+            let query = if current_version >= DEVICE_REVOCATION_SCHEMA {
+                "SELECT device_id,user_id FROM crypto_device_revocations"
+            } else {
+                "SELECT device_id,user_id FROM crypto_devices WHERE active=0"
+            };
+            let mut read = current.prepare(query)?;
+            let mut rows = read.query([])?;
+            let mut keep = tx.prepare(
+                "INSERT INTO crypto_device_revocations(device_id,user_id) VALUES(?1,?2)
+                 ON CONFLICT(device_id) DO UPDATE SET user_id=excluded.user_id",
+            )?;
+            while let Some(row) = rows.next()? {
+                keep.execute(params![row.get::<_, String>(0)?, row.get::<_, String>(1)?])?;
+            }
+        }
+        tx.execute(
+            "UPDATE crypto_devices SET active=0 WHERE active=1
+             AND device_id IN (SELECT device_id FROM crypto_device_revocations)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM crypto_call_requests
+             WHERE author_device_id IN (SELECT device_id FROM crypto_device_revocations)",
+            [],
+        )?;
+        tx.execute("DELETE FROM sessions", [])?;
+        crate::replica::after_restore(&tx)?;
+        tx.commit()?;
+        Ok(Self {
+            snapshot,
+            server,
+            _staging: staging,
+        })
+    }
+
+    fn commit(&self, current: &mut Connection) -> rusqlite::Result<()> {
+        Self::copy(&self.snapshot, current)
+    }
+
+    fn copy(source: &Connection, destination: &mut Connection) -> rusqlite::Result<()> {
+        rusqlite::backup::Backup::new(source, destination)?.run_to_completion(
+            128,
+            Duration::from_millis(5),
+            None,
+        )
+    }
 }
 pub async fn backups(
     State(state): State<AppState>,
@@ -1516,48 +1598,33 @@ impl AppState {
             return Err("Cancel handover preparation before restoring a database".into());
         }
         std::fs::create_dir_all(self.0.data.join("backups"))?;
-        let prepared = self
-            .0
-            .data
-            .join(format!("restore-staging-{}.sqlite3", id()));
-        std::fs::copy(source, &prepared)?;
-        let result = (|| {
-            let mut copy = Connection::open(&prepared)?;
-            copy.execute_batch("PRAGMA foreign_keys=ON;")?;
-            migrate_database(&mut copy)?;
-            drop(copy);
-            backup_database(
-                &lock(&self.0.db),
-                &self
-                    .0
-                    .data
-                    .join("backups")
-                    .join(format!("{}.sqlite3", id())),
-            )?;
-            let mut db = lock(&self.0.db);
-            let incoming =
-                Connection::open_with_flags(&prepared, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            self.0
-                .handover
-                .begin_restore(server_id(&incoming)?)
-                .map_err(|error| Box::<dyn std::error::Error>::from(error.message))?;
-            self.0
-                .handover_exports
-                .recover(&self.0.data, &self.0.handover.status());
-            drop(incoming);
-            let result = restore_database(&mut db, &prepared);
-            self.0
-                .handover
-                .stamp_database(&db)
-                .map_err(|error| Box::<dyn std::error::Error>::from(error.message))?;
-            self.0
-                .handover
-                .finish_restore(server_id(&db)?)
-                .map_err(|error| Box::<dyn std::error::Error>::from(error.message))?;
-            result
-        })();
-        let _ = std::fs::remove_file(&prepared);
-        result
+        let mut db = lock(&self.0.db);
+        let prepared = PreparedRestore::open(&db, source, true)?;
+        backup_database(
+            &db,
+            &self.0.data.join("backups").join(format!("{}.sqlite3", id())),
+        )?;
+        self.0
+            .handover
+            .begin_restore(prepared.server.clone())
+            .map_err(|error| Box::<dyn std::error::Error>::from(error.message))?;
+        self.0
+            .handover_exports
+            .recover(&self.0.data, &self.0.handover.status());
+        let result = prepared.commit(&mut db);
+        if result.is_ok() {
+            self.0.history_transfer.clear_after_restore();
+        }
+        self.0
+            .handover
+            .stamp_database(&db)
+            .map_err(|error| Box::<dyn std::error::Error>::from(error.message))?;
+        self.0
+            .handover
+            .finish_restore(server_id(&db)?)
+            .map_err(|error| Box::<dyn std::error::Error>::from(error.message))?;
+        result?;
+        Ok(())
     }
     pub fn initialize_admin(
         &self,
@@ -1675,15 +1742,17 @@ pub async fn restore_backup(
                 "Cannot create recovery backup; restore cancelled",
             )
         })?;
-        let incoming =
-            Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        state.0.handover.begin_restore(server_id(&incoming)?)?;
+        let prepared = PreparedRestore::open(&db, &source, false)
+            .map_err(|_| bad("Restore failed: backup must be valid and match this schema"))?;
+        state.0.handover.begin_restore(prepared.server.clone())?;
         state
             .0
             .handover_exports
             .recover(&state.0.data, &state.0.handover.status());
-        drop(incoming);
-        let result = restore_database(&mut db, &source);
+        let result = prepared.commit(&mut db);
+        if result.is_ok() {
+            state.0.history_transfer.clear_after_restore();
+        }
         state.0.handover.stamp_database(&db)?;
         state.0.handover.finish_restore(server_id(&db)?)?;
         result.map_err(|_| bad("Restore failed: backup must be valid and match this schema"))?;
@@ -1709,6 +1778,49 @@ pub async fn storage(
     ))
 }
 
+pub(super) async fn request_read_guard(
+    state: &AppState,
+) -> ApiResult<tokio::sync::OwnedRwLockReadGuard<()>> {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        state.0.maintenance.clone().read_owned(),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server maintenance is busy. Retry shortly",
+        )
+    })
+}
+
+pub(super) fn check_request_admission(state: &AppState, path: &str, mutation: bool) -> ApiResult<()> {
+    // Co-hosts must still be able to reach the feed to reconnect.
+    let takeover_route = path.starts_with("/api/hosting/takeover/");
+    if state.takeover_blocked() && !takeover_route {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Protected host is paused while its copies reconnect or recover",
+        ));
+    }
+    state.0.handover.admit(path)?;
+    if mutation && !takeover_route {
+        if state.takeover_waiting() {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Paused: waiting for a co-host to confirm changes",
+            ));
+        }
+        if state.arming() {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Changes are paused for a few minutes while takeover protection is turned on",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Bounded blocking workers isolate synchronous SQLite/filesystem work from Tokio IO.
 /// Security changes serialize with outstanding requests so stale Auth values cannot
 /// commit after a permission/session revocation. Guard/body waits have bounded timeouts.
@@ -1729,6 +1841,11 @@ pub async fn dispatch(
         }
     };
     let path = uri.path();
+    let history_upload = request.method() == axum::http::Method::PUT
+        && request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .is_some_and(|path| path.as_str().ends_with(history_transfer::ROUTE));
     // The co-hosts' feed and answers change nothing here and must never wait
     // for the database: a protected write holds it while it waits for them.
     let mutation = !matches!(
@@ -1758,32 +1875,11 @@ pub async fn dispatch(
     let admission_path = path.to_owned();
     let handle = tokio::runtime::Handle::current();
     let work_state = state.clone();
-    let run = move || {
+    let run = move |request| {
         handle.block_on(async move {
             let _permit = permit;
-            // Co-hosts must still be able to reach the feed to reconnect.
-            if work_state.takeover_blocked()
-                && !admission_path.starts_with("/api/hosting/takeover/")
-            {
-                return ApiError::new(StatusCode::SERVICE_UNAVAILABLE,
-                    "Protected host is paused while its copies reconnect or recover").into_response();
-            }
-            if let Err(error) = work_state.0.handover.admit(&admission_path) {
+            if let Err(error) = check_request_admission(&work_state, &admission_path, mutation) {
                 return error.into_response();
-            }
-            if mutation
-                && work_state.takeover_waiting()
-                && !admission_path.starts_with("/api/hosting/takeover/")
-            {
-                return ApiError::new(StatusCode::SERVICE_UNAVAILABLE,
-                    "Paused: waiting for a co-host to confirm changes").into_response();
-            }
-            if mutation
-                && work_state.arming()
-                && !admission_path.starts_with("/api/hosting/takeover/")
-            {
-                return ApiError::new(StatusCode::SERVICE_UNAVAILABLE,
-                    "Changes are paused for a few minutes while takeover protection is turned on").into_response();
             }
             let mut response =
                 match tokio::time::timeout(Duration::from_secs(30), next.run(request)).await {
@@ -1796,7 +1892,9 @@ pub async fn dispatch(
                         .into_response()
                     }
                 };
-            if mutation && work_state.writes_allowed() {
+            // The streamed history upload only publishes opaque data in RAM.
+            // It releases maintenance in the handler and never changes RTC access.
+            if mutation && !history_upload && work_state.writes_allowed() {
                 if exclusive {
                     chat_controls::prune_typing(&work_state);
                 }
@@ -1837,28 +1935,25 @@ pub async fn dispatch(
         };
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
-            run()
+            run(request)
         })
     } else {
-        let guard = match tokio::time::timeout(
-            Duration::from_secs(5),
-            state.0.maintenance.clone().read_owned(),
-        )
-        .await
-        {
+        let guard = match request_read_guard(&state).await {
             Ok(g) => g,
-            Err(_) => {
-                return ApiError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Server maintenance is busy. Retry shortly",
-                )
-                .into_response()
-            }
+            Err(error) => return error.into_response(),
         };
-        tokio::task::spawn_blocking(move || {
-            let _guard = guard;
-            run()
-        })
+        if history_upload {
+            let mut request = request;
+            request
+                .extensions_mut()
+                .insert(history_transfer::UploadAdmission::new(guard));
+            tokio::task::spawn_blocking(move || run(request))
+        } else {
+            tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                run(request)
+            })
+        }
     };
     match worker.await {
         Ok(response) => response,

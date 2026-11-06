@@ -454,6 +454,114 @@ mod tests {
         assert_eq!(info.stream_latency_ms(), 2.5);
     }
 
+    /// The Windows default endpoint's name, mix rate and channels.
+    fn default_endpoint(capture: bool) -> (String, u32, u16) {
+        named_endpoint(None, capture)
+    }
+
+    /// An endpoint by friendly name (the default when None): name, mix rate, channels.
+    fn named_endpoint(name: Option<&str>, capture: bool) -> (String, u32, u16) {
+        unsafe {
+            // The thread may already be in an apartment (cpal lists devices there).
+            let initialised = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+            let _com = initialised.then_some(Com);
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).unwrap();
+            let flow = if capture { eCapture } else { eRender };
+            let device = match name {
+                Some(name) => endpoint(name, capture).unwrap(),
+                None => enumerator.GetDefaultAudioEndpoint(flow, eConsole).unwrap(),
+            };
+            let value = device
+                .OpenPropertyStore(STGM_READ)
+                .unwrap()
+                .GetValue(&PKEY_Device_FriendlyName)
+                .unwrap();
+            let text = PropVariantToStringAlloc(&value).unwrap();
+            let name = text.to_string().unwrap();
+            CoTaskMemFree(Some(text.0.cast()));
+            let client: IAudioClient = device.Activate(CLSCTX_ALL, None).unwrap();
+            let format = client.GetMixFormat().unwrap();
+            let (rate, channels) = ((*format).nSamplesPerSec, (*format).nChannels);
+            CoTaskMemFree(Some(format.cast()));
+            (name, rate, channels)
+        }
+    }
+
+    /// What following a device change costs in audio on this PC, from the
+    /// moment Windows notifies: listing the devices (as the app's enumeration
+    /// thread does), closing the running microphone and speakers and opening
+    /// the default ones again (as `change_voice_devices` does), until the new
+    /// microphone delivers its first samples. Only callback times are kept.
+    /// Ten rounds; prints median and worst. `RELAY_MEASURE_INPUT` /
+    /// `RELAY_MEASURE_OUTPUT` pick devices by name. The app adds one 20 ms
+    /// poll of the audio owner and two UI frames to this.
+    #[test]
+    #[ignore = "Opens the real default microphone and speakers; run by hand to measure the gap"]
+    fn actual_device_follow_gap_on_the_default_microphone() {
+        use std::{
+            sync::Mutex,
+            time::{Duration, Instant},
+        };
+        type Calls = Arc<Mutex<Vec<Instant>>>;
+        let open = |calls: &Calls| {
+            let input_name = std::env::var("RELAY_MEASURE_INPUT").ok();
+            let output_name = std::env::var("RELAY_MEASURE_OUTPUT").ok();
+            let (input, rate, channels) = named_endpoint(input_name.as_deref(), true);
+            let (output, out_rate, out_channels) = named_endpoint(output_name.as_deref(), false);
+            let record = calls.clone();
+            let capture = Stream::input(input.clone(), rate, channels, move |_| {
+                record.lock().unwrap().push(Instant::now());
+            }, |error| panic!("{error}"))
+            .unwrap();
+            let render = Stream::output(output.clone(), out_rate, out_channels, |data| data.fill(0.0), |error| panic!("{error}")).unwrap();
+            render.play().unwrap();
+            capture.play().unwrap();
+            (capture, render, input, output)
+        };
+        let (mut listing, mut reopening, mut gaps) = (Vec::new(), Vec::new(), Vec::new());
+        let mut calls: Calls = Arc::default();
+        let mut streams = Some(open(&calls));
+        for _ in 0..10 {
+            thread::sleep(Duration::from_millis(500));
+            let notified = Instant::now();
+            // On a thread of its own, as the app lists devices.
+            let devices = thread::spawn(crate::media::enumerate_audio_devices).join().unwrap().unwrap();
+            let listed = Instant::now();
+            assert!(devices.default_input.is_some());
+            let last_old = *calls.lock().unwrap().last().expect("the old microphone ran");
+            let fresh: Calls = Arc::default();
+            drop(streams.take());
+            streams = Some(open(&fresh));
+            let until = Instant::now() + Duration::from_secs(2);
+            let first_new = loop {
+                if let Some(at) = fresh.lock().unwrap().first().copied() {
+                    break at;
+                }
+                assert!(Instant::now() < until, "the new microphone delivered nothing");
+                thread::sleep(Duration::from_millis(1));
+            };
+            let ms = |a: Instant, b: Instant| b.saturating_duration_since(a).as_secs_f64() * 1000.0;
+            listing.push(ms(notified, listed));
+            reopening.push(ms(listed, first_new));
+            gaps.push(ms(last_old, first_new));
+            calls = fresh;
+        }
+        let (_, _, input, output) = streams.take().unwrap();
+        let summary = |values: &mut Vec<f64>| {
+            values.sort_by(f64::total_cmp);
+            (values[values.len() / 2], values[values.len() - 1])
+        };
+        let (list, list_max) = summary(&mut listing);
+        let (reopen, reopen_max) = summary(&mut reopening);
+        let (gap, gap_max) = summary(&mut gaps);
+        println!("Device follow on \"{input}\" / \"{output}\", 10 rounds (median / worst, ms):");
+        println!("  list devices {list:.1} / {list_max:.1}; close and reopen until the first new samples {reopen:.1} / {reopen_max:.1}");
+        println!("  audio gap from the last old to the first new microphone samples {gap:.1} / {gap_max:.1}");
+        println!("  all rounds, sorted (ms): {gaps:.1?}");
+        assert!(gap < 500.0, "the median gap reached {gap:.1} ms");
+    }
+
     /// Opens the default microphone, then the default speakers, for 3 s each
     /// and prints the period Windows negotiated and the callback interval
     /// actually seen. Audio is never stored: only callback times and sizes.
@@ -465,29 +573,6 @@ mod tests {
             sync::Mutex,
             time::{Duration, Instant},
         };
-        fn default_endpoint(capture: bool) -> (String, u32, u16) {
-            unsafe {
-                CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap();
-                let _com = Com;
-                let enumerator: IMMDeviceEnumerator =
-                    CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).unwrap();
-                let flow = if capture { eCapture } else { eRender };
-                let device = enumerator.GetDefaultAudioEndpoint(flow, eConsole).unwrap();
-                let value = device
-                    .OpenPropertyStore(STGM_READ)
-                    .unwrap()
-                    .GetValue(&PKEY_Device_FriendlyName)
-                    .unwrap();
-                let text = PropVariantToStringAlloc(&value).unwrap();
-                let name = text.to_string().unwrap();
-                CoTaskMemFree(Some(text.0.cast()));
-                let client: IAudioClient = device.Activate(CLSCTX_ALL, None).unwrap();
-                let format = client.GetMixFormat().unwrap();
-                let (rate, channels) = ((*format).nSamplesPerSec, (*format).nChannels);
-                CoTaskMemFree(Some(format.cast()));
-                (name, rate, channels)
-            }
-        }
         for capture in [true, false] {
             let (mut name, rate, channels) = default_endpoint(capture);
             let variable = if capture { "RELAY_MEASURE_INPUT" } else { "RELAY_MEASURE_OUTPUT" };

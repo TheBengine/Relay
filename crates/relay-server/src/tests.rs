@@ -46,7 +46,8 @@ pub(super) fn discard_private_call_schema(db: &Connection) {
         DROP TRIGGER IF EXISTS private_call_permission_insert;DROP TRIGGER IF EXISTS private_call_permission_update;
         DROP TRIGGER IF EXISTS private_call_permission_delete;DROP TRIGGER IF EXISTS private_call_unfriend;
         DROP TRIGGER IF EXISTS private_call_block;
-        DROP TABLE IF EXISTS private_call_recovery;").unwrap();
+        DROP TABLE IF EXISTS private_call_recovery;
+        DROP TABLE IF EXISTS crypto_device_revocations;").unwrap();
 }
 
 #[tokio::test]

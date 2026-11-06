@@ -330,6 +330,10 @@ pub(crate) struct StudioKind {
     /// background. Off (bench, tests): the model is built before the first
     /// block and never swapped, so the output is the model's alone.
     pub(crate) guarded: bool,
+    /// Hold back keys struck while the user talks, before the model sees
+    /// them and after it (`click_suppression::KeyHold`).
+    pub(crate) keys_before: Option<crate::click_suppression::KeyHoldParams>,
+    pub(crate) keys_after: Option<crate::click_suppression::KeyHoldParams>,
 }
 
 /// Wall time of the model per block, 50 µs buckets up to 50 ms.
@@ -379,6 +383,10 @@ struct Core {
     voice: f32,
     guard: Option<Guard>,
     timing: Timing,
+    keys_before: Option<crate::click_suppression::KeyHold>,
+    keys_after: Option<crate::click_suppression::KeyHold>,
+    /// The model's input of the last blocks, to line up with its output.
+    inputs: VecDeque<[f32; BLOCK]>,
 }
 
 impl Core {
@@ -413,6 +421,9 @@ impl Core {
             voice: 0.0,
             guard,
             timing: Timing::new(),
+            keys_before: kind.keys_before.map(crate::click_suppression::KeyHold::new),
+            keys_after: kind.keys_after.map(crate::click_suppression::KeyHold::new),
+            inputs: VecDeque::with_capacity(DELAY_BLOCKS + 1),
         }
     }
 
@@ -463,8 +474,17 @@ fn crossfade(from: &[f32; BLOCK], to: &[f32; BLOCK]) -> [f32; BLOCK] {
 
 impl Suppressor for Core {
     fn process(&mut self, block: &mut [f32; BLOCK]) {
-        let input = *block;
+        let mut input = *block;
+        if let Some(keys) = self.keys_before.as_mut() {
+            keys.process(&mut input);
+        }
         self.energies.push_back(energy(&input));
+        if self.keys_after.is_some() {
+            self.inputs.push_back(input);
+            if self.inputs.len() > DELAY_BLOCKS + 1 {
+                self.inputs.pop_front();
+            }
+        }
         if self.energies.len() > DELAY_BLOCKS + 1 {
             self.energies.pop_front();
         }
@@ -551,6 +571,11 @@ impl Suppressor for Core {
             }
         }
 
+        if let Some(keys) = self.keys_after.as_mut() {
+            // The model's output answers the input of DELAY_BLOCKS blocks ago.
+            let reference = (self.inputs.len() > DELAY_BLOCKS).then(|| &self.inputs[0]);
+            keys.process_with(&mut out, reference);
+        }
         self.voice = if from_model && self.active.is_some() {
             // The model keeps speech and removes the rest: what is left of
             // the input block it is answering is a cheap voice probability.
@@ -833,7 +858,7 @@ mod tests {
     }
 
     fn unguarded(variant: Variant) -> Studio {
-        Studio::new(StudioKind { variant, probability: false, guarded: false })
+        Studio::new(StudioKind { variant, probability: false, guarded: false, keys_before: None, keys_after: None })
     }
 
     /// Opt-in check against another implementation's output on the same
@@ -977,7 +1002,7 @@ mod tests {
     fn the_ratio_probability_follows_speech_and_is_off_unless_asked() {
         let input = reference_input();
         let mut plain = unguarded(Variant::Eight);
-        let mut ratio = Studio::new(StudioKind { variant: Variant::Eight, probability: true, guarded: false });
+        let mut ratio = Studio::new(StudioKind { variant: Variant::Eight, probability: true, guarded: false, keys_before: None, keys_after: None });
         let mut probabilities = Vec::new();
         for chunk in input.chunks_exact(BLOCK) {
             let mut a: [f32; BLOCK] = chunk.try_into().unwrap();
@@ -1018,7 +1043,7 @@ mod tests {
         load_blocking(Variant::Two).unwrap();
         let sticky: &'static Sticky = Box::leak(Box::default());
         let guard = Guard { budget: Duration::ZERO, run: 0, sticky };
-        let kind = StudioKind { variant: Variant::Eight, probability: false, guarded: true };
+        let kind = StudioKind { variant: Variant::Eight, probability: false, guarded: true, keys_before: None, keys_after: None };
         let mut studio = Core::with_guard(kind, Some(guard));
         assert_eq!(studio.active_variant(), Some(Variant::Eight));
         // A smooth tone: any hard switch between sources would be a step far
@@ -1060,7 +1085,7 @@ mod tests {
         let sticky: &'static Sticky = Box::leak(Box::default());
         sticky.eight_too_slow.store(true, Ordering::Release);
         sticky.two_too_slow.store(true, Ordering::Release);
-        let kind = StudioKind { variant: Variant::Eight, probability: true, guarded: true };
+        let kind = StudioKind { variant: Variant::Eight, probability: true, guarded: true, keys_before: None, keys_after: None };
         let mut studio = Core::with_guard(kind, Some(Guard { budget: BLOCK_TIME, run: 0, sticky }));
         let mut rnnoise = RnNoise::new();
         let input = reference_input();
@@ -1097,7 +1122,7 @@ mod tests {
     /// (this test waits for each result; the app never does).
     #[test]
     fn the_model_thread_gives_the_inline_output_at_the_same_delay() {
-        let kind = StudioKind { variant: Variant::Eight, probability: true, guarded: false };
+        let kind = StudioKind { variant: Variant::Eight, probability: true, guarded: false, keys_before: None, keys_after: None };
         let mut threaded = Studio::with_runner(kind, Studio::spawn(kind, true, None));
         let mut inline = Studio::new(kind);
         assert!(matches!(inline.runner, Runner::Inline { .. }));
@@ -1118,7 +1143,7 @@ mod tests {
     /// suppressor does not wait for the thread either.
     #[test]
     fn a_stuck_model_thread_never_stalls_the_caller() {
-        let kind = StudioKind { variant: Variant::Two, probability: false, guarded: false };
+        let kind = StudioKind { variant: Variant::Two, probability: false, guarded: false, keys_before: None, keys_after: None };
         let gate = Arc::new(Mutex::new(()));
         let stuck = gate.lock().unwrap();
         let mut studio = Studio::with_runner(kind, Studio::spawn(kind, false, Some(gate.clone())));
@@ -1152,7 +1177,7 @@ mod tests {
     #[ignore]
     fn paced_hand_off_in_real_time() {
         load_blocking(Variant::Eight).unwrap();
-        let kind = StudioKind { variant: Variant::Eight, probability: false, guarded: false };
+        let kind = StudioKind { variant: Variant::Eight, probability: false, guarded: false, keys_before: None, keys_after: None };
         let mut studio = Studio::with_runner(kind, Studio::spawn(kind, false, None));
         let input = reference_input();
         let blocks = 2_000;

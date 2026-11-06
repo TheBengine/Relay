@@ -310,7 +310,7 @@ fn wait_from_args(args: &[String]) -> Result<(), &'static str> {
 #[cfg(windows)]
 fn wait_for_process(identity: ProcessIdentity) -> Result<(), &'static str> {
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, FILETIME, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, FILETIME, WAIT_OBJECT_0},
         System::Threading::{
             GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
         },
@@ -324,6 +324,11 @@ fn wait_for_process(identity: ProcessIdentity) -> Result<(), &'static str> {
         )
     };
     if handle.is_null() {
+        // The installer can exit and lose its last handle before the child
+        // reaches this call. Startup still checks the installation records.
+        if unsafe { GetLastError() } == ERROR_INVALID_PARAMETER {
+            return Ok(());
+        }
         return Err("Cannot observe the requested installer process.");
     }
     let result = (|| {
@@ -742,6 +747,68 @@ mod tests {
             // These cases are rejected during parsing, without opening a process.
             assert!(wait_from_args(&arguments).is_err());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installer_can_exit_before_the_restarted_client_opens_its_process() {
+        use std::{
+            os::windows::io::AsRawHandle,
+            process::{Command, Stdio},
+            thread,
+            time::{Duration, Instant},
+        };
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, FILETIME},
+            System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        };
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut times = [FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        }; 4];
+        let [created, exited, kernel, user] = &mut times;
+        assert_ne!(
+            unsafe { GetProcessTimes(child.as_raw_handle(), created, exited, kernel, user) },
+            0
+        );
+        let identity = ProcessIdentity {
+            pid: child.id(),
+            creation_low: created.dwLowDateTime,
+            creation_high: created.dwHighDateTime,
+        };
+        assert!(child.wait().unwrap().success());
+        assert!(wait_for_process(identity).is_ok());
+        let wrong_creation = ProcessIdentity {
+            creation_low: identity.creation_low ^ 1,
+            ..identity
+        };
+        assert_eq!(
+            wait_for_process(wrong_creation),
+            Err("Installer process identity did not match.")
+        );
+        drop(child);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, identity.pid) };
+            if handle.is_null() {
+                assert_eq!(unsafe { GetLastError() }, ERROR_INVALID_PARAMETER);
+                break;
+            }
+            unsafe { CloseHandle(handle) };
+            assert!(
+                Instant::now() < deadline,
+                "fixture PID still has an open handle"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(wait_for_process(identity), Ok(()));
     }
 
     #[test]

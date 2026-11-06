@@ -1444,12 +1444,15 @@ async fn devices_are_owned_bounded_immutable_and_revoked_without_identity_reuse(
         .0,
         StatusCode::NO_CONTENT
     );
-    assert_eq!(
-        request(&app, "PUT", "/api/e2ee/device", Some(&admin.token), changed)
-            .await
-            .0,
-        StatusCode::CONFLICT
-    );
+    // A reconnect must not undo revocation even with the original fingerprint.
+    for attempted in [valid, changed] {
+        assert_eq!(
+            request(&app, "PUT", "/api/e2ee/device", Some(&admin.token), attempted)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
     // Simulate a lost revocation acknowledgement. Durable retries of the
     // owner's tombstone succeed; neither a foreign nor unknown ID does.
     assert_eq!(
@@ -1531,6 +1534,180 @@ async fn devices_are_owned_bounded_immutable_and_revoked_without_identity_reuse(
             StatusCode::BAD_REQUEST
         );
     }
+}
+
+#[tokio::test]
+async fn older_backups_keep_revocations_for_present_and_missing_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path(), "restore revocations", 0).unwrap();
+    let app = router(state.clone());
+    let admin = signup(&app, "Admin", "").await;
+    let server = state.server_id().unwrap();
+    enroll(&app, &admin, "keep-active").await;
+    let first = enroll(&app, &admin, "already-in-backup").await;
+    let backup_id = id();
+    let backups = dir.path().join("backups");
+    std::fs::create_dir(&backups).unwrap();
+    let early = backups.join(format!("{backup_id}.sqlite3"));
+    state.backup_to(&early).unwrap();
+    let early_bytes = std::fs::read(&early).unwrap();
+    let second = enroll(&app, &admin, "absent-from-backup").await;
+    let member = signup(&app, "Member", &new_invite(&app, &admin).await).await;
+    enroll(&app, &member, "absent-owner").await;
+    let later = dir.path().join("before-revocation-v30.sqlite3");
+    state.backup_to(&later).unwrap();
+    Connection::open(&later)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE crypto_device_revocations;
+             DELETE FROM schema_migrations WHERE version=31;
+             PRAGMA user_version=30;",
+        )
+        .unwrap();
+    let later_bytes = std::fs::read(&later).unwrap();
+    for (session, device_id) in [
+        (&admin, first.device_id.as_str()),
+        (&admin, second.device_id.as_str()),
+        (&member, "absent-owner"),
+    ] {
+        assert_eq!(
+            request(
+                &app,
+                "DELETE",
+                &format!("/api/e2ee/device/{device_id}"),
+                Some(&session.token),
+                serde_json::Value::Null,
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT,
+        );
+    }
+
+    let (code, body) = request(
+        &app,
+        "POST",
+        "/api/admin/restore",
+        Some(&admin.token),
+        serde_json::json!({"backup_id":backup_id,"confirm_server_id":server}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/e2ee/device",
+            Some(&admin.token),
+            serde_json::Value::Null
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED,
+    );
+    let (status, value) = request(
+        &app,
+        "POST",
+        "/api/login",
+        None,
+        serde_json::json!({"username":"Admin","password":"a-long-test-password"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let fresh: Session = serde_json::from_value(value).unwrap();
+    for revoked in [&first, &second] {
+        assert_eq!(
+            request(
+                &app,
+                "PUT",
+                "/api/e2ee/device",
+                Some(&fresh.token),
+                serde_json::json!({"device_id":revoked.device_id,"identity":revoked.identity,
+                                  "key_package":revoked.key_package}),
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT,
+        );
+    }
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("/api/e2ee/device/{}", second.device_id),
+            Some(&fresh.token),
+            serde_json::Value::Null,
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT,
+    );
+    enroll(&app, &fresh, "keep-active").await;
+    {
+        let db = lock(&state.0.db);
+        assert_eq!(
+            revocation_owner(&db, "absent-owner").unwrap(),
+            Some(member.user.id.clone())
+        );
+        assert!(device(&db, &admin.user.id, &first.device_id).is_err());
+    }
+    assert_eq!(std::fs::read(&early).unwrap(), early_bytes);
+
+    // Rolling forward to a second old snapshot must retain IDs from accounts
+    // and devices that were absent from the first restored database.
+    state.restore_from(&later).unwrap();
+    assert_eq!(std::fs::read(&later).unwrap(), later_bytes);
+    let db = lock(&state.0.db);
+    assert!(device(&db, &admin.user.id, "keep-active").is_ok());
+    for (user, revoked) in [
+        (admin.user.id.as_str(), first.device_id.as_str()),
+        (admin.user.id.as_str(), second.device_id.as_str()),
+        (member.user.id.as_str(), "absent-owner"),
+    ] {
+        let active: bool = db
+            .query_row(
+                "SELECT active FROM crypto_devices WHERE device_id=?1 AND user_id=?2",
+                params![revoked, user],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!active);
+    }
+}
+
+#[tokio::test]
+async fn restore_of_another_community_does_not_import_local_revocations() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path(), "original community", 0).unwrap();
+    let app = router(state.clone());
+    let admin = signup(&app, "Admin", "").await;
+    let id = "same-device-id";
+    enroll(&app, &admin, id).await;
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("/api/e2ee/device/{id}"),
+            Some(&admin.token),
+            serde_json::Value::Null,
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT,
+    );
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = AppState::open(other_dir.path(), "other community", 0).unwrap();
+    let other_app = router(other.clone());
+    let other_admin = signup(&other_app, "Admin", "").await;
+    enroll(&other_app, &other_admin, id).await;
+    let backup = other_dir.path().join("other.sqlite3");
+    other.backup_to(&backup).unwrap();
+
+    state.restore_from(&backup).unwrap();
+    assert_eq!(state.server_id().unwrap(), other.server_id().unwrap());
+    let db = lock(&state.0.db);
+    assert!(device(&db, &other_admin.user.id, id).is_ok());
+    assert_eq!(revocation_owner(&db, id).unwrap(), None);
 }
 
 #[tokio::test]

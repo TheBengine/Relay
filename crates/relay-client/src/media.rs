@@ -120,6 +120,10 @@ pub(crate) struct AudioControls {
     echo_reference: EchoReference,
     ptt_pressed: AtomicBool,
     ptt_key: AtomicI32,
+    /// Push-to-talk stays open this long after the key is released.
+    ptt_release_ms: AtomicU32,
+    /// Only the thread polling the key takes this lock.
+    ptt_release: Mutex<crate::voice_gate::PushToTalkRelease>,
     attack_ms: AtomicU32,
     release_ms: AtomicU32,
     /// What the voice-activation gate measured, for the Settings bar.
@@ -163,6 +167,10 @@ pub(crate) struct AudioControls {
     heard: Mutex<HashMap<String, Instant>>,
     #[cfg(feature = "native-rtc")]
     application_audio: ApplicationAudioSink,
+    /// "Make everyone the same volume" (`receive_level`).
+    level_voices: AtomicBool,
+    /// "Clean up what I hear": dpdfnet2 on the mixed incoming audio.
+    clean_incoming: AtomicBool,
 }
 impl AudioControls {
     fn set_voice_connection(&self, address: &str, private: bool) {
@@ -217,6 +225,8 @@ impl AudioControls {
             echo_reference: EchoReference::default(),
             ptt_pressed: AtomicBool::new(false),
             ptt_key: AtomicI32::new(0),
+            ptt_release_ms: AtomicU32::new(settings.push_to_talk_release_ms),
+            ptt_release: Mutex::default(),
             attack_ms: AtomicU32::new(settings.activation_attack_ms),
             release_ms: AtomicU32::new(settings.activation_release_ms),
             gate_meter: Default::default(),
@@ -250,6 +260,8 @@ impl AudioControls {
             heard: Mutex::new(HashMap::new()),
             #[cfg(feature = "native-rtc")]
             application_audio: ApplicationAudioSink::default(),
+            level_voices: AtomicBool::new(settings.level_voices),
+            clean_incoming: AtomicBool::new(settings.clean_incoming),
         }
     }
     fn apply(&self, settings: &AudioSettings) {
@@ -268,8 +280,9 @@ impl AudioControls {
         let mode_changed = self.transmission.load(Ordering::Relaxed) != settings.transmission as u32;
         let volume_model_changed = self.automatic_volume_model.load(Ordering::Relaxed)
             != settings.automatic_volume_model as u32;
-        let noise_changed = self.suppression.load(Ordering::Relaxed) != settings.noise_suppression
-            || self.noise_model.load(Ordering::Relaxed) != settings.noise_model as u32;
+        // Only a different model needs new streams; suppression on/off is read
+        // per block, so a preview keeps its queued audio when it is toggled.
+        let noise_model_changed = self.noise_model.load(Ordering::Relaxed) != settings.noise_model as u32;
         let model_packet_changed = settings.noise_model.comparison().is_some()
             && self.packet_samples.load(Ordering::Relaxed) != settings.packet_samples() as u32;
         // Changing playback/receive settings must not reset VAD, RNNoise, gain
@@ -319,6 +332,8 @@ impl AudioControls {
             .store(settings.activation_attack_ms, Ordering::Relaxed);
         self.release_ms
             .store(settings.activation_release_ms, Ordering::Relaxed);
+        self.ptt_release_ms
+            .store(settings.push_to_talk_release_ms, Ordering::Relaxed);
         self.preserve_speech_start
             .store(settings.preserve_speech_start, Ordering::Relaxed);
         self.bitrate_kbps
@@ -375,8 +390,14 @@ impl AudioControls {
             self.echo_delay_ms
                 .store(settings.echo_delay_ms, Ordering::Relaxed);
         }
-        let capture_changed = if preview { mode_changed || volume_model_changed || noise_changed || model_packet_changed } else { capture_changed };
-        if noise_changed || model_packet_changed {
+        // What you hear; neither touches the microphone.
+        self.level_voices.store(settings.level_voices, Ordering::Relaxed);
+        self.clean_incoming.store(settings.clean_incoming, Ordering::Relaxed);
+        if settings.clean_incoming {
+            crate::dpdfnet::request(crate::dpdfnet::Variant::Two);
+        }
+        let capture_changed = if preview { mode_changed || volume_model_changed || noise_model_changed || model_packet_changed } else { capture_changed };
+        if noise_model_changed || model_packet_changed {
             self.model_status.store(crate::audio_model_lab::Status::Idle as u32, Ordering::Release);
         }
         // Publish after the changed capture policy, so an acquired generation
@@ -3375,6 +3396,16 @@ pub(crate) struct MicrophoneProcessor {
     voice_detector: Option<crate::audio_activity::VoiceDetector>,
     clicks: crate::click_suppression::ClickSuppressor,
     gate: crate::voice_gate::NoiseGate,
+    /// How much of each block the suppressor kept, for the gate.
+    kept: crate::voice_gate::SuppressionRatio,
+    /// The suppressor's verdict on the last block, for the gate.
+    speech_model: Option<crate::voice_gate::SpeechModel>,
+    /// The gate bench's "before": the gate as it was, without the ratio.
+    #[cfg(test)]
+    pub(crate) gate_without_ratio: bool,
+    /// Last block's energy: raw, after the suppressor, after click suppression.
+    #[cfg(test)]
+    pub(crate) trace_energy: [f32; 4],
     noise_floor: f32,
     noise_minimum: f32,
     noise_samples: usize,
@@ -3405,6 +3436,12 @@ impl MicrophoneProcessor {
             voice_detector: None,
             clicks: crate::click_suppression::ClickSuppressor::new(),
             gate: crate::voice_gate::NoiseGate::new(),
+            kept: Default::default(),
+            speech_model: None,
+            #[cfg(test)]
+            gate_without_ratio: false,
+            #[cfg(test)]
+            trace_energy: [0.0; 4],
             noise_floor: 0.0005,
             noise_minimum: f32::INFINITY,
             noise_samples: 0,
@@ -3433,6 +3470,12 @@ impl MicrophoneProcessor {
             ..Self::new()
         }
     }
+    /// What the gate did with the last block: its mean squared gain and the
+    /// suppressor's kept ratio (the gate bench reads it).
+    #[cfg(test)]
+    pub(crate) fn gate_trace(&self) -> (f32, Option<f32>) {
+        (self.gate.gain_power(), self.speech_model.map(|model| model.kept))
+    }
     pub(crate) fn process(&mut self, input: &mut [f32], controls: &AudioControls) -> bool {
         if input.is_empty() {
             return false;
@@ -3454,6 +3497,7 @@ impl MicrophoneProcessor {
             }
             self.clicks = crate::click_suppression::ClickSuppressor::new();
             self.gate = crate::voice_gate::NoiseGate::new();
+            self.kept = Default::default();
             self.automatic_gain = 1.0;
             self.sonora_gain = None;
             self.silero = None;
@@ -3534,6 +3578,7 @@ impl MicrophoneProcessor {
                 });
                 self.denoiser_kind = Some(kind);
                 self.denoiser_handoff = handoff;
+                self.kept = Default::default();
             }
             #[cfg(feature = "native-rtc")]
             {
@@ -3546,15 +3591,41 @@ impl MicrophoneProcessor {
                 }
             }
             let suppressor = self.denoiser.as_mut().unwrap();
+            let lag = crate::voice_gate::SuppressionRatio::lag_blocks(
+                suppressor.delay_samples(),
+                crate::noise_suppressor::BLOCK,
+            );
+            let mut model_voice: Option<f32> = None;
             for chunk in input.chunks_exact_mut(crate::noise_suppressor::BLOCK) {
+                self.kept.raw(chunk);
+                #[cfg(test)]
+                {
+                    self.trace_energy[0] = chunk.iter().map(|s| s * s).sum();
+                }
                 let block: &mut [f32; crate::noise_suppressor::BLOCK] =
                     chunk.try_into().expect("chunks_exact yields whole blocks");
                 suppressor.process(block);
                 controls.model_status.store(suppressor.status() as u32, Ordering::Release);
+                // The suppressor's own verdict, before click suppression: that
+                // stage also thins a voice at its first syllable and under a
+                // loud fan, which the gate must not read as "not speech".
+                self.kept.kept(chunk, lag);
+                if let Some(voice) = suppressor.voice_probability() {
+                    model_voice = Some(model_voice.map_or(voice, |seen| seen.max(voice)));
+                }
+                #[cfg(test)]
+                {
+                    self.trace_energy[1] = chunk.iter().map(|s| s * s).sum();
+                    self.trace_energy[3] = suppressor.voice_probability().unwrap_or(-1.0);
+                }
                 // Before speech detection, so a click cannot open the gate.
                 // Click suppression needs a voice probability to spare speech.
                 if let (true, Some(voice)) = (clicks, suppressor.voice_probability()) {
                     self.clicks.process(chunk, voice, strength);
+                }
+                #[cfg(test)]
+                {
+                    self.trace_energy[2] = chunk.iter().map(|s| s * s).sum();
                 }
                 #[cfg(feature = "native-rtc")]
                 if let Some(detector) = self.voice_detector.as_mut() {
@@ -3569,11 +3640,17 @@ impl MicrophoneProcessor {
                     *detected.get_or_insert(false) |= detector.is_speech(&analysis);
                 }
             }
+            self.speech_model = self.kept.take(input.len()).map(|kept| crate::voice_gate::SpeechModel {
+                kept,
+                voice: model_voice,
+            });
         } else {
             controls.model_status.store(crate::audio_model_lab::Status::Idle as u32, Ordering::Release);
             self.denoiser = None;
             self.denoiser_kind = None;
             self.clicks = crate::click_suppression::ClickSuppressor::new();
+            self.kept = Default::default();
+            self.speech_model = None;
             #[cfg(feature = "native-rtc")]
             {
                 self.voice_detector = None;
@@ -3772,7 +3849,11 @@ impl MicrophoneProcessor {
         } else {
             None
         };
-        let speech = self.gate.detect(rms, threshold, decision);
+        // The suppressor's verdict (how much of the block it kept) must agree.
+        let model = self.speech_model;
+        #[cfg(test)]
+        let model = model.filter(|_| !self.gate_without_ratio);
+        let speech = self.gate.detect(rms, threshold, decision, model);
         let timing = crate::voice_gate::GateTiming {
             attack_ms: controls.attack_ms.load(Ordering::Relaxed),
             hold_ms: controls.hold_ms.load(Ordering::Relaxed),
@@ -4210,6 +4291,10 @@ impl PlayoutSchedule {
     }
 }
 
+/// Largest Opus payload with copies; a larger one goes out plain. Leaves room
+/// for the protected header, both identities and the whisper wrapper.
+const MAX_REDUNDANT_PAYLOAD: usize = 1000;
+
 fn voice_worker(mut w: VoiceWorker) {
     if let Ok(mut direct) = w.controls.direct.lock() {
         *direct = Some(crate::direct_voice::DirectVoice::new(w.session_id));
@@ -4240,10 +4325,16 @@ fn voice_worker(mut w: VoiceWorker) {
     let mut last_recovery = w.encoder.get_inband_fec().unwrap_or(false);
     // Automatic loss recovery, from incoming loss.
     let mut loss_policy = crate::voice_quality::LossRecoveryPolicy::default();
+    // A copy of the previous frame in each packet while loss comes in runs,
+    // once everyone else in the call has said their Relay decodes them.
+    let mut redundancy_policy = crate::voice_quality::RedundancyPolicy::default();
+    let mut copy_history = crate::voice_jitter::redundancy::History::default();
+    let mut copy_peers = crate::voice_jitter::redundancy::Peers::default();
     let mut last_packet_samples = 0;
     let mut last_whisper: Option<Vec<String>> = None;
     let mut last_privacy_generation = w.controls.privacy_generation.load(Ordering::Acquire);
     let mut playout = PlayoutSchedule::default();
+    let mut receive = crate::receive_level::Receive::default();
     let mut last_capture = None;
     let mut speech_preroll = crate::voice_preroll::SpeechPreroll::default();
     let mut next_ptt_poll = Instant::now();
@@ -4457,6 +4548,7 @@ fn voice_worker(mut w: VoiceWorker) {
                         w.counters.rejected.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
+                    copy_peers.heard(&frame.user_id, &frame.opus);
                     let speaker_key = if whisper {
                         format!("whisper:{}", frame.user_id)
                     } else {
@@ -4694,6 +4786,8 @@ fn voice_worker(mut w: VoiceWorker) {
             speech_preroll.clear();
             discard_encoder_history(&mut w.encoder, &w.errors, &w.stop);
             encoded_history = false;
+            // Copies never carry audio across a change of who may hear it.
+            copy_history.clear();
             microphone = MicrophoneProcessor::new();
             if let Ok(mut capture) = w.capture.lock() {
                 capture.clear();
@@ -4728,18 +4822,38 @@ fn voice_worker(mut w: VoiceWorker) {
                 ),
                 now,
             );
-            let recovery = choice.active(high_loss, packet_samples);
+            // Copies follow the same choice as recovery (never with Off, never
+            // in packets shorter than 10 ms) but switch on loss runs only.
+            let loss_runs = redundancy_policy.observe(
+                arrivals.values_mut().filter_map(|arrival| arrival.bursts(now)),
+                now,
+            );
+            let plan = crate::voice_jitter::redundancy::PLAN;
+            let redundant = loss_runs
+                && choice.active(true, packet_samples)
+                && copy_peers.all_decode(
+                    w.call.keys.sender_keys.keys(),
+                    &w.call.keys.local_user_id,
+                );
+            let recovery =
+                choice.active(high_loss, packet_samples) && (!redundant || plan.keep_fec);
+            let user_bitrate = w.controls.bitrate_kbps.load(Ordering::Relaxed);
+            // While copies go out, the new frame gets the plan's share so the
+            // frame, its copies and the framing stay within the budget.
+            let bitrate = if redundant {
+                plan.primary_kbps(user_bitrate, packet_samples)
+            } else {
+                user_bitrate
+            };
             if recovery != last_recovery {
-                match crate::audio_settings::make_voice_encoder_with_recovery(
-                    w.controls.bitrate_kbps.load(Ordering::Relaxed),
-                    recovery,
-                ) {
+                match crate::audio_settings::make_voice_encoder_with_recovery(bitrate, recovery) {
                     Ok(encoder) => {
                         // Not a restart: listeners keep decoding across the
                         // rebuilt encoder. A restart would make their buffer
                         // start over mid-sentence (a gap on older Relay).
                         w.encoder = encoder;
                         last_recovery = recovery;
+                        last_bitrate = bitrate;
                     }
                     Err(error) => {
                         record_error(&w.errors, format!("Configure voice recovery: {error}"));
@@ -4779,7 +4893,6 @@ fn voice_worker(mut w: VoiceWorker) {
                     break;
                 };
                 sample_clock = next_clock;
-                let bitrate = w.controls.bitrate_kbps.load(Ordering::Relaxed);
                 if bitrate != last_bitrate {
                     match w
                         .encoder
@@ -4833,6 +4946,17 @@ fn voice_worker(mut w: VoiceWorker) {
                             Ok(n) => {
                                 let restart = !encoded_history;
                                 encoded_history = true;
+                                // The plain packet, or the same with copies of
+                                // earlier frames (or a capability note) in its
+                                // Opus padding, which older Relay ignores.
+                                let opus = copy_history.frame(
+                                    &encoded[..n],
+                                    media_sequence,
+                                    frame_timestamp + (packet_index * packet_samples) as u64,
+                                    restart,
+                                    redundant.then_some(plan),
+                                    MAX_REDUNDANT_PAYLOAD,
+                                );
                                 let Some(next) = media_sequence.checked_add(1) else {
                                     record_error(
                                         &w.errors,
@@ -4860,7 +4984,7 @@ fn voice_worker(mut w: VoiceWorker) {
                                                                 + (packet_index * packet_samples)
                                                                     as u64,
                                                             restart,
-                                                            &encoded[..n],
+                                                            opus,
                                                         )
                                                     })
                                                     .and_then(|inner| {
@@ -4877,7 +5001,7 @@ fn voice_worker(mut w: VoiceWorker) {
                                             frame_timestamp
                                                 + (packet_index * packet_samples) as u64,
                                             restart,
-                                            &encoded[..n],
+                                            opus,
                                         )
                                         .map(|packet| vec![packet])
                                 };
@@ -4974,6 +5098,10 @@ fn voice_worker(mut w: VoiceWorker) {
                 })
             });
         if playout.due(now, &speakers, jitter_ms) {
+            receive.configure(
+                w.controls.level_voices.load(Ordering::Relaxed),
+                w.controls.clean_incoming.load(Ordering::Relaxed),
+            );
             let mut mixed = [0.0f32; 120];
             let mut active = false;
             for (speaker_key, speaker) in speakers.iter_mut() {
@@ -4992,6 +5120,9 @@ fn voice_worker(mut w: VoiceWorker) {
                             heard.insert(speaker_id.to_owned(), now);
                         }
                     }
+                    // Everyone at the same loudness first; their volume
+                    // (and priority) on top.
+                    receive.level(speaker_key, &mut decoded);
                     let volume = w
                         .controls
                         .peer_volumes
@@ -5025,6 +5156,7 @@ fn voice_worker(mut w: VoiceWorker) {
                     .fetch_add(speaker.stats.quiet_skips, Ordering::Relaxed);
                 speaker.stats = Default::default();
             }
+            let active = receive.finish(&mut mixed, active);
             if let Ok(mut speaking) = w.controls.speaking.lock() {
                 speaking.retain(|id, at| {
                     (speakers.contains_key(id) || speakers.contains_key(&format!("whisper:{id}")))
@@ -5049,6 +5181,7 @@ fn voice_worker(mut w: VoiceWorker) {
         speakers.retain(|_, speaker| {
             now.duration_since(speaker.last_received) < Duration::from_secs(3)
         });
+        receive.retain(|key| speakers.contains_key(key));
         if now.duration_since(last_keepalive) >= Duration::from_secs(1) {
             send_packet(&w, &mut sequence, &[0]);
             send_tunnel_control(&w, &mut sequence, &[0]);
@@ -5106,14 +5239,26 @@ fn poll_push_to_talk(controls: &AudioControls) {
     #[cfg(target_os = "windows")]
     {
         // A bounded key-state query runs only while the voice worker exists. No hook.
-        let pressed =
+        let down =
             unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(key) } < 0;
+        let pressed = push_to_talk_open(controls, down, Instant::now());
         if controls.ptt_pressed.swap(pressed, Ordering::AcqRel) != pressed {
             controls.privacy_generation.fetch_add(1, Ordering::AcqRel);
         }
     }
     #[cfg(not(target_os = "windows"))]
     controls.ptt_pressed.store(false, Ordering::Release);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))] // The key poll is Windows-only; tests use it everywhere.
+/// The key's state with the release delay: "pressed" for that long after the
+/// key comes up, so every check of `ptt_pressed` keeps the tail.
+fn push_to_talk_open(controls: &AudioControls, down: bool, now: Instant) -> bool {
+    let delay = controls.ptt_release_ms.load(Ordering::Relaxed);
+    controls
+        .ptt_release
+        .lock()
+        .map_or(down, |mut release| release.open(down, delay, now))
 }
 
 fn discard_encoder_history(encoder: &mut Encoder, errors: &ErrorSlot, stop: &AtomicBool) {
@@ -6355,6 +6500,80 @@ mod tests {
         );
         assert!(engine.shared.muted.load(Ordering::Acquire));
         assert!(engine.shared.deafened.load(Ordering::Acquire));
+        engine.stop_voice();
+    }
+
+    /// What the app does with a Windows endpoint notification (device_follow
+    /// and `follow_device_change`), fed fake notifications instead of
+    /// IMMNotificationClient: the microphone reopens within 500 ms and the
+    /// call, its transport and its counters stay.
+    #[test]
+    fn fake_windows_notifications_reopen_the_microphone_within_500_ms_and_keep_the_call() {
+        use crate::device_follow::{decide, effective, real_default_changes, Change, Follow};
+        let (mut engine, entered, _release, published) = delayed_audio();
+        engine
+            .start_voice("ready", voice_ticket(), test_call_keys("local"))
+            .unwrap();
+        assert_eq!(entered.recv_timeout(Duration::from_secs(1)).unwrap(), "ready");
+        let until = Instant::now() + Duration::from_secs(1);
+        while !engine.is_active() && Instant::now() < until {
+            thread::yield_now();
+        }
+        let stop = engine.stop.clone().unwrap();
+        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        let outputs = names(&["Speakers"]);
+        // One notification as the UI thread handles it; returns the time until
+        // the audio owner reopens the devices, and which input it opened.
+        let notify = |engine: &mut MediaEngine, saved: &AudioSettings, change: Change, inputs: &[String]| {
+            let heard = Instant::now();
+            let running = engine.device_selection();
+            let Follow::Reopen { notice } = decide(change, saved, (&running.0, &running.1), inputs, &outputs) else {
+                return None;
+            };
+            engine.follow_device_change(effective(saved, inputs, &outputs)).unwrap();
+            let opened = entered.recv_timeout(Duration::from_secs(1)).unwrap();
+            Some((heard.elapsed(), opened, notice.unwrap_or_default()))
+        };
+        // "Default" selected: a headset becomes the Windows default microphone.
+        let default = AudioSettings::default().normalized();
+        let before = (Some("Scarlett".to_string()), Some("Speakers".to_string()));
+        let after = (Some("Headset".to_string()), Some("Speakers".to_string()));
+        let change = real_default_changes(
+            Change { default_input: true, ..Default::default() },
+            (&before.0, &before.1),
+            (&after.0, &after.1),
+        );
+        let (took, opened, notice) = notify(&mut engine, &default, change, &names(&["Scarlett", "Headset"])).unwrap();
+        assert_eq!(opened, "devices:default");
+        assert!(took < Duration::from_millis(500), "reopened after {took:?}");
+        assert!(notice.contains("default"), "{notice}");
+        // Windows repeating the same default is not a change.
+        let same = real_default_changes(change, (&after.0, &after.1), (&after.0, &after.1));
+        assert!(notify(&mut engine, &default, same, &names(&["Scarlett", "Headset"])).is_none());
+        // A named microphone: unplugged, the call falls back to Default; back, it returns.
+        let named = AudioSettings { input_device: Some("USB Headset".into()), ..Default::default() }.normalized();
+        engine.configure(named.clone());
+        engine.reopen_voice_devices().unwrap();
+        assert_eq!(entered.recv_timeout(Duration::from_secs(1)).unwrap(), "devices:USB Headset");
+        let devices = Change { devices: true, ..Default::default() };
+        let (took, opened, notice) = notify(&mut engine, &named, devices, &names(&["Scarlett"])).unwrap();
+        assert_eq!(opened, "devices:default");
+        assert!(took < Duration::from_millis(500), "fell back after {took:?}");
+        assert!(notice.contains("unplugged"), "{notice}");
+        assert_eq!(engine.settings.input_device, None, "running on the default");
+        let (took, opened, notice) = notify(&mut engine, &named, devices, &names(&["Scarlett", "USB Headset"])).unwrap();
+        assert_eq!(opened, "devices:USB Headset");
+        assert!(took < Duration::from_millis(500), "returned after {took:?}");
+        assert!(notice.contains("is back"), "{notice}");
+        // Some other device came or went: nothing reopens.
+        assert!(notify(&mut engine, &named, devices, &names(&["Scarlett", "USB Headset", "Webcam"])).is_none());
+        let until = Instant::now() + Duration::from_secs(1);
+        while !engine.is_active() && Instant::now() < until {
+            thread::yield_now();
+        }
+        assert!(engine.is_active(), "the call kept running");
+        assert!(Arc::ptr_eq(&stop, engine.stop.as_ref().unwrap()));
+        assert_eq!(published.load(Ordering::Relaxed), 1, "one call start, no reconnect");
         engine.stop_voice();
     }
 
@@ -7690,6 +7909,46 @@ mod tests {
             processor.denoiser.is_none(),
             "closed PTT never retains private denoiser history"
         );
+    }
+    #[test]
+    fn push_to_talk_release_delay_keeps_sending_the_last_word_then_closes() {
+        let settings = AudioSettings {
+            transmission: TransmissionMode::PushToTalk,
+            push_to_talk_release_ms: 200,
+            ..Default::default()
+        };
+        let controls = AudioControls::new(&settings);
+        let mut processor = MicrophoneProcessor::new();
+        let start = Instant::now();
+        // What the key poll stores every 2.5 ms, then one 10 ms block per poll.
+        let mut send = |ms: u64, down: bool| {
+            let pressed = push_to_talk_open(&controls, down, start + Duration::from_millis(ms));
+            controls.ptt_pressed.store(pressed, Ordering::Release);
+            let mut block = [0.1; AUDIO_FRAME_SAMPLES];
+            processor.process(&mut block, &controls)
+        };
+        assert!(!send(0, false), "never pressed");
+        assert!(send(10, true));
+        // Released at 20 ms: the tail is sent until 200 ms after the last press.
+        for ms in (20..210).step_by(10) {
+            assert!(send(ms, false), "closed {ms} ms in, inside the release delay");
+        }
+        assert!(!send(210, false), "the delay ended");
+        // Pressing again inside the delay continues the same talkspurt.
+        assert!(send(300, true));
+        assert!(send(450, false));
+        assert!(send(460, true));
+        assert!(send(650, false));
+        assert!(!send(670, false));
+        // 0 ms is the former behaviour: closed with the key.
+        controls.ptt_release_ms.store(0, Ordering::Relaxed);
+        assert!(send(700, true));
+        assert!(!send(702, false));
+        // A new setting applies to the running call.
+        controls.apply(&AudioSettings { push_to_talk_release_ms: 2000, ..settings });
+        assert!(send(800, true));
+        assert!(send(2790, false));
+        assert!(!send(2800, false));
     }
     #[test]
     fn automatic_voice_activity_passes_quiet_speech_without_learning_it_as_noise() {

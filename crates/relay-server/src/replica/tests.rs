@@ -546,6 +546,7 @@ fn upload_policy_metadata_is_logged_after_upgrading_existing_schema_27_triggers(
     for (name, sql) in trigger_definitions().into_iter().filter(|(name, _)| name.starts_with("replica_metadata_")) {
         db.execute_batch(&format!("DROP TRIGGER {name};{}", sql.replace(",'upload_policy'", ""))).unwrap();
     }
+    db.execute("DROP TABLE crypto_device_revocations", []).unwrap();
     db.pragma_update(None, "user_version", 27).unwrap();
     db.execute("DELETE FROM schema_migrations WHERE version>=28", []).unwrap();
     clear_log(&db);
