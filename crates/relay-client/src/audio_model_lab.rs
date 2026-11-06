@@ -346,9 +346,88 @@ impl Drop for Comparison {
     }
 }
 
+/// A comparison model run on the calling thread, held back by the same
+/// hand-off `Comparison` adds: its output is what the worker returns when it
+/// keeps up (test `inline_matches_the_worker_when_it_keeps_up`). For the
+/// bench, which needs deterministic output and the worker's time per block.
+#[cfg(any(test, feature = "audio-bench"))]
+pub(crate) struct Inline {
+    model: Model,
+    engine: Option<Engine>,
+    held: std::collections::VecDeque<[f32; BLOCK]>,
+    handoff: usize,
+}
+#[cfg(any(test, feature = "audio-bench"))]
+impl Inline {
+    /// `packet_samples`: as for `Comparison::new`.
+    pub(crate) fn new(model: Model, packet_samples: usize) -> Self {
+        let engine = Engine::new(model)
+            .map_err(|error| eprintln!("Voice model {}: {error}", model.name()))
+            .ok();
+        let handoff = packet_samples.div_ceil(BLOCK).clamp(1, 20);
+        Self { model, engine, held: std::collections::VecDeque::with_capacity(handoff + 1), handoff }
+    }
+}
+#[cfg(any(test, feature = "audio-bench"))]
+impl Suppressor for Inline {
+    fn process(&mut self, block: &mut [f32; BLOCK]) {
+        let mut samples = *block;
+        // A model that fails stays failed and silent, as on the worker.
+        if self.engine.as_mut().is_some_and(|engine| engine.process(&mut samples).is_err()) {
+            self.engine = None;
+        }
+        if self.engine.is_none() {
+            samples = [0.0; BLOCK];
+        }
+        self.held.push_back(samples);
+        *block = if self.held.len() > self.handoff { self.held.pop_front().expect("held") } else { [0.0; BLOCK] };
+    }
+    fn delay_samples(&self) -> usize {
+        self.model.delay_samples() + self.handoff * BLOCK
+    }
+    fn name(&self) -> &'static str {
+        self.model.name()
+    }
+    fn voice_probability(&self) -> Option<f32> {
+        None
+    }
+    fn status(&self) -> Status {
+        if self.engine.is_some() { Status::Active } else { Status::Unavailable }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The bench's inline runner gives exactly what `Comparison` plays when
+    /// the worker answers every block in time, at the same declared delay.
+    #[test]
+    fn inline_matches_the_worker_when_it_keeps_up() {
+        let speech = crate::voice_test_signals::talker(0.6, (105.0, 135.0), 13, 0.3);
+        let gtcrn = Model::External(relay_audio_models::Model::Gtcrn);
+        for model in [model(), gtcrn].into_iter().filter(|model| match model {
+            Model::External(model) => model.is_built_in(),
+            Model::Dpdf(_) => true,
+        }) {
+            let (service, inbox, outbox) = manual();
+            let mut worker = Comparison::new(service, model, BLOCK);
+            let mut engine = Engine::new(model).unwrap();
+            let mut inline = Inline::new(model, BLOCK);
+            assert_eq!(inline.delay_samples(), worker.delay_samples(), "{model:?}");
+            for chunk in speech.chunks_exact(BLOCK) {
+                let mut via_worker: [f32; BLOCK] = chunk.try_into().unwrap();
+                let mut via_inline = via_worker;
+                worker.process(&mut via_worker);
+                let mut job = inbox.try_recv().unwrap();
+                engine.process(&mut job.samples).unwrap();
+                outbox
+                    .try_send(Done { epoch: job.epoch, number: job.number, samples: job.samples, status: Status::Active })
+                    .unwrap();
+                inline.process(&mut via_inline);
+                assert_eq!(via_inline, via_worker, "{model:?}");
+            }
+        }
+    }
     fn manual() -> (Arc<Service>, Receiver<Job>, SyncSender<Done>) {
         let (jobs, inbox) = sync_channel(40);
         let (outbox, results) = sync_channel(40);

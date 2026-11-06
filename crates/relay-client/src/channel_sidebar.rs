@@ -189,46 +189,96 @@ impl RelayApp {
                                 .find(|c| c.id == channel)
                                 .map(|c| c.name.as_str())
                                 .unwrap_or("Voice room");
+                            let call = self.call_state();
+                            // Discord: signal bars, "Voice Connected" in green,
+                            // amber while connecting or recovering, red when paused.
+                            let paused = self.voice_encryption_error.is_some();
+                            let (headline, tone) = if call.reconnecting {
+                                ("Reconnecting…", voice_room_ui::AMBER)
+                            } else if paused {
+                                ("Voice Paused", c_bad())
+                            } else if self.joining_voice.is_some() {
+                                ("Joining Voice…", voice_room_ui::AMBER)
+                            } else if self
+                                .media
+                                .as_ref()
+                                .is_some_and(MediaEngine::is_changing_devices)
+                            {
+                                ("Changing Audio Devices…", voice_room_ui::AMBER)
+                            } else if self.audio_connecting && !call.ready {
+                                ("Opening Audio…", voice_room_ui::AMBER)
+                            } else if call.connected {
+                                ("Voice Connected", c_good())
+                            } else {
+                                ("Connecting Voice…", voice_room_ui::AMBER)
+                            };
+                            // Light theme: a darker amber keeps AA contrast on the light panel.
+                            let tone = if tone == voice_room_ui::AMBER && c_card().r() > 128 {
+                                Color32::from_rgb(138, 90, 0)
+                            } else {
+                                tone
+                            };
+                            let signal = self
+                                .media
+                                .as_ref()
+                                .filter(|media| call.connected && media.is_active())
+                                .map(|media| {
+                                    crate::voice_connection::Status::from_stats(
+                                        &media.network_stats(),
+                                    )
+                                });
+                            let (level, ping) = match signal.as_ref() {
+                                Some(status) => (
+                                    match status.quality() {
+                                        crate::connection_path::Quality::Poor => 1,
+                                        crate::connection_path::Quality::Fair => 2,
+                                        _ => 3,
+                                    },
+                                    status
+                                        .rtt_ms
+                                        .map(|ms| format!("Ping {ms:.0} ms"))
+                                        .unwrap_or_else(|| "Ping not measured yet".into()),
+                                ),
+                                None if call.connected => (3, "Voice connected".to_owned()),
+                                None => (0, headline.to_owned()),
+                            };
+                            let bars_tone = match level {
+                                1 => c_bad(),
+                                2 => voice_room_ui::AMBER,
+                                _ => tone,
+                            };
                             ui.horizontal(|ui| {
                                 let text_width = (ui.available_width() - 36.0).max(80.0);
                                 ui.vertical(|ui| {
                                     ui.set_width(text_width);
-                                    ui.label(
-                                        RichText::new(if self.voice_reconnecting() {
-                                            "Reconnecting voice…"
-                                        } else if self.voice_encryption_error.is_some() {
-                                            "Voice paused"
-                                        } else if self.joining_voice.is_some() {
-                                            "Joining voice…"
-                                        } else if self
-                                            .media
-                                            .as_ref()
-                                            .is_some_and(MediaEngine::is_changing_devices)
-                                        {
-                                            "Changing audio devices…"
-                                        } else if self.audio_connecting && !self.voice_ready() {
-                                            "Opening audio…"
-                                        } else if self.voice_connected() {
-                                            "Voice connected"
-                                        } else {
-                                            "Connecting voice…"
-                                        })
-                                        .size(font_size(13.0))
-                                        .family(egui::FontFamily::Name("Relay Semibold".into()))
-                                        .strong()
-                                        .color(
-                                            if self.voice_connected() {
-                                                c_good()
-                                            } else {
-                                                c_accent()
-                                            },
-                                        ),
-                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        let (bars, _) = ui.allocate_exact_size(
+                                            Vec2::new(14.0, 12.0),
+                                            Sense::hover(),
+                                        );
+                                        voice_room_ui::signal_bars(
+                                            ui.painter(),
+                                            bars,
+                                            level,
+                                            bars_tone,
+                                        );
+                                        ui.label(
+                                            RichText::new(headline)
+                                                .size(font_size(14.0))
+                                                .family(egui::FontFamily::Name(
+                                                    "Relay Semibold".into(),
+                                                ))
+                                                .strong()
+                                                .color(tone),
+                                        )
+                                        .on_hover_text(ping);
+                                    });
                                     let room = ui
                                         .add_sized(
                                             [text_width, 18.0],
                                             egui::Label::new(
-                                                RichText::new(name)
+                                                RichText::new(format!("{name} / {}", b.server_name))
                                                     .size(font_size(TEXT_CAPTION))
                                                     .color(c_muted()),
                                             )
@@ -239,7 +289,7 @@ impl RelayApp {
                                     if room.clicked() {
                                         self.select(Target::Channel(channel.clone()));
                                     }
-                                    if self.voice_connected() {
+                                    if call.connected {
                                         self.connection_path_caption(ui, text_width);
                                     }
                                     if let Some(media) = &self.media {
@@ -289,8 +339,8 @@ impl RelayApp {
                                         ui,
                                         Icon::HangUp,
                                         false,
-                                        if self.voice_ready() {
-                                            "Disconnect voice"
+                                        if call.ready {
+                                            "Disconnect"
                                         } else {
                                             "Cancel voice join"
                                         },
@@ -304,12 +354,13 @@ impl RelayApp {
                             // Discord's row under "Voice Connected": camera and screen
                             // share are always one click away, lit while they run.
                             ui.add_space(4.0);
-                            let ready = self.voice_ready();
+                            let ready = call.ready;
                             let mut toggle = None;
                             ui.columns(2, |columns| {
                                 for (column, camera) in columns.iter_mut().zip([true, false]) {
                                     let starting = self.source_starting(camera);
-                                    let active = self.source_active(camera) || starting;
+                                    let live = if camera { call.camera_live } else { call.screen_live };
+                                    let active = live || starting;
                                     let label = match (camera, active) {
                                         (true, false) => "Turn on camera",
                                         (true, true) if starting => "Opening camera…",
@@ -323,8 +374,9 @@ impl RelayApp {
                                         Vec2::new(column.available_width(), 32.0),
                                         if enabled { Sense::click() } else { Sense::hover() },
                                     );
+                                    // Discord: a running camera or share turns the button white.
                                     let fill = if active {
-                                        c_good()
+                                        c_text()
                                     } else if response.hovered() && enabled {
                                         c_text().gamma_multiply(0.18)
                                     } else {
@@ -339,7 +391,7 @@ impl RelayApp {
                                         egui::Rect::from_center_size(rect.center(), Vec2::splat(18.0)),
                                         if camera { Icon::Camera } else { Icon::Screen },
                                         if active {
-                                            Color32::WHITE
+                                            c_card()
                                         } else if enabled {
                                             c_text()
                                         } else {

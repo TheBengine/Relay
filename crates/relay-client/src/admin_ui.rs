@@ -254,6 +254,9 @@ impl RelayApp {
         let Some(b) = self.bootstrap.clone() else {
             return;
         };
+        if self.call_capture_panel(panel, &b) {
+            return;
+        }
         let server_section = match panel {
             "settings-overview" => Some(Section::Overview),
             "settings-channels" => Some(Section::Channels),

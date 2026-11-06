@@ -1181,6 +1181,9 @@ impl RelayApp {
         ] {
             controls::radio_value(ui, ("noise-model", label), &mut choice, option, label, body);
         }
+        if let (Some(removed), Some(NoiseModel::Enhanced)) = (audio.removed_noise_model, choice) {
+            controls::description(ui, &format!("{} is no longer included in Relay, so your saved choice now uses Enhanced.", removed.label()));
+        }
         egui::CollapsingHeader::new("Compare voice models")
             .default_open(choice.is_some_and(|model| model != NoiseModel::RECOMMENDED))
             .show(ui, |ui| {
@@ -1190,7 +1193,7 @@ impl RelayApp {
                     .selected_text(choice.map_or("None", NoiseModel::label))
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut choice, None, "None · No noise filter");
-                        for model in NoiseModel::ALL {
+                        for model in NoiseModel::ALL.into_iter().filter(|model| model.is_built_in()) {
                             #[cfg(not(feature = "native-rtc"))]
                             if matches!(model, NoiseModel::WebRtc | NoiseModel::RnNoiseThenWebRtc | NoiseModel::WebRtcThenRnNoise) { continue; }
                             ui.selectable_value(&mut choice, Some(model), format!("{} · ~{} ms", model.label(), model.suppression_ms_for(batch)));

@@ -67,6 +67,8 @@ struct Registration {
     token_hash: String,
     address: SocketAddrV4,
     expires: Instant,
+    /// When this exact registration (instance, session, address) began.
+    since: Instant,
 }
 
 /// What a request saw and validated; the registration must still be exactly this
@@ -213,8 +215,10 @@ impl Book {
             .gateways
             .get(user)
             .is_some_and(|old| old.seen() == registration.seen());
-        if !same {
-            self.drop_gateway(user);
+        let mut registration = registration;
+        match self.gateways.get(user) {
+            Some(old) if same => registration.since = old.since,
+            _ => self.drop_gateway(user),
         }
         let others = self.gateways.iter().filter(|(other, _)| *other != user);
         if others.count() >= MAX_REGISTRATIONS
@@ -613,6 +617,7 @@ pub(crate) async fn register(
             token_hash: auth.token_hash.clone(),
             address,
             expires: Instant::now() + REGISTRATION,
+            since: Instant::now(),
         },
     )?;
     Ok(Json(wire::Registered {
@@ -795,11 +800,20 @@ pub(crate) async fn list(
         // Only what is still current is published: a worker that restarted since
         // the snapshot is not listed under its predecessor's instance.
         if book.registration_is(user, &registration.seen()) {
+            // What the gateway's machine measured, for the LAN election.
+            let capacity = state.0.measurements.capacity(user, &[], now_ms());
+            let capability = relay_protocol::host_choice::Capability {
+                upload_kbps: capacity.and_then(|c| c.upload_kbps),
+                cpu_free_pct: capacity.and_then(|c| c.cpu_free_pct),
+                host_rtt_ms: book.host_rtt_ms(&channel_id, user),
+            };
             gateways.push(wire::GatewayOffer {
                 gateway_id: user.clone(),
                 instance: wire::encode_id(&registration.instance),
                 ip: registration.address.ip().to_string(),
                 port: registration.address.port(),
+                capability: (capability != Default::default()).then_some(capability),
+                serving_secs: Some(registration.since.elapsed().as_secs()),
             });
         }
     }

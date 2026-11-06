@@ -187,6 +187,288 @@ impl RelayApp {
         ui.ctx().request_repaint_after(Duration::from_secs(1));
     }
 
+    /// Call messages under the bar, or under Join Voice before joining.
+    fn call_messages(
+        &mut self,
+        ui: &mut egui::Ui,
+        joined: bool,
+        selected_call: bool,
+        ready: bool,
+        can_join: bool,
+        can_stream: bool,
+    ) {
+        if let Some(reason) = self
+            .voice_encryption_error
+            .clone()
+            .filter(|_| selected_call)
+        {
+            ui.add(egui::Label::new(RichText::new(reason).color(c_bad())).wrap(true));
+            let open = self.bootstrap.as_ref().is_some_and(|b| {
+                b.protection.level == relay_protocol::ProtectionLevel::Open
+            });
+            match voice_ui_state::pause_action(self.voice_reconnecting(), open) {
+                Some(voice_ui_state::PauseAction::RetryCall)
+                    if ui.add(secondary("Try again")).clicked() =>
+                {
+                    self.send(Command::CryptoRefresh);
+                }
+                Some(voice_ui_state::PauseAction::EncryptionDetails)
+                    if ui.add(secondary("Encryption details")).clicked() =>
+                {
+                    self.settings_tab = SettingsTab::Encryption;
+                    self.settings_open = true;
+                    self.send(Command::CryptoRefresh);
+                }
+                _ => {}
+            }
+        }
+        let video_restart_hint = match self.video_restart_needed {
+            [true, true] => Some("Camera and screen sharing stopped when the call changed. Start them again when ready."),
+            [true, false] => Some("Screen sharing stopped when the call changed. Start sharing again when ready."),
+            [false, true] => Some("Your camera stopped when the call changed. Start it again when ready."),
+            [false, false] => None,
+        };
+        if let Some(hint) = video_restart_hint.filter(|_| joined) {
+            ui.add(egui::Label::new(RichText::new(hint).size(font_size(TEXT_CAPTION)).color(c_muted())).wrap(true));
+        }
+        if self.rtc_reconnecting() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reconnecting video…");
+            });
+        }
+        #[cfg(feature = "native-rtc")]
+        if joined
+            && ready
+            && !self.rtc_active()
+            && !self.rtc_starting()
+            && self
+                .bootstrap
+                .as_ref()
+                .is_some_and(|b| b.capabilities.iter().any(|cap| cap == "native-rtc-v1"))
+            && ui.add(secondary("Connect Video")).clicked()
+        {
+            self.request_video_connection();
+        }
+        #[cfg(not(feature = "native-rtc"))]
+        let _ = ready;
+        if !joined
+            && self.joining_voice.is_some()
+            && ui.add(secondary("Cancel join")).clicked()
+        {
+            self.leave_voice();
+        }
+        if !can_join {
+            ui.label(
+                RichText::new("You do not have permission to join this room.")
+                    .size(font_size(12.0))
+                    .color(c_muted()),
+            );
+        } else if !can_stream && joined {
+            ui.label(
+                RichText::new("Sharing is disabled by this room's permissions.")
+                    .size(font_size(12.0))
+                    .color(c_muted()),
+            );
+        }
+        if !joined {
+            ui.label(
+                RichText::new("Your microphone opens when you join.")
+                    .size(font_size(TEXT_CAPTION))
+                    .color(c_muted()),
+            );
+        }
+    }
+
+    /// What the call surfaces show about your own call: the real state, or a
+    /// capture fixture's fixed state while capturing screenshots.
+    pub(super) fn call_state(&self) -> voice_room_ui::CallState {
+        if let Some(fixture) = self.capture_call.filter(|_| self.capture_path.is_some()) {
+            return fixture.state();
+        }
+        voice_room_ui::CallState {
+            ready: self.voice_ready(),
+            connected: self.voice_connected(),
+            reconnecting: self.voice_reconnecting(),
+            screen_live: self.source_active(false),
+            camera_live: self.source_active(true),
+            video_connected: self.rtc_active(),
+            video_connecting: self.rtc_starting(),
+        }
+    }
+
+    /// The name of the screen or window you share, for the stop-sharing bar.
+    fn shared_source_name(&self) -> Option<String> {
+        let id = self.screen_source.as_ref()?;
+        self.inventory
+            .screens
+            .iter()
+            .find(|source| &source.id == id)
+            .map(|source| source.name.clone())
+    }
+
+    /// The first received stream of someone in `room`, pinned first: what
+    /// the bar's Focus button puts large.
+    fn first_room_stream(&self, room: &str) -> Option<String> {
+        let members: Vec<_> = self
+            .bootstrap
+            .as_ref()?
+            .voice_members
+            .iter()
+            .filter(|member| member.channel_id == room)
+            .map(|member| member.user.id.clone())
+            .collect();
+        let mut keys: Vec<_> = self
+            .video
+            .iter()
+            .filter(|(_, video)| members.contains(&video.metadata.user.id))
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort_by_key(|key| (self.pinned_stream.as_ref() != Some(key), key.clone()));
+        keys.into_iter().next()
+    }
+
+    /// Discord's call bar: camera, screen, microphone and deafen (each audio
+    /// button with its device menu), the red Disconnect, and at the right end
+    /// the layout, full screen and Voice & Video settings.
+    fn call_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        room: &str,
+        ready: bool,
+        can_stream: bool,
+        call: voice_room_ui::CallState,
+    ) {
+        use voice_room_ui::{BarTool, BAR_TOOL, CALL_GAP, CALL_LEAVE_GAP};
+        const MENU: f32 = 16.0;
+        const MENU_GAP: f32 = 2.0;
+        let first_stream = self.first_room_stream(room);
+        let width = voice_room_ui::call_bar_width(5) + 2.0 * (MENU + MENU_GAP);
+        let tools = if first_stream.is_some() { 3 } else { 2 };
+        let tools_width = tools as f32 * BAR_TOOL + (tools - 1) as f32 * 4.0;
+        let side = ((ui.available_width() - width) * 0.5).max(0.0);
+        let show_tools = side >= tools_width + 8.0;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = CALL_GAP;
+            ui.add_space(side);
+            let camera_on = call.camera_live;
+            if ui
+                .add_enabled_ui(
+                    ready && (can_stream || camera_on || self.source_starting(true)),
+                    |ui| {
+                        call_control(
+                            ui,
+                            Icon::Camera,
+                            camera_on,
+                            false,
+                            if self.source_starting(true) {
+                                "Cancel camera start"
+                            } else if camera_on {
+                                "Turn Off Camera"
+                            } else {
+                                "Turn On Camera"
+                            },
+                        )
+                    },
+                )
+                .inner
+                .clicked()
+            {
+                self.camera_toggle();
+            }
+            let screen_on = call.screen_live;
+            if ui
+                .add_enabled_ui(
+                    ready && (can_stream || screen_on || self.source_starting(false)),
+                    |ui| {
+                        call_control(
+                            ui,
+                            Icon::Screen,
+                            screen_on,
+                            false,
+                            if self.source_starting(false) {
+                                "Cancel screen share start"
+                            } else if screen_on {
+                                "Stop Sharing"
+                            } else {
+                                "Share Your Screen"
+                            },
+                        )
+                    },
+                )
+                .inner
+                .clicked()
+            {
+                self.screen_toggle();
+            }
+            if call_control(
+                ui,
+                Icon::Mic,
+                self.muted,
+                false,
+                if self.muted { "Unmute" } else { "Mute" },
+            )
+            .clicked()
+            {
+                self.toggle_mute();
+            }
+            ui.add_space(MENU_GAP - CALL_GAP);
+            self.audio_device_menu(ui, true);
+            if call_control(
+                ui,
+                Icon::Headphones,
+                self.deafened,
+                false,
+                if self.deafened { "Undeafen" } else { "Deafen" },
+            )
+            .clicked()
+            {
+                self.toggle_deafen();
+            }
+            ui.add_space(MENU_GAP - CALL_GAP);
+            self.audio_device_menu(ui, false);
+            ui.add_space(CALL_LEAVE_GAP - CALL_GAP);
+            if call_control(ui, Icon::HangUp, false, true, "Disconnect").clicked() {
+                self.leave_voice();
+            }
+            if show_tools {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if voice_room_ui::bar_tool(ui, BarTool::Settings, "Voice & Video Settings")
+                        .clicked()
+                    {
+                        self.settings_open = true;
+                        self.settings_tab = SettingsTab::VoiceVideo;
+                        self.voice_video_tab = VoiceVideoTab::Voice;
+                    }
+                    let fullscreen = ui
+                        .ctx()
+                        .input(|input| input.viewport().fullscreen.unwrap_or(false));
+                    let (tool, label) = if fullscreen {
+                        (BarTool::ExitFullScreen, "Exit Full Screen")
+                    } else {
+                        (BarTool::FullScreen, "Full Screen")
+                    };
+                    if voice_room_ui::bar_tool(ui, tool, label).clicked() {
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+                    }
+                    if let Some(first) = first_stream {
+                        let focused = self.focused_stream.is_some();
+                        let (tool, label) = if focused {
+                            (BarTool::Grid, "Grid View")
+                        } else {
+                            (BarTool::Focus, "Focus View")
+                        };
+                        if voice_room_ui::bar_tool(ui, tool, label).clicked() {
+                            self.focused_stream = if focused { None } else { Some(first) };
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     pub(super) fn voice_view(&mut self, ui: &mut egui::Ui, name: &str, selected: &str) {
         self.stage_controls(ui, selected);
         let selected = selected.to_owned();
@@ -200,213 +482,26 @@ impl RelayApp {
         });
         let can_join = channel.is_some_and(|channel| channel.can_join);
         let can_stream = channel.is_some_and(|channel| channel.can_stream);
-        let ready = joined && self.voice_ready();
+        let call = self.call_state();
+        let ready = joined && call.ready;
         let needs_consent = self.call_needs_open_consent();
-        egui::TopBottomPanel::bottom("voice-controls")
-            .frame(egui::Frame::none().inner_margin(Margin::symmetric(16.0, 12.0)))
-            .show_inside(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let controls_width = if joined { 6.0 * 54.0 } else { 220.0 };
-                    ui.add_space(((ui.available_width() - controls_width) * 0.5).max(0.0));
-                    if self.current_voice_text_parent().is_none() {
-                        if let Some(chat) = self
-                            .bootstrap
-                            .as_ref()
-                            .and_then(|b| {
-                                b.channels
-                                    .iter()
-                                    .find(|c| c.voice_parent_id.as_ref() == Some(&selected))
-                            })
-                            .cloned()
-                        {
-                            if call_control(ui, Icon::Chat, false, false, "Open voice channel chat")
-                                .clicked()
-                            {
-                                self.select(Target::Channel(chat.id));
-                            }
-                        }
-                    }
-                    if joined {
-                        if call_control(
-                            ui,
-                            Icon::Mic,
-                            self.muted,
-                            false,
-                            if self.muted {
-                                "Unmute microphone"
-                            } else {
-                                "Mute microphone"
-                            },
-                        )
-                        .clicked()
-                        {
-                            self.toggle_mute();
-                        }
-                        if call_control(
-                            ui,
-                            Icon::Headphones,
-                            self.deafened,
-                            false,
-                            if self.deafened { "Undeafen" } else { "Deafen" },
-                        )
-                        .clicked()
-                        {
-                            self.toggle_deafen();
-                        }
-                        if ui
-                            .add_enabled_ui(
-                                ready
-                                    && (can_stream
-                                        || self.source_active(false)
-                                        || self.source_starting(false)),
-                                |ui| {
-                                    call_control(
-                                        ui,
-                                        Icon::Screen,
-                                        self.source_active(false),
-                                        false,
-                                        if self.source_starting(false) {
-                                            "Cancel screen share start"
-                                        } else if self.source_active(false) {
-                                            "Stop screen share"
-                                        } else {
-                                            "Start screen share"
-                                        },
-                                    )
-                                },
-                            )
-                            .inner
-                            .clicked()
-                        {
-                            self.screen_toggle();
-                        }
-                        if ui
-                            .add_enabled_ui(
-                                ready
-                                    && (can_stream
-                                        || self.source_active(true)
-                                        || self.source_starting(true)),
-                                |ui| {
-                                    call_control(
-                                        ui,
-                                        Icon::Camera,
-                                        self.source_active(true),
-                                        false,
-                                        if self.source_starting(true) {
-                                            "Cancel camera start"
-                                        } else if self.source_active(true) {
-                                            "Stop camera"
-                                        } else {
-                                            "Start camera"
-                                        },
-                                    )
-                                },
-                            )
-                            .inner
-                            .clicked()
-                        {
-                            self.camera_toggle();
-                        }
-                        if call_control(ui, Icon::HangUp, false, true, "Disconnect").clicked() {
-                            self.leave_voice();
-                        }
-                    } else if ui
-                        .add_enabled(
-                            can_join
-                                && !needs_consent
-                                && self.joining_voice.as_ref() != Some(&selected),
-                            primary(if self.joining_voice.as_ref() == Some(&selected) {
-                                "Joining…"
-                            } else {
-                                "Join voice"
-                            })
-                            .min_size(Vec2::new(130.0, 38.0)),
-                        )
-                        .clicked()
-                    {
-                        self.join_voice(selected.clone());
-                    }
+        // Discord's call view sits on a black stage; the bar shares it.
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, voice_room_ui::stage_fill());
+        if joined {
+            egui::TopBottomPanel::bottom("voice-controls")
+                .frame(
+                    egui::Frame::none()
+                        .fill(voice_room_ui::stage_fill())
+                        .inner_margin(Margin::symmetric(16.0, 14.0)),
+                )
+                .show_inside(ui, |ui| {
+                    self.call_bar(ui, &selected, ready, can_stream, call);
+                    ui.vertical_centered(|ui| {
+                        self.call_messages(ui, joined, selected_call, ready, can_join, can_stream);
+                    });
                 });
-                if let Some(reason) = self
-                    .voice_encryption_error
-                    .clone()
-                    .filter(|_| selected_call)
-                {
-                    ui.add(egui::Label::new(RichText::new(reason).color(c_bad())).wrap(true));
-                    let open = self.bootstrap.as_ref().is_some_and(|b| {
-                        b.protection.level == relay_protocol::ProtectionLevel::Open
-                    });
-                    match voice_ui_state::pause_action(self.voice_reconnecting(), open) {
-                        Some(voice_ui_state::PauseAction::RetryCall)
-                            if ui.add(secondary("Try again")).clicked() =>
-                        {
-                            self.send(Command::CryptoRefresh);
-                        }
-                        Some(voice_ui_state::PauseAction::EncryptionDetails)
-                            if ui.add(secondary("Encryption details")).clicked() =>
-                        {
-                            self.settings_tab = SettingsTab::Encryption;
-                            self.settings_open = true;
-                            self.send(Command::CryptoRefresh);
-                        }
-                        _ => {}
-                    }
-                }
-                let video_restart_hint = match self.video_restart_needed {
-                    [true, true] => Some("Camera and screen sharing stopped when the call changed. Start them again when ready."),
-                    [true, false] => Some("Screen sharing stopped when the call changed. Start sharing again when ready."),
-                    [false, true] => Some("Your camera stopped when the call changed. Start it again when ready."),
-                    [false, false] => None,
-                };
-                if let Some(hint) = video_restart_hint.filter(|_| joined) {
-                    ui.add(egui::Label::new(RichText::new(hint).size(font_size(TEXT_CAPTION)).color(c_muted())).wrap(true));
-                }
-                if self.rtc_reconnecting() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Reconnecting video…");
-                    });
-                }
-                #[cfg(feature = "native-rtc")]
-                if joined
-                    && ready
-                    && !self.rtc_active()
-                    && !self.rtc_starting()
-                    && self
-                        .bootstrap
-                        .as_ref()
-                        .is_some_and(|b| b.capabilities.iter().any(|cap| cap == "native-rtc-v1"))
-                    && ui.add(secondary("Connect Video")).clicked()
-                {
-                    self.request_video_connection();
-                }
-                if !joined
-                    && self.joining_voice.is_some()
-                    && ui.add(secondary("Cancel join")).clicked()
-                {
-                    self.leave_voice();
-                }
-                if !can_join {
-                    ui.label(
-                        RichText::new("You do not have permission to join this room.")
-                            .size(font_size(12.0))
-                            .color(c_muted()),
-                    );
-                } else if !can_stream && joined {
-                    ui.label(
-                        RichText::new("Sharing is disabled by this room's permissions.")
-                            .size(font_size(12.0))
-                            .color(c_muted()),
-                    );
-                }
-                if !joined {
-                    ui.label(
-                        RichText::new("Your microphone opens when you join.")
-                            .size(font_size(TEXT_CAPTION))
-                            .color(c_muted()),
-                    );
-                }
-            });
+        }
         let members = self
             .bootstrap
             .as_ref()
@@ -418,21 +513,37 @@ impl RelayApp {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let status = voice_room_ui::room_status(voice_room_ui::RoomConnection {
+        let connection = voice_room_ui::RoomConnection {
             joined,
             encryption_paused: selected_call && self.voice_encryption_error.is_some(),
-            reconnecting: selected_call && self.voice_reconnecting(),
-            connected: self.voice_connected(),
+            reconnecting: selected_call && call.reconnecting,
+            connected: call.connected,
             media_ready: ready,
-        });
+        };
+        let status = voice_room_ui::room_status(connection);
         if self.voice_channel.is_none() {
             self.sound_check_since.clear();
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(24.0);
-            voice_room_ui::room_header(ui, name, members.len(), status);
-            ui.add_space(28.0);
+            ui.add_space(16.0);
+            if let Some(status) = status {
+                ui.vertical_centered(|ui| {
+                    voice_room_ui::status_pill(ui, status, voice_room_ui::status_tone(connection));
+                });
+                ui.add_space(12.0);
+            }
             self.call_protection_notice(ui);
+            if joined && call.screen_live {
+                let source = self.shared_source_name();
+                let stop = egui::Frame::none()
+                    .inner_margin(Margin::symmetric(24.0, 0.0))
+                    .show(ui, |ui| voice_room_ui::sharing_bar(ui, source.as_deref()))
+                    .inner;
+                if stop {
+                    self.stop_capture(false);
+                }
+                ui.add_space(12.0);
+            }
             if joined && (ready || self.capture_path.is_some()) {
                 self.sound_check(ui, &members);
                 if let Some(stats) = self.media.as_ref().filter(|_| self.capture_path.is_none()).map(|media| media.network_stats()) {
@@ -441,12 +552,22 @@ impl RelayApp {
                     // broken call or prevent someone from sharing their server.
                     // Keep Stop accessible if the person already opted in.
                     if stats.gateway_available || self.audio_applied.local_voice_gateways {
+                        let choice = self.media.as_ref().and_then(|media| media.gateway_choice()).map(|choice| {
+                            voice_room_ui::gateway_choice_text(&choice, stats.gateway_active, |id| {
+                                members
+                                    .iter()
+                                    .find(|m| m.user.id == id)
+                                    .map(|m| format!("{}'s PC", profile_ui::display_name(&m.user)))
+                                    .unwrap_or_else(|| "An approved PC".into())
+                            })
+                        });
                         if let Some(enabled) = voice_room_ui::local_gateway_controls(
                             ui,
                             self.audio_applied.local_voice_gateways,
                             stats.gateway_available,
                             stats.gateway_active,
                             friends_call,
+                            choice,
                         ) {
                             self.apply_quick_audio_change(|audio| audio.local_voice_gateways = enabled);
                         }
@@ -454,58 +575,155 @@ impl RelayApp {
                     }
                 }
             }
-            if members.is_empty() {
+            // Streams of people in this room, the pinned one first.
+            let mut streams: Vec<_> = self
+                .video
+                .iter()
+                .filter(|(_, v)| members.iter().any(|m| m.user.id == v.metadata.user.id))
+                .map(|(key, tile)| (key.clone(), tile.clone()))
+                .collect();
+            streams.sort_by(|(a_key, a), (b_key, b)| {
+                let pinned = self.pinned_stream.as_ref();
+                (
+                    pinned != Some(a_key),
+                    profile_ui::display_name(&a.metadata.user),
+                )
+                    .cmp(&(
+                        pinned != Some(b_key),
+                        profile_ui::display_name(&b.metadata.user),
+                    ))
+            });
+            if members.is_empty() && streams.is_empty() {
                 ui.add_space(30.0);
                 ui.vertical_centered(|ui| {
-                    // The header already says "No one in voice".
                     icon(ui, Icon::Headphones, 60.0, c_muted());
                     ui.add_space(14.0);
                     ui.label(
-                        RichText::new("Be the first to join.")
+                        RichText::new("No one is in voice. Be the first to join.")
                             .size(font_size(13.0))
                             .color(c_muted()),
                     );
                 });
             } else {
-                let own = self.session.as_ref().map(|session| session.user.id.clone());
-                let level =
-                    self.media
-                        .as_ref()
-                        .map(|media| if self.muted { 0.0 } else { media.input_level() });
-                let tiles: Vec<_> = members
+                let mut tiles: Vec<_> = members
                     .iter()
-                    .map(|member| voice_room_ui::ParticipantTile {
-                        user: &member.user,
-                        avatar: self.avatar_texture(&member.user),
-                        speaking: self.member_speaking(member),
-                        muted: member.muted,
-                        deafened: member.deafened,
-                        sharing: member.sharing,
-                        camera: member.camera,
-                        own_level: level
-                            .filter(|_| joined && own.as_ref() == Some(&member.user.id)),
+                    .map(|member| {
+                        voice_room_ui::Tile::Person(voice_room_ui::ParticipantTile {
+                            user: &member.user,
+                            avatar: self.avatar_texture(&member.user),
+                            speaking: self.member_speaking(member),
+                            muted: member.muted,
+                            deafened: member.deafened,
+                            sharing: member.sharing,
+                            camera: member.camera,
+                        })
                     })
                     .collect();
-                // Centre the grid in the page below the header, unless a
-                // whisper line or video tiles follow it; the closing 28-point
-                // gap of the page stays reserved.
-                let follows = self.focused_stream.is_some()
-                    || self
-                        .video
-                        .values()
-                        .any(|v| members.iter().any(|m| m.user.id == v.metadata.user.id))
-                    || (joined
-                        && self
-                            .media
-                            .as_ref()
-                            .is_some_and(|media| media.active_settings().whisper_enabled));
-                let space = if follows {
+                let mut ids: Vec<_> = members
+                    .iter()
+                    .map(|member| egui::Id::new(("voice-member-tile", &member.user.id)))
+                    .collect();
+                for (key, video) in &streams {
+                    tiles.push(voice_room_ui::Tile::Stream(voice_room_ui::StreamTile {
+                        user: &video.metadata.user,
+                        texture: video.texture.clone(),
+                        screen: video.metadata.kind == "screen",
+                        preview: !video.metadata.url.is_empty(),
+                        pinned: self.pinned_stream.as_ref() == Some(key),
+                    }));
+                    ids.push(egui::Id::new(("voice-stream-tile", key)));
+                }
+                // Someone shares but no picture has arrived: Discord's Watch Stream tile.
+                let own = self.session.as_ref().map(|session| session.user.id.clone());
+                let watch = voice_room_ui::watch_offer(joined, call);
+                let waiting: Vec<&VoiceMember> = members
+                    .iter()
+                    .filter(|member| {
+                        member.sharing
+                            && own.as_ref() != Some(&member.user.id)
+                            && !streams.iter().any(|(_, video)| {
+                                video.metadata.user.id == member.user.id
+                                    && video.metadata.kind == "screen"
+                            })
+                    })
+                    .collect();
+                for member in &waiting {
+                    tiles.push(voice_room_ui::Tile::Waiting(voice_room_ui::WaitingTile {
+                        user: &member.user,
+                        avatar: self.avatar_texture(&member.user),
+                        watch,
+                    }));
+                    ids.push(egui::Id::new(("voice-waiting-tile", &member.user.id)));
+                }
+                let focus = self
+                    .focused_stream
+                    .as_ref()
+                    .and_then(|focused| streams.iter().position(|(key, _)| key == focused))
+                    .map(|index| members.len() + index);
+                // The whisper line under the grid is centred with it.
+                let whisper = joined
+                    && self
+                        .media
+                        .as_ref()
+                        .is_some_and(|media| media.active_settings().whisper_enabled);
+                let below = if whisper {
+                    72.0
+                } else if joined {
                     0.0
                 } else {
-                    ui.available_height() - 28.0
+                    voice_room_ui::join_block_height()
                 };
-                let responses = voice_room_ui::participant_grid(ui, &tiles, space);
-                for (member, response) in members.iter().zip(responses) {
+                let space = ui.available_height() - 16.0;
+                let mut responses =
+                    voice_room_ui::participant_grid(ui, &tiles, &ids, focus, space, below, !joined)
+                        .into_iter();
+                drop(tiles);
+                let people: Vec<_> = responses.by_ref().take(members.len()).collect();
+                for ((key, video), response) in streams.iter().zip(responses.by_ref()) {
+                    let focused = self.focused_stream.as_ref() == Some(key);
+                    let mut hover = format!(
+                        "{} · {}",
+                        profile_ui::display_name(&video.metadata.user),
+                        voice_room_ui::stream_kind(&voice_room_ui::StreamTile {
+                            user: &video.metadata.user,
+                            texture: video.texture.clone(),
+                            screen: video.metadata.kind == "screen",
+                            preview: !video.metadata.url.is_empty(),
+                            pinned: false,
+                        })
+                    );
+                    if let Some(line) = self.delivered_caption(key, video) {
+                        hover.push('\n');
+                        hover.push_str(&line);
+                        hover.push('\n');
+                        hover.push_str(crate::video_quality::DELIVERED_HINT);
+                    }
+                    hover.push_str(if focused {
+                        "\nClick to return to the grid. Right-click for more."
+                    } else {
+                        "\nClick to focus this stream. Right-click for more."
+                    });
+                    if response.double_clicked() {
+                        self.stream_preview = Some(key.clone());
+                    } else if response.clicked() {
+                        self.focused_stream = if focused { None } else { Some(key.clone()) };
+                    }
+                    let response = response.on_hover_text(hover);
+                    self.stream_context_menu(ui, key, &response);
+                }
+                for (member, response) in waiting.iter().zip(responses.by_ref()) {
+                    let name = profile_ui::display_name(&member.user).to_owned();
+                    let response = response.on_hover_text(match watch {
+                        voice_room_ui::Watch::Offer => {
+                            format!("Connect video to watch {name}'s screen")
+                        }
+                        other => other.caption().to_owned(),
+                    });
+                    if watch == voice_room_ui::Watch::Offer && response.clicked() {
+                        self.request_video_connection();
+                    }
+                }
+                for (member, response) in members.iter().zip(people) {
                     let display = profile_ui::display_name(&member.user);
                     if response.clicked() {
                         self.open_profile(member.user.clone());
@@ -607,8 +825,27 @@ impl RelayApp {
                     });
                 }
             }
+            if !joined {
+                ui.add_space(voice_room_ui::JOIN_GAP);
+                ui.vertical_centered(|ui| {
+                    let joining = self.joining_voice.as_ref() == Some(&selected);
+                    if ui
+                        .add_enabled(
+                            can_join && !needs_consent && !joining,
+                            primary(if joining { "Joining…" } else { "Join Voice" })
+                                .min_size(Vec2::new(130.0, 38.0)),
+                        )
+                        .on_hover_text(format!("Join {name}"))
+                        .clicked()
+                    {
+                        self.join_voice(selected.clone());
+                    }
+                    ui.add_space(6.0);
+                    self.call_messages(ui, joined, selected_call, ready, can_join, can_stream);
+                });
+            }
             if joined {
-                // Same side margin as the stream tiles below.
+                // Same side margin as the grid above.
                 egui::Frame::none()
                     .inner_margin(Margin::symmetric(24.0, 8.0))
                     .show(ui, |ui| {
@@ -651,105 +888,201 @@ impl RelayApp {
                 }
                     });
             }
-            ui.add_space(28.0);
-            if self.focused_stream.is_some()
-                && ui.add(secondary("Back to Stream Gallery")).clicked()
-            {
-                self.focused_stream = None;
-            }
-            let mut tiles: Vec<_> = self
-                .video
-                .iter()
-                .filter(|(_, v)| members.iter().any(|m| m.user.id == v.metadata.user.id))
-                .filter(|(key, _)| {
-                    self.focused_stream
-                        .as_ref()
-                        .is_none_or(|focused| focused == *key)
-                })
-                .map(|(key, tile)| (key.clone(), tile.clone()))
-                .collect();
-            tiles.sort_by(|(a_key, a), (b_key, b)| {
-                let pinned = self.pinned_stream.as_ref();
-                (
-                    pinned != Some(a_key),
-                    profile_ui::display_name(&a.metadata.user),
-                )
-                    .cmp(&(
-                        pinned != Some(b_key),
-                        profile_ui::display_name(&b.metadata.user),
-                    ))
-            });
-            for (key, tile) in &tiles {
-                egui::Frame::none()
-                    .inner_margin(Margin::symmetric(24.0, 10.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            dot(ui, c_bad(), 4.0);
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · {}",
-                                    profile_ui::display_name(&tile.metadata.user),
-                                    if tile.metadata.url.is_empty()
-                                        && tile.metadata.kind == "screen"
-                                    {
-                                        "Screen share"
-                                    } else if tile.metadata.url.is_empty() {
-                                        "Camera"
-                                    } else if tile.metadata.kind == "screen" {
-                                        "Screen preview"
-                                    } else {
-                                        "Camera preview"
-                                    }
-                                ))
-                                .size(font_size(12.0))
-                                .family(egui::FontFamily::Name("Relay Semibold".into()))
-                                .strong(),
-                            );
-                        });
-                        if let Some(line) = self.delivered_caption(key, tile) {
-                            ui.label(
-                                RichText::new(line)
-                                    .size(font_size(TEXT_CAPTION))
-                                    .color(c_muted()),
-                            )
-                            .on_hover_text(crate::video_quality::DELIVERED_HINT);
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.small_button("View larger").clicked() {
-                                self.stream_preview = Some(key.clone());
-                            }
-                            let pinned = self.pinned_stream.as_ref() == Some(key);
-                            if ui
-                                .small_button(if pinned { "Unpin" } else { "Pin stream" })
-                                .clicked()
-                            {
-                                self.pinned_stream = if pinned { None } else { Some(key.clone()) };
-                            }
-                        });
-                        ui.add_space(8.0);
-                        let size = tile.texture.size_vec2();
-                        let max = Vec2::new(
-                            ui.available_width(),
-                            if self.pinned_stream.as_ref() == Some(key) {
-                                600.0
-                            } else {
-                                380.0
-                            },
-                        );
-                        let scale = (max.x / size.x).min(max.y / size.y);
-                        let response = ui
-                            .add(
-                                egui::Image::new((tile.texture.id(), size * scale))
-                                    .rounding(12.0)
-                                    .sense(Sense::click()),
-                            )
-                            .on_hover_text("Click to enlarge this stream");
-                        self.stream_context_menu(ui, key, &response);
-                        if response.clicked() {
-                            self.stream_preview = Some(key.clone());
-                        }
-                    });
-            }
+            ui.add_space(16.0);
         });
+    }
+}
+
+/// A generated picture for capture fixtures: a dark app window with a title
+/// bar, a side list and content blocks in `tint`. Never a real screen.
+fn fixture_picture(width: usize, height: usize, tint: [u8; 3]) -> egui::ColorImage {
+    let mut image = egui::ColorImage::new([width, height], Color32::from_rgb(30, 31, 36));
+    let mut fill = |x0: usize, y0: usize, x1: usize, y1: usize, color: Color32| {
+        for y in y0.min(height)..y1.min(height) {
+            for x in x0.min(width)..x1.min(width) {
+                image.pixels[y * width + x] = color;
+            }
+        }
+    };
+    let [r, g, b] = tint;
+    let bar = height / 12;
+    fill(0, 0, width, bar, Color32::from_rgb(18, 19, 22));
+    fill(0, bar, width / 5, height, Color32::from_rgb(24, 25, 29));
+    for row in 0..5 {
+        let y = bar + 12 + row * (height / 9);
+        fill(10, y, width / 5 - 10, y + height / 30, Color32::from_rgb(52, 54, 60));
+    }
+    let left = width / 5 + 16;
+    fill(left, bar + 16, width - 16, bar + 16 + height / 3, Color32::from_rgb(r, g, b));
+    for column in 0..3 {
+        let x = left + column * ((width - left - 16) / 3);
+        fill(
+            x,
+            bar + 28 + height / 3,
+            x + (width - left - 16) / 3 - 10,
+            height - 16,
+            Color32::from_rgb(r / 3 + 30, g / 3 + 30, b / 3 + 34),
+        );
+    }
+    image
+}
+
+impl RelayApp {
+    /// Capture fixtures for the call surfaces. Display state only: no voice
+    /// transport, device, camera or capture starts, and nothing is sent.
+    /// Returns true when `panel` was one of them.
+    pub(super) fn call_capture_panel(&mut self, panel: &str, b: &Bootstrap) -> bool {
+        const PANELS: [&str; 9] = [
+            "stream-popout",
+            "call-connected",
+            "call-reconnecting",
+            "call-sharing",
+            "stream-waiting",
+            "share-picker-live",
+            "share-picker-screens",
+            "camera-preview",
+            "call-focus",
+        ];
+        if self.capture_path.is_none() || !PANELS.contains(&panel) {
+            return false;
+        }
+        self.prefs.audio_setup_offered = true;
+        let Some(room) = b.channels.iter().find(|channel| channel.kind == "voice") else {
+            return true;
+        };
+        let own = b.user.id.clone();
+        self.select(Target::Channel(room.id.clone()));
+        self.voice_channel = Some(room.id.clone());
+        self.muted = false;
+        self.deafened = false;
+        self.capture_call = Some(CaptureCall {
+            connected: panel != "call-reconnecting",
+            reconnecting: panel == "call-reconnecting",
+            sharing_screen: panel == "call-sharing",
+            video: panel != "stream-waiting",
+        });
+        // The person who shares (as the fixture server says) first.
+        let mut others: Vec<&VoiceMember> = b
+            .voice_members
+            .iter()
+            .filter(|member| member.channel_id == room.id && member.user.id != own)
+            .collect();
+        others.sort_by_key(|member| !member.sharing);
+        let others: Vec<User> = others.into_iter().map(|member| member.user.clone()).collect();
+        let add_stream = |app: &mut Self, user: &User, kind: &str, tint: [u8; 3]| {
+            let key = format!("{}:{kind}", user.id);
+            let texture = app.capture_ctx.load_texture(
+                &key,
+                fixture_picture(640, 360, tint),
+                egui::TextureOptions::LINEAR,
+            );
+            app.video.insert(
+                key.clone(),
+                VideoTile {
+                    metadata: MediaFrame {
+                        user: user.clone(),
+                        kind: kind.into(),
+                        // Kept by the capture-only rule in `updates`.
+                        url: "owned-capture://synthetic".into(),
+                        frame_id: "generated-fixture".into(),
+                        width: 640,
+                        height: 360,
+                    },
+                    texture,
+                    updated: Instant::now(),
+                },
+            );
+            key
+        };
+        match panel {
+            "call-sharing" | "call-focus" | "stream-popout" => {
+                if let Some(user) = others.first() {
+                    let key = add_stream(self, user, "screen", [88, 101, 242]);
+                    if panel == "call-focus" {
+                        self.focused_stream = Some(key);
+                    } else if panel == "stream-popout" {
+                        // Opens the second window; the capture shows the main one.
+                        self.stream_popout = Some(key);
+                    }
+                }
+                self.inventory.screens = vec![CaptureSource {
+                    id: "window:fixture-game".into(),
+                    name: "Game Night - Map Planner".into(),
+                    kind: SourceKind::Window,
+                    width: 1920,
+                    height: 1080,
+                }];
+                self.screen_source = Some("window:fixture-game".into());
+            }
+            // "stream-waiting": the fixture server marks someone as sharing and
+            // no picture is added, so the Watch Stream tile shows.
+            "share-picker-live" | "share-picker-screens" => {
+                self.inventory_loaded = true;
+                self.share_kind = if panel == "share-picker-live" {
+                    SourceKind::Window
+                } else {
+                    SourceKind::Monitor
+                };
+                let fixtures = [
+                    ("window:fixture-1", "Game Night - Map Planner", SourceKind::Window, [88, 101, 242]),
+                    ("window:fixture-2", "Notes - Friday co-op plans", SourceKind::Window, [35, 165, 90]),
+                    ("window:fixture-3", "Music Player", SourceKind::Window, [235, 69, 158]),
+                    ("window:fixture-4", "Browser - Patch notes", SourceKind::Window, [240, 178, 50]),
+                    ("window:fixture-5", "A window that blocks capture", SourceKind::Window, [0, 0, 0]),
+                    ("monitor:fixture-1", "Display 1 (primary)", SourceKind::Monitor, [88, 101, 242]),
+                    ("monitor:fixture-2", "Display 2", SourceKind::Monitor, [69, 140, 200]),
+                ];
+                let mut thumbnails = share_thumbnails::ShareThumbnails::default();
+                self.inventory.screens = fixtures
+                    .iter()
+                    .map(|(id, name, kind, tint)| {
+                        if *tint != [0, 0, 0] {
+                            thumbnails.insert_fixture(
+                                &self.capture_ctx,
+                                id,
+                                fixture_picture(320, 180, *tint),
+                            );
+                        } else {
+                            thumbnails.mark_unavailable(id);
+                        }
+                        CaptureSource {
+                            id: (*id).into(),
+                            name: (*name).into(),
+                            kind: *kind,
+                            width: 1920,
+                            height: 1080,
+                        }
+                    })
+                    .collect();
+                self.screen_source = Some(if panel == "share-picker-live" {
+                    "window:fixture-1".into()
+                } else {
+                    "monitor:fixture-1".into()
+                });
+                self.share_thumbnails = Some(thumbnails);
+                self.share_picker = Some(false);
+            }
+            "camera-preview" => {
+                self.inventory_loaded = true;
+                self.inventory.cameras = vec![CaptureSource {
+                    id: "camera:fixture".into(),
+                    name: "Generated test camera".into(),
+                    kind: SourceKind::Camera,
+                    width: 1280,
+                    height: 720,
+                }];
+                self.camera_source = Some("camera:fixture".into());
+                let mut thumbnails = share_thumbnails::ShareThumbnails::default();
+                thumbnails.insert_fixture(
+                    &self.capture_ctx,
+                    "camera:fixture",
+                    fixture_picture(640, 360, [69, 140, 200]),
+                );
+                self.share_thumbnails = Some(thumbnails);
+                self.share_picker = Some(true);
+            }
+            _ => {}
+        }
+        true
     }
 }

@@ -911,7 +911,8 @@ impl Worker {
                 proof,
                 cancel,
                 request_id,
-            } => self.account_login_finish(
+                local_owner,
+            } => self.account_login_finish_as(
                 authority,
                 url,
                 expected_server_id,
@@ -919,6 +920,7 @@ impl Worker {
                 proof,
                 cancel,
                 request_id,
+                local_owner,
             )?,
             Command::FetchUserProfile {
                 user_id,

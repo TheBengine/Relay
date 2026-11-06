@@ -584,6 +584,8 @@ struct Counters {
     gateway_active: AtomicBool,
     gateway_rtt_us: AtomicU64,
     gateway_rtt_at: AtomicU64,
+    /// The LAN's elected voice gateway and why, for the call panel.
+    gateway_choice: std::sync::Mutex<Option<crate::gateway_control::Choice>>,
     direct_rtt_us: AtomicU64,
     direct_rtt_at: AtomicU64,
     tcp_rtt_us: AtomicU64,
@@ -1004,6 +1006,7 @@ impl MediaEngine {
         }
     }
     /// Queues DNS and device startup; is_active becomes true only once streams are playing.
+    #[cfg(test)]
     pub fn start_voice(
         &mut self,
         host: &str,
@@ -1429,6 +1432,7 @@ impl MediaEngine {
         f32::from_bits(self.shared.controls.capture_rms.load(Ordering::Relaxed))
     }
 
+    #[cfg(test)]
     pub fn input_level(&self) -> f32 {
         if self.shared.muted.load(Ordering::Relaxed) && !self.is_microphone_test_active() {
             0.0
@@ -1436,6 +1440,7 @@ impl MediaEngine {
             f32::from_bits(self.shared.level.load(Ordering::Relaxed))
         }
     }
+
     pub fn set_user_volume(&self, user_id: &str, volume: f32) {
         let volume = if volume.is_finite() {
             volume.clamp(0.0, 2.0)
@@ -1643,6 +1648,11 @@ impl MediaEngine {
     pub fn private_network(&self) -> bool {
         self.shared.controls.private_network.load(Ordering::Acquire)
     }
+    /// Which approved gateway serves this LAN, and why, while one is elected.
+    pub fn gateway_choice(&self) -> Option<crate::gateway_control::Choice> {
+        self.counters.gateway_choice.lock().ok()?.clone()
+    }
+
     pub fn network_stats(&self) -> NetworkStats {
         let mut stats = self.counters.snapshot();
         stats.input_timing = self
@@ -5303,6 +5313,9 @@ fn gateway_tick(w: &VoiceWorker, sequence: &mut u64, now: Instant) -> bool {
     let failed = !tcp && w.counters.udp_link.load(Ordering::Acquire) & 2 != 0;
     let (active, changed) = gateway.select(now, previous, failed);
     w.counters.gateway_active.store(active, Ordering::Release);
+    if let Ok(mut choice) = w.counters.gateway_choice.lock() {
+        *choice = gateway.choice();
+    }
     let sample = gateway.with_path(|path| (path.server_rtt_us(), path.server_measured_at()));
     w.counters.gateway_rtt_us.store(sample.and_then(|s| s.0).unwrap_or(0), Ordering::Relaxed);
     w.counters.gateway_rtt_at.store(sample.and_then(|s| s.1).map(|at| w.counters.clock.tick(at)).unwrap_or(0), Ordering::Release);
@@ -5920,7 +5933,7 @@ mod tests {
             let mut callback = input_callback::<f32>(&config, state.clone());
             callback(&vec![0.25; batch]);
             assert_eq!(state.controls.model_handoff_samples(), batch);
-            let settings = AudioSettings { noise_model: crate::audio_settings::NoiseModel::DeepFilter3, ..Default::default() };
+            let settings = AudioSettings { noise_model: crate::audio_settings::NoiseModel::RnNoiseNew, ..Default::default() };
             assert_eq!(send_delay_budget_for_capture(&settings, 48_000, batch as f32 / 48.0).suppression,
                 settings.noise_model.suppression_ms_for(batch) as f32);
         }

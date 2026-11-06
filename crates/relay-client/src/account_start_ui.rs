@@ -29,6 +29,42 @@ pub(super) struct Attempt {
     /// Started for another server than the visible login form (an automatic
     /// reconnect, or the first account of a server created while Relay is open).
     detached: bool,
+    /// Waiting for the saved login's fresh identity for the server this PC
+    /// hosts, instead of the account page.
+    server_proof: Option<ServerProof>,
+}
+
+/// The silent way into the server this PC hosts. If the saved login cannot
+/// give an identity in time, the ordinary account page is used.
+pub(super) struct ServerProof {
+    receiver: std::sync::mpsc::Receiver<zeroize::Zeroizing<String>>,
+    nonce: String,
+    since: Instant,
+}
+
+pub(super) enum ProofStep {
+    Wait,
+    Ready(zeroize::Zeroizing<String>),
+    /// Use the account page with this challenge nonce.
+    AccountPage(String),
+}
+
+/// A refresh normally answers within a second; transient account-service
+/// trouble is retried by the saved login, but the page is offered after this.
+const SERVER_PROOF_WAIT: Duration = Duration::from_secs(20);
+
+impl ServerProof {
+    fn poll(&self, now: Instant) -> ProofStep {
+        match self.receiver.try_recv() {
+            Ok(proof) if !proof.is_empty() => ProofStep::Ready(proof),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+                if now.duration_since(self.since) < SERVER_PROOF_WAIT =>
+            {
+                ProofStep::Wait
+            }
+            _ => ProofStep::AccountPage(self.nonce.clone()),
+        }
+    }
 }
 impl Attempt {
     pub(super) fn is_people(&self) -> bool {
@@ -89,6 +125,10 @@ pub(super) struct State {
     pub(super) auto: Option<AutoEntry>,
     pub(super) hosting_error: Option<String>,
     pub(super) creation_request: Option<String>,
+    /// A server created while another sign-in was running (an automatic
+    /// reconnect at start-up): its first account is claimed right after that
+    /// one ends, instead of waiting on a page. Holds the server's setup hint.
+    claim_waiting: Option<Option<bool>>,
     pub(super) opening_local: Option<String>,
     pub(super) local_choices: Option<Result<Vec<SavedCommunity>, String>>,
     pub(super) clearing_previous_account: Option<u64>,
@@ -112,6 +152,7 @@ impl Default for State {
             auto: None,
             hosting_error: None,
             creation_request: None,
+            claim_waiting: None,
             opening_local: None,
             local_choices: None,
             clearing_previous_account: None,
@@ -692,6 +733,7 @@ impl RelayApp {
         self.account_start.pending = None;
         self.account_start.auto = None;
         self.account_start.creation_request = None;
+        self.account_start.claim_waiting = None;
         self.account_start.opening_local = Some(server_id.clone());
         self.account_start.hosting_error = None;
         self.hosting_setup.cancel_creation();
@@ -832,7 +874,11 @@ impl RelayApp {
     /// server) gets its first account from the Relay account at once, as the
     /// start page's "Continue with my Relay account" did. Errors are shown.
     pub(super) fn claim_new_server(&mut self, setup_required: Option<bool>) {
-        if self.central_account.account.is_none() || self.account_start.pending.is_some() {
+        if self.central_account.account.is_none() {
+            return;
+        }
+        if self.account_start.pending.is_some() {
+            self.account_start.claim_waiting = Some(setup_required);
             return;
         }
         let previous_login = std::mem::take(&mut self.login);
@@ -1047,6 +1093,7 @@ impl RelayApp {
             authority: authority.clone(),
             background: false,
             detached: false,
+            server_proof: None,
         });
         self.send(Command::RememberNextLogins {
             enabled: self.prefs.stay_signed_in,
@@ -1112,6 +1159,7 @@ impl RelayApp {
         url: &str,
         data: serde_json::Value,
         request: u64,
+        local_owner: bool,
     ) {
         if !self.account_login_current(request, url) {
             return;
@@ -1146,6 +1194,23 @@ impl RelayApp {
                 && attempt.expected.as_ref().is_none_or(|e| e == server)
                 && challenge_matches(nonce, url, server)
             {
+                // The server this PC hosts (a new one included) accepts the
+                // saved login's fresh identity from this app: no page, and no
+                // password typed again. Every other server needs the page.
+                if local_owner {
+                    if let Some(receiver) = self.central_account.request_server_proof() {
+                        let attempt = self.account_start.pending.as_mut().expect("validated attempt");
+                        attempt.expected = Some(server.into());
+                        attempt.challenge = Some(challenge.into());
+                        attempt.server_proof = Some(ServerProof {
+                            receiver,
+                            nonce: nonce.into(),
+                            since: Instant::now(),
+                        });
+                        ctx.request_repaint_after(Duration::from_millis(50));
+                        return;
+                    }
+                }
                 if self.defer_background_account_signin(request, url) {
                     return;
                 }
@@ -1170,6 +1235,16 @@ impl RelayApp {
     }
 
     pub(super) fn account_login_tick(&mut self, ctx: &egui::Context) {
+        if self.account_start.pending.is_none() {
+            if let Some(setup_required) = self.account_start.claim_waiting.take() {
+                if self.hosting_setup.new_host
+                    && self.hosting_setup.local_ready
+                    && self.account_start.opening_local.is_none()
+                {
+                    self.claim_new_server(setup_required);
+                }
+            }
+        }
         let Some(a) = self.account_start.pending.as_mut() else {
             return;
         };
@@ -1179,6 +1254,43 @@ impl RelayApp {
             })
         {
             self.account_start.pending = None;
+            return;
+        }
+        if let Some(server_proof) = &a.server_proof {
+            match server_proof.poll(Instant::now()) {
+                ProofStep::Wait => ctx.request_repaint_after(Duration::from_millis(50)),
+                ProofStep::Ready(proof) => {
+                    let command = Command::AccountLoginFinish {
+                        authority: a.authority.clone(),
+                        url: a.url.clone(),
+                        expected_server_id: a.expected.clone().unwrap_or_default(),
+                        challenge_id: a.challenge.take().unwrap_or_default(),
+                        proof,
+                        cancel: a.cancel.clone(),
+                        request_id: a.request,
+                        local_owner: true,
+                    };
+                    a.server_proof = None;
+                    self.send(command);
+                }
+                ProofStep::AccountPage(nonce) => {
+                    a.server_proof = None;
+                    let (request, destination) = (a.request, a.url.clone());
+                    if self.defer_background_account_signin(request, &destination) {
+                        return;
+                    }
+                    let Some(service) = self.central_account.provider.clone() else {
+                        self.account_start.pending = None;
+                        return;
+                    };
+                    let a = self.account_start.pending.as_mut().expect("current attempt");
+                    let mut browser = crate::central_account::Controller::default();
+                    browser.provider = Some(service);
+                    browser.start_community(ctx.clone(), nonce, a.account.clone());
+                    a.browser = Some(browser);
+                    ctx.request_repaint();
+                }
+            }
             return;
         }
         let Some(browser) = a.browser.as_mut() else {
@@ -1231,6 +1343,7 @@ impl RelayApp {
                 proof: proof.id_token,
                 cancel: a.cancel.clone(),
                 request_id: a.request,
+                local_owner: false,
             };
             a.browser = None;
             self.send(command);
@@ -1261,7 +1374,7 @@ mod tests {
             },
             cancel: Arc::new(AtomicBool::new(false)),
             form_cancel: Arc::new(AtomicBool::new(false)), browser: None, challenge: None,
-            authority: None, background, detached: true,
+            authority: None, background, detached: true, server_proof: None,
         }
     }
 
@@ -1353,6 +1466,7 @@ mod tests {
             authority: None,
             background: false,
             detached: false,
+            server_proof: None,
         };
         let mut other = crate::connection_setup::JoinFlow {
             url: login.url.clone(),
@@ -1378,6 +1492,32 @@ mod tests {
         automatic.detached = true;
         login.setup = Default::default();
         assert!(automatic.form_current(&login, &other, false));
+    }
+
+    /// The server this PC hosts is entered with the saved login's fresh
+    /// identity; when the saved login cannot give one (ended, or too slow),
+    /// the attempt falls back to the account page with the same challenge.
+    #[test]
+    fn this_pcs_server_uses_the_saved_login_and_falls_back_to_the_account_page() {
+        use std::sync::mpsc::sync_channel;
+        let since = Instant::now();
+        let (sender, receiver) = sync_channel(1);
+        let proof = ServerProof { receiver, nonce: "relay-login-v1:fixture".into(), since };
+        assert!(matches!(proof.poll(since), ProofStep::Wait));
+        sender.send(zeroize::Zeroizing::new("signed-identity".into())).unwrap();
+        assert!(matches!(proof.poll(since), ProofStep::Ready(token) if token.as_str() == "signed-identity"));
+        drop(sender);
+        assert!(matches!(proof.poll(since), ProofStep::AccountPage(nonce) if nonce == "relay-login-v1:fixture"));
+
+        let (_waiting, receiver) = sync_channel(1);
+        let slow = ServerProof { receiver, nonce: "relay-login-v1:slow".into(), since };
+        assert!(matches!(slow.poll(since + SERVER_PROOF_WAIT - Duration::from_millis(1)), ProofStep::Wait));
+        assert!(matches!(slow.poll(since + SERVER_PROOF_WAIT), ProofStep::AccountPage(_)));
+
+        let (sender, receiver) = sync_channel(1);
+        sender.send(zeroize::Zeroizing::default()).unwrap();
+        let empty = ServerProof { receiver, nonce: "relay-login-v1:empty".into(), since };
+        assert!(matches!(empty.poll(since), ProofStep::AccountPage(_)), "an empty token is never sent");
     }
 
     #[test]

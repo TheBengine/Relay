@@ -114,6 +114,14 @@ impl NoiseModel {
             Self::DpdfNet2 => "The smaller Studio model, kept fixed so you can compare its sound and speed.",
         }
     }
+    /// False for the comparison models a release does not carry
+    /// (DeepFilterNet 3 and GTCRN need the `model-lab` feature).
+    pub(crate) fn is_built_in(self) -> bool {
+        match self.comparison() {
+            Some(crate::audio_model_lab::Model::External(model)) => model.is_built_in(),
+            _ => true,
+        }
+    }
     pub(crate) fn comparison(self) -> Option<crate::audio_model_lab::Model> {
         use crate::audio_model_lab::Model;
         use relay_audio_models::Model as External;
@@ -291,6 +299,11 @@ pub struct AudioSettings {
     pub noise_model: NoiseModel,
     /// Strength of Enhanced suppression.
     pub noise_strength: crate::click_suppression::NoiseStrength,
+    /// A saved noise model this build does not carry, replaced by Enhanced
+    /// when the settings were loaded (`normalized`); the settings page says
+    /// so. Never saved.
+    #[serde(skip)]
+    pub removed_noise_model: Option<NoiseModel>,
     /// Experimental native AEC. The reference is only Relay's actual speaker output.
     pub echo_cancellation: bool,
     pub echo_delay_ms: u32,
@@ -348,6 +361,7 @@ impl Default for AudioSettings {
             noise_suppression: true,
             noise_model: NoiseModel::Enhanced,
             noise_strength: crate::click_suppression::NoiseStrength::Normal,
+            removed_noise_model: None,
             echo_cancellation: false,
             echo_delay_ms: 40,
             sounds_enabled: true,
@@ -598,6 +612,10 @@ impl AudioSettings {
         self.push_to_talk_release_ms = self
             .push_to_talk_release_ms
             .min(crate::voice_gate::MAX_PTT_RELEASE_MS);
+        if !self.noise_model.is_built_in() {
+            self.removed_noise_model = Some(self.noise_model);
+            self.noise_model = NoiseModel::Enhanced;
+        }
         self
     }
 }
@@ -666,6 +684,29 @@ mod tests {
         assert_eq!((chosen.noise_model, chosen.noise_strength), (super::NoiseModel::Standard, crate::click_suppression::NoiseStrength::High));
         let text = serde_json::to_string(&chosen).unwrap();
         assert!(text.contains(r#""noise_model":"standard""#) && text.contains(r#""noise_strength":"high""#));
+    }
+
+    #[test]
+    fn a_saved_model_this_build_lacks_loads_as_enhanced_with_a_note() {
+        use super::{AudioSettings, NoiseModel};
+        for model in [NoiseModel::DeepFilter3, NoiseModel::DeepFilter3LowLatency, NoiseModel::Gtcrn] {
+            let text = format!(r#"{{"noise_model":{}}}"#, serde_json::to_string(&model).unwrap());
+            let saved: AudioSettings = serde_json::from_str(&text).unwrap();
+            assert_eq!(saved.noise_model, model, "{text} still parses");
+            let loaded = saved.normalized();
+            if cfg!(feature = "model-lab") {
+                assert_eq!((loaded.noise_model, loaded.removed_noise_model), (model, None));
+            } else {
+                assert_eq!((loaded.noise_model, loaded.removed_noise_model), (NoiseModel::Enhanced, Some(model)));
+                let written = serde_json::to_string(&loaded).unwrap();
+                assert!(written.contains(r#""noise_model":"enhanced""#) && !written.contains("removed"), "{written}");
+            }
+        }
+        for model in NoiseModel::ALL.into_iter().filter(|model| model.is_built_in()) {
+            let loaded = AudioSettings { noise_model: model, ..Default::default() }.normalized();
+            assert_eq!((loaded.noise_model, loaded.removed_noise_model), (model, None), "{model:?}");
+        }
+        assert!(NoiseModel::RnNoiseNew.is_built_in() && NoiseModel::DpdfNet8.is_built_in());
     }
 
     #[test]

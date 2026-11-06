@@ -195,6 +195,35 @@ async fn verify_identity(
     nonce: &str,
     recent_auth: bool,
 ) -> ApiResult<(String, String)> {
+    let nonce = Nonce::new(nonce.to_owned());
+    verify_identity_with(provider, token, &nonce, recent_auth).await
+}
+
+/// The host app's refreshed identity. Its nonce is the desktop sign-in's own
+/// random one (or none); a proof the account page minted for some server or
+/// for linking (`relay-login-v1:`/`relay-link-v1:`) is valid only where it is
+/// bound and is never accepted here. Signature, issuer, audience, expiry and
+/// a fresh issue time are checked exactly as for every other proof.
+async fn verify_host_identity(provider: &Provider, token: &str) -> ApiResult<(String, String)> {
+    let unbound = |returned: Option<&Nonce>| {
+        if returned.is_some_and(|nonce| {
+            let value = nonce.secret();
+            value.starts_with("relay-login-v1:") || value.starts_with("relay-link-v1:")
+        }) {
+            Err("A destination-bound proof is not a host identity".to_owned())
+        } else {
+            Ok(())
+        }
+    };
+    verify_identity_with(provider, token, unbound, false).await
+}
+
+async fn verify_identity_with(
+    provider: &Provider,
+    token: &str,
+    nonce: impl openidconnect::NonceVerifier,
+    recent_auth: bool,
+) -> ApiResult<(String, String)> {
     let http = Transport {
         provider: provider.clone(),
         client: reqwest::Client::builder()
@@ -234,8 +263,7 @@ async fn verify_identity(
         });
     let token: CoreIdToken =
         serde_json::from_value(Value::String(token.to_owned())).map_err(|_| invalid())?;
-    let nonce = Nonce::new(nonce.to_owned());
-    let claims = token.claims(&verifier, &nonce).map_err(|_| invalid())?;
+    let claims = token.claims(&verifier, nonce).map_err(|_| invalid())?;
     let timestamp = chrono::Utc::now();
     if recent_auth
         && claims.auth_time().is_none_or(|time| {

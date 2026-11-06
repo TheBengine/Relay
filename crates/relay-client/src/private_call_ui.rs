@@ -397,12 +397,16 @@ impl RelayApp {
         };
         let incoming = call.recipient_id == bootstrap.user.id;
         let peer_id = peer(&call, &bootstrap.user.id).unwrap_or_default();
-        let name = bootstrap
+        let peer_user = bootstrap
             .members
             .iter()
             .find(|member| member.id == peer_id)
+            .cloned();
+        let name = peer_user
+            .as_ref()
             .map(profile_ui::display_name)
             .unwrap_or("Friend");
+        let avatar = peer_user.as_ref().and_then(|user| self.avatar_texture(user));
         let ringing = call.state == "ringing"
             && call.expires_at > timestamp
             && origin
@@ -431,6 +435,14 @@ impl RelayApp {
             .show(ctx, |ui| {
                 ui.set_enabled(!self.modal_open());
                 ui.horizontal_wrapped(|ui| {
+                    // Discord's call header: the friend's avatar and the same
+                    // round green answer and red hang-up buttons as the call bar.
+                    ui.spacing_mut().item_spacing.x = voice_room_ui::CALL_GAP;
+                    if let Some(user) = &peer_user {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+                        profile_ui::paint_user_avatar(ui, rect, user, avatar.as_ref(), ringing);
+                        ui.add_space(4.0);
+                    }
                     let label = ui.label(RichText::new(text).strong());
                     if clock.server_sample_age.is_none() {
                         label.on_hover_text("This older server uses your PC's clock for call timing. Ask the host to update Relay.");
@@ -444,17 +456,49 @@ impl RelayApp {
                                 self.offer_leave_and_answer(origin, call.id.clone(), name.into());
                             }
                         }
-                        if idle && ui.add_enabled(!pending, primary("Accept call"))
-                            .on_disabled_hover_text("Another call action is still being prepared.")
-                            .clicked()
+                        if idle
+                            && ui
+                                .add_enabled_ui(!pending, |ui| {
+                                    voice_room_ui::call_button(
+                                        ui,
+                                        Icon::Phone,
+                                        voice_room_ui::CallStyle::Answer,
+                                        "Accept call",
+                                    )
+                                })
+                                .inner
+                                .on_disabled_hover_text("Another call action is still being prepared.")
+                                .clicked()
                         {
                             self.answer_private_call(&call, "accept");
                         }
-                        if ui.add_enabled(!pending, secondary("Decline")).clicked() {
+                        if ui
+                            .add_enabled_ui(!pending, |ui| {
+                                voice_room_ui::call_button(
+                                    ui,
+                                    Icon::HangUp,
+                                    voice_room_ui::CallStyle::Leave,
+                                    "Decline",
+                                )
+                            })
+                            .inner
+                            .clicked()
+                        {
                             self.answer_private_call(&call, "decline");
                         }
                     } else if ringing {
-                        if ui.add_enabled(!pending, secondary("Cancel call")).clicked() {
+                        if ui
+                            .add_enabled_ui(!pending, |ui| {
+                                voice_room_ui::call_button(
+                                    ui,
+                                    Icon::HangUp,
+                                    voice_room_ui::CallStyle::Leave,
+                                    "Cancel call",
+                                )
+                            })
+                            .inner
+                            .clicked()
+                        {
                             self.answer_private_call(&call, "cancel");
                         }
                     } else if call.state == "accepted"
@@ -471,10 +515,15 @@ impl RelayApp {
                     {
                         let fresh = call.expires_at > timestamp;
                         if ui
-                            .add_enabled(
-                                fresh && channel_available(&call, &bootstrap),
-                                secondary("Join call"),
-                            )
+                            .add_enabled_ui(fresh && channel_available(&call, &bootstrap), |ui| {
+                                voice_room_ui::call_button(
+                                    ui,
+                                    Icon::Phone,
+                                    voice_room_ui::CallStyle::Answer,
+                                    "Join call",
+                                )
+                            })
+                            .inner
                             .on_disabled_hover_text(if fresh {
                                 "The call room is not available yet."
                             } else {

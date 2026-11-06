@@ -129,6 +129,11 @@ fn worse(a: HopQuality, b: HopQuality) -> HopQuality {
 }
 
 impl Book {
+    /// The gateway's last reported round trip to the host in this channel's mesh.
+    pub(super) fn host_rtt_ms(&self, channel: &str, user: &str) -> Option<u32> {
+        self.meshes.channels.get(channel)?.nodes.get(user)?.host_rtt_ms
+    }
+
     /// Rebuilds one channel's plan from fresh gateway reports, live
     /// registrations, live LAN leases and live seats. Returns the sessions
     /// the mesh may carry now.

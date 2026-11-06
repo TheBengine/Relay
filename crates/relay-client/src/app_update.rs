@@ -213,7 +213,8 @@ impl RelayApp {
                     url,
                     data,
                     request_id,
-                } => self.account_login_challenge(ctx, &url, data, request_id),
+                    local_owner,
+                } => self.account_login_challenge(ctx, &url, data, request_id, local_owner),
                 Update::Connected {
                     url,
                     session,
@@ -2078,12 +2079,10 @@ impl RelayApp {
                             .local_account_ready(&mut self.login, setup_required);
                     } else {
                         self.hosting_setup.local_ready = true;
-                        if self.hosting_setup.new_host {
-                            self.claim_new_server(setup_required);
-                        }
                     }
-                    if self.hosting_setup.new_host && self.central_account.account.is_some()
-                        && self.account_start.pending.is_none() {
+                    // The first account comes from the Relay account at once;
+                    // if another sign-in is running it follows right after it.
+                    if self.hosting_setup.new_host && self.central_account.account.is_some() {
                         self.claim_new_server(setup_required);
                     }
                     self.hosting_setup.entry = host_setup_ui::LoginEntry::Account;

@@ -57,6 +57,14 @@ pub struct GatewayOffer {
     pub instance: String,
     pub ip: String,
     pub port: u16,
+    /// What was measured on the gateway's machine, for the LAN election
+    /// (`host_choice`). Older servers omit it; older apps ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<crate::host_choice::Capability>,
+    /// How long this exact registration has served, so everyone on a LAN
+    /// keeps the gateway already in use when two are about equal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_secs: Option<u64>,
 }
 
 /// `GET /api/hosting/voice-gateways`

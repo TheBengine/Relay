@@ -59,10 +59,14 @@ def main():
     parser.add_argument("--output", type=Path, default=package / "THIRD_PARTY_NOTICES.txt")
     parser.add_argument("--without-native-rtc", action="store_true", help="Use the minimal development feature graph")
     parser.add_argument("--offline", action="store_true", help="Do not retrieve missing root licenses from upstream")
+    parser.add_argument("--model-lab", action="store_true",
+                        help="Developer builds with relay-client/model-lab: also DeepFilterNet 3 and GTCRN")
     args = parser.parse_args()
     command = ["cargo", "tree", "--workspace", "--locked", "--prefix", "none", "--edges", "normal,build", "--target", args.target]
     if not args.without_native_rtc:
         command += ['--features','relay-client/native-rtc']
+    if args.model_lab:
+        command += ['--features', 'relay-client/model-lab']
     if args.offline:
         command.append('--offline')
     tree = subprocess.run(command, cwd=package, capture_output=True, text=True, check=True).stdout
@@ -78,7 +82,18 @@ def main():
         source = (package/member).resolve()
         if not source.is_relative_to(package.resolve()):
             raise ValueError('Workspace source must remain inside the packaged source')
-        workspace_names.add(tomllib.loads((source/'Cargo.toml').read_text(encoding='utf-8'))['package']['name'])
+        member_manifest = tomllib.loads((source/'Cargo.toml').read_text(encoding='utf-8'))
+        workspace_names.add(member_manifest['package']['name'])
+        # Vendored path dependencies (relay-deepfilter) ship as source too.
+        for table in ('dependencies', 'build-dependencies'):
+            for dependency in member_manifest.get(table, {}).values():
+                if isinstance(dependency, dict) and dependency.get('path'):
+                    path = (source/dependency['path']).resolve()
+                    if not path.is_relative_to(package.resolve()):
+                        raise ValueError('Dependency path must remain inside the packaged source')
+                    info = tomllib.loads((path/'Cargo.toml').read_text(encoding='utf-8'))['package']
+                    if isinstance(info.get('version'), str):  # workspace members inherit theirs
+                        local_sources[info['name'], info['version']] = path
     for patch in manifest.get('patch', {}).get('crates-io', {}).values():
         if isinstance(patch, dict) and patch.get('path'):
             source = (package/patch['path']).resolve()
@@ -180,8 +195,31 @@ def main():
                   "Source: https://github.com/danielmiessler/SecLists/tree/913b327317496d062bcc7cace524aaad8a693be2\n"
                   "Used only for offline new-password checks; see assets/security/common-passwords.provenance.json.\n\n"
                   + (package / 'assets/security/LICENSE-SecLists.txt').read_text(encoding='utf-8'))
-    # The DPDFNet models are embedded in relay.exe (Studio noise suppression);
-    # they are not a Cargo dependency, so their Apache-2.0 text is added here.
+    # Embedded models and C sources are not Cargo packages: their texts are
+    # added here. DeepFilterNet 3 and GTCRN are embedded only with model-lab,
+    # which releases do not enable (docs/audio-gtcrn-eval-20261106.md).
+    def model_notice(title, lines, *licenses):
+        texts = ''.join((package / path).read_text(encoding='utf-8') + '\n' for path in licenses)
+        header = ''.join(line + '\n' for line in lines)
+        blocks.append('\n' + '=' * 72 + '\n' + title + '\n' + header + '\n' + texts)
+    model_notice("Silero VAD v6.2.2 - embedded model",
+                 ["https://github.com/snakers4/silero-vad", "Commit: 60b7ffa243625ebdc1070275a29f18c87843786a",
+                  "Original and fixed-shape model; no weight retraining."],
+                 'vendor/models/silero/LICENSE')
+    model_notice("Native RNNoise runtime and model",
+                 ["https://github.com/xiph/rnnoise",
+                  "See vendored provenance.json / PROVENANCE.json for pinned revisions and hashes."],
+                 'vendor/rnnoise-native/COPYING')
+    if args.model_lab:
+        model_notice("DeepFilterNet runtime and DeepFilterNet3 models",
+                     ["https://github.com/Rikorose/DeepFilterNet",
+                      "See vendored provenance.json / PROVENANCE.json for pinned revisions and hashes."],
+                     'vendor/models/deepfilter/LICENSE-MIT', 'vendor/models/deepfilter/LICENSE-APACHE')
+        model_notice("GTCRN model",
+                     ["https://github.com/Xiaobin-Rong/gtcrn",
+                      "See vendored provenance.json / PROVENANCE.json for pinned revisions and hashes."],
+                     'vendor/models/gtcrn/LICENSE')
+    # The DPDFNet models are embedded in relay.exe (Studio noise suppression).
     models = package / 'vendor/models/dpdfnet'
     blocks.append("\n" + "=" * 72 + "\nDPDFNet speech enhancement models (dpdfnet8_48khz_hr, dpdfnet2_48khz_hr)\n"
                   "License: Apache-2.0\nPublished by Ceva (Ceva-IP); upstream supplies no separate copyright notice.\n"

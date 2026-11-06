@@ -329,6 +329,10 @@ impl RelayApp {
                 self.stream_preview = Some(key.into());
                 ui.close_menu();
             }
+            if ui.button("Pop Out").clicked() {
+                self.stream_popout = Some(key.into());
+                ui.close_menu();
+            }
             if ui.button("Full Screen").clicked() {
                 self.stream_restore_fullscreen =
                     ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -351,6 +355,11 @@ impl RelayApp {
                 } else {
                     Some(key.into())
                 };
+                ui.close_menu();
+            }
+            let pinned = self.pinned_stream.as_deref() == Some(key);
+            if ui.button(if pinned { "Unpin Stream" } else { "Pin Stream" }).clicked() {
+                self.pinned_stream = (!pinned).then(|| key.into());
                 ui.close_menu();
             }
         });

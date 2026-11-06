@@ -27,6 +27,9 @@ qa-loopback-identity = []
 qa-automation = []
 # Developer only: build the `audio-bench` binary. Never in a release.
 audio-bench = []
+# Developer only: also embed the comparison-only voice models (DeepFilterNet 3
+# standard and low latency, GTCRN; about 45 MB). Never in a release.
+model-lab = ["relay-audio-models/model-lab"]
 
 [build-dependencies]
 toml_edit = "=0.19.15"

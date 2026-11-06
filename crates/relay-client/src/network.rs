@@ -95,6 +95,9 @@ pub enum Command {
         proof: zeroize::Zeroizing<String>,
         cancel: Arc<AtomicBool>,
         request_id: u64,
+        /// The proof is the saved account's refreshed identity for the server
+        /// this PC hosts; it goes only to that server's local sign-in route.
+        local_owner: bool,
     },
     HistoryTransfer {
         origin: CommandOrigin,
@@ -558,6 +561,9 @@ pub enum Update {
         url: String,
         data: serde_json::Value,
         request_id: u64,
+        /// The challenge came from the server this PC hosts, proven by its
+        /// runtime record, so the saved account can complete it without a page.
+        local_owner: bool,
     },
     AccountLoginComplete {
         url: String,
@@ -2036,7 +2042,8 @@ impl Worker {
             || crate::community::account_destination(&c.url).is_err()
             || (crate::embedded_network::routed(&c.url) && private_route.is_none())
         { return None; }
-        let config = crate::gateway_control::Config::new(ticket.session_id, |method, path| self.request(method, path))?;
+        let config = crate::gateway_control::Config::new(ticket.session_id, |method, path| self.request(method, path))?
+            .with_user(c.session.user.id.clone());
         Some(match private_route {
             Some(saved) => config.with_private_route(saved, c.server_id.clone()),
             None => config,

@@ -8,12 +8,19 @@ Voice & Video > Noise Suppression > Compare voice models exposes real local proc
 | Enhanced / Standard RNNoise | 10 ms |
 | WebRTC high-strength NS | 7 ms |
 | RNNoise then WebRTC / WebRTC then RNNoise | 17 ms |
-| DeepFilterNet 3 | 40 ms |
-| DeepFilterNet 3 Low Latency | 20 ms |
-| GTCRN (16 kHz) | 45 ms |
+| DeepFilterNet 3 (`model-lab` builds only) | 40 ms |
+| DeepFilterNet 3 Low Latency (`model-lab` builds only) | 20 ms |
+| GTCRN (16 kHz, `model-lab` builds only) | 45 ms |
 | Newer native RNNoise | 30 ms |
 | DPDFNet 8 / DPDFNet 2 exact | 60 ms |
 | Studio automatic | 60 ms |
+
+Since 2026-11-06, releases no longer carry DeepFilterNet 3 (standard and
+low latency) or GTCRN. They are embedded only when `relay-client` is built
+with the non-default `model-lab` feature, and the page lists only the models
+that are built in. A saved choice of a removed model loads as Enhanced, and
+the page says so in one line. Measurements and sizes:
+`docs/audio-gtcrn-eval-20261106.md`.
 
 These are buffering budgets, not measured physical headset or WAN latency. Experimental models add a bounded worker handoff sized for the larger of packet size and observed capture callback, up to 200 ms; preview labels include that observed handoff. Device periods, playback reserve and call transport add more. GTCRN includes its 48/16 kHz conversion and hop adaptation, and reduces high-frequency bandwidth.
 

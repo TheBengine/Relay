@@ -114,6 +114,10 @@ fn desktop_caption(ui: &mut egui::Ui, context: &str) {
 
 impl RelayApp {
     pub(super) fn remote_video_window_visible(&self, ctx: &egui::Context) -> bool {
+        // A popped-out stream has its own window and stays on screen.
+        if self.stream_popout.is_some() {
+            return true;
+        }
         #[cfg(windows)]
         if self.tray.as_ref().is_some_and(|tray| !tray.window_visible()) {
             return false;

@@ -5,6 +5,7 @@ pub mod direct_voice;
 pub mod game_activity;
 pub mod gateway_broker;
 pub mod handover;
+pub mod host_choice;
 pub mod host_switch;
 pub mod hosting;
 pub mod installation;

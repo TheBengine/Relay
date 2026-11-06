@@ -180,7 +180,8 @@ struct Inner {
     takeover_failed: std::sync::atomic::AtomicBool,
     failover: Mutex<Option<Arc<takeover_failover::Failover>>>,
     measurements: hosting_measurements::Measurements,
-    switch_advisor: Mutex<relay_protocol::host_switch::Advisor>,
+    /// Which machine would host best, by measurement, kept stable over time.
+    host_preference: Mutex<relay_protocol::host_choice::Preference>,
     /// Co-host addresses announced to members once takeover protection is set up.
     standby_urls: Mutex<Vec<String>>,
     /// Off unless the operator turns it on (`--takeover-protection`).
@@ -567,7 +568,9 @@ impl AppState {
             takeover_failed: std::sync::atomic::AtomicBool::new(false),
             failover: Mutex::new(None),
             measurements: Default::default(),
-            switch_advisor: Default::default(),
+            host_preference: Mutex::new(relay_protocol::host_choice::Preference::starting_with(
+                hosting::HOST_ID,
+            )),
             standby_urls: Default::default(),
             protection_enabled: std::sync::atomic::AtomicBool::new(false),
             arming: Mutex::new(None),
@@ -777,6 +780,10 @@ pub fn router(state: AppState) -> Router {
             post(account_identity::login::register_destination),
         )
         .route(
+            "/api/local/account-login",
+            post(account_identity::login::finish_local),
+        )
+        .route(
             "/api/authenticator",
             get(authenticator::status).post(authenticator::change),
         )
@@ -981,6 +988,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/hosting/measurements/upload",
             post(upload_probe::upload).layer(DefaultBodyLimit::max(upload_probe::MAX_BYTES)),
+        )
+        .route(
+            "/api/hosting/measurements/download",
+            get(upload_probe::download),
         )
         .route("/api/hosting/takeover/enroll", post(takeover_setup::enroll))
         .route("/api/hosting/takeover/cohort", get(takeover_setup::cohort))
@@ -1350,6 +1361,7 @@ async fn rate_limit(
             | "/api/rtc/media"
             | "/api/local/shutdown"
             | "/api/local/account-destination"
+            | "/api/local/account-login"
             | "/rtc"
             | "/rtc/v1"
             | "/rtc/validate"
@@ -1385,6 +1397,7 @@ async fn rate_limit(
             | "/api/password/reset"
             | "/api/account-login"
             | "/api/account-login/challenge"
+            | "/api/local/account-login"
     );
     let mutation = !matches!(
         *request.method(),

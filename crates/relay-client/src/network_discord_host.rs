@@ -95,17 +95,18 @@ fn proof(
     Ok(record)
 }
 
-impl Worker {
-    pub(super) fn discord_host(
-        &mut self,
-        origin: CommandOrigin,
-        action: DiscordHostAction,
-        request_id: u64,
-    ) -> Result<(), String> {
-        // This runs serially with account switches; reject stale queued commands
-        // before touching a runtime file or sending either secret.
-        let connection = self.command_connection(&origin)?;
-        let base = endpoint(&connection.url)?;
+/// The server this PC hosts at a loopback address, proven by its own runtime
+/// record: the same server, instance, process and storage that answer there
+/// now. Its control secret goes only to literal loopback, never via a proxy.
+pub(super) struct LocalControl {
+    base: String,
+    http: Client,
+    record: Runtime,
+}
+
+impl LocalControl {
+    pub(super) fn for_server(url: &str, expected_server: &str) -> Result<Self, String> {
+        let base = endpoint(url)?;
         let http = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -121,22 +122,47 @@ impl Worker {
         )?;
         let health = crate::local_host::Identity::parse(&health).ok_or(HOST_ERROR)?;
         let data = crate::local_host::data_directory()?;
-        let record = proof(&data, &base, &connection.server_id, &health)?;
-        let mut control = reqwest::header::HeaderValue::from_str(&record.shutdown_token)
+        let record = proof(&data, &base, expected_server, &health)?;
+        Ok(Self { base, http, record })
+    }
+
+    pub(super) fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> Result<reqwest::blocking::RequestBuilder, String> {
+        let mut control = reqwest::header::HeaderValue::from_str(&self.record.shutdown_token)
             .map_err(|_| HOST_ERROR)?;
         control.set_sensitive(true);
+        Ok(self
+            .http
+            .request(method, format!("{}{path}", self.base))
+            .header("x-relay-local-control", control)
+            .header("x-relay-instance-id", self.record.instance_id.as_str())
+            .header("x-relay-server-id", self.record.server_id.as_str()))
+    }
+}
+
+impl Worker {
+    pub(super) fn discord_host(
+        &mut self,
+        origin: CommandOrigin,
+        action: DiscordHostAction,
+        request_id: u64,
+    ) -> Result<(), String> {
+        // This runs serially with account switches; reject stale queued commands
+        // before touching a runtime file or sending either secret.
+        let connection = self.command_connection(&origin)?;
+        let control = LocalControl::for_server(&connection.url, &connection.server_id)?;
         let method = match &action {
             DiscordHostAction::Status => reqwest::Method::GET,
             DiscordHostAction::Save(_) => reqwest::Method::PUT,
             DiscordHostAction::Remove => reqwest::Method::DELETE,
             DiscordHostAction::Retry => reqwest::Method::POST,
         };
-        let mut request = http
-            .request(method, format!("{base}/api/local/discord-credentials"))
-            .bearer_auth(&connection.session.token)
-            .header("x-relay-local-control", control)
-            .header("x-relay-instance-id", record.instance_id)
-            .header("x-relay-server-id", record.server_id);
+        let mut request = control
+            .request(method, "/api/local/discord-credentials")?
+            .bearer_auth(&connection.session.token);
         if let DiscordHostAction::Save(token) = &action {
             #[derive(serde::Serialize)]
             struct Input<'a> {

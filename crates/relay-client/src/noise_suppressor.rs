@@ -54,6 +54,10 @@ pub(crate) enum SuppressorKind {
     /// DPDFNet (Studio): removes music and other voices, 60 ms.
     DpdfNet(crate::dpdfnet::StudioKind),
     Comparison(crate::audio_model_lab::Model),
+    /// The same comparison model on the calling thread with the same
+    /// one-block hand-off (bench and tests: deterministic output).
+    #[cfg(any(test, feature = "audio-bench"))]
+    ComparisonInline(crate::audio_model_lab::Model),
 }
 
 /// Studio gives click suppression no voice probability: measured on the
@@ -100,6 +104,8 @@ pub(crate) fn make(kind: SuppressorKind) -> Box<dyn Suppressor> {
         SuppressorKind::RnNoise => Box::new(RnNoise::new()),
         SuppressorKind::DpdfNet(kind) => Box::new(crate::dpdfnet::Studio::new(kind)),
         SuppressorKind::Comparison(model) => Box::new(crate::audio_model_lab::Comparison::new(crate::audio_model_lab::Service::new(), model, BLOCK)),
+        #[cfg(any(test, feature = "audio-bench"))]
+        SuppressorKind::ComparisonInline(model) => Box::new(crate::audio_model_lab::Inline::new(model, BLOCK)),
         #[cfg(feature = "native-rtc")]
         SuppressorKind::WebRtcNs(level) => Box::new(WebRtcNs::new(level)),
         #[cfg(feature = "native-rtc")]
@@ -341,6 +347,25 @@ pub(crate) mod bench {
                 noise_model: if clicks.is_some() { NoiseModel::Enhanced } else { NoiseModel::Standard },
                 noise_strength: clicks.unwrap_or_default(),
                 ..Default::default()
+            };
+            Self {
+                name,
+                controls: AudioControls::new(&settings),
+                processor: MicrophoneProcessor::with_suppressor(kind),
+                delay: make(kind).delay_samples(),
+            }
+        }
+
+        /// The app's chain for the noise setting `model` (its click
+        /// suppression rule and everything after the suppressor), with a
+        /// comparison model run inline at the app's one-block hand-off
+        /// instead of on its worker thread.
+        #[cfg_attr(not(feature = "model-lab"), allow(dead_code))]
+        pub fn for_model(name: &'static str, model: NoiseModel) -> Self {
+            let settings = AudioSettings { noise_model: model, ..Default::default() };
+            let kind = match super::for_setting(model, settings.noise_strength) {
+                SuppressorKind::Comparison(model) => SuppressorKind::ComparisonInline(model),
+                kind => kind,
             };
             Self {
                 name,
@@ -630,6 +655,17 @@ pub(crate) mod bench {
             candidate!("dpdfnet8+keys-before", studio_keys(Variant::Eight, false, Some(KEYS_BEFORE), None), None),
             candidate!("dpdfnet8+keys-guided", studio_keys(Variant::Eight, false, None, Some(KEYS_GUIDED)), None),
         ];
+        // Comparison models as the settings page wires them
+        // (docs/audio-gtcrn-eval-20261106.md), in builds with `model-lab`.
+        // DeepFilterNet runs with libDF's default runtime parameters: the
+        // app exposes no others.
+        #[cfg(feature = "model-lab")]
+        chains.extend([
+            ChainSpec::new("gtcrn", || Box::new(Candidate::for_model("gtcrn", NoiseModel::Gtcrn))),
+            ChainSpec::new("deepfilternet3-ll", || {
+                Box::new(Candidate::for_model("deepfilternet3-ll", NoiseModel::DeepFilter3LowLatency))
+            }),
+        ]);
         chains.extend(keys_chains_from_env());
         // Worker E's DeepFilterNet routes (docs/audio-deepfilter-decision-20261029.md),
         // kept for its reruns; RELAY_REPLAY_DIR does the same for any tool.
@@ -711,6 +747,37 @@ mod tests {
                     keys_after: None,
                 })
             );
+        }
+    }
+
+    /// The bench's `gtcrn` and `deepfilternet3-ll` chains run the model the
+    /// setting selects, at the delay the app's worker hand-off declares for
+    /// the default packet, and their output lines up there (within 0.5 ms).
+    #[cfg(feature = "model-lab")]
+    #[test]
+    fn comparison_bench_chains_run_the_settings_model_at_the_apps_delay() {
+        use crate::audio_bench::{measure_delay_between, run_chain, SendChain};
+        use crate::audio_settings::{AudioSettings, NoiseModel};
+        use crate::click_suppression::NoiseStrength::Normal;
+        let speech = talker(2.0, (105.0, 135.0), 13, 0.3);
+        for (setting, model) in [
+            (NoiseModel::Gtcrn, relay_audio_models::Model::Gtcrn),
+            (NoiseModel::DeepFilter3LowLatency, relay_audio_models::Model::DeepFilter3LowLatency),
+        ] {
+            let lab = crate::audio_model_lab::Model::External(model);
+            assert_eq!(for_setting(setting, Normal), SuppressorKind::Comparison(lab));
+            let app = crate::audio_model_lab::Comparison::new(
+                crate::audio_model_lab::Service::new(),
+                lab,
+                AudioSettings::default().packet_samples(),
+            )
+            .delay_samples();
+            let mut chain = bench::Candidate::for_model("candidate", setting);
+            assert_eq!(chain.algorithmic_delay_samples(), app, "{setting:?}");
+            let output = run_chain(&mut chain, &speech).output;
+            let measured = measure_delay_between(&speech, &output, app - 96, app + 96);
+            println!("{setting:?}: declared {app}, measured {measured}");
+            assert!(measured.abs_diff(app) <= 24, "{setting:?}: declared {app}, measured {measured}");
         }
     }
 

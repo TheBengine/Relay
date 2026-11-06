@@ -3,10 +3,15 @@ name = "relay-audio-models"
 version = "0.1.0"
 edition = "2021"
 license = "PolyForm-Perimeter-1.0.0"
+[features]
+# The comparison-only models: DeepFilterNet 3 (standard and low latency) and
+# GTCRN, about 45 MB embedded. Off in releases (docs/audio-gtcrn-eval-20261106.md);
+# without it only the newer native RNNoise is built in.
+model-lab = ["dep:deep_filter", "dep:tract-onnx", "dep:realfft", "dep:ndarray"]
 [dependencies]
-deep_filter = { package = "relay-deepfilter", path = "../../vendor/deep-filter" }
-tract-onnx = { version = "=0.23.9", default-features = false }
-realfft = "3.5"
-ndarray = "0.17"
+deep_filter = { package = "relay-deepfilter", path = "../../vendor/deep-filter", optional = true }
+tract-onnx = { version = "=0.23.9", default-features = false, optional = true }
+realfft = { version = "3.5", optional = true }
+ndarray = { version = "0.17", optional = true }
 [build-dependencies]
 cc = "1"

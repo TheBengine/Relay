@@ -942,12 +942,11 @@ mod tests {
         let mut client = Client::new(grant(1), now, now).unwrap();
         let mut buffer = [0; MAX_PACKET + 1];
         for _ in 0..3 {
-            while let Some(probe) = client.probe(Instant::now()) {
+            if let Some(probe) = client.probe(Instant::now()) {
                 socket.send_to(&probe, worker.address).unwrap();
                 let (n, from) = socket.recv_from(&mut buffer).unwrap();
                 assert_eq!(from, worker.address);
                 client.receive(&buffer[..n], Instant::now());
-                break;
             }
             thread::sleep(Duration::from_millis(55));
         }

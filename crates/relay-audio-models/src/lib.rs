@@ -1,9 +1,17 @@
 //! Real streaming comparison models. No devices, networking or fallback models.
+//!
+//! Only the newer native RNNoise is built in by default. DeepFilterNet 3 and
+//! GTCRN (about 45 MB of models) need the non-default `model-lab` feature;
+//! without it `Stream::new` refuses them and `Model::is_built_in` says so.
+#[cfg(feature = "model-lab")]
 mod gtcrn;
 mod native_rnnoise;
+#[cfg(feature = "model-lab")]
 mod resample;
 
+#[cfg(feature = "model-lab")]
 use deep_filter::tract::{DfParams, DfTract, RuntimeParams};
+#[cfg(feature = "model-lab")]
 use std::sync::{Mutex, OnceLock};
 
 pub const BLOCK: usize = 480;
@@ -17,6 +25,15 @@ pub enum Model {
 }
 
 impl Model {
+    /// Whether this build carries the model (DeepFilterNet and GTCRN only
+    /// with the `model-lab` feature).
+    pub const fn is_built_in(self) -> bool {
+        match self {
+            Self::DeepFilter3 | Self::DeepFilter3LowLatency | Self::Gtcrn => cfg!(feature = "model-lab"),
+            Self::RnNoiseNew => true,
+        }
+    }
+
     /// Algorithmic stream delay, excluding the app's worker handoff and devices.
     pub fn delay_samples(self) -> usize {
         match self {
@@ -29,7 +46,9 @@ impl Model {
 }
 
 enum Engine {
+    #[cfg(feature = "model-lab")]
     DeepFilter(Box<DfTract>),
+    #[cfg(feature = "model-lab")]
     Gtcrn(Box<gtcrn::Stream>),
     RnNoise(native_rnnoise::Stream),
 }
@@ -38,10 +57,13 @@ pub struct Stream {
     engine: Engine,
 }
 
+#[cfg(feature = "model-lab")]
 static DEEP_FILTER: [OnceLock<Result<Mutex<DfTract>, String>>; 2] =
     [OnceLock::new(), OnceLock::new()];
+#[cfg(feature = "model-lab")]
 const DF_STANDARD: &[u8] =
     include_bytes!("../../../vendor/models/deepfilter/DeepFilterNet3_onnx.tar.gz");
+#[cfg(feature = "model-lab")]
 const DF_LOW_LATENCY: &[u8] =
     include_bytes!("../../../vendor/models/deepfilter/DeepFilterNet3_ll_onnx.tar.gz");
 
@@ -49,6 +71,11 @@ impl Stream {
     /// Call on the model worker: graph construction must never block audio/UI.
     pub fn new(model: Model) -> Result<Self, String> {
         let engine = match model {
+            #[cfg(not(feature = "model-lab"))]
+            Model::DeepFilter3 | Model::DeepFilter3LowLatency | Model::Gtcrn => {
+                return Err("This build does not include this comparison model".into());
+            }
+            #[cfg(feature = "model-lab")]
             Model::DeepFilter3 | Model::DeepFilter3LowLatency => {
                 let index = usize::from(model == Model::DeepFilter3LowLatency);
                 let template = DEEP_FILTER[index]
@@ -82,6 +109,7 @@ impl Stream {
                         .clone(),
                 ))
             }
+            #[cfg(feature = "model-lab")]
             Model::Gtcrn => Engine::Gtcrn(Box::new(gtcrn::Stream::new()?)),
             Model::RnNoiseNew => Engine::RnNoise(native_rnnoise::Stream::new()?),
         };
@@ -97,6 +125,7 @@ impl Stream {
             };
         }
         match &mut self.engine {
+            #[cfg(feature = "model-lab")]
             Engine::DeepFilter(stream) => {
                 let mut out = [0.0; BLOCK];
                 stream
@@ -109,6 +138,7 @@ impl Stream {
                     .map_err(|e| format!("DeepFilterNet inference: {e:#}"))?;
                 *block = out;
             }
+            #[cfg(feature = "model-lab")]
             Engine::Gtcrn(stream) => stream.process(block)?,
             Engine::RnNoise(stream) => stream.process(block),
         }
@@ -132,7 +162,10 @@ mod tests {
             Model::DeepFilter3LowLatency,
             Model::Gtcrn,
             Model::RnNoiseNew,
-        ] {
+        ]
+        .into_iter()
+        .filter(|model| model.is_built_in())
+        {
             let mut first = Stream::new(model).unwrap_or_else(|e| panic!("{model:?}: {e}"));
             let mut second = Stream::new(model).unwrap();
             let mut energy = 0.0;
@@ -150,6 +183,16 @@ mod tests {
             }
             assert!(energy > 0.001, "{model:?}: no processed output");
             eprintln!("{model:?}: streaming inference passed, output energy={energy}");
+        }
+    }
+
+    /// Releases carry only the newer RNNoise; the lab models need `model-lab`.
+    #[test]
+    fn only_the_lab_feature_builds_deepfilternet_and_gtcrn() {
+        assert!(Model::RnNoiseNew.is_built_in());
+        for model in [Model::DeepFilter3, Model::DeepFilter3LowLatency, Model::Gtcrn] {
+            assert_eq!(model.is_built_in(), cfg!(feature = "model-lab"), "{model:?}");
+            assert_eq!(Stream::new(model).is_ok(), model.is_built_in(), "{model:?}");
         }
     }
 }
@@ -191,7 +234,10 @@ mod reference_tests {
                 ),
             ),
             (Model::RnNoiseNew, None),
-        ] {
+        ]
+        .into_iter()
+        .filter(|(model, _)| model.is_built_in())
+        {
             let mut stream = Stream::new(model).unwrap();
             let mut output = Vec::new();
             for chunk in input.chunks_exact(BLOCK) {

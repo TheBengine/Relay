@@ -140,7 +140,7 @@ fn user_navigation_cancels_background_friends_and_rejects_its_late_resume() {
             account: crate::central_account::Account { issuer: "https://owned.invalid/realm".into(),
                 subject: "owned-account".into(), handle: "owned_user".into(), expires_at: u64::MAX },
             cancel: cancel.clone(), form_cancel: Arc::new(AtomicBool::new(false)),
-            browser: None, challenge: None, authority: None, background: false, detached: false,
+            browser: None, challenge: None, authority: None, background: false, detached: false, server_proof: None,
         }),
         ..Default::default()
     };

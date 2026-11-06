@@ -1,4 +1,5 @@
 use super::*;
+use super::discord_host::LocalControl;
 use crate::community::account_destination;
 use serde_json::json;
 
@@ -56,13 +57,19 @@ impl Worker {
         if data["server_id"].as_str() != Some(summary.server_id.as_str()) {
             return Err(IDENTITY_CHANGED.into());
         }
+        // Any server reachable here, including one this PC created a moment
+        // ago, is only treated as this PC's own when its runtime record proves it.
+        let local_owner = crate::local_host::is_local_url(&url)
+            && LocalControl::for_server(&url, &summary.server_id).is_ok();
         self.emit(Update::AccountLoginChallenge {
             url,
             data,
             request_id,
+            local_owner,
         });
         Ok(())
     }
+    #[cfg(test)]
     pub(super) fn account_login_finish(
         &mut self,
         authority: Option<handover::RoutePin>,
@@ -72,6 +79,23 @@ impl Worker {
         proof: zeroize::Zeroizing<String>,
         cancel: Arc<AtomicBool>,
         request_id: u64,
+    ) -> Result<(), String> {
+        self.account_login_finish_as(
+            authority, url, expected, challenge, proof, cancel, request_id, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn account_login_finish_as(
+        &mut self,
+        authority: Option<handover::RoutePin>,
+        url: String,
+        expected: String,
+        challenge: String,
+        proof: zeroize::Zeroizing<String>,
+        cancel: Arc<AtomicBool>,
+        request_id: u64,
+        local_owner: bool,
     ) -> Result<(), String> {
         if cancel.load(Ordering::Acquire) {
             return Ok(());
@@ -88,15 +112,31 @@ impl Worker {
         if cancel.load(Ordering::Acquire) {
             return Ok(());
         }
-        let session: Session = parse(
-            self.http
-                .post(crate::embedded_network::endpoint(&format!(
-                    "{url}/api/account-login"
-                )))
-                .json(&json!({"challenge_id":challenge,"id_token":proof.as_str()}))
-                .send()
-                .map_err(network_error)?,
-        )?;
+        let body = json!({"challenge_id":challenge,"id_token":proof.as_str()});
+        let session: Session = if local_owner {
+            // Proven again right before the secret and the identity are sent:
+            // the server answering now must be the one this PC started.
+            let control = LocalControl::for_server(&url, &expected)?;
+            parse(
+                control
+                    .request(reqwest::Method::POST, "/api/local/account-login")?
+                    // The server checks the identity with the account service.
+                    .timeout(Duration::from_secs(30))
+                    .json(&body)
+                    .send()
+                    .map_err(network_error)?,
+            )?
+        } else {
+            parse(
+                self.http
+                    .post(crate::embedded_network::endpoint(&format!(
+                        "{url}/api/account-login"
+                    )))
+                    .json(&body)
+                    .send()
+                    .map_err(network_error)?,
+            )?
+        };
         if cancel.load(Ordering::Acquire) {
             let _ = self
                 .http

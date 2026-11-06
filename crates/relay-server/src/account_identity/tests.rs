@@ -10,6 +10,8 @@ const PASSWORD: &str = "a-long-test-password";
 
 #[path = "people_tests.rs"]
 mod people_tests;
+#[path = "local_login_tests.rs"]
+mod local_login_tests;
 
 /// An explicitly selected fixture only; normal builds never admit HTTP issuers.
 /// The external owner drives the real client worker and provider, then closes

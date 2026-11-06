@@ -4,7 +4,10 @@
 //! Discovery packets cannot create a grant, select a route or supply a URL.
 use crate::local_voice_gateway::{Grant, Path, Worker};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use relay_protocol::gateway_broker as wire;
+use relay_protocol::{
+    gateway_broker as wire,
+    host_choice::{self, Contender},
+};
 use reqwest::{blocking::RequestBuilder, Method};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
@@ -160,6 +163,9 @@ pub(crate) struct Config {
     hosting: RequestBuilder,
     measurements: RequestBuilder,
     upload_probe: RequestBuilder,
+    download_probe: RequestBuilder,
+    /// This account, for the LAN election: a gateway counts itself in.
+    user_id: String,
 }
 impl Config {
     pub fn new(
@@ -180,7 +186,14 @@ impl Config {
             hosting: request(Method::GET, "/api/hosting").ok()?,
             measurements: request(Method::POST, "/api/hosting/measurements").ok()?,
             upload_probe: request(Method::POST, "/api/hosting/measurements/upload").ok()?,
+            download_probe: request(Method::GET, "/api/hosting/measurements/download").ok()?,
+            user_id: String::new(),
         })
+    }
+    /// The signed-in account that owns this call seat.
+    pub fn with_user(mut self, user_id: String) -> Self {
+        self.user_id = user_id;
+        self
     }
     /// Only the authenticated call worker supplies this already pinned route.
     /// It is never a voice port borrowed from the user's ordinary connection.
@@ -207,6 +220,8 @@ impl Config {
             hosting: self.hosting.try_clone()?,
             measurements: self.measurements.try_clone()?,
             upload_probe: self.upload_probe.try_clone()?,
+            download_probe: self.download_probe.try_clone()?,
+            user_id: self.user_id.clone(),
         })
     }
 }
@@ -277,6 +292,87 @@ struct State {
     revision: u64,
     active: bool,
     seen: HashSet<[u8; 16]>,
+    /// Moving to the LAN's newly elected gateway: audio goes back to the
+    /// normal route first, then this path is released.
+    retiring: bool,
+    /// The LAN's elected gateway and why, for the call panel.
+    choice: Option<Choice>,
+}
+
+/// Which gateway serves this LAN and why, in words for the call panel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Choice {
+    pub gateway_id: String,
+    /// What was measured on its machine, or that nothing was.
+    pub reasons: String,
+    /// Other approved gateways on this LAN.
+    pub others: usize,
+    /// Another gateway leads and takes over if that holds: (id, seconds held).
+    pub moving_to: Option<(String, u64)>,
+}
+
+/// One gateway offer as an election contender (`relay_protocol::host_choice`).
+fn offer_contender(offer: &wire::GatewayOffer) -> Contender {
+    Contender::new(
+        offer.gateway_id.clone(),
+        offer
+            .capability
+            .and_then(|c| host_choice::score(&c, 0))
+            .map(|s| s.points),
+        offer.serving_secs.unwrap_or(0).saturating_mul(1000),
+    )
+}
+
+/// Offers this PC can reach on its own LAN, never one being skipped after a failure.
+fn lan_offers(
+    list: wire::GatewayList,
+    subnets: &[crate::invitation_probe::Subnet],
+    skip: Option<&(String, Instant)>,
+    now: Instant,
+) -> Vec<wire::GatewayOffer> {
+    if list.gateways.len() > 16 {
+        return Vec::new();
+    }
+    list.gateways
+        .into_iter()
+        .filter(|v| {
+            wire::valid_instance(&v.instance)
+                && skip.is_none_or(|(id, until)| id != &v.instance || now >= *until)
+                && wire::parse_private_addr(&v.ip, v.port).is_ok_and(|a| {
+                    crate::invitation_probe::allowed_ip(IpAddr::V4(*a.ip()), subnets)
+                })
+        })
+        .collect()
+}
+
+/// True when another gateway on this LAN, not this machine, should serve it.
+fn someone_else_serves(lan: &[wire::GatewayOffer], own: Contender) -> bool {
+    let own_id = own.id.clone();
+    let mut all: Vec<Contender> = lan.iter().map(offer_contender).collect();
+    all.push(own);
+    host_choice::best(&all).is_some_and(|winner| winner.id != own_id)
+}
+
+fn choice_for(decision: &host_choice::Decision, lan: &[wire::GatewayOffer]) -> Option<Choice> {
+    let id = decision.chosen()?;
+    let offer = lan.iter().find(|o| o.gateway_id == id)?;
+    Some(Choice {
+        gateway_id: id.to_owned(),
+        reasons: offer
+            .capability
+            .and_then(|c| host_choice::score(&c, 0))
+            .map(|s| s.reasons)
+            .unwrap_or_else(|| "its machine has not reported measurements yet".into()),
+        others: lan.len().saturating_sub(1),
+        moving_to: match decision {
+            host_choice::Decision::Wait {
+                challenger,
+                held_ms,
+                ..
+            } => Some((challenger.clone(), held_ms / 1000)),
+            _ => None,
+        },
+    })
 }
 pub(crate) struct Session {
     state: Arc<Mutex<State>>,
@@ -402,6 +498,7 @@ impl Session {
         };
         let active = self.enabled.current(state.revision)
             && !self.stop.load(Ordering::Acquire)
+            && !state.retiring
             && state
                 .path
                 .as_ref()
@@ -412,6 +509,13 @@ impl Session {
     }
     pub fn active(&self) -> bool {
         self.state.lock().is_ok_and(|state| state.active)
+    }
+    /// The LAN's elected gateway, while gateways are enabled for this call.
+    pub fn choice(&self) -> Option<Choice> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        self.state.lock().ok()?.choice.clone()
     }
     fn mesh_allowed(&self) -> bool {
         self.enabled.load(Ordering::Acquire) && !self.stop.load(Ordering::Acquire)
@@ -502,6 +606,10 @@ fn measurement_loop(
     let _ = cpu.sample();
     let mut next = Instant::now() + Duration::from_secs(10);
     let mut next_upload = Instant::now() + Duration::from_secs(20);
+    // How fast this member receives from the host: a lower bound of the
+    // host's upload. An older server has no probe and never gets the field.
+    let mut next_download = Instant::now() + Duration::from_secs(25);
+    let mut host_download: Option<(u32, Instant)> = None;
     while alive() {
         if Instant::now() < next {
             thread::sleep(Duration::from_millis(250));
@@ -533,9 +641,33 @@ fn measurement_loop(
                 }
             }
         }
+        if Instant::now() >= next_download {
+            next_download = Instant::now() + Duration::from_secs(5 * 60);
+            if let Some(request) = config.download_probe.try_clone() {
+                let started = Instant::now();
+                let received = request
+                    .timeout(Duration::from_secs(20))
+                    .send()
+                    .ok()
+                    .filter(|r| r.status().is_success())
+                    .and_then(|r| r.bytes().ok())
+                    .is_some_and(|body| body.len() == measure::DOWNLOAD_PROBE_BYTES);
+                if let Some(kbps) = received
+                    .then(|| measure::kbps(measure::DOWNLOAD_PROBE_BYTES, started.elapsed()))
+                    .flatten()
+                {
+                    host_download = Some((kbps, Instant::now()));
+                }
+            }
+        }
+        let host_download_kbps = host_download
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(10 * 60))
+            .map(|(kbps, _)| kbps);
+        let cpu_free = cpu.sample();
+        measure::set_cpu_free_pct(cpu_free);
         let capacity = cohost.then(|| relay_protocol::hosting::CapacityFacts {
             upload_kbps: measure::upload_kbps(),
-            cpu_free_pct: cpu.sample(),
+            cpu_free_pct: cpu_free,
             free_disk_mb: crate::local_host::data_directory()
                 .ok()
                 .and_then(|dir| measure::free_disk_mb(&dir)),
@@ -544,7 +676,7 @@ fn measurement_loop(
         let heard = heard.lock().map(|h| h.clone()).unwrap_or_default();
         let rtt_us = host_rtt_us.load(Ordering::Relaxed);
         let rtt_ms = (rtt_us > 0).then(|| rtt_us as f32 / 1000.0);
-        if let Some(report) = measure::report(&view, &heard, rtt_ms, capacity) {
+        if let Some(report) = measure::report(&view, &heard, rtt_ms, capacity, host_download_kbps) {
             discard(config.measurements.try_clone().map(|r| r.json(&report)));
         }
     }
@@ -572,11 +704,20 @@ fn lease_loop(
     let mut next_list = Instant::now();
     let mut skip: Option<(String, Instant)> = None;
     let mut revision = enabled.revision();
+    // The LAN election: the same rule on every PC of the LAN, with a held
+    // lead before any change.
+    let epoch = Instant::now();
+    let mut preference = host_choice::Preference::default();
+    let mut retiring: Option<(Instant, wire::GatewayOffer)> = None;
     while alive() {
         if !valid() || !enabled.current(revision) {
             if let Ok(mut shared) = state.lock() {
                 shared.path = None;
+                shared.retiring = false;
+                shared.choice = None;
             }
+            retiring = None;
+            preference = host_choice::Preference::default();
             if let Some(id) = lease_id.take() {
                 release(&config, &id);
             }
@@ -588,21 +729,56 @@ fn lease_loop(
             enabled.wait_enabled(alive.as_ref());
             continue;
         }
-        if offer.is_none() && Instant::now() >= next_list {
+        if Instant::now() >= next_list {
             next_list = Instant::now() + RETRY;
             let subnets = crate::invitation_probe::local_subnets();
             let offers: Option<wire::GatewayList> = config.list.try_clone().and_then(reply);
-            if let Some(list) = offers.filter(|v| v.gateways.len() <= 16) {
-                offer = list.gateways.into_iter().find(|v| {
-                    wire::valid_instance(&v.instance)
-                        && skip
-                            .as_ref()
-                            .is_none_or(|(id, until)| id != &v.instance || Instant::now() >= *until)
-                        && wire::parse_private_addr(&v.ip, v.port).is_ok_and(|a| {
-                            crate::invitation_probe::allowed_ip(IpAddr::V4(*a.ip()), &subnets)
-                        })
-                });
-                began = Instant::now();
+            if let Some(list) = offers {
+                let now = Instant::now();
+                let lan = lan_offers(list, &subnets, skip.as_ref(), now);
+                let contenders: Vec<Contender> = lan.iter().map(offer_contender).collect();
+                let decision = preference.observe(epoch.elapsed().as_millis() as u64, &contenders);
+                if let Ok(mut shared) = state.lock() {
+                    shared.choice = choice_for(&decision, &lan);
+                }
+                let target = decision
+                    .chosen()
+                    .and_then(|id| lan.iter().find(|o| o.gateway_id == id))
+                    .cloned();
+                match (&offer, target) {
+                    (None, Some(target)) => {
+                        offer = Some(target);
+                        began = now;
+                    }
+                    (Some(current), Some(target))
+                        if current.gateway_id != target.gateway_id && retiring.is_none() =>
+                    {
+                        // Make before break: audio returns to the normal route
+                        // (which stays registered with the host throughout)
+                        // before this hop is released and the next one leased.
+                        if let Ok(mut shared) = state.lock() {
+                            shared.retiring = true;
+                        }
+                        retiring = Some((now, target));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some((since, _)) = &retiring {
+            let idle = state.lock().map_or(true, |s| !s.active);
+            if idle || since.elapsed() >= Duration::from_millis(1500) {
+                if let Some((_, target)) = retiring.take() {
+                    if let Ok(mut shared) = state.lock() {
+                        shared.path = None;
+                        shared.retiring = false;
+                    }
+                    if let Some(id) = lease_id.take() {
+                        release(&config, &id);
+                    }
+                    offer = Some(target);
+                    began = Instant::now();
+                }
             }
         }
         let Some(candidate) = offer.as_ref() else {
@@ -675,7 +851,9 @@ fn lease_loop(
         if !accepted || (tried && !proven) {
             if let Ok(mut shared) = state.lock() {
                 shared.path = None;
+                shared.retiring = false;
             }
+            retiring = None;
             if let Some(id) = lease_id.take() {
                 release(&config, &id);
             }
@@ -701,6 +879,39 @@ fn private_interfaces(subnets: &[crate::invitation_probe::Subnet]) -> Vec<IpAddr
     }
     out
 }
+/// After the LAN elected another gateway, this one keeps serving this long so
+/// the people on it move first, without a gap.
+const STEP_BACK_GRACE: Duration = Duration::from_secs(20);
+
+/// This machine as a contender in its own LAN's election.
+fn own_contender(config: &Config, host_rtt_us: &AtomicU64, serving: Duration) -> Contender {
+    use crate::host_measurements as measure;
+    let rtt_us = host_rtt_us.load(Ordering::Relaxed);
+    let capability = host_choice::Capability {
+        upload_kbps: measure::upload_kbps(),
+        cpu_free_pct: measure::cpu_free_pct(),
+        host_rtt_ms: (rtt_us > 0).then(|| (rtt_us / 1000).clamp(1, 10_000) as u32),
+    };
+    Contender::new(
+        config.user_id.clone(),
+        host_choice::score(&capability, 0).map(|s| s.points),
+        // Whole seconds, as the server lists every other gateway.
+        serving.as_secs().saturating_mul(1000),
+    )
+}
+
+/// Another approved gateway on this LAN is the one to serve it.
+fn lan_has_better_gateway(config: &Config, host_rtt_us: &AtomicU64, serving: Duration) -> bool {
+    if config.user_id.is_empty() {
+        return false;
+    }
+    let Some(list) = config.list.try_clone().and_then(reply::<wire::GatewayList>) else {
+        return false;
+    };
+    let lan = lan_offers(list, &crate::invitation_probe::local_subnets(), None, Instant::now());
+    someone_else_serves(&lan, own_contender(config, host_rtt_us, serving))
+}
+
 fn serve_loop(
     config: Config,
     upstream: SocketAddr,
@@ -718,6 +929,12 @@ fn serve_loop(
         }
         let revision = enabled.revision();
         let valid = || valid() && enabled.current(revision);
+        // One gateway per LAN: do not start serving where another approved
+        // gateway already serves at least as well. This PC then uses it.
+        if lan_has_better_gateway(&config, &host_rtt_us, Duration::ZERO) {
+            enabled.wait(alive.as_ref(), Duration::from_secs(30), revision);
+            continue;
+        }
         // Iroh gets its own helper client/voice socket; normal voice keeps its
         // existing endpoint, application address, sequence and admission.
         let private = match &config.private_route {
@@ -763,7 +980,27 @@ fn serve_loop(
         let mut registered_until = Instant::now();
         let mut missed_polls = 0u8;
         let mut installed: HashMap<u64, ([u8; 16], Instant)> = HashMap::new();
+        let mut serving_since: Option<Instant> = None;
+        let mut next_election = Instant::now() + RETRY;
+        let mut outvoted_since: Option<Instant> = None;
+        let mut stepping_back: Option<Instant> = None;
         while alive() && valid() {
+            // The LAN election, with the same held lead as everyone on the LAN.
+            if let Some(since) = serving_since.filter(|_| Instant::now() >= next_election) {
+                next_election = Instant::now() + RETRY;
+                if lan_has_better_gateway(&config, &host_rtt_us, since.elapsed()) {
+                    let first = *outvoted_since.get_or_insert_with(Instant::now);
+                    if first.elapsed().as_millis() as u64 >= host_choice::SUSTAIN_MS {
+                        stepping_back.get_or_insert_with(Instant::now);
+                    }
+                } else if stepping_back.is_none() {
+                    outvoted_since = None;
+                }
+            }
+            if stepping_back.is_some_and(|at| at.elapsed() >= STEP_BACK_GRACE) {
+                backoff = Duration::from_millis(host_choice::COOLDOWN_MS);
+                break;
+            }
             if Instant::now() >= renewal {
                 let body = serde_json::json!({"instance":instance,"session_id":config.session,"ip":worker.address.ip().to_string(),"port":worker.address.port()});
                 let requested = Instant::now();
@@ -778,6 +1015,7 @@ fn serve_loop(
                         registered_until = requested + Duration::from_secs(v.expires_in_secs);
                         renewal = Instant::now() + Duration::from_secs(30);
                         backoff = RETRY;
+                        serving_since.get_or_insert(requested);
                     }
                     Err(Failure::Transient) if registered_until > Instant::now() + PERIOD => {
                         renewal = Instant::now() + PERIOD;
@@ -878,5 +1116,151 @@ fn serve_loop(
             ])
         }));
         enabled.wait(alive.as_ref(), backoff, revision);
+    }
+}
+
+#[cfg(test)]
+mod election_tests {
+    use super::*;
+
+    fn offer(id: &str, ip: &str, points: Option<(u32, u8)>, serving_secs: u64) -> wire::GatewayOffer {
+        wire::GatewayOffer {
+            gateway_id: id.into(),
+            instance: "ab".repeat(16),
+            ip: ip.into(),
+            port: 47000,
+            capability: points.map(|(upload_kbps, cpu)| host_choice::Capability {
+                upload_kbps: Some(upload_kbps),
+                cpu_free_pct: Some(cpu),
+                host_rtt_ms: Some(20),
+            }),
+            serving_secs: Some(serving_secs),
+        }
+    }
+
+    fn home() -> Vec<crate::invitation_probe::Subnet> {
+        vec![crate::invitation_probe::Subnet("192.168.1.30".parse().unwrap(), 24)]
+    }
+
+    #[test]
+    fn only_gateways_on_this_lan_take_part_and_a_skipped_one_sits_out() {
+        let list = wire::GatewayList {
+            gateways: vec![
+                offer("gus", "192.168.1.20", Some((30_000, 70)), 600),
+                offer("far", "192.168.7.20", Some((90_000, 90)), 900),
+            ],
+        };
+        let now = Instant::now();
+        let lan = lan_offers(list.clone(), &home(), None, now);
+        assert_eq!(lan.iter().map(|o| o.gateway_id.as_str()).collect::<Vec<_>>(), ["gus"]);
+        let skip = ("ab".repeat(16), now + Duration::from_secs(15));
+        assert!(lan_offers(list, &home(), Some(&skip), now).is_empty());
+    }
+
+    #[test]
+    fn a_gateway_steps_back_only_for_a_better_or_longer_serving_one() {
+        let gus = offer("gus", "192.168.1.20", Some((1_500, 40)), 600);
+        let strong = |id: &str, serving: u64| {
+            Contender::new(id, host_choice::score(&host_choice::Capability {
+                upload_kbps: Some(90_000), cpu_free_pct: Some(95), host_rtt_ms: Some(20),
+            }, 0).map(|s| s.points), serving * 1000)
+        };
+        let equal = |id: &str, serving: u64| {
+            Contender::new(id, offer_contender(&gus).points, serving * 1000)
+        };
+        // About equal: the one already serving wins; the newcomer steps back.
+        assert!(someone_else_serves(std::slice::from_ref(&gus), equal("ada", 0)));
+        // Clearly better: the newcomer serves and the old one will step back.
+        assert!(!someone_else_serves(std::slice::from_ref(&gus), strong("ada", 0)));
+        // Alone on the LAN: always serve.
+        assert!(!someone_else_serves(&[], equal("ada", 0)));
+    }
+
+    #[test]
+    fn retiring_a_path_sends_audio_on_the_normal_route_and_never_drops_it() {
+        let enabled = Arc::new(Toggle::new(true));
+        let now = Instant::now();
+        let path = Path::new("127.0.0.1:49898".parse().unwrap(), Grant {
+            id: [14; 16], session: 7, key: Zeroizing::new([54; 32]),
+            valid_for: Duration::from_secs(2),
+        }, now, now).unwrap();
+        let session = Session::fixture(path, enabled);
+        session.state.lock().unwrap().active = true;
+        session.state.lock().unwrap().retiring = true;
+        // The next tick deselects the hop (and sends the binding keepalive on
+        // the normal route); audio after that is routed normally, not lost.
+        assert_eq!(session.select(Instant::now(), 0, true), (false, true));
+        assert_eq!(session.wrap_selected(&[1, 2, 3], Instant::now()), Ok(None));
+    }
+
+    #[test]
+    fn choice_words_name_the_gateway_its_measurements_and_a_pending_move() {
+        let lan = vec![
+            offer("gus", "192.168.1.20", Some((30_000, 70)), 600),
+            offer("ada", "192.168.1.21", None, 5),
+        ];
+        let decision = host_choice::Decision::Wait {
+            current: "gus".into(),
+            challenger: "ada".into(),
+            held_ms: 12_000,
+            lead: host_choice::Lead::ClearlyBetter,
+        };
+        let choice = choice_for(&decision, &lan).unwrap();
+        assert_eq!(choice.gateway_id, "gus");
+        assert!(choice.reasons.contains("upload 30 Mbit/s"), "{}", choice.reasons);
+        assert_eq!(choice.others, 1);
+        assert_eq!(choice.moving_to, Some(("ada".into(), 12)));
+        let pick = host_choice::Decision::Pick { to: "ada".into() };
+        assert_eq!(choice_for(&pick, &lan).unwrap().reasons, "its machine has not reported measurements yet");
+    }
+
+    /// Three minutes on one LAN, in 5-second listing rounds: Gus has served for
+    /// ten minutes, Ada's much stronger PC starts serving at 0 s. Lena was on
+    /// Gus; Max arrives at 30 s. Everyone ends on Ada, each moves once, and
+    /// Gus keeps serving until the last person on him has moved.
+    #[test]
+    fn simulation_a_lan_moves_to_a_better_gateway_once_and_without_a_gap() {
+        let ada_cap = (90_000, 95);
+        let mut lena = host_choice::Preference::starting_with("gus");
+        let mut max: Option<host_choice::Preference> = None;
+        let mut moves = Vec::new();
+        let mut gus_outvoted: Option<u64> = None;
+        let mut gus_stops: Option<u64> = None;
+        let mut lena_moved: Option<u64> = None;
+        for round in 0..36u64 {
+            let t = round * 5_000;
+            let mut list = vec![offer("ada", "192.168.1.21", Some(ada_cap), t / 1000)];
+            if gus_stops.is_none_or(|stop| t < stop) {
+                list.push(offer("gus", "192.168.1.20", Some((1_500, 60)), 600 + t / 1000));
+            }
+            let contenders: Vec<Contender> = list.iter().map(offer_contender).collect();
+            if let host_choice::Decision::Change { to, .. } = lena.observe(t, &contenders) {
+                moves.push(("lena", to.clone(), t));
+                lena_moved = Some(t);
+            }
+            if round == 6 {
+                max = Some(host_choice::Preference::default());
+            }
+            if let Some(max) = max.as_mut() {
+                if let host_choice::Decision::Pick { to } = max.observe(t, &contenders) {
+                    assert_eq!(to, "ada", "a newcomer picks the elected gateway at once");
+                }
+            }
+            // Gus's own app: the same list without itself, plus itself.
+            let others: Vec<_> = list.iter().filter(|o| o.gateway_id != "gus").cloned().collect();
+            let own = offer_contender(&offer("gus", "192.168.1.20", Some((1_500, 60)), 600 + t / 1000));
+            if gus_stops.is_none() && someone_else_serves(&others, own) {
+                let since = *gus_outvoted.get_or_insert(t);
+                if t - since >= host_choice::SUSTAIN_MS {
+                    gus_stops = Some(t + STEP_BACK_GRACE.as_millis() as u64);
+                }
+            }
+        }
+        assert_eq!(moves, vec![("lena", "ada".to_string(), host_choice::SUSTAIN_MS)]);
+        assert_eq!(lena.current(), Some("ada"));
+        assert_eq!(max.unwrap().current(), Some("ada"));
+        let (moved, stops) = (lena_moved.unwrap(), gus_stops.unwrap());
+        assert!(moved < stops, "Lena moved at {moved} ms, Gus stopped at {stops} ms");
+        println!("LAN election: Lena moved to Ada at {moved} ms; Gus stopped serving at {stops} ms");
     }
 }

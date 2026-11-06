@@ -128,12 +128,34 @@ pub(crate) async fn register_destination(
     headers: HeaderMap,
     Json(input): Json<OwnDestination>,
 ) -> ApiResult<StatusCode> {
+    host_app(&state, connect.as_ref(), ingress.is_some(), &headers)?;
+    let url = destination_url(&input.url).map_err(|_| bad("Invalid address."))?;
+    let url = url.as_str().trim_end_matches('/').to_owned();
+    let mut own = lock(&state.0.account_destinations);
+    if !own.contains(&url) && own.len() >= 8 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "Too many addresses. Restart the server to reset them.",
+        ));
+    }
+    own.insert(url);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The host app on this PC: a direct loopback connection, no proxy or network
+/// listener, the server's local control secret, and this exact server instance.
+fn host_app(
+    state: &AppState,
+    connect: Option<&axum::Extension<ConnectInfo<SocketAddr>>>,
+    ingress: bool,
+    headers: &HeaderMap,
+) -> ApiResult<()> {
     let loopback = connect.is_some_and(|c| c.0 .0.ip().is_loopback());
     let forwarded = headers.keys().any(|k| {
         let name = k.as_str();
         name == "origin" || name == "forwarded" || name.starts_with("x-forwarded-")
     });
-    if ingress.is_some() || !loopback || forwarded {
+    if ingress || !loopback || forwarded {
         return Err(forbidden());
     }
     let expected = state
@@ -156,17 +178,7 @@ pub(crate) async fn register_destination(
             "The local host changed. Refresh its connection.",
         ));
     }
-    let url = destination_url(&input.url).map_err(|_| bad("Invalid address."))?;
-    let url = url.as_str().trim_end_matches('/').to_owned();
-    let mut own = lock(&state.0.account_destinations);
-    if !own.contains(&url) && own.len() >= 8 {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "Too many addresses. Restart the server to reset them.",
-        ));
-    }
-    own.insert(url);
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -180,6 +192,42 @@ pub(crate) async fn finish(
     State(state): State<AppState>,
     ingress: Option<axum::Extension<NetworkIngress>>,
     Json(input): Json<Finish>,
+) -> ApiResult<PrivateJson> {
+    complete(state, ingress, input, Proof::Bound).await
+}
+
+/// Sign-in for the host app on this PC with the Relay account it already
+/// holds: the same one-use challenge and account rules as `finish`, but the
+/// ID token is the app's freshly refreshed identity instead of one minted
+/// for this challenge in the account page. The desktop app restores its saved
+/// login by refresh, without a browser session, so a server it just created
+/// (or reopens) could otherwise only be entered by typing the password again.
+/// Binding comes from the caller instead: loopback, no proxy or network
+/// listener, the local control secret and this exact server instance.
+pub(crate) async fn finish_local(
+    State(state): State<AppState>,
+    connect: Option<axum::Extension<ConnectInfo<SocketAddr>>>,
+    ingress: Option<axum::Extension<NetworkIngress>>,
+    headers: HeaderMap,
+    Json(input): Json<Finish>,
+) -> ApiResult<PrivateJson> {
+    host_app(&state, connect.as_ref(), ingress.is_some(), &headers)?;
+    complete(state, ingress, input, Proof::HostApp).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Proof {
+    /// The ID token's nonce is this challenge's destination-bound nonce.
+    Bound,
+    /// The host app's refreshed identity; its nonce is the app's own.
+    HostApp,
+}
+
+async fn complete(
+    state: AppState,
+    ingress: Option<axum::Extension<NetworkIngress>>,
+    input: Finish,
+    proof: Proof,
 ) -> ApiResult<PrivateJson> {
     if Uuid::parse_str(&input.challenge_id).is_err()
         || input.id_token.is_empty()
@@ -219,7 +267,10 @@ pub(crate) async fn finish(
     // Ordinary SSO accepts the provider's existing login session, while every
     // new proof still has a fresh signed issue time and one-use server nonce.
     // Sensitive linking keeps its separate recent-authentication requirement.
-    let (subject, handle) = verify_identity(provider, &input.id_token, &nonce, false).await?;
+    let (subject, handle) = match proof {
+        Proof::Bound => verify_identity(provider, &input.id_token, &nonce, false).await?,
+        Proof::HostApp => verify_host_identity(provider, &input.id_token).await?,
+    };
     let session = {
         let mut db = lock(&state.0.db);
         let tx = db.transaction()?;

@@ -961,3 +961,117 @@ fn udp_workers_fan_out_between_two_homes_over_real_sockets() {
     drop(home_a);
     drop(home_b);
 }
+
+/// The production arrangement for mixed routes: the server plans only the
+/// people of a home (`host_relay: false`, as `gateway_admission::mesh` does),
+/// and the shared host relays every pair the plan does not carry. Home A has
+/// its gateway with a1 and a2 on the LAN; c reaches the host over iroh (or the
+/// internet: the host cannot tell and treats both alike).
+fn lan_home_and_remote() -> RoutePlan {
+    let topology = Topology {
+        binding: binding(),
+        epoch: 1,
+        gateways: vec![Gateway {
+            id: "gw-a".into(),
+            node: A,
+            approval: Some(binding()),
+            uplink: Some(q(40)),
+            upload_kbps: Some(0),
+        }],
+        trunks: Vec::new(),
+        members: vec![
+            person("a1", 1, Some(A), &[(A, 1)]),
+            person("a2", 2, Some(A), &[(A, 1)]),
+        ],
+        host_relay: false,
+        speakers: 0,
+    };
+    RoutePlan::build(&topology).unwrap()
+}
+
+/// (listener, speaker) -> (frames by the gateway, frames by the host).
+type Heard = BTreeMap<(u32, u32), (usize, usize)>;
+
+/// Runs `frames` with everyone speaking. `host_up` says, per frame, whether the
+/// shared host still relays. Returns (listener, speaker) -> frames heard and
+/// the way they came.
+fn mixed_call(
+    frames: u64,
+    host_up: impl Fn(u64) -> bool,
+) -> (Heard, World) {
+    let plan = lan_home_and_remote();
+    let covered: Vec<u32> = plan.members.iter().map(|m| m.stream).collect();
+    let mut world = World::new(&plan);
+    let people = [1u32, 2, 7];
+    let mut by_host: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+    let begin = world.start + Duration::from_millis(220);
+    for seq in 0..frames {
+        let now = begin + Duration::from_millis(seq * 20);
+        world.probe(now);
+        for speaker in people {
+            if plan.attachment(speaker).is_some() {
+                world.speak(speaker, seq, now);
+            }
+            // Everyone also sends the ordinary frame to the host.
+            if host_up(seq) {
+                for listener in people.iter().filter(|l| **l != speaker) {
+                    if !(covered.contains(&speaker) && covered.contains(listener)) {
+                        *by_host.entry((*listener, speaker)).or_default() += 1;
+                    }
+                }
+            }
+        }
+        world.pump(now);
+    }
+    let mut out = BTreeMap::new();
+    for listener in people {
+        for speaker in people.iter().filter(|s| **s != listener) {
+            out.insert(
+                (listener, *speaker),
+                (
+                    world.heard(listener, *speaker),
+                    by_host.get(&(listener, *speaker)).copied().unwrap_or(0),
+                ),
+            );
+        }
+    }
+    (out, world)
+}
+
+#[test]
+fn simulation_a_lan_pair_and_a_remote_member_hear_each_other_once() {
+    const FRAMES: u64 = 50;
+    let plan = lan_home_and_remote();
+    assert_eq!(plan.nodes, vec![A], "one home, its gateway alone");
+    let (heard, world) = mixed_call(FRAMES, |_| true);
+    let mut lines = String::from("mixed routes, host up (listener <- speaker: gateway + host)\n");
+    for ((listener, speaker), (gateway, host)) in &heard {
+        assert_eq!(
+            gateway + host,
+            FRAMES as usize,
+            "{listener} hears {speaker} once per frame"
+        );
+        let lan_pair = *listener != 7 && *speaker != 7;
+        assert_eq!((*gateway > 0, *host > 0), (lan_pair, !lan_pair));
+        lines += &format!("  {listener} <- {speaker}: {gateway} + {host}\n");
+    }
+    // Speech inside the home never crosses its internet link.
+    assert_eq!(world.load.get(&Site::HomeA).map_or(0, |l| l.up), 0);
+    println!("{lines}");
+}
+
+#[test]
+fn simulation_when_the_host_goes_away_only_the_lan_pair_keeps_talking() {
+    const FRAMES: u64 = 50;
+    // The host stops relaying after frame 20. The gateway's approval is still
+    // valid in this simulation; in a real call it lapses within its 2 s lease
+    // because only the host renews it.
+    let (heard, _) = mixed_call(FRAMES, |seq| seq < 20);
+    for ((listener, speaker), (gateway, host)) in &heard {
+        if *listener != 7 && *speaker != 7 {
+            assert_eq!(*gateway, FRAMES as usize, "{listener} <- {speaker}");
+        } else {
+            assert_eq!((*gateway, *host), (0, 20), "{listener} <- {speaker}");
+        }
+    }
+}

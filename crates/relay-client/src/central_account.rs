@@ -553,6 +553,53 @@ struct PersistenceState {
 struct Persistence {
     state: Mutex<PersistenceState>,
     store: Arc<dyn SessionStore>,
+    /// Waiting requests for a fresh signed identity from the running refresh
+    /// loop (a server hosted on this PC signs the account in with it).
+    proofs: ServerProofs,
+}
+/// One refresh serves every waiting request. A sender dropped without a
+/// token means the saved login cannot give one now; the caller falls back to
+/// the account page.
+#[derive(Default)]
+struct ServerProofs(Mutex<Vec<mpsc::SyncSender<Zeroizing<String>>>>);
+impl ServerProofs {
+    fn wanted(&self) -> bool {
+        self.0.lock().is_ok_and(|waiting| !waiting.is_empty())
+    }
+    fn add(&self, waiting: mpsc::SyncSender<Zeroizing<String>>) -> bool {
+        // Every refresh drains the list, so it stays short; it is bounded anyway.
+        self.0
+            .lock()
+            .map(|mut all| {
+                let room = all.len() < 8;
+                if room {
+                    all.push(waiting);
+                }
+                room
+            })
+            .unwrap_or(false)
+    }
+    fn deliver(&self, id_token: &str) {
+        if let Ok(mut all) = self.0.lock() {
+            for sender in all.drain(..) {
+                let _ = sender.try_send(Zeroizing::new(id_token.to_owned()));
+            }
+        }
+    }
+    fn release(&self) {
+        if let Ok(mut all) = self.0.lock() {
+            all.clear();
+        }
+    }
+}
+/// Ends every waiting request when a refresh loop stops for any reason.
+struct ReleaseProofs(Option<Arc<Persistence>>);
+impl Drop for ReleaseProofs {
+    fn drop(&mut self) {
+        if let Some(persistence) = &self.0 {
+            persistence.proofs.release();
+        }
+    }
 }
 impl Persistence {
     fn new(provider: Option<&Provider>) -> Self {
@@ -562,6 +609,7 @@ impl Persistence {
                 current: None,
             }),
             store: Arc::new(VaultStore(provider.cloned())),
+            proofs: ServerProofs::default(),
         }
     }
     fn set_enabled(&self, enabled: bool) -> Result<()> {
@@ -599,6 +647,7 @@ impl Persistence {
         if let Ok(mut state) = self.state.lock() {
             state.current = None;
         }
+        self.proofs.release();
     }
 }
 
@@ -1001,15 +1050,18 @@ fn refresh_session(
     persistence: Option<Arc<Persistence>>,
 ) -> Result<()> {
     let nonce = Nonce::new(saved.nonce.clone());
+    let _release = ReleaseProofs(persistence.clone());
     let mut attempt = 0;
     loop {
         if cancel.load(Ordering::Acquire) {
             return Ok(());
         }
         let now = chrono::Utc::now().timestamp().max(0) as u64;
-        if account
-            .as_ref()
-            .is_some_and(|a| now < a.expires_at.saturating_sub(30))
+        let proof_wanted = persistence.as_ref().is_some_and(|p| p.proofs.wanted());
+        if !proof_wanted
+            && account
+                .as_ref()
+                .is_some_and(|a| now < a.expires_at.saturating_sub(30))
         {
             thread::sleep(Duration::from_millis(100));
             continue;
@@ -1104,6 +1156,10 @@ fn refresh_session(
             continue;
         }
         deliver_account(events, &cancel, next.clone())?;
+        // Only an identity verified above, for the saved subject, is handed out.
+        if let (Some(persistence), Some(id_token)) = (&persistence, refreshed.id_token()) {
+            persistence.proofs.deliver(&id_token.to_string());
+        }
         account = Some(next);
         attempt = 0;
     }
@@ -1303,6 +1359,25 @@ impl Controller {
 
     pub fn take_link_proof(&mut self) -> Option<LinkProof> {
         self.link_proof.take()
+    }
+
+    /// A fresh signed identity of the signed-in account from the saved login's
+    /// own refresh loop, without any page. Only a server hosted on this PC
+    /// accepts it, together with its local control secret; every other server
+    /// needs the destination-bound proof of `start_community`. None when there
+    /// is no saved login running (then the account page is used).
+    pub fn request_server_proof(&self) -> Option<mpsc::Receiver<Zeroizing<String>>> {
+        let running = self.job.is_some() && self.account.is_some() && !self.resuming;
+        let saved = self
+            .persistence
+            .state
+            .lock()
+            .is_ok_and(|state| state.current.is_some());
+        if !running || !saved {
+            return None;
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.persistence.proofs.add(sender).then_some(receiver)
     }
 
     fn start_job(&mut self, ctx: egui::Context, link: Option<LinkRequest>) {

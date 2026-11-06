@@ -460,3 +460,55 @@ async fn the_takeover_setup_is_a_checklist_of_what_the_host_actually_measured() 
     assert!(second[0].1, "{second:?}");
     assert!(second[1..].iter().all(|step| !step.1));
 }
+
+#[tokio::test]
+async fn the_most_capable_machine_is_ranked_and_preferred_only_after_a_held_lead() {
+    let (_temp, state, app, anna, bo, clara) = approved_bo().await;
+    let measurements = "/api/hosting/measurements";
+    // Nothing measured: the host stays and says why, in words.
+    let view = get(&app, &anna.token).await.1;
+    let ranking = view["host_ranking"].as_array().unwrap().clone();
+    assert_eq!(ranking.len(), 2, "{ranking:?}");
+    assert!(ranking.iter().all(|m| m["points"].is_null()));
+    let host = ranking.iter().find(|m| m["hosting"] == true).unwrap();
+    assert_eq!(host["preferred"], true);
+    assert!(host["name"].as_str().unwrap().starts_with("This host"));
+    assert!(view["switch_advice"].as_str().unwrap().contains("not fully measured"));
+    // Bo's machine is strong; Clara timed a modest download from the host.
+    let capacity = json!({"capacity":{"upload_kbps":40000,"cpu_free_pct":80,"free_disk_mb":50000,"participants":0}});
+    assert_eq!(post(&app, &bo.token, measurements, capacity).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        post(&app, &clara.token, measurements, json!({"host_download_kbps":2000})).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post(&app, &clara.token, measurements, json!({"host_download_kbps":0})).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    // The host's processor needs two samples a moment apart.
+    get(&app, &anna.token).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let view = get(&app, &anna.token).await.1;
+    let ranking = view["host_ranking"].as_array().unwrap();
+    assert_eq!(ranking[0]["name"], "Bo's PC", "{ranking:?}");
+    assert!(ranking[0]["reasons"].as_str().unwrap().contains("upload 40 Mbit/s"));
+    assert!(ranking[1]["points"].as_u64().is_some(), "the host is measured too: {ranking:?}");
+    assert_eq!(ranking[1]["preferred"], true, "one good moment changes nothing");
+    let advice = view["switch_advice"].as_str().unwrap();
+    assert!(advice.contains("Bo's PC has been clearly better by measurement than This host"), "{advice}");
+    assert!(advice.contains("60 s without a break"), "{advice}");
+    // Once the lead has held, Bo's PC is preferred; nothing moves while
+    // planned handover is off and the policy keeps the current host.
+    let later = relay_protocol::host_choice::SUSTAIN_MS + now_ms();
+    let contenders = [
+        relay_protocol::host_choice::Contender::new(HOST_ID, Some(50), u64::MAX),
+        relay_protocol::host_choice::Contender::new(bo.user.id.clone(), Some(92), 0),
+    ];
+    lock(&state.0.host_preference).observe(later, &contenders);
+    assert_eq!(lock(&state.0.host_preference).current(), Some(bo.user.id.as_str()));
+    let view = get(&app, &anna.token).await.1;
+    let advice = view["switch_advice"].as_str().unwrap();
+    assert!(advice.contains("Hosting is set to keep the current host, so nothing moves"), "{advice}");
+    let bo_row = view["host_ranking"].as_array().unwrap().iter().find(|m| m["name"] == "Bo's PC").unwrap().clone();
+    assert_eq!(bo_row["preferred"], true);
+}

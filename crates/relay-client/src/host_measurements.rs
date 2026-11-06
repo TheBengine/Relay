@@ -35,6 +35,24 @@ pub(crate) fn set_upload_kbps(value: u32) {
     UPLOAD_KBPS.store(value, Ordering::Relaxed);
 }
 
+/// Free processor plus one; zero is "not sampled".
+static CPU_FREE: AtomicU32 = AtomicU32::new(0);
+
+/// The last sampled free processor of this machine, for the LAN election.
+pub(crate) fn cpu_free_pct() -> Option<u8> {
+    let value = CPU_FREE.load(Ordering::Relaxed);
+    (1..=101).contains(&value).then(|| (value - 1) as u8)
+}
+
+pub(crate) fn set_cpu_free_pct(value: Option<u8>) {
+    if let Some(free) = value.filter(|v| *v <= 100) {
+        CPU_FREE.store(u32::from(free) + 1, Ordering::Relaxed);
+    }
+}
+
+/// Bytes the host's download probe sends.
+pub(crate) const DOWNLOAD_PROBE_BYTES: usize = 256 * 1024;
+
 /// kbit/s from a timed transfer; `None` for a sample too short to mean anything.
 pub(crate) fn kbps(bytes: usize, elapsed: Duration) -> Option<u32> {
     let ms = elapsed.as_secs_f64() * 1000.0;
@@ -119,6 +137,7 @@ pub(crate) fn report(
     heard: &[(String, Quality)],
     own_rtt_ms: Option<f32>,
     capacity: Option<CapacityFacts>,
+    host_download_kbps: Option<u32>,
 ) -> Option<MeasurementReport> {
     let approved = |user: &str| {
         view.candidates
@@ -149,7 +168,11 @@ pub(crate) fn report(
             .collect(),
         None => Vec::new(),
     };
-    let report = MeasurementReport { capacity, voice };
+    let report = MeasurementReport {
+        capacity,
+        voice,
+        host_download_kbps,
+    };
     report.validate().ok()?;
     Some(report)
 }
@@ -224,6 +247,7 @@ mod tests {
             &[heard("gus", 2.0), heard("otto", 9.0), heard("lena", 1.0)],
             Some(42.0),
             Some(CAPACITY),
+            None,
         )
         .unwrap();
         assert!(
@@ -247,6 +271,7 @@ mod tests {
             &[heard("gus", 0.0), heard("otto", 1.0)],
             Some(30.0),
             Some(CAPACITY),
+            None,
         )
         .unwrap();
         assert_eq!(report.capacity, Some(CAPACITY));
@@ -257,12 +282,16 @@ mod tests {
         assert!(report.voice.is_empty());
         // Nothing honest to say: no report at all.
         let lone = view("me", vec![candidate("gus", true)]);
-        assert!(super::report(&lone, &[], Some(30.0), None).is_none());
-        assert!(super::report(&lone, &[heard("gus", 0.0)], None, None).is_none());
+        assert!(super::report(&lone, &[], Some(30.0), None, None).is_none());
+        assert!(super::report(&lone, &[heard("gus", 0.0)], None, None, None).is_none());
+        // A timed download from the host is worth reporting on its own.
+        let download = super::report(&lone, &[], None, None, Some(12_000)).unwrap();
+        assert_eq!(download.host_download_kbps, Some(12_000));
+        assert!(download.capacity.is_none() && download.voice.is_empty());
     }
 
     fn report_without_rtt(v: &HostingView) -> MeasurementReport {
-        report(v, &[heard("otto", 1.0)], None, Some(CAPACITY)).unwrap()
+        report(v, &[heard("otto", 1.0)], None, Some(CAPACITY), None).unwrap()
     }
 
     #[test]

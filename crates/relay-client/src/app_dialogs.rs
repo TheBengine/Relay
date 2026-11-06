@@ -105,6 +105,289 @@ fn channel_type_card(
     response
 }
 
+/// A tab in the Share Screen dialog: bright with an accent underline when chosen.
+fn share_tab(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        semibold(ui, font_size(15.0)),
+        c_text(),
+    );
+    let size = galley.size() + Vec2::new(0.0, 12.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let ink = if selected || response.hovered() {
+        c_text()
+    } else {
+        c_muted()
+    };
+    ui.painter()
+        .galley(rect.left_top() + Vec2::new(0.0, 2.0), galley, ink);
+    if selected {
+        ui.painter().rect_filled(
+            Rect::from_min_max(
+                Pos2::new(rect.left(), rect.bottom() - 2.0),
+                rect.right_bottom(),
+            ),
+            1.0,
+            c_accent(),
+        );
+    }
+    if response.has_focus() {
+        ui.painter()
+            .rect_stroke(rect.expand(3.0), 4.0, Stroke::new(1.0_f32, c_accent()));
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, selected, label)
+    });
+    response
+}
+
+/// Discord's small uppercase section label.
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        RichText::new(text.to_uppercase())
+            .size(font_size(12.0))
+            .family(egui::FontFamily::Name("Relay Semibold".into()))
+            .color(c_muted()),
+    );
+    ui.add_space(4.0);
+}
+
+/// A source card's height for a card `width` wide: picture, name, padding.
+fn source_card_height(width: f32) -> f32 {
+    let thumb = (width - 16.0) * 9.0 / 16.0;
+    8.0 + thumb + 6.0 + font_size(14.0) * 1.4 + 8.0
+}
+
+/// One window or screen in the picker: its live picture, its name under it,
+/// an accent ring when chosen.
+fn source_card(
+    ui: &mut egui::Ui,
+    width: f32,
+    source: &CaptureSource,
+    picture: Option<&egui::TextureHandle>,
+    unavailable: bool,
+    selected: bool,
+) -> egui::Response {
+    const PAD: f32 = 8.0;
+    let thumb = Vec2::new(width - 2.0 * PAD, (width - 2.0 * PAD) * 9.0 / 16.0);
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(width, source_card_height(width)),
+        Sense::click(),
+    );
+    let painter = ui.painter_at(rect.expand(3.0));
+    let fill = if selected || response.hovered() {
+        c_hover()
+    } else {
+        c_card()
+    };
+    painter.rect_filled(rect, 8.0, fill);
+    let stage = Rect::from_min_size(rect.min + Vec2::splat(PAD), thumb);
+    painter.rect_filled(stage, 4.0, Color32::from_rgb(12, 12, 14));
+    match picture {
+        Some(texture) => {
+            let size = texture.size_vec2();
+            let scale = (stage.width() / size.x).min(stage.height() / size.y);
+            let shown = Rect::from_center_size(stage.center(), size * scale);
+            egui::Image::new((texture.id(), size * scale))
+                .rounding(4.0)
+                .paint_at(ui, shown);
+        }
+        None => {
+            let glyph = Rect::from_center_size(stage.center() - Vec2::new(0.0, 8.0), Vec2::splat(28.0));
+            draw_icon(&painter, glyph, Icon::Screen, Color32::from_gray(150));
+            painter.text(
+                Pos2::new(stage.center().x, glyph.bottom() + 12.0),
+                Align2::CENTER_CENTER,
+                if unavailable {
+                    "No preview for this window"
+                } else {
+                    "Loading preview…"
+                },
+                egui::FontId::proportional(font_size(12.0)),
+                Color32::from_gray(170),
+            );
+        }
+    }
+    let mut job = egui::text::LayoutJob::simple(
+        source.name.clone(),
+        egui::FontId::proportional(font_size(14.0)),
+        if selected { c_text() } else { c_muted() },
+        thumb.x,
+    );
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = ui.painter().layout_job(job);
+    painter.galley(
+        Pos2::new(stage.left(), stage.bottom() + 6.0),
+        galley,
+        c_text(),
+    );
+    if selected {
+        painter.rect_stroke(rect.expand(1.0), 9.0, Stroke::new(2.0_f32, c_accent()));
+    } else if response.has_focus() {
+        painter.rect_stroke(rect.expand(1.0), 9.0, Stroke::new(1.0_f32, c_accent()));
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, selected, &source.name)
+    });
+    response.on_hover_text(&source.name)
+}
+
+/// A capture fixture's picture drawn like `SourcePreview::show`.
+#[cfg(feature = "native-rtc")]
+fn fixture_preview(ui: &mut egui::Ui, picture: &egui::TextureHandle) {
+    let width = ui.available_width().max(160.0);
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(width, (width * 9.0 / 16.0).min(420.0)),
+        Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 8.0, Color32::from_gray(12));
+    let size = picture.size_vec2();
+    let scale = (rect.width() / size.x).min(rect.height() / size.y);
+    egui::Image::new((picture.id(), size * scale))
+        .rounding(8.0)
+        .paint_at(ui, Rect::from_center_size(rect.center(), size * scale));
+    let galley = painter.layout_no_wrap(
+        "Preview · only you can see this".into(),
+        egui::FontId::proportional(font_size(12.0)),
+        Color32::WHITE,
+    );
+    let pill = Rect::from_min_size(
+        rect.left_bottom() + Vec2::new(10.0, -18.0 - galley.size().y),
+        galley.size() + Vec2::new(16.0, 8.0),
+    );
+    painter.rect_filled(pill, 6.0, Color32::from_black_alpha(170));
+    painter.galley(pill.min + Vec2::new(8.0, 4.0), galley, Color32::WHITE);
+}
+
+/// A 16:9 stage like the live preview, for when there is none.
+fn camera_placeholder(ui: &mut egui::Ui, text: &str) {
+    let width = ui.available_width().max(160.0);
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(width, (width * 9.0 / 16.0).min(420.0)),
+        Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 8.0, Color32::from_gray(12));
+    let glyph = Rect::from_center_size(rect.center() - Vec2::new(0.0, 14.0), Vec2::splat(40.0));
+    draw_icon(&painter, glyph, Icon::Camera, Color32::from_gray(150));
+    painter.text(
+        Pos2::new(rect.center().x, glyph.bottom() + 18.0),
+        Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(font_size(13.0)),
+        Color32::from_gray(205),
+    );
+}
+
+/// A choice pill: accent when chosen. Disabled pills explain why on hover.
+fn quality_pill(ui: &mut egui::Ui, selected: bool, enabled: bool, label: &str) -> egui::Response {
+    let text = RichText::new(label).size(font_size(14.0)).color(if selected {
+        Color32::WHITE
+    } else {
+        c_text()
+    });
+    let button = egui::Button::new(text)
+        .fill(if selected { c_accent() } else { c_card() })
+        .rounding(4.0)
+        .min_size(Vec2::new(56.0, 32.0));
+    let response = ui.add_enabled(enabled, button);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, selected, label)
+    });
+    response.on_disabled_hover_text("Needs the video connection, which starts when you join a call.")
+}
+
+fn quality_label(quality: CaptureQuality) -> &'static str {
+    match quality {
+        CaptureQuality::P480 => "480p",
+        CaptureQuality::P720 => "720p",
+        CaptureQuality::P1080 => "1080p",
+        CaptureQuality::P1440 => "1440p",
+        CaptureQuality::P2160 => "4K",
+        CaptureQuality::Source => "Source",
+    }
+}
+
+/// The resolution and frame-rate choices Discord shows for a stream or a
+/// camera, written into the stored capture options. A stored value that is
+/// not among the pills (chosen under More options) shows as its own pill.
+fn quality_pills(
+    ui: &mut egui::Ui,
+    options: &mut CaptureOptions,
+    camera: bool,
+    native_video: bool,
+) -> bool {
+    let mut changed = false;
+    let mut resolutions: Vec<(CaptureQuality, bool)> = if camera {
+        vec![
+            (CaptureQuality::P480, true),
+            (CaptureQuality::P720, true),
+            (CaptureQuality::P1080, true),
+        ]
+    } else {
+        vec![
+            (CaptureQuality::P720, true),
+            (CaptureQuality::P1080, true),
+            (CaptureQuality::P1440, native_video),
+            (CaptureQuality::Source, native_video),
+        ]
+    };
+    if !resolutions.iter().any(|(q, _)| *q == options.quality) {
+        resolutions.push((options.quality, true));
+    }
+    let mut rates: Vec<(u32, bool)> = if camera {
+        vec![(15, true), (30, true)]
+    } else {
+        vec![(15, true), (30, true), (60, native_video)]
+    };
+    if !rates.iter().any(|(fps, _)| *fps == options.fps) {
+        rates.push((options.fps, true));
+        rates.sort_by_key(|(fps, _)| *fps);
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.vertical(|ui| {
+            ui.label(
+                RichText::new("Resolution")
+                    .size(font_size(12.0))
+                    .color(c_muted()),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (quality, enabled) in &resolutions {
+                    if quality_pill(ui, options.quality == *quality, *enabled, quality_label(*quality))
+                        .clicked()
+                    {
+                        options.quality = *quality;
+                        changed = true;
+                    }
+                }
+            });
+        });
+        ui.add_space(16.0);
+        ui.vertical(|ui| {
+            ui.label(
+                RichText::new("Frame Rate")
+                    .size(font_size(12.0))
+                    .color(c_muted()),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (fps, enabled) in &rates {
+                    if quality_pill(ui, options.fps == *fps, *enabled, &format!("{fps} FPS"))
+                        .clicked()
+                    {
+                        options.fps = *fps;
+                        changed = true;
+                    }
+                }
+            });
+        });
+    });
+    changed
+}
+
 impl RelayApp {
     pub(super) fn stream_preview_dialog(&mut self, ctx: &egui::Context) {
         let Some(key) = self.stream_preview.clone() else {
@@ -180,19 +463,29 @@ impl RelayApp {
             let scale = (ui.available_width() / dimensions.x)
                 .min((ctx.screen_rect().height() - 150.0).max(100.0) / dimensions.y);
             ui.add(egui::Image::new((tile.texture.id(), dimensions * scale)).rounding(8.0));
-            if ui.add(secondary("Full Screen")).clicked() {
-                self.stream_restore_fullscreen =
-                    ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-                self.stream_fullscreen = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
-            }
-            let pinned = self.pinned_stream.as_ref() == Some(&key);
-            if ui
-                .small_button(if pinned { "Unpin stream" } else { "Pin stream" })
-                .clicked()
-            {
-                self.pinned_stream = if pinned { None } else { Some(key.clone()) };
-            }
+            ui.horizontal(|ui| {
+                if ui.add(secondary("Full Screen")).clicked() {
+                    self.stream_restore_fullscreen =
+                        ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                    self.stream_fullscreen = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                }
+                if ui
+                    .add(secondary("Pop Out"))
+                    .on_hover_text("Open this stream in its own window you can move and resize")
+                    .clicked()
+                {
+                    self.stream_popout = Some(key.clone());
+                    self.stream_preview = None;
+                }
+                let pinned = self.pinned_stream.as_ref() == Some(&key);
+                if ui
+                    .add(secondary(if pinned { "Unpin Stream" } else { "Pin Stream" }))
+                    .clicked()
+                {
+                    self.pinned_stream = if pinned { None } else { Some(key.clone()) };
+                }
+            });
         }) {
             open = false;
         }
@@ -201,80 +494,480 @@ impl RelayApp {
         }
     }
 
+    /// Discord's Screen Share and camera preview dialogs. Screens: tabs for
+    /// applications and screens, a grid of live thumbnails, stream quality as
+    /// pills, then Go Live. Camera: a live preview first, the device and its
+    /// quality, then Turn On Camera. Nothing is sent before the final button.
     pub(super) fn share_dialog(&mut self, ctx: &egui::Context) {
-        let native_video = self.rtc_active();
+        let native_video = self.rtc_active() || self.call_state().video_connected;
         if !self.inventory_loaded && self.inventory_rx.is_none() {
             self.refresh_devices();
         }
         let camera = self.share_picker.unwrap_or(false);
+        let title = if camera { "Turn on your camera" } else { "Share your screen" };
+        let width = (if camera { 520.0_f32 } else { 680.0 }).min(ctx.screen_rect().width() - 48.0);
         let mut open = true;
-        desktop_ui::dialog(ctx, if camera { "Turn on your camera" } else { "Share your screen" })
-            .open(&mut open).collapsible(false).resizable(false).default_width(480.0)
+        desktop_ui::dialog(ctx, title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(width)
+            // Tall enough for the footer on first show; the dialog scrolls
+            // (desktop_ui::dialog) when the window is shorter than this.
+            .min_height((if camera { 640.0_f32 } else { 600.0 }).min(ctx.screen_rect().height() - 150.0))
             .title_bar(false)
-            .frame(egui::Frame::none().fill(c_panel()).rounding(12.0).inner_margin(Margin::same(20.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(c_panel())
+                    .rounding(12.0)
+                    .inner_margin(Margin::same(20.0)),
+            )
             .show(ctx, |ui| {
-                ui.set_width(480.0);
-                // The shared header (title, Close, Escape) stays above the chooser's own
-                // scrolling area. Closing cancels like the old X: nothing starts.
-                let title = if camera { "Turn on your camera" } else { "Share your screen" };
+                ui.set_width(width);
+                // The shared header (title, Close, Escape) stays above the
+                // scrolling body. Closing cancels: nothing starts.
                 if profile_ui::dialog_header_ui::dialog_header(ui, title) {
                     self.share_picker = None;
                 }
-                egui::ScrollArea::vertical().max_height((ctx.screen_rect().height()-160.0).max(220.0)).show(ui, |ui| {
-                    if !camera {
-                        ui.horizontal(|ui| { ui.selectable_value(&mut self.share_kind, SourceKind::Monitor, "Entire screen"); ui.selectable_value(&mut self.share_kind, SourceKind::Window, "Application window"); });
-                        ui.add_space(8.0);
-                    }
-                    let sources: Vec<_> = if camera { self.inventory.cameras.clone() } else { self.inventory.screens.iter().filter(|s|s.kind==self.share_kind).cloned().collect() };
-                    let selected = if camera { &mut self.camera_source } else { &mut self.screen_source };
-                    if selected.as_ref().is_none_or(|id| !sources.iter().any(|s|s.id==*id)) { *selected = sources.first().map(|s|s.id.clone()); }
-                    source_combo(ui, if camera {"Camera"} else {"What would you like to share?"}, "sharing-source", selected, &sources);
-                    if self.inventory_rx.is_some() { ui.horizontal(|ui| { ui.spinner(); ui.label("Finding available sources…"); }); }
-                    else if sources.is_empty() { ui.label(RichText::new(if camera {"No camera found. Connect one and refresh."} else {"No available source. Open the window you want to share and refresh."}).color(c_muted())); }
-                    if ui.small_button("Refresh sources").clicked() { self.refresh_devices(); }
-                    ui.add_space(12.0);
-                    let options = if camera { &mut self.prefs.camera_options } else { &mut self.prefs.screen_options };
-                    let mut changed=capture_options_ui(ui,"sharing-profile",options,native_video);
-                    if !camera {
-                        let can_audio=native_video&&self.share_kind==SourceKind::Window&&!sources.is_empty();
-                        let mut include_audio=options.application_audio&&can_audio;
-                        if ui.add_enabled(can_audio,egui::Checkbox::new(&mut include_audio,"Include selected app audio")).changed(){options.application_audio=include_audio;changed=true;}
-                        ui.label(RichText::new(if can_audio {"Includes sound from this application and its child processes. Audio starts only when you click Start sharing."}else{"Application audio requires native video and a selected application window."}).size(font_size(TEXT_BODY)).color(c_muted()));
-                    }
-                    if changed {self.save_preferences();}
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(if camera {"The camera opens when you click Start camera."} else {"Only the selected display or window will be shared."}).size(font_size(12.0)).color(c_muted()));
-                    ui.add_space(14.0);
-                    let id = if camera {self.camera_source.as_ref()} else {self.screen_source.as_ref()};
-                    let source = id.and_then(|id|sources.iter().find(|s|s.id==*id)).cloned();
-                    #[cfg(feature="native-rtc")]
-                    {
-                        if self.source_preview.as_ref().is_some_and(|preview|preview.camera!=camera||source.as_ref().is_none_or(|source|source.id!=preview.source_id)){self.stop_source_preview();}
-                        ui.horizontal(|ui| {
-                            if self.source_preview.is_some() {if ui.add(secondary("Stop local preview")).clicked(){self.stop_source_preview();}}
-                            else if ui.add_enabled(source.is_some()&&self.inventory_rx.is_none()&&self.preview_release.is_none()&&!self.source_active(camera)&&!self.source_starting(camera),secondary("Preview source")).clicked() {
-                                match source_preview::SourcePreview::new(source.clone().unwrap(),camera){Ok(preview)=>self.source_preview=Some(preview),Err(error)=>self.error=Some(error)}
-                            }
-                        });
-                        if let Some(preview)=&self.source_preview{preview.show(ui);}
-                        else if self.preview_release.is_some(){ui.horizontal(|ui|{ui.spinner();ui.label("Closing local preview…");});}
-                        ui.add_space(8.0);
-                    }
-                    if self.rtc_starting(){ui.horizontal(|ui|{ui.spinner();ui.label(if self.rtc_reconnecting(){"Reconnecting video…"}else{"Connecting native video…"});});}
-                    let ready = source.is_some() && self.voice_ready() && !self.rtc_starting() && self.inventory_rx.is_none();
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(ready,primary(if camera {"Start camera"} else {"Start sharing"})).clicked() { self.start_capture(camera,source.unwrap()); self.share_picker=None; }
-                        if ui.add(secondary("Cancel")).clicked() { self.share_picker=None; }
-                    });
-                    for warning in &self.inventory.warnings { ui.label(RichText::new(warning).size(font_size(TEXT_BODY)).color(c_bad())); }
-                });
+                if camera {
+                    self.camera_picker_body(ui, native_video);
+                } else {
+                    // The grid scrolls on its own; quality and Go Live stay in view.
+                    self.screen_picker_body(ui, native_video);
+                }
+                for warning in &self.inventory.warnings {
+                    ui.label(
+                        RichText::new(warning)
+                            .size(font_size(TEXT_BODY))
+                            .color(c_bad()),
+                    );
+                }
+                ui.add_space(12.0);
+                self.share_footer(ui, camera);
             });
         if !open {
             self.share_picker = None;
         }
         if self.share_picker.is_none() {
             self.stop_source_preview();
+            self.share_thumbnails = None;
         }
+    }
+
+    /// The source the dialog would start, if it is still listed.
+    fn picked_source(&self, camera: bool) -> Option<CaptureSource> {
+        let id = if camera {
+            self.camera_source.as_ref()
+        } else {
+            self.screen_source.as_ref()
+        }?;
+        let list = if camera {
+            &self.inventory.cameras
+        } else {
+            &self.inventory.screens
+        };
+        list.iter().find(|source| &source.id == id).cloned()
+    }
+
+    /// Cancel and the start button, with the reason when it cannot start yet.
+    fn share_footer(&mut self, ui: &mut egui::Ui, camera: bool) {
+        let source = self.picked_source(camera);
+        let call = self.call_state();
+        let video_wait = self.rtc_starting() && self.capture_path.is_none();
+        let ready = source.is_some() && call.ready && !video_wait && self.inventory_rx.is_none();
+        let reason = if self.inventory_rx.is_some() {
+            Some("Finding sources…")
+        } else if source.is_none() {
+            Some(if camera {
+                "Choose a camera."
+            } else {
+                "Choose a window or screen."
+            })
+        } else if !call.ready {
+            Some("Join a voice room first.")
+        } else if video_wait {
+            Some(if self.rtc_reconnecting() {
+                "Reconnecting video…"
+            } else {
+                "Connecting video…"
+            })
+        } else {
+            None
+        };
+        ui.horizontal(|ui| {
+            if let Some(reason) = reason {
+                if video_wait || self.inventory_rx.is_some() {
+                    ui.spinner();
+                }
+                ui.label(
+                    RichText::new(reason)
+                        .size(font_size(TEXT_BODY))
+                        .color(c_muted()),
+                );
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let start = primary(if camera { "Turn On Camera" } else { "Go Live" })
+                    .min_size(Vec2::new(112.0, 38.0));
+                let hint = if camera {
+                    "Others see you after this. The preview above is only on this PC."
+                } else {
+                    "Shares only the window or screen you picked. The pictures in this dialog stay on this PC."
+                };
+                if ui.add_enabled(ready, start).on_hover_text(hint).clicked() {
+                    if let Some(source) = source {
+                        self.start_capture(camera, source);
+                    }
+                    self.share_picker = None;
+                }
+                if ui
+                    .add(secondary("Cancel").min_size(Vec2::new(0.0, 38.0)))
+                    .clicked()
+                {
+                    self.share_picker = None;
+                }
+            });
+        });
+    }
+
+    fn screen_picker_body(&mut self, ui: &mut egui::Ui, native_video: bool) {
+        // Discord's tabs: Applications (windows) and Screens (displays).
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 20.0;
+            for (kind, label) in [
+                (SourceKind::Window, "Applications"),
+                (SourceKind::Monitor, "Screens"),
+            ] {
+                if share_tab(ui, self.share_kind == kind, label).clicked() {
+                    self.share_kind = kind;
+                }
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        self.inventory_rx.is_none(),
+                        egui::Button::new(
+                            RichText::new("Refresh")
+                                .size(font_size(TEXT_BODY))
+                                .color(c_muted()),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text("Look for windows and screens again")
+                    .clicked()
+                {
+                    self.refresh_devices();
+                }
+            });
+        });
+        let line = ui.cursor().min.y;
+        ui.painter().hline(
+            ui.max_rect().x_range(),
+            line,
+            Stroke::new(1.0_f32, c_line()),
+        );
+        ui.add_space(12.0);
+        let all = self.inventory.screens.clone();
+        let sources: Vec<_> = all
+            .iter()
+            .filter(|source| source.kind == self.share_kind)
+            .cloned()
+            .collect();
+        if self
+            .screen_source
+            .as_ref()
+            .is_none_or(|id| !sources.iter().any(|source| source.id == *id))
+        {
+            self.screen_source = sources.first().map(|source| source.id.clone());
+        }
+        if self.capture_path.is_none() {
+            self.share_thumbnails
+                .get_or_insert_with(Default::default)
+                .update(ui.ctx(), &all);
+        }
+        if self.inventory_rx.is_some() && sources.is_empty() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Finding windows and screens…");
+            });
+        } else if sources.is_empty() {
+            ui.add_space(16.0);
+            ui.vertical_centered(|ui| {
+                icon(ui, Icon::Screen, 40.0, c_muted());
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(if self.share_kind == SourceKind::Window {
+                        "No windows to share. Open the app you want to share, then Refresh."
+                    } else {
+                        "No screens found. Refresh to look again."
+                    })
+                    .color(c_muted()),
+                );
+            });
+            ui.add_space(16.0);
+        } else {
+            let mut picked = None;
+            let mut go = false;
+            let columns = if ui.available_width() < 420.0 { 2 } else { 3 };
+            let gap = 12.0;
+            // Leave room for the scrollbar so cards never sit under it.
+            let card = (ui.available_width() - 12.0 - gap * (columns as f32 - 1.0))
+                / columns as f32;
+            let row = source_card_height(card) + gap;
+            // One or two whole rows (the rest scrolls), so quality and Go Live
+            // stay in view and no card is cut through its name.
+            let room = ui.ctx().screen_rect().height() - 520.0;
+            let max_height = if room >= 2.0 * row { 2.0 * row } else { row };
+            egui::ScrollArea::vertical()
+                .id_source("share-sources")
+                .max_height(max_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for row in sources.chunks(columns) {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for source in row {
+                                let selected = self.screen_source.as_ref() == Some(&source.id);
+                                let thumbnails = self.share_thumbnails.as_ref();
+                                let response = source_card(
+                                    ui,
+                                    card,
+                                    source,
+                                    thumbnails.and_then(|t| t.texture(&source.id)),
+                                    thumbnails.is_some_and(|t| t.unavailable(&source.id)),
+                                    selected,
+                                );
+                                if response.clicked() {
+                                    picked = Some(source.id.clone());
+                                }
+                                if response.double_clicked() {
+                                    picked = Some(source.id.clone());
+                                    go = true;
+                                }
+                            }
+                        });
+                        ui.add_space(gap);
+                    }
+                });
+            if let Some(id) = picked {
+                self.screen_source = Some(id);
+            }
+            if go && self.call_state().ready && !self.rtc_starting() {
+                if let Some(source) = self.picked_source(false) {
+                    self.start_capture(false, source);
+                    self.share_picker = None;
+                    return;
+                }
+            }
+        }
+        ui.add_space(8.0);
+        section_label(ui, "Stream Quality");
+        let options = &mut self.prefs.screen_options;
+        let mut changed = quality_pills(ui, options, false, native_video);
+        let can_audio =
+            native_video && self.share_kind == SourceKind::Window && !sources.is_empty();
+        let mut include_audio = options.application_audio && can_audio;
+        ui.add_space(4.0);
+        if ui
+            .add_enabled(
+                can_audio,
+                egui::Checkbox::new(&mut include_audio, "Share the application's sound"),
+            )
+            .on_disabled_hover_text(if self.share_kind == SourceKind::Window {
+                "Needs the video connection, which starts when you join a call."
+            } else {
+                "Sound can be shared from an application window."
+            })
+            .changed()
+        {
+            options.application_audio = include_audio;
+            changed = true;
+        }
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new(
+            RichText::new("More options")
+                .size(font_size(TEXT_BODY))
+                .color(c_muted()),
+        )
+        .id_source("share-more-options")
+        .show(ui, |ui| {
+            changed |= capture_options_ui(ui, "sharing-profile", options, native_video);
+        });
+        if changed {
+            self.save_preferences();
+        }
+    }
+
+    fn camera_picker_body(&mut self, ui: &mut egui::Ui, native_video: bool) {
+        let sources = self.inventory.cameras.clone();
+        if self
+            .camera_source
+            .as_ref()
+            .is_none_or(|id| !sources.iter().any(|source| source.id == *id))
+        {
+            self.camera_source = sources.first().map(|source| source.id.clone());
+        }
+        let source = self.picked_source(true);
+        #[cfg(feature = "native-rtc")]
+        {
+            // Discord opens the preview as soon as the dialog opens: you see
+            // yourself before anyone else can. One try per camera, so a busy
+            // or broken camera does not retry every frame.
+            if self.source_preview.as_ref().is_some_and(|preview| {
+                !preview.camera || source.as_ref().is_none_or(|s| s.id != preview.source_id)
+            }) {
+                self.stop_source_preview();
+            }
+            let tried = egui::Id::new("camera-preview-tried");
+            let tried_for = ui.ctx().data(|d| d.get_temp::<String>(tried));
+            if let Some(source) = source.as_ref().filter(|source| {
+                self.capture_path.is_none()
+                    && self.source_preview.is_none()
+                    && self.preview_release.is_none()
+                    && self.inventory_rx.is_none()
+                    && !self.source_active(true)
+                    && !self.source_starting(true)
+                    && tried_for.as_deref() != Some(source.id.as_str())
+            }) {
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(tried, source.id.clone()));
+                match source_preview::SourcePreview::new(source.clone(), true) {
+                    Ok(preview) => self.source_preview = Some(preview),
+                    Err(error) => self.error = Some(crate::capture::camera_error_message(&error)),
+                }
+            }
+            let fixture = self
+                .share_thumbnails
+                .as_ref()
+                .filter(|_| self.capture_path.is_some())
+                .zip(source.as_ref())
+                .and_then(|(thumbnails, source)| thumbnails.texture(&source.id).cloned());
+            if let Some(preview) = &self.source_preview {
+                preview.show(ui);
+            } else if let Some(picture) = fixture {
+                // Capture fixtures: a generated picture in the same stage.
+                fixture_preview(ui, &picture);
+            } else {
+                camera_placeholder(
+                    ui,
+                    if self.inventory_rx.is_some() {
+                        "Looking for cameras…"
+                    } else if sources.is_empty() {
+                        "No camera found. Connect one, then choose Refresh."
+                    } else if self.preview_release.is_some() {
+                        "Closing the preview…"
+                    } else if self.source_active(true) {
+                        "Your camera is already on."
+                    } else {
+                        "The preview could not start. Pick another camera or try again."
+                    },
+                );
+            }
+        }
+        #[cfg(not(feature = "native-rtc"))]
+        camera_placeholder(ui, "Camera preview needs the native video build.");
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - 90.0).max(160.0));
+                source_combo(ui, "Camera", "sharing-source", &mut self.camera_source, &sources);
+            });
+            ui.vertical(|ui| {
+                ui.add_space(font_size(12.0) * 1.4);
+                if ui
+                    .add_enabled(self.inventory_rx.is_none(), secondary("Refresh"))
+                    .clicked()
+                {
+                    ui.ctx()
+                        .data_mut(|d| d.remove::<String>(egui::Id::new("camera-preview-tried")));
+                    self.refresh_devices();
+                }
+            });
+        });
+        ui.add_space(12.0);
+        section_label(ui, "Video Quality");
+        let options = &mut self.prefs.camera_options;
+        let mut changed = quality_pills(ui, options, true, native_video);
+        egui::CollapsingHeader::new(
+            RichText::new("More options")
+                .size(font_size(TEXT_BODY))
+                .color(c_muted()),
+        )
+        .id_source("camera-more-options")
+        .show(ui, |ui| {
+            changed |= capture_options_ui(ui, "camera-profile", options, native_video);
+        });
+        if changed {
+            self.save_preferences();
+        }
+        ui.label(
+            RichText::new("The preview is only on this PC. Others see you after Turn On Camera.")
+                .size(font_size(12.0))
+                .color(c_muted()),
+        );
+    }
+
+    /// A stream in its own window that the viewer can move and resize, as
+    /// Discord's Pop Out. The picture fits the window; Escape or the window's
+    /// close button ends it. Where Windows cannot open a second window, egui
+    /// shows it as a movable window inside Relay instead.
+    pub(super) fn stream_popout_window(&mut self, ctx: &egui::Context) {
+        let Some(key) = self.stream_popout.clone() else {
+            return;
+        };
+        let Some(tile) = self.video.get(&key).cloned() else {
+            self.stream_popout = None;
+            return;
+        };
+        let name = profile_ui::display_name(&tile.metadata.user).to_owned();
+        let kind = if tile.metadata.kind == "screen" { "Screen" } else { "Camera" };
+        let title = format!("{name} · {kind} — Relay");
+        let size = tile.texture.size_vec2();
+        let start = if size.x > 0.0 && size.y > 0.0 {
+            let scale = (960.0 / size.x).min(540.0 / size.y);
+            size * scale
+        } else {
+            Vec2::new(960.0, 540.0)
+        };
+        let mut close = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of(("stream-popout", &key)),
+            egui::ViewportBuilder::default()
+                .with_title(title)
+                .with_inner_size(start)
+                .with_min_inner_size([320.0, 180.0])
+                .with_resizable(true),
+            |ctx, _class| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(Color32::BLACK))
+                    .show(ctx, |ui| {
+                        let area = ui.max_rect();
+                        if size.x > 0.0 && size.y > 0.0 {
+                            let scale = (area.width() / size.x).min(area.height() / size.y);
+                            let shown = Rect::from_center_size(area.center(), size * scale);
+                            egui::Image::new((tile.texture.id(), size * scale)).paint_at(ui, shown);
+                        }
+                        let painter = ui.painter();
+                        let galley = painter.layout_no_wrap(
+                            format!("{name} · {kind}"),
+                            egui::FontId::proportional(font_size(13.0)),
+                            Color32::WHITE,
+                        );
+                        let pill = Rect::from_min_size(
+                            area.left_bottom() + Vec2::new(10.0, -18.0 - galley.size().y),
+                            galley.size() + Vec2::new(16.0, 8.0),
+                        );
+                        painter.rect_filled(pill, 6.0, Color32::from_black_alpha(153));
+                        painter.galley(pill.min + Vec2::new(8.0, 4.0), galley, Color32::WHITE);
+                    });
+                if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            },
+        );
+        if close {
+            self.stream_popout = None;
+        }
+        ctx.request_repaint_after(Duration::from_millis(33));
     }
 
     pub(super) fn transfers_dialog(&mut self, ctx: &egui::Context) {
@@ -564,6 +1257,8 @@ impl RelayApp {
         }
         if self.share_picker.is_some() {
             self.share_dialog(ctx);
+        } else {
+            self.share_thumbnails = None;
         }
         self.poll_image_copy();
         if self.media_preview.is_some() {
@@ -572,6 +1267,9 @@ impl RelayApp {
         self.online_gif_preview_dialog(ctx);
         if self.stream_preview.is_some() {
             self.stream_preview_dialog(ctx);
+        }
+        if self.stream_popout.is_some() {
+            self.stream_popout_window(ctx);
         }
         if let Some(url) = self.pending_link.clone() {
             let mut open = true;

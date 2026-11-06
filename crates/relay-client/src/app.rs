@@ -157,6 +157,8 @@ mod sidebar_tooltip;
 #[cfg(feature = "native-rtc")]
 #[path = "source_preview.rs"]
 pub(crate) mod source_preview;
+#[path = "share_thumbnails.rs"]
+pub(crate) mod share_thumbnails;
 #[path = "support_report.rs"]
 mod support_report;
 #[path = "lan_profile.rs"]
@@ -922,6 +924,13 @@ pub struct RelayApp {
     stream_preview: Option<String>,
     stream_fullscreen: bool,
     stream_restore_fullscreen: bool,
+    /// A stream shown in its own resizable window (Discord's Pop Out).
+    stream_popout: Option<String>,
+    /// Live pictures of screens and windows while the Share Screen picker is open.
+    share_thumbnails: Option<share_thumbnails::ShareThumbnails>,
+    /// Capture fixtures only: the call state the call surfaces draw. Never
+    /// set outside `--capture`; voice, video and the connection ignore it.
+    capture_call: Option<CaptureCall>,
     settings_open: bool,
     settings_tab: SettingsTab,
     voice_video_tab: VoiceVideoTab,
@@ -1183,7 +1192,10 @@ impl RelayApp {
             Ok(m) => (Some(m), None),
             Err(e) => (None, Some(e)),
         };
-        let audio_applied = prefs.audio.clone().normalized();
+        // The draft starts from the same normalized settings, so a saved model
+        // this build lacks shows as Enhanced (with a note) and is not "unsaved".
+        prefs.audio = prefs.audio.clone().normalized();
+        let audio_applied = prefs.audio.clone();
         let sound_settings = sound_settings_ui::State::new(
             crate::sound_customization::library_root(&prefs_path),
             prefs.audio.event_sounds.clone(),
@@ -1409,6 +1421,9 @@ impl RelayApp {
             stream_preview: None,
             stream_fullscreen: false,
             stream_restore_fullscreen: false,
+            stream_popout: None,
+            share_thumbnails: None,
+            capture_call: None,
             settings_open: value("--settings").is_some(),
             settings_tab: match value("--settings").as_deref() {
                 Some("audio" | "voice" | "video" | "debug") => SettingsTab::VoiceVideo,
@@ -3815,10 +3830,6 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, password: bool) -> 
     }
     response
 }
-fn dot(ui: &mut egui::Ui, color: Color32, radius: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(radius * 2.0), Sense::hover());
-    ui.painter().circle_filled(rect.center(), radius, color);
-}
 fn mark(ui: &mut egui::Ui, size: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let c = rect.center();
@@ -4763,55 +4774,7 @@ fn consume_send_key(input: &mut egui::InputState) -> bool {
     consumed
 }
 
-fn call_control(
-    ui: &mut egui::Ui,
-    shape: Icon,
-    selected: bool,
-    disconnect: bool,
-    label: &str,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(46.0), Sense::click());
-    let active_media = selected && matches!(shape, Icon::Camera | Icon::Screen);
-    let fill = if disconnect || (selected && !active_media) {
-        c_bad()
-    } else if active_media {
-        c_good()
-    } else {
-        c_card()
-    };
-    ui.painter().circle_filled(
-        rect.center(),
-        23.0,
-        if response.hovered() {
-            fill.gamma_multiply(0.8)
-        } else {
-            fill
-        },
-    );
-    if response.has_focus() {
-        ui.painter()
-            .circle_stroke(rect.center(), 22.0, Stroke::new(2.0_f32, c_accent()));
-    }
-    draw_icon(
-        ui.painter(),
-        rect.shrink(13.0),
-        shape,
-        if disconnect || selected {
-            Color32::WHITE
-        } else {
-            c_text()
-        },
-    );
-    if selected && matches!(shape, Icon::Mic | Icon::Headphones) {
-        let r = rect.shrink(12.0);
-        ui.painter().line_segment(
-            [r.left_top(), r.right_bottom()],
-            Stroke::new(2.0_f32, Color32::WHITE),
-        );
-    }
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, label));
-    response.on_hover_text(label)
-}
+use voice_room_ui::{call_control, CaptureCall};
 
 #[cfg(test)]
 #[path = "app_tests.rs"]

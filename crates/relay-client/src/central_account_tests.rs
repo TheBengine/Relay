@@ -928,6 +928,7 @@ fn remembered_controller(provider: Provider, store: Arc<MemorySessionStore>) -> 
                 current: None,
             }),
             store,
+            proofs: Default::default(),
         }),
         last_identity: None,
         account_changed: false,
@@ -1274,6 +1275,7 @@ fn persistent_signin_asks_for_a_long_lived_login_whether_or_not_it_is_advertised
                 current: None,
             }),
             store,
+            proofs: Default::default(),
         });
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
@@ -1358,4 +1360,94 @@ fn saved_subject_and_original_nonce_remain_checked_during_silent_restoration() {
         assert!(controller.account.is_none());
         assert!(store.saved.lock().unwrap().is_none());
     }
+}
+
+fn jwt_claims(token: &str) -> Value {
+    let payload = token.split('.').nth(1).expect("signed token payload");
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
+}
+
+/// Server creation (6 Nov 2026): the first account on a server the user just
+/// created needed the account page, and after a restart that page has no
+/// account-service session (it is incognito), so the password was asked again.
+/// A login restored without any page now also gives the server on this PC a
+/// fresh signed identity without any page. It comes from the same refresh loop
+/// that keeps the login, so the rotated refresh credential stays the saved one.
+#[test]
+fn a_restored_login_gives_this_pcs_server_a_fresh_identity_without_opening_a_page() {
+    let _guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
+    wait_account_workers();
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().rotate = true;
+    let store = Arc::new(MemorySessionStore::default());
+    *store.saved.lock().unwrap() = Some(saved_fixture(&fixture));
+    let mut controller = remembered_controller(fixture.provider.clone(), store.clone());
+    assert!(
+        controller.request_server_proof().is_none(),
+        "nothing to hand out before the saved login runs"
+    );
+    assert!(controller.resume(egui::Context::default(), true));
+    restored_account(&mut controller);
+    for round in 0..2 {
+        let before = fixture.state.lock().unwrap().refreshes;
+        let proof = controller.request_server_proof().expect("running saved login");
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let token = loop {
+            assert!(controller.poll().is_none(), "no sign-in page may open");
+            assert!(controller.error.is_none(), "{:?}", controller.error);
+            match proof.try_recv() {
+                Ok(token) => break token,
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => panic!("the saved login gave no identity"),
+            }
+            assert!(Instant::now() < deadline, "server proof timed out");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let claims = jwt_claims(&token);
+        assert_eq!(claims["sub"], "stable-subject-a", "round {round}");
+        assert_eq!(
+            claims["nonce"], "owned-remembered-nonce",
+            "the desktop login's own nonce, never a server-bound proof"
+        );
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.refreshes, before + 1, "one refresh per request");
+        assert_eq!(state.exchanges, 0, "no authorization code: no page");
+        assert_eq!(
+            store.saved.lock().unwrap().as_ref().unwrap().refresh_token,
+            format!("owned-rotated-refresh-{}", state.refreshes),
+            "the rotated credential is the saved one"
+        );
+    }
+    assert!(controller.account.is_some(), "the signed-in account is unchanged");
+    controller.disconnect();
+    assert!(controller.request_server_proof().is_none());
+}
+
+/// When the saved login can no longer give an identity (revoked or ended), a
+/// waiting request ends at once instead of hanging, so the caller falls back
+/// to the account page.
+#[test]
+fn an_ended_saved_login_releases_waiting_server_identity_requests() {
+    let _guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
+    wait_account_workers();
+    let fixture = Fixture::new();
+    let store = Arc::new(MemorySessionStore::default());
+    *store.saved.lock().unwrap() = Some(saved_fixture(&fixture));
+    let mut controller = remembered_controller(fixture.provider.clone(), store.clone());
+    assert!(controller.resume(egui::Context::default(), true));
+    restored_account(&mut controller);
+    fixture.state.lock().unwrap().reject_refresh = true;
+    let proof = controller.request_server_proof().expect("running saved login");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        assert!(controller.poll().is_none(), "no sign-in page may open");
+        match proof.try_recv() {
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
+            Ok(_) => panic!("an ended login must not give an identity"),
+        }
+        assert!(Instant::now() < deadline, "the waiting request was not released");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(store.saved.lock().unwrap().is_none());
 }

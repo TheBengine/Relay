@@ -716,8 +716,14 @@ impl RelayApp {
         card(ui, |ui| {
             use hosting_switch::SwitchMode;
             ui.label(RichText::new("Choosing the host").strong());
+            if !view.host_ranking.is_empty() {
+                ui.label(RichText::new("Best machine to host, by measurement").color(c_muted()));
+                for line in host_ranking_lines(&view.host_ranking) {
+                    ui.add(egui::Label::new(RichText::new(line)).wrap(true));
+                }
+            }
             if !view.switch_advice.is_empty() {
-                ui.label(RichText::new(&view.switch_advice).color(c_muted()));
+                ui.add(egui::Label::new(RichText::new(&view.switch_advice).color(c_muted())).wrap(true));
             }
             if !view.can_manage {
                 ui.label(match view.switching.mode {
@@ -1451,5 +1457,60 @@ mod tests {
         .map(|v| v.word())
         .collect();
         assert_eq!(words.len(), 4);
+    }
+}
+
+/// One plain line per machine: rank, name, score, what was measured, and
+/// whether it hosts now or is the preferred host. No colour carries meaning.
+pub(super) fn host_ranking_lines(ranking: &[relay_protocol::hosting::RankedMachine]) -> Vec<String> {
+    ranking
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let mut tags = Vec::new();
+            if m.hosting {
+                tags.push("hosting now");
+            }
+            if m.preferred {
+                tags.push("preferred");
+            }
+            let tags = if tags.is_empty() { String::new() } else { format!(" ({})", tags.join(", ")) };
+            match m.points {
+                Some(points) => format!("{}. {}{tags}: {points} of 100. {}", i + 1, m.name, m.reasons),
+                None => format!("{}. {}{tags}: {}", i + 1, m.name, m.reasons),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod host_ranking_tests {
+    use relay_protocol::hosting::RankedMachine;
+
+    #[test]
+    fn the_ranking_reads_as_plain_lines() {
+        let ranking = vec![
+            RankedMachine {
+                name: "Bo's PC".into(),
+                points: Some(92),
+                reasons: "upload 40 Mbit/s (19.8x what 8 people need), processor 80% free".into(),
+                hosting: false,
+                preferred: true,
+            },
+            RankedMachine {
+                name: "This host (Home)".into(),
+                points: None,
+                reasons: "Not measured yet: upload.".into(),
+                hosting: true,
+                preferred: false,
+            },
+        ];
+        assert_eq!(
+            super::host_ranking_lines(&ranking),
+            vec![
+                "1. Bo's PC (preferred): 92 of 100. upload 40 Mbit/s (19.8x what 8 people need), processor 80% free".to_string(),
+                "2. This host (Home) (hosting now): Not measured yet: upload.".to_string(),
+            ]
+        );
     }
 }

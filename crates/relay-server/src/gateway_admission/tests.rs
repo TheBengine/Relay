@@ -323,7 +323,7 @@ async fn a_client_leases_only_its_own_live_session_in_the_same_channel() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         listed["gateways"],
-        json!([{"gateway_id":gateway,"instance":INSTANCE,"ip":"192.168.1.20","port":47000}])
+        json!([{"gateway_id":gateway,"instance":INSTANCE,"ip":"192.168.1.20","port":47000,"serving_secs":0}])
     );
     let (status, got) = lease(&w, &w.client, &gateway).await;
     assert_eq!(status, StatusCode::OK, "{got}");
@@ -721,6 +721,7 @@ fn registration(instance: u8, port: u16) -> Registration {
         token_hash: "token".into(),
         address: SocketAddrV4::new("192.168.1.20".parse().unwrap(), port),
         expires: Instant::now() + REGISTRATION,
+        since: Instant::now(),
     }
 }
 
@@ -1706,4 +1707,122 @@ async fn other_rooms_unmeasured_upload_and_stale_instances_get_no_mesh() {
     // A member who is not a registered gateway cannot report as one.
     let (status, _) = mesh_report(&w, &w.client, ENDPOINT_A, Some(4000), None, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// Mixed routes: a LAN home next to people who reach the host another way
+
+/// Gus serves his LAN as its voice gateway and Cleo leases from him. Lena
+/// reaches the host over iroh (the host's helper presents her as a loopback
+/// address), Otto over the internet or Tailscale. Returns the four seats and
+/// the address each one's voice arrives from at the host.
+async fn mixed_routes() -> (World, Vec<(u64, std::net::SocketAddr)>) {
+    let w = ready().await;
+    let (status, body) = lease(&w, &w.client, &w.gateway.user.id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let lena = signup(&w.app, "Lena", &new_invite(&w.app, &w.admin).await).await;
+    seat(&w.state, &lena, 55, "vc1");
+    seat(&w.state, &w.other, 33, "vc1");
+    let seats: Vec<(u64, std::net::SocketAddr)> = vec![
+        // Gus's own seat and Cleo's leased hop both arrive from the LAN gateway's sockets.
+        (11, "192.168.1.20:47001".parse().unwrap()),
+        (22, "192.168.1.20:47002".parse().unwrap()),
+        (33, "100.101.102.103:41641".parse().unwrap()),
+        (55, "127.0.0.1:47123".parse().unwrap()),
+    ];
+    {
+        let mut voice = lock(&w.state.0.voice);
+        for (id, from) in &seats {
+            voice.get_mut(id).unwrap().remote = Some(*from);
+        }
+    }
+    (w, seats)
+}
+
+/// Who gets each speaker's frame, and by which way: the host's relay or the
+/// home's gateway (both ends carried by the mesh). Every other person must get
+/// it exactly once.
+fn deliveries(w: &World, seats: &[(u64, std::net::SocketAddr)], sequence: u64) -> Vec<(u64, u64, &'static str)> {
+    let mut frame = vec![relay_protocol::AUDIO_PACKET_V2];
+    frame.extend([0; relay_protocol::AUDIO_V2_HEADER_LEN + 20]);
+    let mut out = Vec::new();
+    for (speaker, from) in seats {
+        let relayed = voice::relay_packet(&w.state, *from, &sealed_voice(*speaker, sequence, &frame));
+        for (listener, at) in seats.iter().filter(|(id, _)| id != speaker) {
+            let by_host = relayed.iter().filter(|(to, _)| to == at).count();
+            let by_gateway = usize::from(w.state.0.gateways.mesh_carries(*speaker, *listener));
+            assert_eq!(
+                by_host + by_gateway,
+                1,
+                "{speaker} -> {listener}: host {by_host}, gateway {by_gateway}"
+            );
+            out.push((*speaker, *listener, if by_host == 1 { "host" } else { "gateway" }));
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_lan_home_an_iroh_member_and_an_internet_member_all_hear_each_other() {
+    let (w, seats) = mixed_routes().await;
+    // Without a mesh the host relays every pair, the LAN pair included.
+    let before = deliveries(&w, &seats, 100);
+    assert!(before.iter().all(|(_, _, way)| *way == "host"));
+    // Gus's home alone forms the mesh: one gateway, no link to another home.
+    let (status, plan) = mesh_report(&w, &w.gateway, ENDPOINT_A, Some(4000), None, None).await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    let epoch = plan["plan"]["epoch"].as_u64().unwrap();
+    for who in [&w.gateway, &w.client] {
+        let (status, body) = mesh_member(&w, who, true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    mesh_report(&w, &w.gateway, ENDPOINT_A, Some(4000), Some(epoch), None).await;
+    let during = deliveries(&w, &seats, 200);
+    for (speaker, listener, way) in &during {
+        let lan_pair = [11, 22].contains(speaker) && [11, 22].contains(listener);
+        assert_eq!(*way, if lan_pair { "gateway" } else { "host" }, "{speaker} -> {listener}");
+    }
+    // Cleo's hop to the gateway fails: the host carries her again at once.
+    mesh_member(&w, &w.client, false).await;
+    let after = deliveries(&w, &seats, 300);
+    assert!(after.iter().all(|(_, _, way)| *way == "host"));
+    println!("mixed routes, LAN home on the mesh:");
+    for (speaker, listener, way) in during {
+        println!("  {speaker} -> {listener}: {way}");
+    }
+}
+
+#[tokio::test]
+async fn offers_carry_what_the_gateway_measured_and_how_long_it_has_served() {
+    let w = ready().await;
+    let (status, body) = list(&w, &w.client).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = &body["gateways"][0];
+    assert!(offer.get("capability").is_none(), "nothing measured yet: {offer}");
+    assert_eq!(offer["serving_secs"], 0);
+    // The gateway's own capacity report and its mesh report's host round trip.
+    let (status, _) = request(
+        &w.app,
+        "POST",
+        "/api/hosting/measurements",
+        Some(&w.gateway.token),
+        json!({"capacity":{"upload_kbps":30000,"cpu_free_pct":65,"free_disk_mb":1,"participants":0}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    mesh_report(&w, &w.gateway, ENDPOINT_A, Some(30000), None, None).await;
+    let since = lock(&w.state.0.gateways.book).gateways[&w.gateway.user.id].since;
+    // A renewal of the same registration keeps its start.
+    let (status, _) = register(&w, &w.gateway, "192.168.1.20", 47000).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(lock(&w.state.0.gateways.book).gateways[&w.gateway.user.id].since, since);
+    let (_, body) = list(&w, &w.client).await;
+    let capability = &body["gateways"][0]["capability"];
+    assert_eq!(capability["upload_kbps"], 30000, "{body}");
+    assert_eq!(capability["cpu_free_pct"], 65);
+    assert_eq!(capability["host_rtt_ms"], 40);
+    // A different address is a new registration that starts again.
+    let (status, _) = register(&w, &w.gateway, "192.168.1.21", 47000).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(lock(&w.state.0.gateways.book).gateways[&w.gateway.user.id].since > since);
 }

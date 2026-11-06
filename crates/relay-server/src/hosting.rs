@@ -23,6 +23,9 @@ mod tests;
 
 const KEY: &str = "hosting.v1";
 
+/// The running host in the host ranking. Never an account id.
+pub(crate) const HOST_ID: &str = "@host";
+
 /// What this build can do. Raised only by the change that adds the protocol.
 const ABILITIES: Abilities = Abilities {
     planned_handover: false,
@@ -95,7 +98,7 @@ fn view(state: &AppState, db: &Connection, viewer: &str) -> ApiResult<HostingVie
     let can_manage = roles::has(db, viewer, PERMISSION_ADMIN);
     let in_voice = state.members_in_voice();
     let mut copies_ready = 0usize;
-    let mut scores = Vec::new();
+    let mut capabilities = Vec::new();
     let mut candidates = Vec::new();
     for candidate in &roster.candidates {
         if !can_manage && candidate.user_id != viewer && candidate.effective().is_empty() {
@@ -130,10 +133,16 @@ fn view(state: &AppState, db: &Connection, viewer: &str) -> ApiResult<HostingVie
         if candidate.holds(HostRole::Replica) && model::copy_ready(&facts) {
             copies_ready += 1;
         }
-        scores.push((
-            candidate.user_id.clone(),
-            relay_protocol::host_switch::score(&model::assess(Task::PlannedHandover, &facts)),
-        ));
+        if !candidate.effective().is_empty() {
+            capabilities.push((
+                candidate.user_id.clone(),
+                facts.capacity.map(|c| relay_protocol::host_choice::Capability {
+                    upload_kbps: c.upload_kbps,
+                    cpu_free_pct: c.cpu_free_pct,
+                    host_rtt_ms: None,
+                }),
+            ));
+        }
         let assessments = Task::ALL
             .into_iter()
             .filter(|task| candidate.offered.contains(&task.role()))
@@ -145,18 +154,27 @@ fn view(state: &AppState, db: &Connection, viewer: &str) -> ApiResult<HostingVie
             assessments,
         });
     }
-    // The active host is not measured from members' side yet, so automatic
-    // switching compares nothing; the advice says so instead of guessing.
-    let ready = ABILITIES.planned_handover && ABILITIES.unexpected_takeover;
-    let switch_advice = lock(&state.0.switch_advisor)
-        .observe(now_ms, &roster.switching, ready, None, &scores)
-        .text(|id| display_name(db, id));
+    let host_name = server_settings::presentation(db, &state.0.name)?.name;
+    let (switch_advice, host_ranking) = host_choice(
+        state,
+        &roster.switching,
+        &capabilities,
+        in_voice.len() as u32,
+        now_ms,
+        |id| {
+            if id == HOST_ID {
+                format!("This host ({host_name})")
+            } else {
+                format!("{}'s PC", display_name(db, id))
+            }
+        },
+    );
     let takeover = state.takeover_status();
     Ok(HostingView {
         schema: model::SCHEMA,
         revision: roster.revision,
         active_host: ActiveHost {
-            name: server_settings::presentation(db, &state.0.name)?.name,
+            name: host_name.clone(),
             instance_id: state.0.instance_id.clone(),
         },
         abilities: ABILITIES,
@@ -186,7 +204,108 @@ fn view(state: &AppState, db: &Connection, viewer: &str) -> ApiResult<HostingVie
             steps.push(general[2].clone());
             steps
         },
+        host_ranking,
     })
+}
+
+/// Which machine would host best, by measurement, with the stable preference
+/// and the community's switching policy, in plain words. Nothing moves the
+/// community from here: a move needs planned handover, and this build reports
+/// it as unavailable.
+fn host_choice(
+    state: &AppState,
+    policy: &relay_protocol::host_switch::SwitchPolicy,
+    candidates: &[(String, Option<relay_protocol::host_choice::Capability>)],
+    participants: u32,
+    now_ms: u64,
+    name: impl Fn(&str) -> String,
+) -> (String, Vec<model::RankedMachine>) {
+    use relay_protocol::{
+        host_choice::{score, Contender},
+        host_switch::SwitchMode,
+    };
+    let host = state.0.measurements.host(now_ms);
+    let mut machines = vec![(HOST_ID.to_string(), Some(host))];
+    machines.extend(candidates.iter().cloned());
+    let scored: Vec<(String, Option<relay_protocol::host_choice::Score>)> = machines
+        .iter()
+        .map(|(id, c)| (id.clone(), c.as_ref().and_then(|c| score(c, participants))))
+        .collect();
+    let contenders: Vec<Contender> = scored
+        .iter()
+        .map(|(id, s)| {
+            // The running host has stood longest; it wins a tie.
+            let standing = if id == HOST_ID { u64::MAX } else { 0 };
+            Contender::new(id.clone(), s.as_ref().map(|s| s.points), standing)
+        })
+        .collect();
+    let decision = lock(&state.0.host_preference).observe(now_ms, &contenders);
+    let preferred = decision.chosen().unwrap_or(HOST_ID).to_string();
+    let mut ranking: Vec<model::RankedMachine> = scored
+        .iter()
+        .zip(&machines)
+        .map(|((id, s), (_, c))| model::RankedMachine {
+            name: name(id),
+            points: s.as_ref().map(|s| s.points),
+            reasons: match (s, c) {
+                (Some(s), _) => s.reasons.clone(),
+                (None, Some(c)) => missing(c),
+                (None, None) => "Not measured: it reports while its owner is in a call.".into(),
+            },
+            hosting: id == HOST_ID,
+            preferred: *id == preferred,
+        })
+        .collect();
+    ranking.sort_by(|a, b| {
+        b.points
+            .cmp(&a.points)
+            .then_with(|| b.hosting.cmp(&a.hosting))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let ready = ABILITIES.planned_handover && ABILITIES.unexpected_takeover;
+    let elsewhere = preferred != HOST_ID;
+    let mut text = match &decision {
+        relay_protocol::host_choice::Decision::Keep { current, .. } if elsewhere => format!(
+            "{} is the preferred host by measurement; no machine is clearly better.",
+            name(current)
+        ),
+        _ => decision.text(&name),
+    };
+    let policy_text = match policy.mode {
+        SwitchMode::KeepCurrent if elsewhere => {
+            " Hosting is set to keep the current host, so nothing moves.".to_string()
+        }
+        SwitchMode::KeepCurrent => String::new(),
+        SwitchMode::UseThisHost if !ready => {
+            " A move is requested, but moving a community is not available in this version yet."
+                .into()
+        }
+        SwitchMode::UseThisHost => format!(
+            " Moving to {} is requested.",
+            name(policy.preferred.as_deref().unwrap_or_default())
+        ),
+        SwitchMode::Automatic if !ready => {
+            " Automatic switching is allowed, but it waits until moving a community is available in this version.".into()
+        }
+        SwitchMode::Automatic if elsewhere => {
+            " Relay moves the community there with a planned handover.".into()
+        }
+        SwitchMode::Automatic => String::new(),
+    };
+    text.push_str(&policy_text);
+    (text, ranking)
+}
+
+/// What is missing before a machine can be compared.
+fn missing(c: &relay_protocol::host_choice::Capability) -> String {
+    let mut gaps = Vec::new();
+    if c.upload_kbps.is_none() {
+        gaps.push("upload");
+    }
+    if c.cpu_free_pct.is_none() {
+        gaps.push("processor");
+    }
+    format!("Not measured yet: {}.", gaps.join(" and "))
 }
 
 fn refused(error: model::Error) -> ApiError {

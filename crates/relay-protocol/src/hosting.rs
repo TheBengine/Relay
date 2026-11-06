@@ -840,6 +840,24 @@ pub struct HostingView {
     /// The steps to continuing without the host, each with its live state.
     #[serde(default)]
     pub takeover_setup: Vec<SetupStep>,
+    /// The machines that could host, best measured first, the running host
+    /// included. Older servers omit it.
+    #[serde(default)]
+    pub host_ranking: Vec<RankedMachine>,
+}
+
+/// One machine in the host ranking, in plain words.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankedMachine {
+    pub name: String,
+    /// 0..=100 from `host_choice::score`; `None` when not fully measured.
+    pub points: Option<u32>,
+    /// What was measured, or what is missing.
+    pub reasons: String,
+    /// Runs the community now.
+    pub hosting: bool,
+    /// The machine the stable preference points to.
+    pub preferred: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -990,12 +1008,23 @@ pub struct MeasurementReport {
     pub capacity: Option<CapacityFacts>,
     #[serde(default)]
     pub voice: Vec<VoiceSample>,
+    /// How fast this member downloaded the host's probe. The host's upload is
+    /// at least this. Sent only to a server that answered the probe, so an
+    /// older server never sees the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_download_kbps: Option<u32>,
 }
 
 impl MeasurementReport {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.capacity.is_none() && self.voice.is_empty() {
+        if self.capacity.is_none() && self.voice.is_empty() && self.host_download_kbps.is_none() {
             return Err("The report is empty");
+        }
+        if self
+            .host_download_kbps
+            .is_some_and(|v| !(1..10_000_000).contains(&v))
+        {
+            return Err("The download rate is not plausible");
         }
         if let Some(c) = self.capacity {
             if c.cpu_free_pct.is_some_and(|v| v > 100) {

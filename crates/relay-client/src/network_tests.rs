@@ -5894,8 +5894,10 @@ fn account_login_accepts_slow_health_but_still_checks_identity_before_challenge(
             result.unwrap();
             assert_eq!(requests.len(), 2);
             assert_eq!(requests[1].path, "/api/account-login/challenge");
+            // Only a loopback server proven by this PC's runtime record may be
+            // completed with the saved login; any other address needs the page.
             assert!(updates.iter().any(|update| matches!(update,
-                Update::AccountLoginChallenge { request_id: 53, .. })));
+                Update::AccountLoginChallenge { request_id: 53, local_owner: false, .. })));
         } else {
             assert_eq!(result.unwrap_err(), IDENTITY_CHANGED);
             assert_eq!(requests.len(), 1);
