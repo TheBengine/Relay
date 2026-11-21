@@ -15,6 +15,8 @@ mod status_problem_tests;
 mod upload_policy_tests;
 #[path = "network_navigation_cancel_tests.rs"]
 mod navigation_cancel_tests;
+#[path = "network_cleartext_tests.rs"]
+mod cleartext_tests;
 
 use super::*;
 use base64::Engine as _;
@@ -7464,6 +7466,7 @@ fn remembered_login_checks_public_pin_before_token_and_authenticated_scope_after
             _ => panic!("unexpected remembered-login request"),
         });
         let remembered = crate::credential_vault::RememberedSession {
+            host: None,
             authority: None,
             server_id: (case != "legacy").then(|| PIN.into()),
             session: Session {
@@ -7506,6 +7509,7 @@ fn unconfirmed_or_conflicting_remembered_pin_never_sends_a_request() {
     let server = MockHttp::new(|_| panic!("invalid remembered scope must be rejected before HTTP"));
     let client = TestWorker::new();
     let mut remembered = crate::credential_vault::RememberedSession {
+        host: None,
         authority: None,
         server_id: None,
         session: Session {
@@ -7861,13 +7865,15 @@ fn game_activity_background_write_and_retry_keep_the_selected_voice_account_unch
         );
         match (r.method.as_str(), r.path.as_str()) {
             ("GET", "/api/bootstrap") => {
-                let mut b = Bootstrap::default();
-                b.server_id = if remote_altered.load(Ordering::SeqCst) {
-                    "replaced-service"
-                } else {
-                    "friends"
-                }
-                .into();
+                let mut b = Bootstrap {
+                    server_id: if remote_altered.load(Ordering::SeqCst) {
+                        "replaced-service"
+                    } else {
+                        "friends"
+                    }
+                    .into(),
+                    ..Bootstrap::default()
+                };
                 b.user.id = "fixture-user".into();
                 b.capabilities = vec![
                     "people-v1".into(),
@@ -8123,6 +8129,7 @@ fn remembered_host_move_restarts_the_bound_account_and_removes_old_vault_aliases
     };
     let source_url = format!("https://{}.owned-resume.invalid", uuid::Uuid::new_v4());
     let old = crate::credential_vault::RememberedSession {
+        host: None,
         server_id: Some(source_pin.server_id.clone()),
         session: Session {
             token: "owned-restart-token".into(),
@@ -8217,6 +8224,7 @@ fn remembered_host_move_is_cancelled_by_logout_before_a_completed_probe_can_send
             user_id: "fixture-user".into(),
         },
         remembered: crate::credential_vault::RememberedSession {
+            host: None,
             server_id: Some(pin.server_id.clone()),
             session: Session {
                 token: "cancelled-token".into(),
@@ -8452,8 +8460,10 @@ fn local_pairing_http_never_receives_a_plain_code_or_account_credential(){
 fn friends_gateway_requests_keep_the_accepted_account_and_require_its_own_capability() {
     let mut test = TestWorker::new();
     test.connection("https://friends.example".into());
-    let mut bootstrap = Bootstrap::default();
-    bootstrap.capabilities = vec!["people-v1".into(), "gateway-broker-v1".into()];
+    let mut bootstrap = Bootstrap {
+        capabilities: vec!["people-v1".into(), "gateway-broker-v1".into()],
+        ..Bootstrap::default()
+    };
     test.worker.connection.as_mut().unwrap().chat = extended::ChatSession::new(&bootstrap);
     let ticket: VoiceTicket = serde_json::from_value(json!({
         "session_id":201,"key":base64::engine::general_purpose::STANDARD.encode([1u8;32]),

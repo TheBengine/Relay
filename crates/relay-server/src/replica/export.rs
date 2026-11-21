@@ -782,7 +782,7 @@ fn snapshot_table(
             Shown::Omit => *withheld.entry(table.name.into()).or_default() += 1,
         }
         seen += 1;
-        if seen % CLOCK_EVERY == 0 {
+        if seen.is_multiple_of(CLOCK_EVERY) {
             clock.check()?;
         }
     }
@@ -892,7 +892,7 @@ fn stream_keys(
         let key = read_row(row, table.key.len(), budget.left())?;
         affected.insert(table.name, key, budget)?;
         seen += 1;
-        if seen % CLOCK_EVERY == 0 {
+        if seen.is_multiple_of(CLOCK_EVERY) {
             clock.check()?;
         }
     }
@@ -1159,7 +1159,7 @@ fn build(
                         .ok_or(Refusal::Unavailable)?;
                     affected.insert(table.name, parse_key(table, &key)?, &mut budget)?;
                     seen += 1;
-                    if seen % CLOCK_EVERY == 0 {
+                    if seen.is_multiple_of(CLOCK_EVERY) {
                         clock.check()?;
                     }
                 }

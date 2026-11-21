@@ -1180,7 +1180,10 @@ pub async fn sessions(
     let auth = state.auth(&headers)?;
     let db = lock(&state.0.db);
     let mut s=db.prepare("SELECT token_hash,created_at,expires FROM sessions WHERE user_id=?1 AND expires>?2 ORDER BY created_at DESC")?;
-    let rows=s.query_map(params![auth.user.id,now()],|r|{let id:String=r.get(0)?;Ok(serde_json::json!({"id":id,"created_at":r.get::<_,u64>(1)?,"expires_at":r.get::<_,u64>(2)?,"current":id==auth.token_hash}))})?.collect::<Result<Vec<_>,_>>()?;
+    let rows=s.query_map(params![auth.user.id,now()],|r|{let id:String=r.get(0)?;let mut row=serde_json::json!({"id":id,"created_at":r.get::<_,u64>(1)?,"expires_at":r.get::<_,u64>(2)?,"current":id==auth.token_hash});
+        // Optional and only ever added: older clients read the list unchanged.
+        if crate::unencrypted_sessions::marked(&state,&id){row["unencrypted"]=serde_json::json!(true);}
+        Ok(row)})?.collect::<Result<Vec<_>,_>>()?;
     Ok(Json(serde_json::json!(rows)))
 }
 pub async fn revoke_session(

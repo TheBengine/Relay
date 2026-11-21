@@ -7,6 +7,9 @@ pub(super) type ChatEventInbox = Arc<std::sync::Mutex<VecDeque<Event>>>;
 #[derive(Default)]
 pub(super) struct ChatSession {
     pub(super) authority: Option<relay_protocol::handover::RoutePin>,
+    /// The host key of an address without an authority, seen or proven when
+    /// this session was made; remembered with the login (R7).
+    pub(super) host_key: Option<relay_protocol::handover::RoutePin>,
     pub(super) host_paused: bool,
     pub(super) authority_aliases: Vec<String>,
     pub(super) handover_checked_at: Option<Instant>,
@@ -1043,6 +1046,11 @@ impl Worker {
             Command::RememberNextLogins { enabled } => {
                 self.remember_session = enabled;
             }
+            Command::AllowUnencrypted { url } => {
+                if let Some(canonical) = crate::cleartext::needs_consent(&url) {
+                    self.unencrypted_ok.insert(canonical);
+                }
+            }
             Command::RememberAccountSessions { enabled, urls } => {
                 let urls = urls.iter()
                     .map(|url| crate::community::normalize_url(url))
@@ -1115,11 +1123,12 @@ impl Worker {
                                 account_provider: c.chat.account_provider.clone(),
                                 previous_urls: c.chat.authority_aliases.clone(),
                             });
-                    crate::credential_vault::save_bound(
+                    crate::credential_vault::save_full(
                         &c.url,
                         &c.server_id,
                         &c.session,
                         authority.as_ref(),
+                        c.chat.host_key.as_ref(),
                     )?;
                     c.remembered = true;
                 }

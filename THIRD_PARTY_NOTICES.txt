@@ -18790,7 +18790,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ========================================================================
-ctutils 0.4.2
+ctutils 0.4.4
 License: Apache-2.0 OR MIT
 Repository: https://github.com/RustCrypto/utils
 

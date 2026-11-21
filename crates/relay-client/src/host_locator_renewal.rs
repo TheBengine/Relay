@@ -74,7 +74,10 @@ fn scratch_prefix(purpose: Purpose) -> &'static str {
 /// What one call to `advance` did.
 pub(crate) enum Advance {
     /// A page was queued durably and the checkpoint moved; `more` says another page follows.
-    Queued { more: bool },
+    Queued {
+        #[cfg_attr(not(test), allow(dead_code))] // only the renewal tests read it
+        more: bool,
+    },
     /// The walk is finished and not yet due again. This is not delivery to the directory.
     Complete,
     /// The outbox has no room for a whole page; nothing was fetched.

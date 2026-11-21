@@ -1591,8 +1591,13 @@ impl RelayApp {
             let mut session_row = |ui: &mut egui::Ui, session: &Value, label: &str| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!(
-                        "{label} · signed in {}",
-                        date_value(&session["created_at"])
+                        "{label} · signed in {}{}",
+                        date_value(&session["created_at"]),
+                        if session["unencrypted"].as_bool() == Some(true) {
+                            " over an unencrypted connection"
+                        } else {
+                            ""
+                        }
                     ));
                     if ui.small_button("Sign out").clicked() {
                         if let Some(id) = session["id"].as_str() {

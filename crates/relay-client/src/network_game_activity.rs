@@ -98,8 +98,10 @@ mod tests {
             server_id: "friends".into(),
             user_id: "me".into(),
         };
-        let mut b = Bootstrap::default();
-        b.server_id = origin.server_id.clone();
+        let mut b = Bootstrap {
+            server_id: origin.server_id.clone(),
+            ..Bootstrap::default()
+        };
         b.user.id = origin.user_id.clone();
         b.capabilities = vec!["people-v1".into(), activity::CAPABILITY.into()];
         assert!(destination(&origin, &b).is_ok());

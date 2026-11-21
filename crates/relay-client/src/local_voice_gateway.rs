@@ -579,8 +579,8 @@ impl Worker {
                                     if from != upstream {
                                         activity.store(true, Ordering::Release);
                                     }
-                                    if to == upstream && uplink.is_some() {
-                                        let _ = uplink.as_ref().unwrap().send(&bytes);
+                                    if let Some(link) = uplink.as_ref().filter(|_| to == upstream) {
+                                        let _ = link.send(&bytes);
                                     } else {
                                         let _ = socket.send_to(&bytes, to);
                                     }

@@ -113,6 +113,9 @@ struct Work {
     expected_bytes: u64,
     decision: Phase,
 }
+// A few per takeover, never in bulk; boxing would add an allocation to every
+// serde round trip of the write-ahead record.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 enum Phase {

@@ -208,6 +208,9 @@ pub struct TransferManifest {
     pub signature: String,
 }
 
+// A wire type, one value per export; boxing the manifest would change every
+// construct and match site in the client and server for no gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ExportStatus {
@@ -471,6 +474,9 @@ pub fn manifest_message(context: &TransferContext, parts: &[TransferPart]) -> Ve
 /// One bounded JSON command over the companion's owned stdin/stdout pipe.
 /// No account bearer, password or private key is part of this contract.
 /// A setup request may carry this destination's scoped connection invitation.
+// One command per companion call over a pipe; boxing the large variants would
+// change every construct and match site across the client and the companion.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TargetCommand {

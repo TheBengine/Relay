@@ -12,11 +12,18 @@ struct StoredSession {
     session: Session,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     authority: Option<crate::host_route::RememberedAuthority>,
+    /// Older clients ignore this optional field and keep working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<relay_protocol::handover::RoutePin>,
 }
 
 #[derive(Clone)]
 pub struct RememberedSession {
     pub authority: Option<crate::host_route::RememberedAuthority>,
+    /// The host key this login was made with, for an address that has no pinned
+    /// authority (plain HTTP, Tailscale). The saved token goes only to a host
+    /// that proves this key with a fresh challenge first.
+    pub host: Option<relay_protocol::handover::RoutePin>,
     pub server_id: Option<String>,
     pub session: Session,
 }
@@ -54,17 +61,40 @@ impl RememberedSession {
     }
 }
 
+#[cfg(test)]
 fn encode(url: &str, server_id: &str, session: &Session) -> Result<Vec<u8>, String> {
-    encode_bound(url, server_id, session, None)
+    encode_full(url, server_id, session, None, None)
 }
+#[cfg(test)]
 fn encode_bound(
     url: &str,
     server_id: &str,
     session: &Session,
     authority: Option<&crate::host_route::RememberedAuthority>,
 ) -> Result<Vec<u8>, String> {
+    encode_full(url, server_id, session, authority, None)
+}
+/// A host key is kept only where no authority is: one trust root per login.
+fn valid_host(
+    host: Option<&relay_protocol::handover::RoutePin>,
+    server_id: &str,
+    has_authority: bool,
+) -> bool {
+    host.is_none_or(|pin| {
+        !has_authority && pin.server_id == server_id && crate::host_route::valid_pin(pin)
+    })
+}
+fn encode_full(
+    url: &str,
+    server_id: &str,
+    session: &Session,
+    authority: Option<&crate::host_route::RememberedAuthority>,
+    host: Option<&relay_protocol::handover::RoutePin>,
+) -> Result<Vec<u8>, String> {
     let url = crate::community::normalize_url(url)?;
-    if authority.is_some_and(|a| !a.valid_for(&url, server_id)) {
+    if authority.is_some_and(|a| !a.valid_for(&url, server_id))
+        || !valid_host(host, server_id, authority.is_some())
+    {
         return Err("Invalid remembered host authority.".into());
     }
     if uuid::Uuid::parse_str(server_id).is_err()
@@ -80,6 +110,7 @@ fn encode_bound(
         server_id: server_id.into(),
         session: session.clone(),
         authority: authority.cloned(),
+        host: host.cloned(),
     })
     .map_err(|_| "Cannot prepare remembered login.")?;
     if bytes.len() > 4096 {
@@ -104,6 +135,13 @@ fn decode(url: &str, bytes: &[u8]) -> Result<RememberedSession, String> {
             .authority
             .as_ref()
             .is_some_and(|a| !a.valid_for(&url, &stored.server_id))
+        || (stored.host.is_some()
+            && (stored.version == 0
+                || !valid_host(
+                    stored.host.as_ref(),
+                    &stored.server_id,
+                    stored.authority.is_some(),
+                )))
         || (stored.version == 0 && !stored.server_id.is_empty())
         || (stored.version >= 1 && uuid::Uuid::parse_str(&stored.server_id).is_err())
     {
@@ -111,11 +149,13 @@ fn decode(url: &str, bytes: &[u8]) -> Result<RememberedSession, String> {
     }
     Ok(RememberedSession {
         authority: stored.authority,
+        host: stored.host,
         server_id: (stored.version >= 1).then_some(stored.server_id),
         session: stored.session,
     })
 }
 
+#[cfg(test)]
 pub fn save(url: &str, server_id: &str, session: &Session) -> Result<(), String> {
     save_bound(url, server_id, session, None)
 }
@@ -125,7 +165,18 @@ pub fn save_bound(
     session: &Session,
     authority: Option<&crate::host_route::RememberedAuthority>,
 ) -> Result<(), String> {
+    save_full(url, server_id, session, authority, None)
+}
+/// Like `save_bound`, with the host key of an address that has no authority.
+pub fn save_full(
+    url: &str,
+    server_id: &str,
+    session: &Session,
+    authority: Option<&crate::host_route::RememberedAuthority>,
+    host: Option<&relay_protocol::handover::RoutePin>,
+) -> Result<(), String> {
     let mut authority = authority.cloned();
+    let host = if authority.is_some() { None } else { host };
     #[cfg(target_os = "windows")]
     if let Some(current) = &mut authority {
         if let Some(previous) = load(url)? {
@@ -151,7 +202,7 @@ pub fn save_bound(
             retired = current.previous_urls.split_off(8);
         }
     }
-    let bytes = encode_bound(url, server_id, session, authority.as_ref())?;
+    let bytes = encode_full(url, server_id, session, authority.as_ref(), host)?;
     #[cfg(target_os = "windows")]
     {
         native::save(

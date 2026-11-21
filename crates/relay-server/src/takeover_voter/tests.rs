@@ -279,7 +279,7 @@ fn only_verified_set_consent_and_two_distinct_bound_members_grant_a_commit() {
     let (mut l, mut a, mut b, ..) = trio(&n);
     let (e1, own) = l.propose(p("AAAA")).unwrap();
     let ack_a = ack(a.append(&e1).unwrap());
-    assert_eq!(l.commit_gate(&e1, &[ack_a.clone()], &[]), Decision::Commit);
+    assert_eq!(l.commit_gate(&e1, std::slice::from_ref(&ack_a), &[]), Decision::Commit);
     assert_eq!(
         l.commit_gate(&e1, &[], &[]),
         Decision::Rollback(Why::Insufficient)
@@ -331,12 +331,12 @@ fn only_verified_set_consent_and_two_distinct_bound_members_grant_a_commit() {
     // A stale ack (for e1) never commits the next entry.
     let (e2, _) = l.propose(p("BBBB")).unwrap();
     assert_eq!(
-        l.commit_gate(&e2, &[ack_a.clone()], &[]),
+        l.commit_gate(&e2, std::slice::from_ref(&ack_a), &[]),
         Decision::Rollback(Why::Insufficient)
     );
     // Without this host's own persisted append there is nothing to commit.
     assert_eq!(
-        b.commit_gate(&e1, &[ack_a.clone()], &[]),
+        b.commit_gate(&e1, std::slice::from_ref(&ack_a), &[]),
         Decision::Rollback(Why::NotPersisted)
     );
     // Too much evidence is refused outright.
@@ -356,7 +356,7 @@ fn only_verified_set_consent_and_two_distinct_bound_members_grant_a_commit() {
         body: fence.body.clone(),
     };
     assert_eq!(
-        l.commit_gate(&e1, &[ack_a.clone()], &[unverified]),
+        l.commit_gate(&e1, std::slice::from_ref(&ack_a), &[unverified]),
         Decision::Commit
     );
     assert_eq!(
@@ -751,7 +751,7 @@ fn the_exact_full_entry_is_retained_recoverable_and_verified_before_every_ack_an
     let mut a = reload().unwrap();
     // The commit gate rests on the retained record as well, never on a remembered position.
     let ack_a = ack(a.append(&e1).unwrap());
-    assert_eq!(l.commit_gate(&e1, &[ack_a.clone()], &[]), Decision::Commit);
+    assert_eq!(l.commit_gate(&e1, std::slice::from_ref(&ack_a), &[]), Decision::Commit);
     lm.entries.borrow_mut().remove(&1);
     assert_eq!(
         l.commit_gate(&e1, &[ack_a], &[]),

@@ -14,8 +14,7 @@ use std::{
 use zeroize::Zeroizing;
 
 #[cfg(windows)]
-#[path = "data_privacy.rs"]
-mod privacy;
+use crate::data_privacy as privacy;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -64,10 +63,10 @@ pub(crate) fn verify(proof: &HostProof, message: &[u8]) -> bool {
 }
 
 pub(crate) fn private_directory(folder: &Path) -> Result<()> {
-    super::handover::direct(&folder)?;
-    fs::create_dir_all(&folder)?;
+    super::handover::direct(folder)?;
+    fs::create_dir_all(folder)?;
     #[cfg(windows)]
-    privacy::protect_data_directory(&folder)?;
+    privacy::protect_data_directory(folder)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -437,6 +436,10 @@ pub fn run(data: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn active_runtime(data: &Path) -> Result<Option<model::HostRuntime>> {
+    super::handover::activation::active_runtime(data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,8 +634,4 @@ mod tests {
         status.preparation.as_mut().unwrap().target_host_id = id();
         assert!(key.accept(&status).is_err());
     }
-}
-
-pub fn active_runtime(data: &Path) -> Result<Option<model::HostRuntime>> {
-    super::handover::activation::active_runtime(data)
 }

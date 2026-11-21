@@ -676,7 +676,7 @@ async fn freeze_closes_existing_event_socket_even_when_immediately_cancelled() {
     })
     .await;
     server.abort();
-    assert_eq!(closed.unwrap(), true);
+    assert!(closed.unwrap());
 }
 
 #[tokio::test]

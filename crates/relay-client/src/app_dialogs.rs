@@ -1189,6 +1189,84 @@ impl RelayApp {
         None
     }
 
+    /// W-01: one question before a password or saved login travels in clear text.
+    pub(super) fn unencrypted_dialog(&mut self, ctx: &egui::Context) {
+        let Some((url, _)) = self.unencrypted_prompt.as_ref() else {
+            return;
+        };
+        let (title, body) = crate::cleartext::dialog_text(url);
+        let mut open = true;
+        let mut answer = None;
+        let window = desktop_ui::dialog(ctx, title.as_str())
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0);
+        if host_setup_ui::show_with_header(ctx, window, &title, |ui| {
+            ui.add(egui::Label::new(body).wrap(true));
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Safer: ask the host for an https:// or iroh invitation.",
+                    )
+                    .color(c_muted()),
+                )
+                .wrap(true),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.add(secondary("Cancel")).clicked() {
+                    answer = Some(false);
+                }
+                if ui.add(primary("Sign in anyway")).clicked() {
+                    answer = Some(true);
+                }
+            });
+        }) {
+            open = false;
+        }
+        if !open {
+            answer = Some(false);
+        }
+        let Some(accepted) = answer else {
+            return;
+        };
+        let Some((url, command)) = self.unencrypted_prompt.take() else {
+            return;
+        };
+        if !accepted {
+            self.unencrypted_declined(command);
+            return;
+        }
+        if let Some(canonical) = crate::cleartext::needs_consent(&url) {
+            if !self.prefs.unencrypted_ok.contains(&canonical) {
+                self.prefs.unencrypted_ok.push(canonical.clone());
+                // Bounded: the oldest acknowledgement is asked again first.
+                let extra = self.prefs.unencrypted_ok.len().saturating_sub(64);
+                self.prefs.unencrypted_ok.drain(..extra);
+                self.defer_preferences();
+            }
+            self.send(Command::AllowUnencrypted { url: canonical });
+        }
+        self.send(command);
+    }
+
+    /// The person kept the connection closed: nothing was sent.
+    pub(super) fn unencrypted_declined(&mut self, command: Command) {
+        self.busy = false;
+        let error = crate::cleartext::DECLINED.to_owned();
+        if let Command::Auth { request_id, .. } = command {
+            match self.account_feedback.failed(request_id, error) {
+                account_feedback_ui::AuthAnswer::NotAccount(error)
+                | account_feedback_ui::AuthAnswer::General(error) => self.error = Some(error),
+                account_feedback_ui::AuthAnswer::OnField => self.error = None,
+            }
+        } else {
+            self.error = Some(error);
+        }
+    }
+
     pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
         self.audio_setup_dialog(ctx);
         self.squads_window(ctx);

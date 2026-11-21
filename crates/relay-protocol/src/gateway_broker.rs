@@ -250,8 +250,10 @@ mod tests {
     #[test]
     fn limits_match_the_data_plane() {
         // The data plane refuses a lease above two seconds and more than 32 routes.
-        assert!(LEASE_TTL_MS > 0 && LEASE_TTL_MS <= 2000);
+        const {
+            assert!(LEASE_TTL_MS > 0 && LEASE_TTL_MS <= 2000);
+            assert!(REGISTRATION_TTL_SECS >= 60 && REGISTRATION_TTL_SECS <= 600);
+        }
         assert_eq!(MAX_GRANTS_PER_GATEWAY, 32);
-        assert!(REGISTRATION_TTL_SECS >= 60 && REGISTRATION_TTL_SECS <= 600);
     }
 }

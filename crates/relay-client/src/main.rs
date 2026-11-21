@@ -49,6 +49,7 @@ mod voice_quality;
 mod call_alerts;
 mod capture;
 mod central_account;
+mod cleartext;
 mod chat_features;
 mod chat_media;
 mod chat_state;

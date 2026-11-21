@@ -849,8 +849,10 @@ async fn the_capability_is_community_only() {
     };
     assert!(has(&boot), "a community with the broker advertises it");
     // The Friends service strips it, so a client does not poll a consent-only server.
-    let mut bootstrap = Bootstrap::default();
-    bootstrap.capabilities = vec!["gateway-broker-v1".into(), "history".into()];
+    let mut bootstrap = Bootstrap {
+        capabilities: vec!["gateway-broker-v1".into(), "history".into()],
+        ..Default::default()
+    };
     people::snapshot(&lock(&w.state.0.db), &w.admin.user.id, &mut bootstrap);
     assert!(!bootstrap
         .capabilities

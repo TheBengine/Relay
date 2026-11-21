@@ -36,6 +36,7 @@ impl Worker {
         crate::host_route::confirm_login(url, &pins)
     }
 
+    #[allow(clippy::too_many_arguments)] // one argument per field of the login command it serves
     pub(super) fn account_login_begin(
         &mut self,
         authority: Option<handover::RoutePin>,
@@ -70,6 +71,7 @@ impl Worker {
         Ok(())
     }
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)] // one argument per field of the login command it serves
     pub(super) fn account_login_finish(
         &mut self,
         authority: Option<handover::RoutePin>,

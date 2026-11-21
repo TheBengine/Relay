@@ -108,57 +108,11 @@ fn lan_find_controls(
     picked
 }
 
+// One value per click on the setup form; boxing would add an allocation for no gain.
+#[allow(clippy::large_enum_variant)]
 enum SetupAction {
     Check(String),
     Invitation(Invitation),
-}
-
-#[cfg(test)]
-mod setup_action_tests {
-    use super::*;
-
-    #[test]
-    fn advanced_invitation_click_keeps_full_capability_for_the_shared_join_flow() {
-        let ctx = egui::Context::default();
-        configure(&ctx);
-        ctx.enable_accesskit();
-        let endpoint = "b".repeat(64);
-        let invitation = Invitation::new(
-            &crate::route_choice::iroh_address(&endpoint),
-            "4be44aef-8c98-4db6-a9d5-81c2eb311330",
-            "synthetic-invitation",
-        ).unwrap().with_iroh(crate::invitation_routes::IrohRoute::new(
-            &endpoint, None, "abcdefghijklmnopqrstuvwxyzABCDEF0123456789_-",
-        ).unwrap());
-        let mut address = invitation.browser_link();
-        let mut code = String::new();
-        let mut state = SetupState::default();
-        let mut action = None;
-        let mut frame = |events| ctx.run(egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 800.0))),
-            focused: true,
-            events,
-            ..Default::default()
-        }, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                action = setup_controls(ui, &mut address, &mut code, &mut state, true);
-            });
-        });
-        let first = frame(Vec::new());
-        let button = first.platform_output.accesskit_update.unwrap().nodes.into_iter()
-            .find(|(_, node)| node.name() == Some("Use invitation")).unwrap().0;
-        frame(vec![egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
-            target: button,
-            action: egui::accesskit::Action::Default,
-            data: None,
-        })]);
-        let Some(SetupAction::Invitation(chosen)) = action else {
-            panic!("The advanced control must request the ordinary join flow");
-        };
-        assert!(chosen == invitation);
-        assert_eq!(address, invitation.browser_link());
-        assert!(code.is_empty() && state.invitation.is_none() && state.pending.is_none());
-    }
 }
 
 fn setup_controls(
@@ -572,5 +526,53 @@ impl RelayApp {
         if !open {
             self.invite_dialog = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod setup_action_tests {
+    use super::*;
+
+    #[test]
+    fn advanced_invitation_click_keeps_full_capability_for_the_shared_join_flow() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        ctx.enable_accesskit();
+        let endpoint = "b".repeat(64);
+        let invitation = Invitation::new(
+            &crate::route_choice::iroh_address(&endpoint),
+            "4be44aef-8c98-4db6-a9d5-81c2eb311330",
+            "synthetic-invitation",
+        ).unwrap().with_iroh(crate::invitation_routes::IrohRoute::new(
+            &endpoint, None, "abcdefghijklmnopqrstuvwxyzABCDEF0123456789_-",
+        ).unwrap());
+        let mut address = invitation.browser_link();
+        let mut code = String::new();
+        let mut state = SetupState::default();
+        let mut action = None;
+        let mut frame = |events| ctx.run(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 800.0))),
+            focused: true,
+            events,
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = setup_controls(ui, &mut address, &mut code, &mut state, true);
+            });
+        });
+        let first = frame(Vec::new());
+        let button = first.platform_output.accesskit_update.unwrap().nodes.into_iter()
+            .find(|(_, node)| node.name() == Some("Use invitation")).unwrap().0;
+        frame(vec![egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            target: button,
+            action: egui::accesskit::Action::Default,
+            data: None,
+        })]);
+        let Some(SetupAction::Invitation(chosen)) = action else {
+            panic!("The advanced control must request the ordinary join flow");
+        };
+        assert!(chosen == invitation);
+        assert_eq!(address, invitation.browser_link());
+        assert!(code.is_empty() && state.invitation.is_none() && state.pending.is_none());
     }
 }

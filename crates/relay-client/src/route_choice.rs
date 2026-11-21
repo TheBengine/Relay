@@ -269,9 +269,9 @@ pub struct Probe {
 
 fn rank(candidate: &Candidate) -> u8 {
     match (candidate.kind, safety(candidate)) {
-        (RouteKind::Direct, Safety::HomeNetwork) => 0,
-        (RouteKind::Direct, Safety::Encrypted) => 1,
-        (RouteKind::Iroh, _) => 2,
+        (RouteKind::Direct, Safety::Encrypted) => 0,
+        (RouteKind::Iroh, _) => 1,
+        (RouteKind::Direct, Safety::HomeNetwork) => 2,
         (RouteKind::Tailscale, _) => 3,
         (RouteKind::Direct, Safety::PlainOverInternet) => 4,
     }
@@ -293,6 +293,19 @@ pub fn choose(probes: &[Probe], prefs: &ConnectionPrefs) -> Result<Candidate, St
         .iter()
         .filter(|(c, _)| allowed(c, prefs))
         .collect();
+    // W-01: when the same community answers on an encrypted route, a plain
+    // address (which would carry the password in clear text) is not used.
+    let usable: Vec<&(&Candidate, f32)> = if usable
+        .iter()
+        .any(|(c, _)| safety(c) == Safety::Encrypted)
+    {
+        usable
+            .into_iter()
+            .filter(|(c, _)| safety(c) == Safety::Encrypted)
+            .collect()
+    } else {
+        usable
+    };
     if prefs.mode == ConnectionMode::PreferIroh {
         if let Some((candidate, _)) = usable
             .iter()
@@ -436,6 +449,7 @@ pub struct Outcome {
 }
 
 /// The whole decision, run on a background thread by the caller.
+#[cfg(test)]
 pub fn decide(
     invitation: &Invitation,
     prefs: &ConnectionPrefs,
@@ -546,6 +560,7 @@ impl Job {
         }
     }
 
+    #[cfg(test)]
     pub fn start(
         original: Invitation,
         prefs: ConnectionPrefs,
@@ -823,8 +838,19 @@ mod tests {
     #[test]
     fn routes_within_a_few_milliseconds_are_equal_so_the_better_kind_wins() {
         let iroh = c(RouteKind::Iroh, &iroh_address(&"b".repeat(64)));
-        // 2 ms on the home network against 4 ms by iroh: the home network.
-        let probes = [ok(iroh.clone(), 2.0), ok(c(RouteKind::Direct, HOME), 4.0)];
+        // W-01: 2 ms by iroh against 4 ms on the plain home network: iroh, and
+        // an encrypted route wins even when the plain one is clearly faster.
+        let probes = [ok(iroh.clone(), 4.0), ok(c(RouteKind::Direct, HOME), 2.0)];
+        assert_eq!(choose(&probes, &auto()).unwrap().kind, RouteKind::Iroh);
+        let probes = [ok(iroh.clone(), 60.0), ok(c(RouteKind::Direct, HOME), 2.0)];
+        assert_eq!(choose(&probes, &auto()).unwrap().kind, RouteKind::Iroh);
+        let probes = [
+            ok(c(RouteKind::Direct, PUBLIC_TLS), 60.0),
+            ok(c(RouteKind::Direct, HOME), 2.0),
+        ];
+        assert_eq!(choose(&probes, &auto()).unwrap().address, PUBLIC_TLS);
+        // With no encrypted route answering, the home network still works.
+        let probes = [no(iroh.clone(), "no answer"), ok(c(RouteKind::Direct, HOME), 2.0)];
         assert_eq!(choose(&probes, &auto()).unwrap().address, HOME);
         // 100 vs 120 ms is within a quarter: the better kind (https) wins.
         let probes = [
@@ -1177,10 +1203,11 @@ mod tests {
 
     #[test]
     fn deciding_names_the_home_network_when_it_wins() {
+        // The home network wins only when no encrypted route answers (W-01).
         let prober = FakeProber {
             delays: HashMap::from([
                 (HOME.to_owned(), Ok(1.6)),
-                (PUBLIC_TLS.to_owned(), Ok(30.0)),
+                (PUBLIC_TLS.to_owned(), Err("no answer".to_owned())),
             ]),
             started: Default::default(),
         };
@@ -1351,8 +1378,9 @@ mod tests {
             delays: [(PUBLIC_TLS.into(), Ok(60.0)), (HOME.into(), Ok(1.0))].into(),
             started: Default::default(),
         };
+        // W-01: the encrypted route wins although the home address is faster.
         let legacy = decide_for_login(&invitation, &auto(), Capabilities { iroh: false }, &prober, false);
-        assert_eq!(legacy.invitation.unwrap().server, HOME);
+        assert_eq!(legacy.invitation.unwrap().server, PUBLIC_TLS);
         let shared = decide_for_login(&invitation, &auto(), Capabilities { iroh: false }, &prober, true);
         assert_eq!(shared.invitation.unwrap().server, PUBLIC_TLS);
         // Plaintext consent never grants permission to carry a shared-account

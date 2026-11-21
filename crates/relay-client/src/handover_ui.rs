@@ -46,38 +46,6 @@ pub(super) struct State {
     inspected: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn move_panel_discards_late_account_and_request_results() {
-        let owner = CommandOrigin {
-            url: "https://source.example".into(),
-            server_id: "community".into(),
-            user_id: "member".into(),
-        };
-        let mut state = State {
-            owner: Some(owner.clone()),
-            request: Some(7),
-            ..State::default()
-        };
-        let mut view = crate::handover_client::Job::failure(
-            owner,
-            7,
-            crate::handover_client::Fault::Connection,
-        );
-        view.origin.user_id = "other".into();
-        assert!(!state.receive(view.clone()));
-        view.origin.user_id = "member".into();
-        view.request_id = 6;
-        assert!(!state.receive(view.clone()));
-        view.request_id = 7;
-        assert!(state.receive(view.clone()));
-        assert!(state.request.is_none());
-        assert!(!state.receive(view));
-    }
-}
-
 impl State {
     fn receive(&mut self, mut view: View) -> bool {
         if self.owner.as_ref() != Some(&view.origin) || self.request != Some(view.request_id) {
@@ -311,5 +279,37 @@ impl RelayApp {
         if let Some(action) = action {
             self.handover_request(action);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn move_panel_discards_late_account_and_request_results() {
+        let owner = CommandOrigin {
+            url: "https://source.example".into(),
+            server_id: "community".into(),
+            user_id: "member".into(),
+        };
+        let mut state = State {
+            owner: Some(owner.clone()),
+            request: Some(7),
+            ..State::default()
+        };
+        let mut view = crate::handover_client::Job::failure(
+            owner,
+            7,
+            crate::handover_client::Fault::Connection,
+        );
+        view.origin.user_id = "other".into();
+        assert!(!state.receive(view.clone()));
+        view.origin.user_id = "member".into();
+        view.request_id = 6;
+        assert!(!state.receive(view.clone()));
+        view.request_id = 7;
+        assert!(state.receive(view.clone()));
+        assert!(state.request.is_none());
+        assert!(!state.receive(view));
     }
 }

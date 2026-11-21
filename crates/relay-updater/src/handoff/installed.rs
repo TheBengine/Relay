@@ -73,7 +73,6 @@ fn inspect(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::APP_ID;
     use std::fs;
 

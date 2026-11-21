@@ -17,6 +17,9 @@ pub const UNAVAILABLE: &str = "The current host cannot answer the route check ye
 /// read-only to finish or cancel the move. A first login still needs a writable host.
 pub const PAUSED: &str = "This community's host is paused for a move. Sign-ins resume when the move is finished or cancelled.";
 pub const REFUSED: &str = "Relay could not confirm the new host. Your existing account, drafts and server identity have been kept.";
+/// R7: the server at a remembered address could not prove the host key the
+/// login was made with. The saved token was not sent and the login is kept.
+pub const NOT_THE_SAME_SERVER: &str = "This server is not the one you signed in to, so Relay did not send your saved login. Sign in again only if you trust this server.";
 
 fn uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|v| v.to_string() == value)
@@ -286,60 +289,57 @@ fn resolve_cached(
         let moved = if let Some(saved) = remembered {
             saved
         } else {
-            match fetch(&at, &challenge) {
-                Ok(reply) => {
-                    if !proof(&current, &challenge, &reply) {
+            let reply = fetch(&at, &challenge)?;
+            if !proof(&current, &challenge, &reply) {
+                // At the remembered address itself this is another server.
+                return Err(if step == 0 { NOT_THE_SAME_SERVER } else { REFUSED }.into());
+            }
+            if reply.state.pin != current {
+                if reply.state.pin.term.checked_sub(pin.term).is_none_or(|n|n > MAX_MOVES as u64)
+                    || reply.state.history.last().is_none_or(|g|
+                        !safe_destination(&g.receipt.body.target_url).is_ok_and(|url|url == at)) {
+                    return Err(REFUSED.into());
+                }
+                // A new address can prove the whole ancestry without
+                // asking any old machine to come back online. Retain
+                // only already verified immutable grants, before auth.
+                let mut history_at=at.clone();
+                for edge in &reply.state.history {
+                    if edge.source_identity != current.host || edge.receipt.body.term != current.term { continue; }
+                    cache.store(&history_at,&current,edge)?;
+                    current=RoutePin{server_id:pin.server_id.clone(),host:edge.receipt.body.target_identity.clone(),term:edge.next_term};
+                    history_at=safe_destination(&edge.receipt.body.target_url)?;
+                }
+                if current != reply.state.pin || !seen.insert((at.clone(),current.host.host_id.clone(),current.term)) {
+                    return Err(REFUSED.into());
+                }
+            }
+            match reply.state.moved {
+                None => {
+                    return if !reply.state.writes_allowed && step == 0 && current == *pin {
+                        Err(PAUSED.into())
+                    } else if !reply.state.writes_allowed {
+                        Err(UNAVAILABLE.into())
+                    } else if step == 0 && current == *pin {
+                        Ok(None)
+                    } else if reply.state.writes_allowed {
+                        Ok(Some(VerifiedMove {
+                            url: at,
+                            pin: current,
+                        }))
+                    } else {
+                        Err(UNAVAILABLE.into())
+                    };
+                }
+                Some(moved) => {
+                    if reply.state.writes_allowed || !grant(&current, &moved) {
                         return Err(REFUSED.into());
                     }
-                    if reply.state.pin != current {
-                        if reply.state.pin.term.checked_sub(pin.term).is_none_or(|n|n > MAX_MOVES as u64)
-                            || reply.state.history.last().is_none_or(|g|
-                                !safe_destination(&g.receipt.body.target_url).is_ok_and(|url|url == at)) {
-                            return Err(REFUSED.into());
-                        }
-                        // A new address can prove the whole ancestry without
-                        // asking any old machine to come back online. Retain
-                        // only already verified immutable grants, before auth.
-                        let mut history_at=at.clone();
-                        for edge in &reply.state.history {
-                            if edge.source_identity != current.host || edge.receipt.body.term != current.term { continue; }
-                            cache.store(&history_at,&current,edge)?;
-                            current=RoutePin{server_id:pin.server_id.clone(),host:edge.receipt.body.target_identity.clone(),term:edge.next_term};
-                            history_at=safe_destination(&edge.receipt.body.target_url)?;
-                        }
-                        if current != reply.state.pin || !seen.insert((at.clone(),current.host.host_id.clone(),current.term)) {
-                            return Err(REFUSED.into());
-                        }
-                    }
-                    match reply.state.moved {
-                        None => {
-                            return if !reply.state.writes_allowed && step == 0 && current == *pin {
-                                Err(PAUSED.into())
-                            } else if !reply.state.writes_allowed {
-                                Err(UNAVAILABLE.into())
-                            } else if step == 0 && current == *pin {
-                                Ok(None)
-                            } else if reply.state.writes_allowed {
-                                Ok(Some(VerifiedMove {
-                                    url: at,
-                                    pin: current,
-                                }))
-                            } else {
-                                Err(UNAVAILABLE.into())
-                            };
-                        }
-                        Some(moved) => {
-                            if reply.state.writes_allowed || !grant(&current, &moved) {
-                                return Err(REFUSED.into());
-                            }
-                            // Save before probing the destination: a stopped source
-                            // is no longer required after this immutable evidence.
-                            cache.store(&at, &current, &moved)?;
-                            moved
-                        }
-                    }
+                    // Save before probing the destination: a stopped source
+                    // is no longer required after this immutable evidence.
+                    cache.store(&at, &current, &moved)?;
+                    moved
                 }
-                Err(error) => return Err(error),
             }
         };
         if step == MAX_MOVES || !grant(&current, &moved) {
@@ -440,10 +440,64 @@ pub(crate) fn confirm_reply(
     }
     Ok(reply.state.pin.clone())
 }
+/// R7: before a saved token goes to an address without a pinned authority, the
+/// server proves the host key the login was made with (or a signed move from it)
+/// to a fresh challenge. Any other answer is "not the same server".
+pub(crate) fn prove_host(
+    http: &reqwest::blocking::Client,
+    url: &str,
+    pin: &RoutePin,
+) -> Result<RoutePin, String> {
+    if !valid_pin(pin) {
+        return Err(NOT_THE_SAME_SERVER.into());
+    }
+    let mut nonce = [0u8; 32];
+    getrandom::getrandom(&mut nonce).map_err(|_| UNAVAILABLE)?;
+    let challenge = URL_SAFE_NO_PAD.encode(nonce);
+    let reply = fetch_route_answer(http, url, &challenge, NOT_THE_SAME_SERVER).map_err(|error| {
+        if error == REFUSED {
+            NOT_THE_SAME_SERVER.into()
+        } else {
+            error
+        }
+    })?;
+    if !proof(pin, &challenge, &reply)
+        || reply
+            .state
+            .pin
+            .term
+            .checked_sub(pin.term)
+            .is_none_or(|n| n > MAX_MOVES as u64)
+    {
+        return Err(NOT_THE_SAME_SERVER.into());
+    }
+    Ok(reply.state.pin)
+}
+/// The host key worth remembering with a login whose address has no authority.
+pub(crate) fn host_key(
+    authority: Option<&RoutePin>,
+    bootstrap: &relay_protocol::Bootstrap,
+) -> Option<RoutePin> {
+    if authority.is_some() {
+        return None;
+    }
+    bootstrap
+        .host_authority
+        .clone()
+        .filter(|pin| pin.server_id == bootstrap.server_id && valid_pin(pin))
+}
 fn fetch_route(
     http: &reqwest::blocking::Client,
     url: &str,
     challenge: &str,
+) -> Result<RouteProof, String> {
+    fetch_route_answer(http, url, challenge, UNAVAILABLE)
+}
+fn fetch_route_answer(
+    http: &reqwest::blocking::Client,
+    url: &str,
+    challenge: &str,
+    refused_status: &str,
 ) -> Result<RouteProof, String> {
     crate::embedded_network::ensure_route(url).map_err(|_| UNAVAILABLE)?;
     let response = http
@@ -456,7 +510,7 @@ fn fetch_route(
         .send()
         .map_err(|_| UNAVAILABLE)?;
     if !response.status().is_success() {
-        return Err(UNAVAILABLE.into());
+        return Err(refused_status.into());
     }
     let mut bytes = Vec::new();
     response

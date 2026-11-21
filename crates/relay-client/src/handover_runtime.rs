@@ -177,8 +177,8 @@ impl Recipe {
             .and_then(|_| file.sync_all())
             .map_err(|_| Fault::Storage)?;
         drop(file);
-        direct(&selected)?;
-        fs::rename(&pending, &selected).map_err(|_| Fault::Storage)?;
+        direct(selected)?;
+        fs::rename(&pending, selected).map_err(|_| Fault::Storage)?;
         Ok(())
     }
     // Preserve the irreversible source grant before local activation. No source
@@ -210,7 +210,7 @@ pub(crate) fn recover_at(origin: &CommandOrigin, pin: &model::RoutePin, data: &P
     }
     if let Some(value) = recipe.as_mut() {
         if value.status.retired.is_none() {
-            let Some(status) = delivered_status(&data, origin, &value.status)? else {
+            let Some(status) = delivered_status(data, origin, &value.status)? else {
                 return Ok(None);
             };
             value.status = status;
@@ -551,6 +551,7 @@ impl Runtime {
         }
         Ok(result)
     }
+    #[allow(clippy::too_many_arguments)] // each is a distinct handle or secret for the child process launch
     fn start_server(
         exe: &Path,
         data: &Path,
@@ -831,6 +832,46 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// The only authority carried to the publisher is this owned process's local
+/// control secret. It is used on loopback only; it never reaches the directory.
+pub(crate) struct LocatorTask {
+    renewal:crate::host_locator_renewal::Renewal,
+    sessions:crate::host_locator_renewal::Renewal,
+    http:reqwest::blocking::Client,
+    control:Zeroizing<String>,
+    current:model::RoutePin,
+    destination:relay_protocol::host_locator::Destination,
+}
+impl LocatorTask {
+    pub(crate) fn advance(&self,queue:&mut crate::host_locator_outbox::Outbox,now_ms:u64)
+        -> std::result::Result<crate::host_locator_renewal::Advance,String> {
+        use crate::host_locator_renewal::Advance;
+        use relay_protocol::host_locator as locator;
+        // Remembered members are renewed first; neither walk skips queued pages.
+        match self.walk(&self.sessions,locator::LOCAL_SESSION_PAGE_PATH,queue,now_ms)? {
+            Advance::Complete=>self.walk(&self.renewal,locator::LOCAL_PAGE_PATH,queue,now_ms),
+            progress=>Ok(progress),
+        }
+    }
+    fn walk(&self,renewal:&crate::host_locator_renewal::Renewal,path:&str,
+        queue:&mut crate::host_locator_outbox::Outbox,now_ms:u64)
+        -> std::result::Result<crate::host_locator_renewal::Advance,String> {
+        renewal.advance(queue,now_ms,|after| {
+            use relay_protocol::host_locator as locator;
+            let response=self.http.post(format!("http://127.0.0.1:4580{path}"))
+                .bearer_auth(self.control.as_str()).json(&locator::PageRequest{
+                    current:self.current.clone(),destination:self.destination.clone(),after,
+                }).send().map_err(|_|Fault::Companion.message().to_owned())?;
+            if !response.status().is_success() {return Err(Fault::Route.message().into());}
+            let mut bytes=Vec::new();
+            response.take(locator::MAX_PAGE_BYTES as u64+1).read_to_end(&mut bytes)
+                .map_err(|_|Fault::Companion.message().to_owned())?;
+            if bytes.len()>locator::MAX_PAGE_BYTES {return Err(Fault::Binding.message().into());}
+            serde_json::from_slice(&bytes).map_err(|_|Fault::Binding.message().into())
+        })
     }
 }
 
@@ -1124,45 +1165,5 @@ pub(crate) mod tests {
             assert!(Instant::now() < until, "owned process survived its job");
             std::thread::sleep(Duration::from_millis(40));
         }
-    }
-}
-
-/// The only authority carried to the publisher is this owned process's local
-/// control secret. It is used on loopback only; it never reaches the directory.
-pub(crate) struct LocatorTask {
-    renewal:crate::host_locator_renewal::Renewal,
-    sessions:crate::host_locator_renewal::Renewal,
-    http:reqwest::blocking::Client,
-    control:Zeroizing<String>,
-    current:model::RoutePin,
-    destination:relay_protocol::host_locator::Destination,
-}
-impl LocatorTask {
-    pub(crate) fn advance(&self,queue:&mut crate::host_locator_outbox::Outbox,now_ms:u64)
-        -> std::result::Result<crate::host_locator_renewal::Advance,String> {
-        use crate::host_locator_renewal::Advance;
-        use relay_protocol::host_locator as locator;
-        // Remembered members are renewed first; neither walk skips queued pages.
-        match self.walk(&self.sessions,locator::LOCAL_SESSION_PAGE_PATH,queue,now_ms)? {
-            Advance::Complete=>self.walk(&self.renewal,locator::LOCAL_PAGE_PATH,queue,now_ms),
-            progress=>Ok(progress),
-        }
-    }
-    fn walk(&self,renewal:&crate::host_locator_renewal::Renewal,path:&str,
-        queue:&mut crate::host_locator_outbox::Outbox,now_ms:u64)
-        -> std::result::Result<crate::host_locator_renewal::Advance,String> {
-        renewal.advance(queue,now_ms,|after| {
-            use relay_protocol::host_locator as locator;
-            let response=self.http.post(format!("http://127.0.0.1:4580{path}"))
-                .bearer_auth(self.control.as_str()).json(&locator::PageRequest{
-                    current:self.current.clone(),destination:self.destination.clone(),after,
-                }).send().map_err(|_|Fault::Companion.message().to_owned())?;
-            if !response.status().is_success() {return Err(Fault::Route.message().into());}
-            let mut bytes=Vec::new();
-            response.take(locator::MAX_PAGE_BYTES as u64+1).read_to_end(&mut bytes)
-                .map_err(|_|Fault::Companion.message().to_owned())?;
-            if bytes.len()>locator::MAX_PAGE_BYTES {return Err(Fault::Binding.message().into());}
-            serde_json::from_slice(&bytes).map_err(|_|Fault::Binding.message().into())
-        })
     }
 }

@@ -183,7 +183,7 @@ mod tests {
         let (seal, own) = leader.propose(parts.seal().unwrap()).unwrap();
         recovery.seal(&mut leader).unwrap(); // durable BEFORE the seal goes to peers
         assert_eq!(
-            recovery.approve(&mut leader, &[own.clone()], &[]),
+            recovery.approve(&mut leader, std::slice::from_ref(&own), &[]),
             Err(InflightError::NotApproved)
         );
         drop(recovery);
@@ -438,6 +438,7 @@ mod tests {
             addresses,
         )
     }
+    #[allow(clippy::too_many_arguments)] // test fixture: every input is a distinct piece of the scenario
     fn actual_capture_quorum(
         app: &AppState,
         root: &std::path::Path,

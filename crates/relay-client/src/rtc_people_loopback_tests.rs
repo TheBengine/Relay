@@ -431,7 +431,7 @@ async fn selected_owned_turn_tcp_paths(room: &Room, fixture: &Value) -> Result<V
                 || pair.candidate_pair.bytes_sent == 0
                 || pair.candidate_pair.bytes_received == 0
             {
-                return Err(format!("Native media did not prove owned TURN: relay={}, exact_url={}, protocol={}, sent={}, received={}", format!("{:?}",candidate.candidate_type), candidate.url == expected_url, protocol, pair.candidate_pair.bytes_sent, pair.candidate_pair.bytes_received));
+                return Err(format!("Native media did not prove owned TURN: relay={:?}, exact_url={}, protocol={}, sent={}, received={}", candidate.candidate_type, candidate.url == expected_url, protocol, pair.candidate_pair.bytes_sent, pair.candidate_pair.bytes_received));
             }
             paths.push(
                 json!({"selected_nominated_relay":candidate.candidate_type==Some(IceCandidateType::Relay),"selected_nominated_turn":true,"virtual_peer_reflexive":virtual_prflx,"exact_owned_host_url":true,

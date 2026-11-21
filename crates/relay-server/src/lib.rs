@@ -18,6 +18,8 @@ mod lan_pairing;
 mod handover;
 mod handover_locator;
 pub mod handover_readiness;
+#[cfg(windows)]
+mod data_privacy;
 pub mod handover_target;
 pub mod handover_transfer;
 mod hosting;
@@ -51,6 +53,7 @@ mod rtc;
 mod rtc_media;
 mod server_settings;
 mod upload_policy;
+mod unencrypted_sessions;
 mod social;
 mod takeover_voter;
 mod takeover_store;
@@ -138,6 +141,8 @@ struct Inner {
     locator_rates: Mutex<HashMap<String, (u64, u32)>>,
     /// Short-lived LAN pairing entries and per-peer counters. In memory only.
     lan_pairing: lan_pairing::Store,
+    /// Sessions signed in over plain HTTP from another machine. In memory only.
+    unencrypted_sessions: unencrypted_sessions::Marks,
     history_transfer: history_transfer::Store,
     mutation_rates: Mutex<HashMap<String, (u64, u32)>>,
     password_jobs: Arc<tokio::sync::Semaphore>,
@@ -529,6 +534,7 @@ impl AppState {
             route_rates: Mutex::new(HashMap::new()),
             locator_rates: Mutex::new(HashMap::new()),
             lan_pairing: lan_pairing::Store::default(),
+            unencrypted_sessions: Default::default(),
             history_transfer: history_transfer::Store::default(),
             mutation_rates: Mutex::new(HashMap::new()),
             password_jobs: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -1183,6 +1189,10 @@ pub fn router(state: AppState) -> Router {
         .merge(discord_host::routes())
         .merge(discord_channel_status::routes())
         .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            unencrypted_sessions::layer,
+        ))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(state.clone(), dispatch))
         .layer(middleware::from_fn_with_state(state.clone(), people::guard))
@@ -1544,10 +1554,12 @@ fn validate_auth(input: &AuthRequest) -> ApiResult<()> {
 fn new_session(db: &Connection, seal: &credential_seal::Seal, user: User) -> ApiResult<Session> {
     let token = random_token();
     let digest = token_hash(&token);
+    let verifier = seal.session(&digest);
     db.execute(
         "INSERT INTO sessions(token_hash,user_id,expires,created_at,locator) VALUES(?1,?2,?3,?4,?5)",
-        params![seal.session(&digest), user.id, now() + TOKEN_LIFETIME, now(), seal.seal_locator(&digest)],
+        params![verifier, user.id, now() + TOKEN_LIFETIME, now(), seal.seal_locator(&digest)],
     )?;
+    unencrypted_sessions::note(db, &verifier);
     Ok(Session { token, user })
 }
 
@@ -2900,7 +2912,7 @@ pub async fn cleanup_loop(state: AppState) {
         }
         state.enforce_rtc_permissions();
         let _ = state.flush_rtc_removals().await;
-        if ticks % REPLICA_MAINTENANCE_TICKS == 0 {
+        if ticks.is_multiple_of(REPLICA_MAINTENANCE_TICKS) {
             replica::service::maintain(&state);
         }
         let db = lock(&state.0.db);

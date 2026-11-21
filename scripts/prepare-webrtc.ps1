@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 $packageRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $patchRoot = Join-Path $packageRoot 'vendor\relay-frame-crypto'
 $patchSource = Join-Path $patchRoot 'frame_crypto_transformer.cc'
-$patchHash = '79813011a8cfd41a0ed872a1c30fc4ac64f2fd1baae4e61022e7822a98c3590a'
+$patchHash = '8a503241ff05068bafcdc496f9e44e56b726714221a510aa16d422de50976ecd'
 $baseHash = '5c2349c960bae4f06f71c102f58552d0d09c912a142811acfcadfb7c883cbf58'
 if ((Get-FileHash -LiteralPath $patchSource -Algorithm SHA256).Hash -ne $patchHash) {
     throw 'Native cryptor source changed; review and update the pinned patch digest before building.'

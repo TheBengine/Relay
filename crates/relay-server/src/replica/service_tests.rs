@@ -747,7 +747,7 @@ async fn a_permission_change_or_revocation_ends_staged_exports() {
         !dir.exists(),
         "no more bytes of the old eligibility, and nothing left on disk"
     );
-    assert!(manifest.parts.len() >= 1);
+    assert!(!manifest.parts.is_empty());
 
     // Revocation deletes staged exports at once and the next request is refused.
     let id = start(&h, &token, None, &none).await;

@@ -2702,6 +2702,7 @@ impl eframe::App for RelayApp {
         if !account_gateway {
             self.dialogs(ctx);
         }
+        self.unencrypted_dialog(ctx);
         if self.capture_icons {
             // Input is disabled in capture mode. Draw the actual shared controls without joining a call.
             desktop_ui::dialog(ctx, "Relay icon preview")

@@ -53,6 +53,7 @@ pub(super) async fn issue(
         .map(Json)
 }
 
+#[cfg(test)]
 pub(super) fn seal(
     input: model::Issue,
     invite_hash: [u8; 32],

@@ -84,7 +84,9 @@ pub(super) const LIMITS: [&str; 3] = [
 pub(super) struct Drawn {
     pub chosen: Option<Problem>,
     pub action: Option<Action>,
+    #[cfg(test)]
     pub choosers: Vec<(Problem, Rect)>,
+    #[cfg(test)]
     pub button: Option<Rect>,
 }
 
@@ -97,10 +99,12 @@ pub(super) fn content(ui: &mut egui::Ui, chosen: Option<Problem>) -> Drawn {
         "Choose what happened to see the steps. Nothing here changes your account or devices.",
     );
     let mut next = chosen;
+    #[cfg(test)]
     let mut choosers = Vec::new();
     ui.horizontal_wrapped(|ui| {
         for problem in Problem::ALL {
             let response = ui.selectable_label(chosen == Some(problem), problem.label());
+            #[cfg(test)]
             choosers.push((problem, response.rect));
             if response.clicked() {
                 next = (chosen != Some(problem)).then_some(problem);
@@ -108,6 +112,7 @@ pub(super) fn content(ui: &mut egui::Ui, chosen: Option<Problem>) -> Drawn {
         }
     });
     let mut action = None;
+    #[cfg(test)]
     let mut button = None;
     if let Some(problem) = chosen {
         ui.add_space(6.0);
@@ -117,7 +122,10 @@ pub(super) fn content(ui: &mut egui::Ui, chosen: Option<Problem>) -> Drawn {
         }
         ui.add_space(4.0);
         let response = ui.add(secondary(problem.action().label()));
-        button = Some(response.rect);
+        #[cfg(test)]
+        {
+            button = Some(response.rect);
+        }
         if response.clicked() {
             action = Some(problem.action());
         }
@@ -137,7 +145,9 @@ pub(super) fn content(ui: &mut egui::Ui, chosen: Option<Problem>) -> Drawn {
     Drawn {
         chosen: next,
         action,
+        #[cfg(test)]
         choosers,
+        #[cfg(test)]
         button,
     }
 }

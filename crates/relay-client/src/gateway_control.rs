@@ -507,9 +507,6 @@ impl Session {
         state.active = active;
         (active, changed)
     }
-    pub fn active(&self) -> bool {
-        self.state.lock().is_ok_and(|state| state.active)
-    }
     /// The LAN's elected gateway, while gateways are enabled for this call.
     pub fn choice(&self) -> Option<Choice> {
         if !self.enabled.load(Ordering::Acquire) {

@@ -78,20 +78,21 @@ async fn prepare_with_rtc(rtc: Option<crate::rtc::RtcConfig>) -> Fixture {
         StatusCode::OK
     );
     // State deliberately outside the member-copy allowlist, spanning >1 part.
-    let db = lock(&state.0.db);
-    db.execute("CREATE TABLE full_handover_only(secret BLOB)", [])
+    {
+        let db = lock(&state.0.db);
+        db.execute("CREATE TABLE full_handover_only(secret BLOB)", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO full_handover_only(secret) VALUES(?1)",
+            [vec![0x31u8; 2 * PART + 37]],
+        )
         .unwrap();
-    db.execute(
-        "INSERT INTO full_handover_only(secret) VALUES(?1)",
-        [vec![0x31u8; 2 * PART + 37]],
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO metadata(key,value) VALUES('private-handover-fixture','complete state')",
-        [],
-    )
-    .unwrap();
-    drop(db);
+        db.execute(
+            "INSERT INTO metadata(key,value) VALUES('private-handover-fixture','complete state')",
+            [],
+        )
+        .unwrap();
+    }
     let (code, value) = request(
         &app,
         "POST",
@@ -1079,8 +1080,7 @@ async fn exercise_standby_media_routes(
     ] {
         let error = connect(path, token)
             .await
-            .err()
-            .expect("capability must not cross routes");
+            .expect_err("capability must not cross routes");
         assert!(
             matches!(error,tokio_tungstenite::tungstenite::Error::Http(r) if r.status()==StatusCode::FORBIDDEN)
         );

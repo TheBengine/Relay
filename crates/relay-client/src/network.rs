@@ -21,7 +21,7 @@ use relay_protocol::*;
 use reqwest::blocking::{Client, RequestBuilder};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -65,6 +65,8 @@ impl From<&Connection> for CommandOrigin {
     }
 }
 
+// One per user action on the worker channel; boxing would change every send and match site.
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     CreateLanPairing {origin:CommandOrigin,request_id:u64,cancel:Arc<AtomicBool>},
     RevokeLanPairing {origin:CommandOrigin,id:String},
@@ -425,6 +427,11 @@ pub enum Command {
     /// forgets the current server's remembered login.
     RememberNextLogins {
         enabled: bool,
+    },
+    /// The person accepted, once for this exact address, that a password and a
+    /// saved login travel there without encryption (`crate::cleartext`).
+    AllowUnencrypted {
+        url: String,
     },
     /// Apply the shared-account choice to these known server/Friends sessions,
     /// including parked connections, without signing them out while in use.
@@ -1226,6 +1233,9 @@ struct Worker {
     background_pending: std::collections::VecDeque<background_crypto::Pending>,
     status: Option<ConnectionStatus>,
     remember_session: bool,
+    /// Plain-HTTP addresses the person accepted; nothing else may receive a
+    /// password or a saved login in clear text.
+    unencrypted_ok: HashSet<String>,
     legacy_reactions: legacy_reactions::LegacyReactions,
 }
 
@@ -1980,6 +1990,7 @@ impl Worker {
             background_pending: std::collections::VecDeque::new(),
             status: None,
             remember_session: false,
+            unencrypted_ok: HashSet::new(),
             legacy_reactions: legacy_reactions::LegacyReactions::default(),
             call_switch_preflight: false,
         })
@@ -2354,6 +2365,15 @@ impl Worker {
         self.emit(Update::Busy(false));
     }
 
+    pub(super) fn unencrypted_gate(&self, url: &str) -> Result<(), String> {
+        match crate::cleartext::needs_consent(url) {
+            Some(canonical) if !self.unencrypted_ok.contains(&canonical) => {
+                Err(crate::cleartext::CONSENT_NEEDED.into())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn post_empty<B: Serialize>(&self, path: &str, body: &B) -> Result<(), String> {
         checked(
             self.request(reqwest::Method::POST, path)?
@@ -2362,15 +2382,6 @@ impl Worker {
                 .map_err(network_error)?,
         )?;
         Ok(())
-    }
-
-    fn adopt_session(
-        &mut self,
-        url: String,
-        expected_server_id: Option<String>,
-        session: Session,
-    ) -> Result<(), String> {
-        self.adopt_session_checked(url, expected_server_id, session, None, None, None)
     }
 
     fn adopt_session_checked(
@@ -2455,6 +2466,7 @@ impl Worker {
             bootstrap.host_authority.as_ref(),
             previous_pin,
         )?;
+        let host_key = crate::host_route::host_key(authority.as_ref(), &bootstrap);
         if let Some(moving) = &moved {
             let origin = &moving.origin;
             validate_bootstrap_identity(&origin.server_id, &origin.user_id, &bootstrap)?;
@@ -2511,6 +2523,7 @@ impl Worker {
             crypto_pending_join: None,
         });
         self.connection.as_mut().unwrap().chat.authority = authority;
+        self.connection.as_mut().unwrap().chat.host_key = host_key;
         if let Some(m) = &moved {
             self.connection.as_mut().unwrap().chat.authority_aliases = m.aliases.clone();
         }
@@ -2547,11 +2560,12 @@ impl Worker {
                             account_provider: c.chat.account_provider.clone(),
                             previous_urls: c.chat.authority_aliases.clone(),
                         });
-                if let Err(error) = crate::credential_vault::save_bound(
+                if let Err(error) = crate::credential_vault::save_full(
                     &c.url,
                     &c.server_id,
                     &c.session,
                     authority.as_ref(),
+                    c.chat.host_key.as_ref(),
                 ) {
                     c.remembered = false;
                     remember_error = Some(format!(
@@ -2638,6 +2652,14 @@ impl Worker {
             }
             self.emit(Update::LocalOpened(saved));
             return Ok(());
+        }
+        // W-01: no password or saved login to a plain-HTTP address on another
+        // machine without the person's acknowledgement for that exact address.
+        if let Command::Auth { url, .. }
+        | Command::ResetPassword { url, .. }
+        | Command::Resume { url, .. } = &command
+        {
+            self.unencrypted_gate(url)?;
         }
         match &command {
             Command::Auth {
@@ -4722,6 +4744,15 @@ fn resume_remembered(
         return Err(IDENTITY_CHANGED.into());
     }
     crate::embedded_network::bind_identity(url, &pin)?;
+    // R7: an address without a pinned authority proves the host key this login
+    // was made with, to a fresh challenge, before the token leaves.
+    let proven = match (&remembered.authority, &remembered.host) {
+        (None, Some(host)) if host.server_id == pin => {
+            Some(crate::host_route::prove_host(http, url, host)?)
+        }
+        (None, Some(_)) => return Err(crate::host_route::NOT_THE_SAME_SERVER.into()),
+        _ => None,
+    };
     let call_alerts::BootstrapReply { bootstrap, cursor } = parse::<call_alerts::BootstrapReply>(
         http.get(crate::embedded_network::endpoint(&format!(
             "{url}/api/bootstrap"
@@ -4732,6 +4763,9 @@ fn resume_remembered(
     )?;
     let received = Instant::now();
     validate_bootstrap_identity(&pin, &remembered.session.user.id, &bootstrap)?;
+    if proven.is_some() && bootstrap.host_authority != proven {
+        return Err(crate::host_route::NOT_THE_SAME_SERVER.into());
+    }
     if let Some(saved) = &remembered.authority {
         crate::host_route::bootstrap_pin(
             url,

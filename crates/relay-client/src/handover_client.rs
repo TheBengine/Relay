@@ -26,6 +26,8 @@ const CARD_PREFIX: &str = "Relay host setup v1: ";
 #[path = "handover_preflight.rs"]
 mod preflight;
 
+// One value per user action; boxing the large variants would touch every construct and match site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum Action {
     SetupPrivate,
@@ -192,6 +194,7 @@ impl Job {
             true,
         )
     }
+    #[allow(clippy::too_many_arguments)] // the eight values travel together into one worker thread
     fn spawn(
         origin: CommandOrigin,
         pin: model::RoutePin,

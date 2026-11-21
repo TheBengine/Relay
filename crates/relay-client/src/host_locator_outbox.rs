@@ -361,17 +361,6 @@ fn backoff_ms(attempts: u32) -> u64 {
 }
 
 impl Outbox {
-    /// The outbox of this profile. A missing file is an empty outbox; a damaged,
-    /// oversized, redirected or foreign one is an error and stays as it is.
-    ///
-    /// The queue of the Friends service the app is configured with right now.
-    /// A caller that publishes later should capture that address once and use
-    /// `for_service` with it, so the queue and the publication cannot differ.
-    pub(crate) fn for_profile() -> Result<Self, String> {
-        let base = crate::host_locator::directory().ok_or(NO_SERVICE)?;
-        Self::for_service(&base)
-    }
-
     /// The queue that belongs to exactly this Friends service (`https://...`), kept
     /// in its own folder below the profile. Another service never sees it, and an
     /// address that a community supplied must not be passed here.
@@ -380,6 +369,8 @@ impl Outbox {
         Self::open(scoped(&profile,base)?)
     }
 
+    /// A missing file is an empty outbox; a damaged, oversized, redirected or
+    /// foreign one is an error and stays as it is.
     pub(crate) fn for_service(base: &str) -> Result<Self, String> {
         Self::open(scoped(&profile_dir()?, base)?)
     }
@@ -445,6 +436,7 @@ impl Outbox {
 
     /// After `UNCONFIRMED`: reload what is on disk and write it again until the
     /// folder flush is confirmed. Changes nothing otherwise.
+    #[cfg(test)]
     pub(crate) fn settle(&mut self) -> Result<(), String> {
         self.mutate(clock(), |_| Ok(((), false)))
     }

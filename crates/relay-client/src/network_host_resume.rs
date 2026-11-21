@@ -7,6 +7,7 @@ impl Worker {
         remembered: crate::credential_vault::RememberedSession,
         expected_server_id: Option<String>,
     ) -> Result<(), String> {
+        self.unencrypted_gate(&url)?;
         let (session, bootstrap, call_received, alert_cursor) =
             match resume_remembered(&self.http, &url, &remembered, expected_server_id.as_deref()) {
                 Ok(value) => value,
@@ -23,11 +24,16 @@ impl Worker {
             bootstrap.host_authority.as_ref(),
             None,
         )?;
-        if remembered.server_id.is_none() || (remembered.authority.is_none() && authority.is_some())
+        let host_key = crate::host_route::host_key(authority.as_ref(), &bootstrap);
+        if remembered.server_id.is_none()
+            || (remembered.authority.is_none() && authority.is_some())
+            || (authority.is_none() && remembered.host != host_key)
         {
-            // Upgrade only after known community and account match.
+            // Upgrade only after known community and account match. A login
+            // without a host key learns it here once (trust on first use); a
+            // remembered key changes only along a proof `resume_remembered` checked.
             // A failed vault write must preserve the current UI.
-            crate::credential_vault::save_bound(
+            crate::credential_vault::save_full(
                 &url,
                 &bootstrap.server_id,
                 &session,
@@ -39,6 +45,7 @@ impl Worker {
                         previous_urls: Vec::new(),
                     })
                     .as_ref(),
+                host_key.as_ref(),
             )?;
         }
         self.live.epoch.fetch_add(1, Ordering::SeqCst);
@@ -75,6 +82,7 @@ impl Worker {
             crypto_pending_join: None,
         });
         self.connection.as_mut().unwrap().chat.authority = authority;
+        self.connection.as_mut().unwrap().chat.host_key = host_key;
         self.connection.as_mut().unwrap().chat.authority_aliases = remembered
             .authority
             .as_ref()
@@ -106,6 +114,7 @@ impl Worker {
         url: String,
         remembered: crate::credential_vault::RememberedSession,
     ) -> Result<(), String> {
+        self.unencrypted_gate(&url)?;
         let saved = remembered
             .authority
             .as_ref()

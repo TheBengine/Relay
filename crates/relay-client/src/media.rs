@@ -780,6 +780,8 @@ enum DeviceReopen {
     },
 }
 
+// Sent a few times per call (start, stop, tone), never per audio frame; boxing would change every send and match site.
+#[allow(clippy::large_enum_variant)]
 enum AudioCommand {
     CallTone {
         cue: AudioCue,

@@ -166,11 +166,13 @@ struct Job {
     cancelled: Arc<AtomicBool>,
     result: ExportStatus,
 }
+#[cfg(test)]
+type BeforePublish = Box<dyn FnOnce(&AppState) + Send>;
 #[derive(Default)]
 pub(crate) struct Service {
     job: Mutex<Option<Job>>,
     #[cfg(test)]
-    before_publish: Mutex<Option<Box<dyn FnOnce(&AppState) + Send>>>,
+    before_publish: Mutex<Option<BeforePublish>>,
 }
 impl Service {
     pub(crate) fn discard(&self, data: &DiskPath, preparation: &str) {

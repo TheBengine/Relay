@@ -193,10 +193,8 @@ fn active(s: &Standby, p: &Arc<Probe>) -> bool {
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, p))
 }
-fn stopped(p: Arc<Probe>) -> impl std::future::Future<Output = ()> + Send {
-    async move {
-        tokio::select! {_=p.cancel.cancelled()=>{},_=tokio::time::sleep_until(p.until.into())=>{}}
-    }
+async fn stopped(p: Arc<Probe>) {
+    tokio::select! {_=p.cancel.cancelled()=>{},_=tokio::time::sleep_until(p.until.into())=>{}}
 }
 pub(super) async fn validate(
     State(s): State<Arc<Standby>>,

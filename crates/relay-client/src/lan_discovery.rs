@@ -645,7 +645,7 @@ mod tests {
         };
         // A complete record with the helper installed is offered, with its stored name.
         let good = record(&address, credentials(&key, token, None));
-        let route = secure_route(&[good.clone()], &found, true).unwrap();
+        let route = secure_route(std::slice::from_ref(&good), &found, true).unwrap();
         assert_eq!(
             (route.url.as_str(), route.display_name().as_str()),
             (address.as_str(), "Home")
@@ -672,7 +672,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                secure_route(&[bad.clone()], &found, true),
+                secure_route(std::slice::from_ref(&bad), &found, true),
                 None,
                 "{:?}",
                 bad.url

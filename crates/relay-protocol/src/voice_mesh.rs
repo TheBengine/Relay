@@ -250,8 +250,8 @@ fn tree_walk(
             } else {
                 continue;
             };
-            if !out.contains_key(&next) {
-                out.insert(next, (cost.saturating_add(weight), count + 1));
+            if let std::collections::btree_map::Entry::Vacant(slot) = out.entry(next) {
+                slot.insert((cost.saturating_add(weight), count + 1));
                 queue.push_back(next);
             }
         }
@@ -494,7 +494,8 @@ impl RoutePlan {
         // People without a home gateway: whole-path choice, deterministic order.
         lone.sort_by(|a, b| a.id.cmp(&b.id));
         for member in lone {
-            let mut best: Option<((u32, u32, usize, NodeId), Candidate, Vec<NodeId>)> = None;
+            type Choice = ((u32, u32, usize, NodeId), Candidate, Vec<NodeId>);
+            let mut best: Option<Choice> = None;
             for candidate in &member.candidates {
                 if !all.contains(&candidate.node)
                     || banned.contains(&(member.id.clone(), candidate.node))

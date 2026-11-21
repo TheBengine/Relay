@@ -172,7 +172,7 @@ impl SetBody {
         [&self.pin.host, &self.candidates[0], &self.candidates[1]]
     }
     pub fn is_member(&self, identity: &HostIdentity) -> bool {
-        self.members().iter().any(|m| *m == identity)
+        self.members().contains(&identity)
     }
     pub fn is_candidate(&self, identity: &HostIdentity) -> bool {
         self.candidates.iter().any(|c| c == identity)

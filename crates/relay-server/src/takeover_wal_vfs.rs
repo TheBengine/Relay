@@ -1239,7 +1239,7 @@ impl WalVfs {
         let _running = Running(&inner.snapshotting);
         // SAFETY: the handle belongs to `source`, which is borrowed for this call.
         let txn =
-            unsafe { ffi::sqlite3_txn_state(source.handle(), b"main\0".as_ptr() as *const c_char) };
+            unsafe { ffi::sqlite3_txn_state(source.handle(), c"main".as_ptr()) };
         if txn != ffi::SQLITE_TXN_NONE || !source.is_autocommit() {
             return Err(Refusal("the source connection is inside a transaction"));
         }
@@ -1626,7 +1626,7 @@ unsafe fn open_file(
     out_flags: *mut c_int,
 ) -> c_int {
     (*file).pMethods = ptr::null();
-    if (file as usize) % std::mem::align_of::<File>() != 0 || inner.is_poisoned() {
+    if !(file as usize).is_multiple_of(std::mem::align_of::<File>()) || inner.is_poisoned() {
         return ffi::SQLITE_CANTOPEN;
     }
     let path: Option<&[u8]> = if name.is_null() {
@@ -2007,7 +2007,7 @@ unsafe fn wal_write(inner: &Inner, f: &File, bytes: &[u8], at: u64) -> c_int {
     // A write that completes a commit frame ends the transaction: bytes of an earlier, rolled
     // back attempt that lie beyond it are stale and must not be mistaken for part of it.
     if let Some((from, size)) = frame_layout(&state) {
-        if end >= from + size && (end - from) % size == 0 && be32(&state.tail, end - size + 4) != 0
+        if end >= from + size && (end - from).is_multiple_of(size) && be32(&state.tail, end - size + 4) != 0
         {
             // Repeats (padding) after the first commit frame are verified at the sync; a new or
             // smaller commit frame replaces a stale mark and drops the stale bytes behind it.
@@ -2072,7 +2072,7 @@ unsafe fn main_write(inner: &Inner, f: &File, bytes: &[u8], at: u64) -> c_int {
     let page = state.page_size as u64;
     let ok = page != 0
         && bytes.len() as u64 == page
-        && at % page == 0
+        && at.is_multiple_of(page)
         && (at > 0 || (bytes.len() >= 20 && bytes[18] == 2 && bytes[19] == 2))
         && state
             .committed_frames

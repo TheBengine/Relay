@@ -112,7 +112,7 @@ fn verify_native_cryptor() {
     let patch = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
         .join("../../vendor/relay-frame-crypto/frame_crypto_transformer.cc");
     println!("cargo:rerun-if-changed={}", patch.display());
-    let expected_patch = "79813011a8cfd41a0ed872a1c30fc4ac64f2fd1baae4e61022e7822a98c3590a";
+    let expected_patch = "8a503241ff05068bafcdc496f9e44e56b726714221a510aa16d422de50976ecd";
     assert_eq!(
         digest(&patch),
         expected_patch,

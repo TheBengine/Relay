@@ -668,8 +668,10 @@ mod discovery_pin_tests {
     fn a_discovery_answer_never_replaces_a_saved_server_identity() {
         let prefs = [saved("HTTP://192.168.1.20:4580/", KNOWN)];
         // A conflicting answer at the known address is refused and changes nothing.
-        let mut flow = JoinFlow::default();
-        flow.url = "typed-before".into();
+        let mut flow = JoinFlow {
+            url: "typed-before".into(),
+            ..JoinFlow::default()
+        };
         let error = flow
             .select_discovered(&prefs, &found("192.168.1.20", OTHER))
             .unwrap_err();
@@ -711,8 +713,10 @@ mod discovery_pin_tests {
             Some(KNOWN.to_string())
         );
         // No saved route for that id (or only plain HTTP): refused, nothing changes.
-        let mut flow = JoinFlow::default();
-        flow.url = "typed-before".into();
+        let mut flow = JoinFlow {
+            url: "typed-before".into(),
+            ..JoinFlow::default()
+        };
         for list in [
             vec![saved("https://home.example", OTHER)],
             vec![saved("http://192.168.1.20:4580", KNOWN)],
@@ -727,8 +731,10 @@ mod discovery_pin_tests {
         }
         // Even a spoofed id cannot override the pin persisted for the known address
         // through the manual path afterwards.
-        let mut flow = JoinFlow::default();
-        flow.url = "http://192.168.1.20:4580".into();
+        let flow = JoinFlow {
+            url: "http://192.168.1.20:4580".into(),
+            ..JoinFlow::default()
+        };
         assert_eq!(
             flow.setup
                 .expected_id_with_saved(&flow.url, &prefs)
@@ -744,11 +750,13 @@ mod authority_flow_tests {
     #[test]
     fn verified_move_changes_only_the_matching_form_and_keeps_invitation_and_credentials() {
         let (_, _, pin, _) = crate::host_route::tests::fixture();
-        let mut flow = JoinFlow::default();
-        flow.url = "https://source.example".into();
-        flow.username = "owned-user".into();
-        flow.password = "owned-password".into();
-        flow.invite = "owned-invite".into();
+        let mut flow = JoinFlow {
+            url: "https://source.example".into(),
+            username: "owned-user".into(),
+            password: "owned-password".into(),
+            invite: "owned-invite".into(),
+            ..JoinFlow::default()
+        };
         flow.setup.invitation = Some(
             Invitation::new(&flow.url, &pin.server_id, &flow.invite)
                 .unwrap()
@@ -804,9 +812,11 @@ mod authority_flow_tests {
             endpoint_id: "d8".repeat(32), relay: None, token: "Z".repeat(43),
         };
         crate::iroh_route::register(&next);
-        let mut flow = JoinFlow::default();
-        flow.url = "https://source.example".into();
-        flow.invite = "owned-invite".into();
+        let mut flow = JoinFlow {
+            url: "https://source.example".into(),
+            invite: "owned-invite".into(),
+            ..JoinFlow::default()
+        };
         let mut invitation = Invitation::new(&flow.url, &pin.server_id, &flow.invite).unwrap()
             .with_authority(Some(pin.clone())).unwrap();
         invitation.iroh = Some(crate::invitation_routes::IrohRoute::new(&"d7".repeat(32), None, &"Y".repeat(43)).unwrap());

@@ -707,6 +707,7 @@ pub enum Event {
 }
 
 struct Active {
+    #[cfg(test)]
     choice: Choice,
     cancel: Arc<AtomicBool>,
     now: Arc<AtomicBool>,
@@ -739,10 +740,7 @@ impl Controller {
         }
     }
 
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
+    #[cfg(test)]
     pub fn running(&self) -> Option<&Choice> {
         self.active.as_ref().map(|active| &active.choice)
     }
@@ -758,10 +756,11 @@ impl Controller {
         let now = Arc::new(AtomicBool::new(false));
         let slot = Slot::default();
         let previous = self.retiring.take();
+        #[cfg(test)]
+        let kept = choice.clone();
         let handle = {
             let (cancel, now, slot) = (cancel.clone(), now.clone(), slot.clone());
             let (sender, ctx) = (self.sender.clone(), self.ctx.clone());
-            let choice = choice.clone();
             thread::Builder::new()
                 .name("relay-replica-copy".into())
                 .spawn(move || {
@@ -775,7 +774,8 @@ impl Controller {
                 .map_err(|_| "Relay could not start the copy.".to_string())?
         };
         self.active = Some(Active {
-            choice,
+            #[cfg(test)]
+            choice: kept,
             cancel,
             now,
             slot,
@@ -825,6 +825,7 @@ impl Controller {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // thread entry point: each value is a distinct handle moved into the thread
 fn work(
     choice: Choice,
     directory: PathBuf,

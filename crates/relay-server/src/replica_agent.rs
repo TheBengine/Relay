@@ -13,8 +13,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 #[cfg(windows)]
-#[path = "data_privacy.rs"]
-mod privacy;
+use crate::data_privacy as privacy;
 
 const APP_ID: i64 = 0x524c5943;
 const MANIFEST_LIMIT: usize = 16 * 1024 * 1024;

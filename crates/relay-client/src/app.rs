@@ -296,6 +296,10 @@ struct Preferences {
     /// Opt-in game activity for Friends: both choices off unless turned on.
     #[serde(default)]
     game_activity: crate::game_activity::Settings,
+    /// Plain-HTTP community addresses the person accepted signing in to
+    /// without encryption (W-01), one exact address each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unencrypted_ok: Vec<String>,
 }
 
 fn default_remember_drafts() -> bool {
@@ -575,6 +579,7 @@ impl Default for Preferences {
             pending_creation: None,
             replica_copies: Vec::new(),
             game_activity: Default::default(),
+            unencrypted_ok: Vec::new(),
         }
     }
 }
@@ -885,6 +890,8 @@ pub struct RelayApp {
     message_menu: Option<String>,
     message_hover: Option<String>,
     delete_confirm: Option<Message>,
+    /// A sign-in held until the person accepts an unencrypted address (W-01).
+    unencrypted_prompt: Option<(String, Command)>,
     initial_search: Option<String>,
     initial_community_tab: Option<String>,
     initial_capture_panel: Option<String>,
@@ -1386,6 +1393,7 @@ impl RelayApp {
             message_menu: None,
             message_hover: None,
             delete_confirm: None,
+            unencrypted_prompt: None,
             initial_search: value("--search"),
             initial_community_tab: value("--community-tab"),
             initial_capture_panel: capture_path.as_ref().and_then(|_| value("--capture-panel")),
@@ -1554,6 +1562,10 @@ impl RelayApp {
             ui_scale,
             own_local_server: false,
         };
+        // Addresses accepted earlier reach the worker before any sign-in.
+        for url in app.prefs.unencrypted_ok.clone() {
+            app.send(Command::AllowUnencrypted { url });
+        }
         app.sync_call_alert_preferences();
         #[cfg(windows)]
         if app.capture_path.is_none() {
@@ -1661,6 +1673,19 @@ impl RelayApp {
     }
 
     fn send(&mut self, command: Command) {
+        if let Command::Auth { url, .. }
+        | Command::ResetPassword { url, .. }
+        | Command::Resume { url, .. } = &command
+        {
+            if !crate::cleartext::acknowledged(&self.prefs.unencrypted_ok, url) {
+                let url = url.clone();
+                // One question at a time: a newer attempt replaces an older one.
+                if let Some((_, older)) = self.unencrypted_prompt.replace((url, command)) {
+                    self.unencrypted_declined(older);
+                }
+                return;
+            }
+        }
         let resume_intent = match &command {
             Command::Resume { url, .. } => Some(Some(url.clone())),
             Command::Auth { .. }
