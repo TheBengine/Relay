@@ -462,9 +462,10 @@ async fn live_voice_renewal_is_capped_by_login_expiry_and_requires_valid_login()
     let f = Fixture::new().await;
     let ticket = f.join("selected").await;
     let login_expiry = now() + 90;
+    // created_at=0: a login that does not renew, so its expiry is the cap.
     lock(&f.state.0.db)
         .execute(
-            "UPDATE sessions SET expires=?1 WHERE token_hash=?2",
+            "UPDATE sessions SET expires=?1,created_at=0 WHERE token_hash=?2",
             params![login_expiry, crate::session_hash(&f.user.token)],
         )
         .unwrap();

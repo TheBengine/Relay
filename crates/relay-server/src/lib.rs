@@ -111,7 +111,15 @@ use subtle::ConstantTimeEq;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-const TOKEN_LIFETIME: u64 = 7 * 24 * 3600;
+/// A session lives `SESSION_IDLE` past its last authenticated use, and never
+/// longer than `SESSION_ABSOLUTE` after it was created. The token itself is
+/// unchanged by renewal: it stays bound to this server and was never sent
+/// anywhere else, so renewal adds no replay surface (security review R11).
+const SESSION_IDLE: u64 = 30 * 24 * 3600;
+const SESSION_ABSOLUTE: u64 = 180 * 24 * 3600;
+/// Renewal writes at most about once a day per session.
+const SESSION_RENEW_STEP: u64 = 24 * 3600;
+const TOKEN_LIFETIME: u64 = SESSION_IDLE;
 const VOICE_LIFETIME: u64 = 4 * 3600;
 
 #[derive(Clone)]
@@ -614,6 +622,9 @@ impl AppState {
             Ok(Auth { user: row_user(r)?, permissions: 0, token_hash: hash.clone(), token_digest: digest.clone(), expires:r.get(8)? })
         }).optional()?.ok_or_else(unauthorized)?;
         auth.permissions = roles::permissions(&db, &auth.user.id)?;
+        if self.writes_allowed() {
+            auth.expires = renew_session(&db, &hash, auth.expires)?;
+        }
         // Handover status/cancellation still authenticate while the source DB
         // is read-only. Presence must not turn that read into a hidden write.
         if self.writes_allowed() {
@@ -1561,6 +1572,20 @@ fn new_session(db: &Connection, seal: &credential_seal::Seal, user: User) -> Api
     )?;
     unencrypted_sessions::note(db, &verifier);
     Ok(Session { token, user })
+}
+
+/// Slides a used session's expiry forward under its absolute cap. A row from
+/// before `created_at` existed (0) keeps its fixed expiry.
+fn renew_session(db: &Connection, hash: &str, expires: u64) -> ApiResult<u64> {
+    let at = now();
+    if expires.saturating_add(SESSION_RENEW_STEP) > at.saturating_add(SESSION_IDLE) {
+        return Ok(expires);
+    }
+    db.execute(
+        "UPDATE sessions SET expires=MAX(expires,MIN(?2,created_at+?3)) WHERE token_hash=?1 AND created_at>0",
+        params![hash, at.saturating_add(SESSION_IDLE), SESSION_ABSOLUTE],
+    )?;
+    Ok(db.query_row("SELECT expires FROM sessions WHERE token_hash=?1", [hash], |r| r.get(0))?)
 }
 
 /// Seals plain password hashes and re-keys older session rows in one

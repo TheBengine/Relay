@@ -1920,3 +1920,87 @@ fn slowmode_messages_in_the_fixed_sources_use_a_real_en_dash() {
         }
     }
 }
+
+/// Friends re-login (21 Nov 2026): a session renews while it is used, so a
+/// signed-in person is not asked to sign in again every seven days. Renewal is
+/// sliding (idle limit) under an absolute cap from `created_at`; a row written
+/// before `created_at` existed is never extended.
+#[tokio::test]
+async fn sessions_slide_while_used_under_an_absolute_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path(), "test", 0).unwrap();
+    let app = router(state.clone());
+    let admin = signup(&app, "Admin", "").await;
+    let hash = crate::session_hash(&admin.token);
+    let set = |expires: u64, created: u64| {
+        lock(&state.0.db)
+            .execute(
+                "UPDATE sessions SET expires=?1,created_at=?2 WHERE token_hash=?3",
+                params![expires, created, hash],
+            )
+            .unwrap();
+    };
+    let expires = || -> u64 {
+        lock(&state.0.db)
+            .query_row("SELECT expires FROM sessions WHERE token_hash=?1", [&hash], |r| r.get(0))
+            .unwrap()
+    };
+    let bootstrap = || request(&app, "GET", "/api/bootstrap", Some(&admin.token), serde_json::Value::Null);
+
+    // Used an hour before the old fixed expiry: renewed to the idle limit.
+    set(now() + 3600, now() - 6 * 24 * 3600);
+    assert_eq!(bootstrap().await.0, StatusCode::OK);
+    assert!(expires() >= now() + crate::SESSION_IDLE - 60, "a used session slides forward");
+
+    // Near the absolute cap: renewal stops at created_at + cap, never beyond.
+    let created = now() - crate::SESSION_ABSOLUTE + 600;
+    set(now() + 60, created);
+    assert_eq!(bootstrap().await.0, StatusCode::OK);
+    assert_eq!(expires(), created + crate::SESSION_ABSOLUTE);
+
+    // A legacy row without created_at keeps its fixed expiry.
+    let fixed = now() + 3600;
+    set(fixed, 0);
+    assert_eq!(bootstrap().await.0, StatusCode::OK);
+    assert_eq!(expires(), fixed);
+
+    // Expired stays expired: renewal never revives a session.
+    set(now() - 1, now() - 24 * 3600);
+    assert_eq!(bootstrap().await.0, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_fresh_session_is_not_rewritten_on_every_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::open(temp.path(), "test", 0).unwrap();
+    let app = router(state.clone());
+    let admin = signup(&app, "Admin", "").await;
+    let hash = crate::session_hash(&admin.token);
+    // Within a day of the full idle window nothing is written.
+    let marker = now() + crate::SESSION_IDLE - 3600;
+    lock(&state.0.db)
+        .execute("UPDATE sessions SET expires=?1 WHERE token_hash=?2", params![marker, hash])
+        .unwrap();
+    assert_eq!(request(&app, "GET", "/api/bootstrap", Some(&admin.token), serde_json::Value::Null).await.0, StatusCode::OK);
+    let after: u64 = lock(&state.0.db)
+        .query_row("SELECT expires FROM sessions WHERE token_hash=?1", [&hash], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, marker);
+}
+
+/// Friends re-login cause check: a plain restart (or an upgrade that opens the
+/// same data folder) keeps saved sessions; only expiry, a revoke or a lost
+/// host seal key refuses them.
+#[tokio::test]
+async fn a_restart_on_the_same_data_folder_keeps_sessions() {
+    let temp = tempfile::tempdir().unwrap();
+    let token = {
+        let state = AppState::open(temp.path(), "test", 0).unwrap();
+        let app = router(state.clone());
+        signup(&app, "Admin", "").await.token
+    };
+    let state = AppState::open(temp.path(), "test", 0).unwrap();
+    let app = router(state);
+    let (status, _) = request(&app, "GET", "/api/bootstrap", Some(&token), serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+}
